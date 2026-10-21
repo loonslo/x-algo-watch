@@ -35,6 +35,10 @@ python -m compileall -q x_algo_watch tests
 - [补写入口 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39636378288)：**126 passed in 8.81s**。
 - [首次真实模型样例](https://github.com/loonslo/x-algo-watch/actions/runs/39636392038)：detect/draft/publish 成功，但第一次 Xing4.0 请求为 HTTP 429，审计记录为 deferred；因此仅创建[证据 Issue #2](https://github.com/loonslo/x-algo-watch/issues/2)，标记待起草，无草稿。生产进度仍为 7f2ca2b，状态提交为 77357b4。工作流绿色仅表示降级流程成功，不能据此宣称模型质量通过。
 - 为区分账户每日/每分钟限额与提供方拥堵，增加仅输出固定分类与数字 Retry-After 的错误记录，服务端原文不进入产物。相关模型与流程测试 **18 passed in 0.39s**，含服务端回显假 key 不泄露的用例。
+- [错误分类 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39636820234)：**130 passed in 10.00s**。
+- [受控重试](https://github.com/loonslo/x-algo-watch/actions/runs/39636841042)：detect/draft/publish 成功，仍为 HTTP 429；固定分类确认是“模型提供方暂时拥堵”。此次记录提交为 61e6f5d，仍使用同一 Issue #2，生产进度保持 7f2ca2b；共两次真实请求，均未生成草稿，尚未调用 NVIDIA 复核。后续由每 3 小时正常检查自动补写，不持续手动重试。
+
+通知订阅的只读 API 因现有登录缺少 notifications scope 返回不可读，未扩展登录权限，也未据此推断用户已订阅或已收到。通知是否到达等待所有者反馈。
 
 ## P2：检测、发布与工作流
 
