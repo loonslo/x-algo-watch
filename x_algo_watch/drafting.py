@@ -28,6 +28,28 @@ class Deferred(WatchError):
     pass
 
 
+def http_failure(exc: urllib.error.HTTPError) -> Deferred:
+    """只输出固定分类和数字等待时间，绝不记录服务端原文或认证信息。"""
+    reason = "服务或限额原因未细分"
+    try:
+        payload = json.loads(exc.read(16_384))
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        details = json.dumps(error, ensure_ascii=False).lower()
+        if "free-models-per-day" in details or "daily limit" in details:
+            reason = "账户免费每日额度已用尽"
+        elif "free-models-per-min" in details:
+            reason = "账户免费每分钟限流"
+        elif "rate-limited upstream" in details or "provider_overloaded" in details:
+            reason = "模型提供方暂时拥堵"
+        elif "openrouter_key_limit" in details:
+            reason = "项目密钥额度限制"
+    except (OSError, ValueError):
+        pass
+    retry = exc.headers.get("Retry-After", "") if exc.headers else ""
+    wait = f"；建议等待 {retry} 秒" if re.fullmatch(r"\d{1,6}", retry) else ""
+    return Deferred(f"免费模型请求未完成（HTTP {exc.code}；{reason}{wait}）；下一轮补起草")
+
+
 def narrative_strings(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
@@ -123,7 +145,7 @@ class OpenRouter:
                 raise Deferred("模型返回空内容或超长内容；下一轮再补")
             return content
         except urllib.error.HTTPError as exc:
-            raise Deferred(f"免费模型不可用或额度不足（HTTP {exc.code}）；下一轮补起草") from None
+            raise http_failure(exc) from None
         except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 

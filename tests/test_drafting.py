@@ -1,11 +1,13 @@
 import json
+import io
+import urllib.error
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from x_algo_watch.drafting import Deferred, analyze_items, assemble, validate_analysis
+from x_algo_watch.drafting import Deferred, OpenRouter, analyze_items, assemble, validate_analysis
 from x_algo_watch.evidence import items_for_record, weight_math
 from x_algo_watch.models import CheckResult, Finding, Severity, WatchError
 
@@ -117,3 +119,18 @@ def test_same_or_paid_model_rejected():
     for models in ({"analysis": "same:free", "review": "same:free"}, {"analysis": "paid", "review": "other:free"}):
         with pytest.raises(WatchError):
             analyze_items([pack], [], RecordedClient([]), models, NOW, PROMPTS)
+
+
+@pytest.mark.parametrize(("message", "reason"), [("Rate limit exceeded: free-models-per-day", "每日额度"), ("Rate limit exceeded: free-models-per-min", "每分钟限流"), ("Model is temporarily rate-limited upstream", "提供方暂时拥堵"), ("Unrecognized failure", "原因未细分")])
+def test_http_failure_classifies_without_echoing_server_text(monkeypatch, message, reason):
+    secret = "sk-or-v1-" + "x" * 40
+
+    def limited(*args, **kwargs):
+        body = json.dumps({"error": {"message": message, "metadata": {"raw": secret}}}).encode()
+        raise urllib.error.HTTPError("https://openrouter.ai/api/v1/chat/completions", 429, "limited", {"Retry-After": "60"}, io.BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", limited)
+    with pytest.raises(Deferred) as caught:
+        OpenRouter(secret).call(MODELS["analysis"], "prompt", {})
+    assert reason in str(caught.value) and "60" in str(caught.value)
+    assert secret not in str(caught.value) and message not in str(caught.value)

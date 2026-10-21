@@ -32,6 +32,10 @@ python -m compileall -q x_algo_watch tests
 
 密钥交接后的本地补写验证：`python -m pytest -c pyproject.toml tests -q --upstream-repo=../x-algorithm --basetemp=runtime/pytest-backfill-full --tb=short`，**126 passed in 42.89s**。覆盖保持原成功进度、使用既存证据、拒绝不完整/未登记/灰色记录与混合测试模式。改动文件公开内容扫描及 git diff --check 均通过。
 
+- [补写入口 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39636378288)：**126 passed in 8.81s**。
+- [首次真实模型样例](https://github.com/loonslo/x-algo-watch/actions/runs/39636392038)：detect/draft/publish 成功，但第一次 Xing4.0 请求为 HTTP 429，审计记录为 deferred；因此仅创建[证据 Issue #2](https://github.com/loonslo/x-algo-watch/issues/2)，标记待起草，无草稿。生产进度仍为 7f2ca2b，状态提交为 77357b4。工作流绿色仅表示降级流程成功，不能据此宣称模型质量通过。
+- 为区分账户每日/每分钟限额与提供方拥堵，增加仅输出固定分类与数字 Retry-After 的错误记录，服务端原文不进入产物。相关模型与流程测试 **18 passed in 0.39s**，含服务端回显假 key 不泄露的用例。
+
 ## P2：检测、发布与工作流
 
 已实现并本地验证：
