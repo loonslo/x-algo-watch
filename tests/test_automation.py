@@ -132,3 +132,12 @@ def test_commit_data_directory_and_ephemeral_push_auth(tmp_path, monkeypatch):
     assert "test-secret" not in " ".join(args)
     assert options["env"]["GIT_CONFIG_COUNT"] == "1"
     assert "extraheader" not in original_run(["git", "config", "--local", "--list"], capture_output=True, text=True).stdout
+
+
+def test_large_evidence_keeps_important_numbers_and_valid_json():
+    record = sample_record()
+    record["findings"] += [Finding("derived_count", Severity.RED, "levels.rs", "recommendations_extra", "规则差额", 26, 27).to_dict(), Finding("golden_corpus", Severity.GRAY, "case.rs", "case", "佐证", evidence="x" * 60_000).to_dict()]
+    body = evidence_body(record, "owner/x-algo-watch", True)
+    evidence = json.loads(body.split("```json\n", 1)[1].split("\n```", 1)[0])
+    change = next(f for f in evidence["findings"] if f["name"] == "recommendations_extra")
+    assert (change["before"], change["after"]) == (26, 27)

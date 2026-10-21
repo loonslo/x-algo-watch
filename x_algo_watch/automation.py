@@ -145,9 +145,17 @@ def evidence_body(record: dict[str, Any], repository: str, test: bool) -> str:
     details = json.dumps({"base": record["base"], "commit": record["commit"], "counts": record.get("counts", {}), "findings": record["findings"], "numeric_context": record.get("numeric_context", {})}, ensure_ascii=False, indent=2)
     if len(details) > 55_000:
         # 不把截断后的 JSON 冒充完整证据。
-        details = json.dumps({"commit": record["commit"], "findings": [{k: f.get(k) for k in ("category", "severity", "path", "name", "message")} for f in record["findings"]]}, ensure_ascii=False, indent=2)
+        def compact(value: Any) -> Any:
+            if isinstance(value, list) and len(value) > 8:
+                return {"length": len(value), "first_items": value[:8], "full_value_in_record": True}
+            if isinstance(value, str) and len(value) > 800:
+                return {"prefix": value[:800], "full_value_in_record": True}
+            return value
+        details = json.dumps({"base": record["base"], "commit": record["commit"], "counts": record.get("counts", {}), "numeric_context": record.get("numeric_context", {}), "findings": [{k: compact(f.get(k)) for k in ("category", "severity", "path", "name", "message", "before", "after", "line_before", "line_after")} for f in record["findings"]]}, ensure_ascii=False, indent=2)
         prefix += "完整 diff 较长；请在检查记录查看原始证据。\n\n"
-    body = prefix + "```json\n" + details[:55_000] + "\n```\n\n"
+    if len(details) > 55_000:
+        raise WatchError("证据摘要仍超出 Issue 上限；保留完整检查记录，需人工拆分")
+    body = prefix + "```json\n" + details + "\n```\n\n"
     body += f"完整记录：[data/records](https://github.com/{repository}/tree/main/data/records)。\n\n"
     body += "模型不可用时保留证据，下一轮补起草。请仅对机器人草稿使用 `已确认` / `驳回` 标签。"
     public_text(body)

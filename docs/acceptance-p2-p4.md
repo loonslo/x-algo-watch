@@ -13,7 +13,20 @@ python -m compileall -q x_algo_watch tests
 
 实际结果：**118 passed in 38.44s**；语法编译检查通过。测试包含 50 个真实历史提交的两轮回放、原工作区不变、登记表迁移，以及不访问真实账号或模型的合成端到端联调。
 
-GitHub 只读审计：`loonslo/x-algo-watch` 当前不可访问，ready=false。未创建仓库、未推送、未向真实 Issue 发消息、未调用真实模型、未读取或保存模型密钥。
+发布前只读审计曾显示目标仓库不可访问；该结果已被下方真实上线结果取代。模型密钥仍未由程序读取或保存到本机。
+
+## 后续真实上线结果（2026-10-22）
+
+用户明确授权后，已创建并公开发布 [loonslo/x-algo-watch](https://github.com/loonslo/x-algo-watch)。实际 API 已确认：public、默认 main、Actions 默认 read、secret scanning 和 push protection 均开启；openrouter 环境仅允许 main 分支，不允许标签。
+
+- [初次 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39633480028)：118 项通过，9.63 秒。
+- [历史测试工作流](https://github.com/loonslo/x-algo-watch/actions/runs/39633571851)：detect/publish 成功，draft 按配置跳过，已生成[测试 Issue #1](https://github.com/loonslo/x-algo-watch/issues/1)。
+- [首次正常运行](https://github.com/loonslo/x-algo-watch/actions/runs/39633672871)：发现 publish 传入目录 data 时被过严的路径预校验拒绝。已最小修复，增加实际创建本地提交并模拟 push 的边界测试；令牌只在进程环境中，未进参数或 Git 配置。
+- [修复后 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39634159335)：成功，包含上述新增回归。
+- [修复后正常运行](https://github.com/loonslo/x-algo-watch/actions/runs/39634180762)：detect/publish 成功，真实状态提交 bce2f6d 已回到 main，进度仍为 7f2ca2b。
+- 大型证据摘要原先会省略旧/新数值，已补保留 before/after、行号和计数；相关 10 项发布测试通过，真实测试 Issue 将按相同标记幂等更新。
+
+当前等待所有者在准备好的 GitHub 表单中输入环境密钥。DRAFT_ENABLED 仍关闭，未调用真实模型。连续 24 小时定时、通知实际到达与真实模型质量仍未完成。
 
 ## P2：检测、发布与工作流
 
@@ -25,7 +38,7 @@ GitHub 只读审计：`loonslo/x-algo-watch` 当前不可访问，ready=false。
 - 检测数据和通知资格先持久化，Issue API 失败后下一轮仍补发；解析失败保留红色证据并使最终工作流报告失败。
 - 网络失败为“本次未检查”，无新提交不会克隆；登记表改变仍会重核。只读上线审计不会把不可读的配置当作已通过。
 
-尚未验收：真实 Linux Actions 运行、正常状态提交、历史测试 Issue、通知送达、连续满 24 小时的定时结果。check 已包含条件关闭的 P4 draft；MVP 0 模式运行的 detect/publish 不引用 secret，P4 仅 draft 引用专用环境密钥。
+真实 Linux、正常状态提交与历史测试 Issue 已完成，见上方链接。尚未验收：通知送达、连续满 24 小时的定时结果。check 已包含条件关闭的 P4 draft；MVP 0 模式运行的 detect/publish 不引用 secret，P4 仅 draft 引用专用环境密钥。
 
 ## P3：事实登记与引用迁移
 
@@ -53,7 +66,7 @@ GitHub 只读审计：`loonslo/x-algo-watch` 当前不可访问，ready=false。
 - 非所有者、无关标签、人类冒充机器人评论、待补项、冲突标签与假 key 均不能写入 digest。所有者编辑后的机器人草稿可追加一次，保留原修改，按北京时间填确认日期。
 - 先提交速报与决策再关闭 Issue；重复事件不重复追加。驳回只留决策，不进速报。历史测试 Issue 不写生产 digest。
 
-尚未验收：真实免费模型可用性和质量、openrouter 环境的 main 限制、密钥已就位、真实评论编辑与标签工作流。模型 JSON 测试夹具为合成回答，不能据此宣称真实模型质量通过。
+openrouter 的 main 限制已通过实际 API 核验。尚未验收：真实免费模型可用性和质量、密钥已就位、真实评论编辑与标签工作流。模型 JSON 测试夹具为合成回答，不能据此宣称真实模型质量通过。
 
 ## 交付边界
 
