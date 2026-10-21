@@ -104,9 +104,11 @@ def load_bundle(bundle: Path) -> tuple[dict[str, Any], dict[str, bytes], list[di
     return manifest, files, notifications
 
 
-def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_to: str = "") -> dict[str, Any]:
+def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_to: str = "", backfill_commit: str = "") -> dict[str, Any]:
     if bool(test_from) != bool(test_to):
         raise WatchError("测试模式必须同时提供两个历史提交")
+    if backfill_commit and (test_from or not SHA.fullmatch(backfill_commit)):
+        raise WatchError("补写须为完整提交号，且不能与历史测试混用")
     original = data_files(Path("data"))
     working = bundle / "working"
     for name, content in original.items():
@@ -117,7 +119,16 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
     if test:
         # 历史测试有独立输出，不推进生产进度。
         working = bundle / "test-working"
-    if source is None and test:
+    if backfill_commit:
+        # 只补写已有完整证据；不克隆、不重核旧版本、不追加检查记录或改变进度。
+        store = RecordStore(working)
+        record = next((r for r in reversed(store.records()) if r["commit"] == backfill_commit), None)
+        if not record or not record["complete"] or record["severity"] not in ("红", "橙"):
+            raise WatchError("补写只接受已有完整的红橙检查记录")
+        store.append_event({"type": "backfill_requested", "id": "backfill:" + backfill_commit, "commit": backfill_commit}, now)
+        store.append_event({"type": "notification_eligible", "id": "notify:" + backfill_commit, "commit": backfill_commit}, now)
+        result_code = 0
+    elif source is None and test:
         with tempfile.TemporaryDirectory(prefix="xaw-test-") as folder:
             repo_path = Path(folder) / "upstream.git"
             run_git(["clone", "--bare", "--quiet", UPSTREAM, str(repo_path)])
@@ -257,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.stage == "detect":
-            detect(args.bundle, test_from=os.environ.get("TEST_FROM", ""), test_to=os.environ.get("TEST_TO", ""))
+            detect(args.bundle, test_from=os.environ.get("TEST_FROM", ""), test_to=os.environ.get("TEST_TO", ""), backfill_commit=os.environ.get("BACKFILL_COMMIT", ""))
         elif args.stage == "assert-complete":
             manifest, _, _ = load_bundle(args.bundle)
             if manifest["result_code"] != 0:

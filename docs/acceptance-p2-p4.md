@@ -24,9 +24,13 @@ python -m compileall -q x_algo_watch tests
 - [首次正常运行](https://github.com/loonslo/x-algo-watch/actions/runs/39633672871)：发现 publish 传入目录 data 时被过严的路径预校验拒绝。已最小修复，增加实际创建本地提交并模拟 push 的边界测试；令牌只在进程环境中，未进参数或 Git 配置。
 - [修复后 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39634159335)：成功，包含上述新增回归。
 - [修复后正常运行](https://github.com/loonslo/x-algo-watch/actions/runs/39634180762)：detect/publish 成功，真实状态提交 bce2f6d 已回到 main，进度仍为 7f2ca2b。
-- 大型证据摘要原先会省略旧/新数值，已补保留 before/after、行号和计数；相关 10 项发布测试通过，真实测试 Issue 将按相同标记幂等更新。
+- 大型证据摘要原先会省略旧/新数值，已补保留 before/after、行号和计数；相关 10 项发布测试通过。
+- [最新 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39634591048)：提交 f04f916 的 **120 项测试全部通过，8.96 秒**，包含目录发布与大型摘要的新增回归。
+- [摘要修复后的历史测试](https://github.com/loonslo/x-algo-watch/actions/runs/39634645217)：成功；同一测试 Issue #1 已更新，实际正文保留参数 before/after、行号、权重输入和 26→27 的规则差额。
 
-当前等待所有者在准备好的 GitHub 表单中输入环境密钥。DRAFT_ENABLED 仍关闭，未调用真实模型。连续 24 小时定时、通知实际到达与真实模型质量仍未完成。
+所有者已保存环境密钥，随后已设置 DRAFT_ENABLED=true。只读上线审计的 10 项配置检查全部通过（含环境密钥存在、仓库级无模型 key、main-only）；未读取密钥值。两个固定模型的官方列表均保留免费价格与 JSON 响应支持。连续 24 小时定时、通知实际到达与真实模型质量仍未完成。
+
+密钥交接后的本地补写验证：`python -m pytest -c pyproject.toml tests -q --upstream-repo=../x-algorithm --basetemp=runtime/pytest-backfill-full --tb=short`，**126 passed in 42.89s**。覆盖保持原成功进度、使用既存证据、拒绝不完整/未登记/灰色记录与混合测试模式。改动文件公开内容扫描及 git diff --check 均通过。
 
 ## P2：检测、发布与工作流
 
@@ -54,7 +58,7 @@ python -m compileall -q x_algo_watch tests
 
 ## P4：模型、复核与确认
 
-用户已选择两个固定免费模型，写入 config/watch.yaml：Xing4.0 起草、NVIDIA Nemotron 3 Super 复核。尚未调用真实模型。
+用户已选择两个固定免费模型，写入 config/watch.yaml：Xing4.0 起草、NVIDIA Nemotron 3 Super 复核。已启用，真实调用结果待下方补录。
 
 本地合成录制响应与端到端联调已验证：
 
@@ -66,7 +70,7 @@ python -m compileall -q x_algo_watch tests
 - 非所有者、无关标签、人类冒充机器人评论、待补项、冲突标签与假 key 均不能写入 digest。所有者编辑后的机器人草稿可追加一次，保留原修改，按北京时间填确认日期。
 - 先提交速报与决策再关闭 Issue；重复事件不重复追加。驳回只留决策，不进速报。历史测试 Issue 不写生产 digest。
 
-openrouter 的 main 限制已通过实际 API 核验。尚未验收：真实免费模型可用性和质量、密钥已就位、真实评论编辑与标签工作流。模型 JSON 测试夹具为合成回答，不能据此宣称真实模型质量通过。
+openrouter 的 main 限制与密钥存在已通过实际 API 核验。已增加手动 backfill_commit 入口，仅允许已有完整红橙记录；保持最后成功检查位置，沿用调用审计和确认流程，用于方案允许的历史样例补写。尚未验收：真实免费模型可用性和质量、真实评论编辑与标签工作流。模型 JSON 测试夹具为合成回答，不能据此宣称真实模型质量通过。
 
 ## 交付边界
 

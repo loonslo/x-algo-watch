@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.fakes import FakeGitHub
-from x_algo_watch.automation import commit_paths, data_files, evidence_body, hashes, load_bundle, publish, publish_issues, write_bundle
+from x_algo_watch.automation import commit_paths, data_files, detect, evidence_body, hashes, load_bundle, publish, publish_issues, write_bundle
 from x_algo_watch.models import CheckResult, Finding, Severity, WatchError
 from x_algo_watch.storage import RecordStore
 
@@ -141,3 +141,38 @@ def test_large_evidence_keeps_important_numbers_and_valid_json():
     evidence = json.loads(body.split("```json\n", 1)[1].split("\n```", 1)[0])
     change = next(f for f in evidence["findings"] if f["name"] == "recommendations_extra")
     assert (change["before"], change["after"]) == (26, 27)
+
+
+def test_backfill_uses_recorded_evidence_without_moving_progress(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = RecordStore(Path("data"))
+    store.append(CheckResult("a" * 40, "b" * 40, NOW.isoformat(), findings=[Finding("parameter", Severity.ORANGE, "code.rs", "FavoriteWeight", "默认值变化", 0.6, 0.66)]), NOW, "uncommitted")
+    store.append(CheckResult("b" * 40, "c" * 40, NOW.isoformat()), NOW + timedelta(seconds=1), "uncommitted")
+    original = data_files(Path("data"))
+
+    def no_detection(*args, **kwargs):
+        raise AssertionError("补写不能重新检查上游")
+
+    monkeypatch.setattr("x_algo_watch.automation.cli.main", no_detection)
+    bundle = tmp_path / "bundle"
+    manifest = detect(bundle, backfill_commit="b" * 40)
+    assert not manifest["test"] and manifest["notifications"] == ["b" * 40]
+    assert data_files(Path("data")) == original
+    client = FakeGitHub()
+    assert publish(bundle, client, push=False) == [1]
+    assert store.last_success() == "c" * 40 and len(store.records()) == 2
+    assert [e["type"] for e in store.events()] == ["backfill_requested", "notification_eligible"]
+    assert "测试" not in {label["name"] for label in client.rows[0]["labels"]}
+
+
+@pytest.mark.parametrize("mode", ["short_sha", "mixed_test", "missing", "incomplete", "gray"])
+def test_backfill_rejects_untrusted_or_incompatible_inputs(tmp_path, monkeypatch, mode):
+    monkeypatch.chdir(tmp_path)
+    store = RecordStore(Path("data"))
+    findings = [] if mode == "gray" else [Finding("parse_failure", Severity.RED, "code.rs", "Known", "失败")]
+    store.append(CheckResult(None, "b" * 40, NOW.isoformat(), complete=mode != "incomplete", findings=findings), NOW, "uncommitted")
+    original = data_files(Path("data"))
+    target = "bad" if mode == "short_sha" else "c" * 40 if mode == "missing" else "b" * 40
+    with pytest.raises(WatchError, match="补写"):
+        detect(tmp_path / "bundle", backfill_commit=target, test_from="a" * 40 if mode == "mixed_test" else "", test_to="b" * 40 if mode == "mixed_test" else "")
+    assert data_files(Path("data")) == original

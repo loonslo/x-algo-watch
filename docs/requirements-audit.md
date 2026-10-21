@@ -13,15 +13,15 @@
 | P1 去重、上游 HEAD/工作区不变、不执行上游代码 | 两轮逐字比较；Git 对象读取；tests/test_history.py | 本地通过 |
 | P1/P2 失败不能当无变化 | 网络/解析失败测试、工作流最后报告不完整 | 本地通过，待真实运行 |
 | P2 每 3 小时、main、并发、官方 action 提交固定 | .github/workflows/check.yml 与安全结构测试 | 文件与本地断言通过 |
-| P2 detect→publish 隔离、写入白名单、扫描、幂等 Issue | automation.py / github.py；篡改、假 key、过期 main、重复和已关闭 Issue 测试 | 本地通过，真实 API 未验 |
-| P2 手动正常运行与历史测试 Issue | acceptance-p2-p4.md 中的成功 run、状态提交与测试 Issue #1 | 已运行通过；大型数值摘要修复继续复验 |
-| P2 连续 24 小时定时检查、通知到达 | 尚未部署，无真实运行时间线或通知证据 | 未完成 |
+| P2 detect→publish 隔离、写入白名单、扫描、幂等 Issue | automation.py / github.py；边界测试与 Linux CI 120 项通过；真实状态提交与 Issue 更新 | 测试通过，真实正常发布与同一 Issue 更新通过 |
+| P2 手动正常运行与历史测试 Issue | acceptance-p2-p4.md 中的成功 run、状态提交与测试 Issue #1；摘要旧/新数值已核实 | 已运行通过 |
+| P2 连续 24 小时定时检查、通知到达 | 已部署，尚未取得连续满 24 小时的定时时间线或通知到达证据 | 未完成 |
 | P3 三份资料一次性转换、代码事实 claim、开关与忽略初稿 | registry/facts.yaml 420 项；migrations.yaml 的源摘要与覆盖率 | 本地生成并核验，待所有者审阅初稿 |
 | P3 29 行迁移一致 | tests/test_registry_migration.py 独立预期区间 | 全部通过 |
 | P3 26→27、10-16→10-19 | 真实历史定值断言 | 通过 |
 | P3 人工类只登记、不伪装核对 | last_checked=null、unreviewed；monthly 刷新逻辑 | 登记完成，内容未核对（方案允许） |
 | P4 两个固定免费模型 | 用户本次选择、config/watch.yaml、付费/同模型拒绝测试 | 选择与配置完成 |
-| P4 专用环境、main-only、只有 draft 拿 key | check.yml、安全测试、实际环境 main 分支规则 | 环境已完成，等待所有者填写 secret |
+| P4 专用环境、main-only、只有 draft 拿 key | check.yml、安全测试、实际环境 main 分支规则；所有者已存密钥，审计 10 项全通过 | 配置完成，模型已启用 |
 | P4 8 步处理与数字/证据校验、一次纠错、独立复核、程序组稿 | drafting.py、prompts/、合成录制响应及完整联调 | 本地通过，真实质量未验 |
 | P4 不重复调用、留痕、额度用尽只发证据、下轮续写 | 事件审计、调用计数、续跑测试 | 本地通过，真实额度错误未验 |
 | P4 所有者编辑机器人评论后确认，其他人不动 | confirmation.py；确认、驳回、假作者、冲突、重复事件测试 | 本地通过，真实工作流未验 |
