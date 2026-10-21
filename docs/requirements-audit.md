@@ -15,7 +15,8 @@
 | P2 每 3 小时、main、并发、官方 action 提交固定 | .github/workflows/check.yml 与安全结构测试 | 文件与本地断言通过 |
 | P2 detect→publish 隔离、写入白名单、扫描、幂等 Issue | automation.py / github.py；边界测试与 Linux CI 120 项通过；真实状态提交与 Issue 更新 | 测试通过，真实正常发布与同一 Issue 更新通过 |
 | P2 手动正常运行与历史测试 Issue | acceptance-p2-p4.md 中的成功 run、状态提交与测试 Issue #1；摘要旧/新数值已核实 | 已运行通过 |
-| P2 连续 24 小时定时检查、通知到达 | 已部署，尚未取得连续满 24 小时的定时时间线或通知到达证据 | 未完成 |
+| P2 Issue 通知到达 | 2026-10-22 所有者确认 GitHub 绑定邮箱收到 Issue #2 通知，见 acceptance-p2-p4.md | 邮件送达通过；手机未验 |
+| P2 连续 24 小时定时检查 | 已部署，尚未取得连续满 24 小时的定时时间线 | 未完成 |
 | P3 三份资料一次性转换、代码事实 claim、开关与忽略初稿 | registry/facts.yaml 420 项；migrations.yaml 的源摘要与覆盖率 | 本地生成并核验，待所有者审阅初稿 |
 | P3 29 行迁移一致 | tests/test_registry_migration.py 独立预期区间 | 全部通过 |
 | P3 26→27、10-16→10-19 | 真实历史定值断言 | 通过 |
