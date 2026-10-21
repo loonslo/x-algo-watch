@@ -2,11 +2,13 @@ import json
 from datetime import datetime, timezone
 from datetime import timedelta
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from tests.fakes import FakeGitHub
-from x_algo_watch.automation import data_files, evidence_body, hashes, load_bundle, publish, publish_issues, write_bundle
+from x_algo_watch.automation import commit_paths, data_files, evidence_body, hashes, load_bundle, publish, publish_issues, write_bundle
 from x_algo_watch.models import CheckResult, Finding, Severity, WatchError
 from x_algo_watch.storage import RecordStore
 
@@ -107,3 +109,26 @@ def test_registry_red_event_notifies_even_without_new_commit(tmp_path, monkeypat
     assert manifest["notifications"] == ["a" * 40]
     _, _, records = load_bundle(bundle)
     assert records[0]["findings"][0]["category"] == "registry_mismatch"
+
+
+def test_commit_data_directory_and_ephemeral_push_auth(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-b", "main"], check=True, capture_output=True)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/status.md").write_text("checked\n", encoding="utf-8")
+    original_run = subprocess.run
+    pushed = []
+
+    def local_only(args, **kwargs):
+        if "push" in args:
+            pushed.append((args, kwargs))
+            return SimpleNamespace(returncode=0)
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", local_only)
+    assert commit_paths(["data"], "inspection", "owner/x-algo-watch", "test-secret")
+    assert len(pushed) == 1
+    args, options = pushed[0]
+    assert "test-secret" not in " ".join(args)
+    assert options["env"]["GIT_CONFIG_COUNT"] == "1"
+    assert "extraheader" not in original_run(["git", "config", "--local", "--list"], capture_output=True, text=True).stdout

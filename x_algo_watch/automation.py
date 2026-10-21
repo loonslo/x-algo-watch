@@ -192,7 +192,7 @@ def publish_issues(client: GitHub, records: list[dict[str, Any]], test: bool, dr
 
 
 def commit_paths(paths: list[str], message: str, repository: str, token: str) -> bool:
-    if any(path != "digest.md" and not path.startswith("data/") for path in paths):
+    if any(path not in ("data", "digest.md") and not path.startswith("data/") for path in paths):
         raise WatchError("发布超出 data/ 与 digest.md 写入边界")
     run_git(["add", "--", *paths], Path.cwd())
     if not run_git(["diff", "--cached", "--name-only"], Path.cwd()).strip():
