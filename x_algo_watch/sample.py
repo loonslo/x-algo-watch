@@ -19,11 +19,36 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
     """仅供所有者验收的本地双页预览；不改模型文字，不发布争议结论。"""
     from .research import valid_research_event
     from .readers import evidence_links
-    if set(event.get('reviews', {})) != {'review','facts_review','reader_review'} or not valid_research_event(event,pack,required_extra_reviews=2):
+    from .iteration import PHASES, REASONS, NEXT_LABELS
+    original_event = event
+    if not valid_research_event(event,pack,required_extra_reviews=2):
         raise WatchError('审阅预览需要同源的完整三轮裁决')
     if output.exists():
         raise WatchError('审阅预览目录已存在，请使用新目录')
     esc = lambda value: html.escape(str(value))
+    progress = ''
+    loop = event.get('iteration')
+    if loop:
+        label, recovery = PHASES[loop['phase']]
+        progress = '<section class="card"><h2>迭代进度：V'+str(loop['candidate'])+'</h2><p>'+esc(label)+'</p><p>原因：'+esc(REASONS[loop['reason']])+'</p><p>恢复条件：'+esc(recovery)+'</p><p>下一步：'+esc(NEXT_LABELS[loop['next_stage']])+'</p><table><tr><th>候选</th><th>审核</th><th>问题数</th></tr>'
+        for row in loop['history']:
+            progress += '<tr><td>V'+str(row['number'])+'</td><td>'+('全部通过，待人工确认' if row['result']['review']['agree'] else '存在异议')+'</td><td>'+str(len(row['result']['review']['issues']))+'</td></tr>'
+        progress += '</table><details><summary>问题清单与处理状态</summary><p>未再提出仅表示本版未重复该条质疑，不等于人工确认。</p>'
+        for row in loop['ledger']:
+            progress += '<p><code>'+esc(row['id'])+'</code> · '+esc(row['status'])+'：'+esc(row['reason'])+'</p>'
+        progress += '</details></section>'
+        if loop['candidate'] > len(loop['history']) and loop['history']:
+            event = {**event, **loop['history'][-1]['result']}
+            progress += '<p class="notice">当前候选仍未完成。以下展示上一份完成审核的候选原稿；其异议仍待处理。</p>'
+    if set(event.get('reviews', {})) != {'review','facts_review','reader_review'}:
+        if not loop:
+            raise WatchError('审阅预览需要同源的完整三轮裁决')
+        body = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>迭代等待续跑</title><body><nav><a href="index.html">通俗页</a> · <a href="technical.html">技术页</a> · <a href="research.json">研究记录</a></nav>'+progress+'<p>尚无完成三个角色审核的候选，暂不展示用户或技术结论。</p></body></html>'
+        for name in ('index.html', 'technical.html'):
+            atomic_write(output/name, body)
+        atomic_write(output/'research.json',json.dumps(original_event,ensure_ascii=False,indent=2))
+        atomic_write(output/'evidence.json',json.dumps(pack,ensure_ascii=False,indent=2))
+        return
     def refs(values: list[str]) -> str:
         markdown = evidence_links(values,event['sources'],'evidence.json')
         return ' · '.join('<a href="'+esc(url)+'">'+esc(label)+'</a>' for label,url in re.findall(r'\[([^\]]+)\]\(([^)]+)\)',markdown))
@@ -36,7 +61,7 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
     for stage,review in event['reviews'].items():
         audit+='<tr><td>'+names[stage]+'</td><td>'+('同意' if review['agree'] else '不同意')+'</td><td>'+str(len(review['issues']))+'</td></tr>'
     audit+='</table>'
-    top='<p class="meta">版本 '+esc(event['commit'][:7])+' · 所有者审阅样例 · 线上部署尚未核实</p><div class="notice"><strong>'+status+'</strong><p>'+notice+'</p></div>'+audit
+    top='<p class="meta">版本 '+esc(event['commit'][:7])+' · 所有者审阅样例 · 线上部署尚未核实</p>'+progress+'<div class="notice"><strong>'+status+'</strong><p>'+notice+'</p></div>'+audit
     analysis=event['analysis'];reader=analysis['reader']
     def page(title: str, body: str) -> str:
         return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+esc(title)+'</title><style>'+css+'</style></head><body><main><nav><a href="index.html">通俗审阅页</a><a href="technical.html">技术审阅页与审核意见</a><a href="research.json">完整研究 JSON</a></nav>'+top+body+'</main></body></html>'
@@ -67,7 +92,7 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
     tech+='<h2>待核对问题：模型原稿</h2><ul>'+''.join('<li>'+esc(q)+'</li>' for q in analysis['questions'])+'</ul><h2>覆盖与原始输入</h2><p>这是有范围限制的项目证据，不代表通读全部源码。</p><p><a href="evidence.json">实际证据包</a> · <a href="research.json">研究与三轮裁决原始 JSON</a></p><pre>'+esc(json.dumps(pack['coverage'],ensure_ascii=False,indent=2))+'</pre>'
     atomic_write(output/'index.html',page('通俗审阅样例',user))
     atomic_write(output/'technical.html',page('技术审阅样例',tech))
-    atomic_write(output/'research.json',json.dumps(event,ensure_ascii=False,indent=2))
+    atomic_write(output/'research.json',json.dumps(original_event,ensure_ascii=False,indent=2))
     atomic_write(output/'evidence.json',json.dumps(pack,ensure_ascii=False,indent=2))
 
 

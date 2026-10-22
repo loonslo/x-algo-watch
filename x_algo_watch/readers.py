@@ -24,7 +24,7 @@ def validate_reader(reader: Any, evidence: dict[str, Any]) -> list[str]:
         maximum = {"title": 80, "what_changed": 200, "who": 160, "when": 220, "action": 160}[key]
         if not isinstance(reader[key], str) or not reader[key].strip() or len(reader[key]) > maximum:
             errors.append("用户阅读层 " + key + " 无效")
-        elif re.search(r"\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b|\b(?:Enable|Disable)[A-Z][A-Za-z0-9]*|\b(?:Phoenix|VMRanker)\b|水合|kill switch", reader[key]):
+        elif re.search(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|(?:Enable|Disable)[A-Z][A-Za-z0-9]*|Phoenix|VMRanker|水合|kill switch", reader[key]):
             errors.append("用户摘要含技术术语或代码标识，请移到技术分析：" + key)
     if all(isinstance(reader[k], str) for k in ("title", "what_changed", "who", "when", "action")) and sum(len(reader[k]) for k in ("title", "what_changed", "who", "when", "action")) > 420:
         errors.append("用户摘要四问与标题合计不得超过 420 字符")

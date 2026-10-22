@@ -240,7 +240,7 @@ def test_actual_model_input_snapshot_survives_context_revision(sample_repo, tmp_
 
 
 @pytest.mark.parametrize("review_agrees", [True, False])
-def test_project_run_repairs_disagreement_once_and_keeps_history(sample_repo, tmp_path, monkeypatch, review_agrees):
+def test_project_run_with_two_candidate_limit_keeps_history(sample_repo, tmp_path, monkeypatch, review_agrees):
     repo, result = prepare(sample_repo)
     workspace = tmp_path / "watch"
     workspace.mkdir()
@@ -248,7 +248,7 @@ def test_project_run_repairs_disagreement_once_and_keeps_history(sample_repo, tm
     shutil.copytree(PROMPTS, workspace / "prompts")
     config = workspace / "config/watch.yaml"
     config.parent.mkdir()
-    config.write_text(yaml.safe_dump({"models": MODELS, "project_research": True}), encoding="utf-8")
+    config.write_text(yaml.safe_dump({"models": MODELS, "project_research": True, "max_candidate_versions": 2}), encoding="utf-8")
     RecordStore(Path("data")).append(result, NOW, "uncommitted")
     bundle = workspace / "bundle"
     detect(bundle, source=repo.path, research_commit=result.commit)

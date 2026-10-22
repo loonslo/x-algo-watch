@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-22
-status: waiting
+status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 7f2ca2b 已完成真实三轮审核，结果为两轮不同意、一轮同意；审计已合并，本地通俗/技术审阅双页已打开，相关 37 项及 Linux CI 250 项通过，等待用户检查；本轮未通过且未确认发布。
-next: 用户检查本轮双页后确定改进方向，再修正模型生成与核对规则并验证修订稿；当前通俗术语、生效条件和处理时序仍有问题，不将三轮已完成写成全部通过。
+progress: 已实现默认五候选循环、三个角色重审、每版稿件和问题清单、具体暂停原因及显式恢复；循环专项 18 项，最终相关 62 项、项目研究集成 67 项及完整副本历史复验通过；正在同步远程并验证 CI，旧真实样例仍未通过。
+next: 核对 GitHub 完整 CI 和已上线恢复入口；新循环真实免费模型收敛及双读者可读性仍需实际样例验收，不能以程序通过代替内容通过。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
@@ -16,6 +16,7 @@ evidence:
   - docs/reader-output-contract.md
   - docs/acceptance-free-router-reviews.md
   - docs/acceptance-live-reader-sample.md
+  - docs/acceptance-iteration-loop.md
   - docs/acceptance-manual-registration.md
   - registry/manual-coverage.yaml
   - registry/code-claim-coverage.yaml

@@ -156,9 +156,14 @@ def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
     compatible = (settings or {}).get("readability_compatible_profiles", [])
     if not isinstance(compatible, list) or any(not isinstance(p, str) or not re.fullmatch(r"[0-9a-f]{64}", p) for p in compatible):
         raise WatchError("阅读层兼容研究版本配置无效")
-    finished = {e.get("item_id") for e in RecordStore(data).events() if e["type"] == "version_research" and
+    latest = {}
+    for event in RecordStore(data).events():
+        if event["type"] == "version_research":
+            latest[event.get("item_id")] = event
+    finished = {e.get("item_id") for e in latest.values() if
                 ((e.get("state") == "pending_confirmation" and e.get("profile_hash") in {profile, *compatible}) or
-                 (e.get("profile_hash") == profile and (e.get("state") == "manual" or (e.get("state") == "disputed" and e.get("repair_attempted")))))}
+                 (e.get("profile_hash") == profile and (e.get("iteration", {}).get("phase") in {"waiting_manual", "paused_limit", "paused_stagnation"} or
+                  ("iteration" not in e and (e.get("state") == "manual" or (e.get("state") == "disputed" and e.get("repair_attempted")))))))}
     return [p for p in context_packs(data) if p["item_id"] not in finished][:limit]
 
 
@@ -168,7 +173,8 @@ def research_profile() -> str:
     paths = [Path("prompts") / ("version-" + stage + "-v1.md") for stage in ("analysis", "review", "facts_review", "reader_review")]
     config = Path("config/watch.yaml")
     settings = (yaml.safe_load(config.read_text(encoding="utf-8")) or {}) if config.exists() else {}
-    policy = {"models": settings.get("models"), "extra_review_rounds": settings.get("extra_review_rounds", 0)}
+    from .iteration import iteration_policy
+    policy = {"models": settings.get("models"), "extra_review_rounds": settings.get("extra_review_rounds", 0), "iteration": iteration_policy(settings), "iteration_version": 1}
     return digest([*[path.read_text(encoding="utf-8") if path.exists() else "" for path in paths], research_schema(), policy, PROJECT_TRANSPORT])
 
 

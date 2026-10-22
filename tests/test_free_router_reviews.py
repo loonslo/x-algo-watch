@@ -198,12 +198,12 @@ def test_invalid_review_round_config_rejected(sample_repo, value):
 
 
 @pytest.mark.parametrize("final_agrees", [True, False])
-def test_free_router_end_to_end_repairs_once_then_gates_reader(sample_repo, tmp_path, monkeypatch, final_agrees):
+def test_free_router_two_candidate_limit_gates_reader(sample_repo, tmp_path, monkeypatch, final_agrees):
     repo, result = prepare(sample_repo)
     workspace = tmp_path / "watch"; workspace.mkdir(); monkeypatch.chdir(workspace)
     shutil.copytree(PROMPTS, workspace / "prompts")
     config = workspace / "config/watch.yaml"; config.parent.mkdir()
-    config.write_text(yaml.safe_dump({"models": MODELS, "project_research": True, "extra_review_rounds": 2}), encoding="utf-8")
+    config.write_text(yaml.safe_dump({"models": MODELS, "project_research": True, "extra_review_rounds": 2, "max_candidate_versions": 2}), encoding="utf-8")
     RecordStore(workspace / "data").append(result, NOW, "uncommitted")
     bundle = workspace / "bundle"; detect(bundle, source=repo.path, research_commit=result.commit)
     pack = context_packs(bundle / "data")[0]

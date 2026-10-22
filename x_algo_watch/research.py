@@ -111,7 +111,7 @@ def research_event(pack: dict[str, Any], result: dict[str, Any], models: dict[st
         "review_mode": review_mode(models),
         "coverage": pack["coverage"], "sources": {key: {k: v for k, v in e.items() if k != "text"} for key, e in pack["evidence"].items()},
         **({"analysis": result["analysis"], "review": result["review"]} if "review" in result else {}),
-        **{key: result[key] for key in ("reviews", "extra_review_rounds", "resolved_models") if key in result},
+        **{key: result[key] for key in ("reviews", "extra_review_rounds", "resolved_models", "iteration") if key in result},
     }
     payload["id"] = "research:" + digest(payload)
     return payload
@@ -140,6 +140,16 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
         return False
     if type(event.get("repair_attempted")) is not bool:
         return False
+    if "iteration" in event:
+        from .iteration import validate_iteration
+        if not validate_iteration(event["iteration"], pack, models, required_extra_reviews):
+            return False
+        loop = event["iteration"]
+        if (loop["phase"] == "ready") != (event["state"] == "pending_confirmation"):
+            return False
+        if "analysis" in event:
+            if not loop["history"] or any(event.get(key) != value for key, value in loop["history"][-1]["result"].items()):
+                return False
     if "review" in event:
         if rounds < required_extra_reviews:
             return False
@@ -159,13 +169,17 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
         import re
         if not isinstance(resolved, dict) or set(resolved) - {"analysis", *review_stages(2)} or any(m is not None and (not isinstance(m, str) or not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", m)) for m in resolved.values()):
             return False
-    result = {"state": event["state"], "repair_attempted": event["repair_attempted"], **({"analysis": event["analysis"], "review": event["review"]} if "analysis" in event else {}), **{key: event[key] for key in ("reviews", "extra_review_rounds", "resolved_models") if key in event}}
+    result = {"state": event["state"], "repair_attempted": event["repair_attempted"], **({"analysis": event["analysis"], "review": event["review"]} if "analysis" in event else {}), **{key: event[key] for key in ("reviews", "extra_review_rounds", "resolved_models", "iteration") if key in event}}
     return event == research_event(pack, result, models)
 
 
 def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False) -> str:
+    from .iteration import render_iteration
+    progress = render_iteration(event["iteration"]) if "iteration" in event else ""
     if "analysis" not in event:
-        return "## 30 秒摘要\n\n本版本模型研究尚未完成，当前只有源码证据。线上状态与具体影响尚不能判断；现在不据此调整发布策略。\n\n"
+        if technical_only:
+            return progress + "技术稿尚未完成；完整候选和调用审计保留在研究记录中，不发布未完成的技术结论。\n\n"
+        return progress + "## 30 秒摘要\n\n本版本模型研究尚未完成，当前只有源码证据。线上状态与具体影响尚不能判断；现在不据此调整发布策略。\n\n"
     original = event["analysis"]
     analysis = edition.get("analysis", original) if edition else original
     disputed = not event["review"]["agree"]
@@ -173,7 +187,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     context_url = f"{context_base}/{event['commit']}-{event['item_id']}.json"
     refs = lambda values: evidence_links(values, sources, context_url)
     reader = edition["reader"] if edition else (analysis.get("reader") if not disputed else None)
-    text = "## 模型对本次算法迭代的解读\n\n"
+    text = progress + "## 模型对本次算法迭代的解读\n\n"
     text += "普通创作者与运营：先读“30 秒摘要”和“影响解读”。技术分析、证据与历史记录折叠在末尾，可按需展开。\n\n"
     text += "### 30 秒摘要\n\n"
     text += "| 核对项目 | 当前情况 |\n| --- | --- |\n| 源码变化 | 已发现公开源码改动 |\n"
@@ -197,7 +211,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
         if disputed:
             text += "原稿中已被质疑的标题、摘要和影响推断不继续作为用户结论展示，需先完成修订。\n\n"
     if technical_only:
-        text = ""
+        text = progress
     else:
         text += "<details><summary>技术分析（普通读者可跳过）</summary>\n\n"
     if not disputed or edition:
@@ -220,6 +234,9 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     if not technical_only:
         text += "</details>\n\n"
     text += "<details><summary>研究附录：证据、复核与原始记录</summary>\n\n"
+    if "iteration" in event:
+        records_base = context_base.removesuffix("project-context") + "records"
+        text += "每版完整候选稿、审核裁决和问题清单保存在[追加研究记录](" + records_base + ")的 version_research.iteration 中；这些是审计材料，不能作为已发布结论。\n\n"
     text += {"same_model": "起草与复核为同一型号、两个调用角色。", "different_models": "起草与复核使用不同型号。", "free_router": "起草与各轮复核均通过免费自动路由选择型号；实际型号可能相同，不保证异模型独立复核。"}[event["review_mode"]]
     if event.get("reviews"):
         text += "已完成综合复核、源码事实与遗漏核对、机制推断与读者理解核对。" if event["extra_review_rounds"] == 2 else "已完成综合复核、源码事实与遗漏核对。"

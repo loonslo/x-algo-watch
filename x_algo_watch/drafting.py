@@ -190,7 +190,7 @@ class OpenRouter:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 
 
-def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = MAX_DAILY_CALLS, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None, extra_review_rounds: int = 0, call_deadline: float | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = MAX_DAILY_CALLS, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None, extra_review_rounds: int = 0, call_deadline: float | None = None, iteration_context: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if type(daily_limit) is not int or not 1 <= daily_limit <= MAX_DAILY_CALLS:
         raise WatchError(f"免费模型本地每日调用上限须为 1 到 {MAX_DAILY_CALLS}")
     if type(allow_same_model) is not bool:
@@ -207,7 +207,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
     deferred_all = False
     for pack in packs:
         item_id = pack["item_id"]
-        stages: dict[str, Any] = {}; state = "pending"; resolved_models = {}
+        stages: dict[str, Any] = {}; state = "pending"; resolved_models = {}; suspension = {}
         for stage in ("analysis", *checks):
             if stage != "analysis" and "analysis" not in stages:
                 break
@@ -219,13 +219,23 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             feedback = (repair_feedback or {}).get(item_id) if stage == "analysis" else None
             if feedback:
                 prompt_name = "version-analysis-repair-v1"
-                prompt += "\n这是唯一一轮依据复核意见的修订。previous_analysis 是上一稿，review_feedback 是对它的质疑。逐条用原始证据核对，修正成立的问题，降低无依据的置信度，删除不能支持的推测；若质疑本身不成立，在对应依据里用证据简要澄清。保留原 JSON schema，不输出修订说明或额外字段。\n"
+                prompt += "\n这是循环中的一次反馈修订。previous_analysis 是上一稿，review_feedback 是质疑，issue_ledger 是待核对问题。逐条回到原始证据，修正成立的问题；质疑无依据时，用证据在对应正文澄清，不能仅宣称已解决。证据不足时收窄或撤回推断、明确具体未知，不编造证据；同步修正用户和技术层。保留原 JSON schema，不输出额外字段。\n"
             transport = PROJECT_TRANSPORT if stage == "analysis" else REVIEW_TRANSPORT
             version = prompt_name + ":" + digest({"prompt": prompt, "transport": transport} if project_research else prompt)[:16]
             payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage != "analysis" else {}), **({"previous_analysis": feedback["analysis"], "review_feedback": feedback["review"]} if feedback else {})}
+            if feedback and "issue_ledger" in feedback:
+                payload["issue_ledger"] = feedback["issue_ledger"]
+            if iteration_context is not None:
+                payload["iteration_context"] = {k: v for k, v in iteration_context.items() if k != "stage_epochs"}
+                payload["iteration_context"]["attempt_epoch"] = iteration_context.get("stage_epochs", {}).get(stage, 0)
             if repair_feedback and stage != "analysis":
                 # 修订后所有角色重新核对；即使修订稿与旧稿相同，也不能沿用旧裁决。
                 payload["revision_context"] = digest(repair_feedback[item_id])
+                previous = repair_feedback[item_id]
+                own = previous.get("reviews", {}).get(stage, previous["review"] if stage == "review" else {"issues": []})
+                payload["previous_own_issues"] = own["issues"]
+                prompt += "\nprevious_own_issues 仅是你本角色上一版的异议，不含其他角色意见。逐条回到证据检查是否真正修正、收窄或澄清，不能因换了措辞就关闭；原质疑可能有误，应按证据重新判断。还须独立检查新问题。\n"
+                version = prompt_name + ":" + digest({"prompt": prompt, "transport": transport} if project_research else prompt)[:16]
             key = digest({"item": item_id, "stage": stage, "model": model, "version": version, "input": payload})
             calls = [e for e in prior + events if e["type"] == "model_call" and e.get("analysis_key") == key]
             passed = next((e for e in reversed(calls) if e.get("valid")), None)
@@ -240,6 +250,8 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 state = "manual"; break
             while len(invalid) < 2:
                 if used >= daily_limit or deferred_all or (call_deadline is not None and time.monotonic() >= call_deadline):
+                    reason = "daily_budget" if used >= daily_limit else ("service" if deferred_all else "time_budget")
+                    suspension = {"reason": reason, "stage": stage}
                     state = "pending"; break
                 errors = invalid[-1].get("errors", []) if invalid else []
                 request_payload = {**payload, **({"previous_validation_errors": errors} if errors else {})}
@@ -264,6 +276,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     event.update(output=value, errors=errors, valid=not errors, outcome="valid" if not errors else "invalid")
                 except Deferred as exc:
                     event.update(outcome="deferred", errors=[str(exc)])
+                    suspension = {"reason": "service", "stage": stage}
                     deferred_all = True
                 except WatchError:
                     # 疑似敏感输出不留原文；发布扫描依然会再次检查全部产物。
@@ -298,9 +311,13 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
         else:
             # 不能把第一关通过误标成三关通过。
             stages = {"analysis": stages["analysis"]} if "analysis" in stages else {}
+        if state == "manual":
+            suspension = {"reason": "invalid_output", "stage": stage}
         if review_mode == "free_router":
             stages["resolved_models"] = resolved_models
         outputs[item_id] = {"state": state, **stages}
+        if suspension:
+            outputs[item_id]["suspension"] = suspension
         status_event = {"type": "analysis_state", "id": "state:" + digest({"item": item_id, "state": state, "stages": stages, "review_mode": review_mode}), "item_id": item_id, "commit": pack["commit"], "state": state, "review_mode": review_mode}
         events.append(status_event)
     return outputs, events
@@ -355,7 +372,7 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
     return {"body": text, "ready": ready, "version": digest({"packs": packs, "outputs": outputs, "body": text})[:20]}
 
 
-def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> None:
+def run(bundle: Path, output: Path, config: Path, client: Any | None = None, *, resume: bool = False) -> None:
     manifest, _, records = load_bundle(bundle)
     if manifest["test"]:
         atomic_write(output, json.dumps({"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": {}, "events": []}))
@@ -369,15 +386,8 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
         call_deadline = time.monotonic() + 20 * 60
         try:
             client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
-            outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", MAX_DAILY_CALLS), allow_same_model=settings.get("allow_same_model", False), project_research=True, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
-            disputed = [p for p in packs if outputs.get(p["item_id"], {}).get("state") == "disputed"]
-            if disputed:
-                feedback = {p["item_id"]: outputs[p["item_id"]] for p in disputed}
-                repaired, repair_events = analyze_items(disputed, prior + events, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", MAX_DAILY_CALLS), allow_same_model=settings.get("allow_same_model", False), project_research=True, repair_feedback=feedback, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
-                events.extend(repair_events)
-                for pack in disputed:
-                    result = repaired[pack["item_id"]]
-                    outputs[pack["item_id"]] = {**result, "repair_attempted": True}
+            from .iteration import iterate_items
+            outputs, events = iterate_items(packs, prior, client, settings, Path("prompts"), call_deadline=call_deadline, resume=resume)
         except Deferred:
             outputs, events = {}, []
         drafts = {}
@@ -419,9 +429,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("config/watch.yaml"))
+    parser.add_argument("--resume", action="store_true", default=os.environ.get("RESUME_ITERATIONS", "false").lower() == "true", help="处理问题后，显式恢复指定版本暂停的修订批次")
     args = parser.parse_args(argv)
     try:
-        run(args.bundle, args.output, args.config)
+        if args.resume:
+            manifest, _, _ = load_bundle(args.bundle)
+            if len(manifest.get("research", [])) != 1:
+                raise WatchError("恢复须明确指定一个版本，不能恢复整个队列")
+        run(args.bundle, args.output, args.config, resume=args.resume)
         return 0
     except WatchError as exc:
         print(str(exc)); return 2
