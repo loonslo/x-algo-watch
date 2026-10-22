@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "scope": "project_version",
+  "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+  "base": "b089ce64891f9c50fab73aa00dbe65acb82f198f",
+  "committed_at": "2026-08-18T18:57:00Z",
+  "evidence": {
+    "E1": {
+      "kind": "detected_changes",
+      "path": "",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "{\"findings\": [{\"category\": \"legacy_levels\", \"severity\": \"灰\", \"path\": \"visibility-filtering/rules/registry.rs\", \"name\": \"legacy\", \"message\": \"该历史提交尚未引入 levels.rs；旧布局不提供级别名单计数\", \"before\": null, \"after\": null, \"line_before\": null, \"line_after\": null, \"evidence\": \"\", \"fact_ids\": []}], \"derived\": {}}",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E2": {
+      "kind": "project_overview",
+      "path": "README.md",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": 58,
+      "text": "## Overview\n\nThe For You feed is assembled per request. Posts come from two places:\n\n1. **In-Network** — [`thunder/`](thunder/) keeps recent posts from the accounts a viewer follows in memory\n2. **Out-of-Network** — [`phoenix/`](phoenix/) retrieval and [`simclusters/`](simclusters/) find posts from accounts the viewer does not follow\n\nBoth are ranked together by the same model. **Phoenix** reads the viewer's recent engagement history and predicts, for each post, how likely the viewer is to take each action on it. Those predictions are combined into one score using weights held in the code — see [Scoring and Ranking](#scoring-and-ranking).\n\nTwo pipelines do the work. The **Post Pipeline** finds, ranks and filters posts. The **Blending Pipeline** wraps it and adds what the model does not rank: ads, Who to Follow recommendations, prompts.\n\nRanking sets the order. Whether a post can be shown at all is decided separately, by [`visibility-filtering/`](visibility-filtering/), from the viewer's own actions such as blocks and mutes and from labels that other systems here attach to posts and accounts.\n\n---\n\n\n\n## System Architecture\n\n\n\n### Request Path\n\n<pre>\n┌──────────────────────────────────────────────────────────────────────────────────────────┐\n│                                   FOR YOU FEED REQUEST                                   │\n└──────────────────────────────────────────────────────────────────────────────────────────┘\n                                             ▼\n┌──────────────────────────────── HOME MIXER   <a href=\"home-mixer/\">home-mixer/</a> ────────────────────────────────┐\n│                                                                                          │\n├───────────────────────  POST PIPELINE   <a href=\"home-mixer/candidate_pipeline/phoenix_candidate_pipeline.rs\">PhoenixCandidatePipeline</a>  ───────────────────────┤\n│                                                                                          │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 1. <a href=\"home-mixer/query_hydrators/\">QUERY HYDRATION</a>                                                                 │  │\n│  │    user action sequence — the viewer's recent engagements, and the                 │  │\n│  │    main input to the model · following list · blocks and mutes · muted             │  │\n│  │    keywords · posts already seen and served · followed topics, etc.                │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼                                             │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 2. <a href=\"home-mixer/sources/\">CANDIDATE SOURCES</a> — queried in parallel                                         │  │\n│  │    ┌───────────────────────────────┐ ┌────────────────────────────────────────┐    │  │\n│  │    │ IN-NETWORK                    │ │ OUT-OF-NETWORK                         │    │  │\n│  │    │ <a href=\"thunder/\">Thunder</a>                       │ │ <a href=\"phoenix/\">Phoenix retrieval</a>   retrieval model    │    │  │\n│  │    │   recent posts from the       │ │ <a href=\"simclusters/\">SimClusters</a>         cluster similarity │    │  │\n│  │    │   accounts the viewer follows │ │                                        │    │  │\n│  │    └───────────────────────────────┘ └────────────────────────────────────────┘    │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼                                             │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 3. <a href=\"home-mixer/candidate_hydrators/\">CANDIDATE HYDRATION</a>                                                             │  │\n│  │    post text and media · author details and account labels · quoted post ·         │  │\n│  │    language · engagement counts · subscription status, etc.                        │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼                                             │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 4. <a href=\"home-mixer/filters/\">PRE-SCORING FILTERS</a>                                                             │  │\n│  │    duplicates across sources · older than 48 hours · the viewer's own              │  │\n│  │    posts · blocked and muted accounts · muted keywords · already seen              │  │\n│  │    or served · subscriber-only posts the viewer cannot access, etc.                │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼                                             │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 5. SCORING                                                                         │  │\n│  │    <a href=\"home-mixer/scorers/phoenix_scorer.rs\">PhoenixScorer</a>   a probability for each action the viewer might take             │  │\n│  │    <a href=\"home-mixer/scorers/ranking_scorer.rs\">RankingScorer</a>   weighted sum, then repeated-author decay, an                    │  │\n│  │                    out-of-network discount, a new-author boost                     │  │\n│  │    <a href=\"home-mixer/scorers/vm_ranker.rs\">VMRanker</a>        calls the reranking service in <a href=\"vm-ranker/\">vm-ranker/</a>                       │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼                                             │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 6. SELECTION — <a href=\"home-mixer/selectors/top_k_score_selector.rs\">TopKScoreSelector</a>                                                   │  │\n│  │    sort by final score, keep the top K                                             │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼                                             │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ 7. <a href=\"home-mixer/filters/\">POST-SELECTION FILTERS</a> — after the order is fixed                               │  │\n│  │    <a href=\"home-mixer/candidate_hydrators/vf_candidate_hydrator.rs\">VFCandidateHydrator</a>  asks <a href=\"visibility-filtering/\">visibility-filtering/</a> per post and viewer             │  │\n│  │    <a href=\"home-mixer/filters/vf_filter.rs\">VFFilter</a>             removes the posts it said to drop                          │  │\n│  │    <a href=\"home-mixer/filters/dedup_conversation_filter.rs\">DedupConversationFilter</a>  collapses branches of one conversation                 │  │\n│  │                         ◄── these labels come from the Labeling Path               │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                                                                          │\n├─────────────────────  BLENDING PIPELINE   <a href=\"home-mixer/candidate_pipeline/for_you_candidate_pipeline.rs\">ForYouCandidatePipeline</a>  ──────────────────────┤\n│                                                                                          │\n│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │\n│  │ the ranked posts are one source here; the others add non-post items:               │  │\n│  │    ads · Who to Follow · prompts · push-to-home, etc.                              │  │\n│  │                                                                                    │  │\n│  │ <a href=\"home-mixer/selectors/blender_selector.rs\">BlenderSelector</a> interleaves them. The default <a href=\"home-mixer/ads/partition_organic_blender.rs\">ads blender</a> reorders                 │  │\n│  │ posts for ad adjacency. Who to Follow and prompts go at fixed positions.           │  │\n│  └────────────────────────────────────────────────────────────────────────────────────┘  │\n│                                            ▼             ",
+      "truncated": true,
+      "redacted_contacts": 0
+    },
+    "E3": {
+      "kind": "diff",
+      "path": "home-mixer/candidate_hydrators/mod.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/candidate_hydrators/mod.rs b/home-mixer/candidate_hydrators/mod.rs\nindex 6527acf..a31d653 100644\n--- a/home-mixer/candidate_hydrators/mod.rs\n+++ b/home-mixer/candidate_hydrators/mod.rs\n\u0040\u0040 -17,3 +17,4 \u0040\u0040 pub mod subscription_hydrator;\n pub mod topic_feedback_context_hydrator;\n pub mod tweet_type_metrics_hydrator;\n pub mod vf_candidate_hydrator;\n+pub mod vf_following_candidate_hydrator;\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E4": {
+      "kind": "diff",
+      "path": "home-mixer/candidate_hydrators/vf_candidate_hydrator.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/candidate_hydrators/vf_candidate_hydrator.rs b/home-mixer/candidate_hydrators/vf_candidate_hydrator.rs\nindex 24cca23..1d93565 100644\n--- a/home-mixer/candidate_hydrators/vf_candidate_hydrator.rs\n+++ b/home-mixer/candidate_hydrators/vf_candidate_hydrator.rs\n\u0040\u0040 -136,7 +136,7 \u0040\u0040 impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {\n     }\n }\n \n-fn should_drop_ancillary(\n+pub(crate) fn should_drop_ancillary(\n     candidate: &PostCandidate,\n     vf_results: &HashMap<u64, Result<Option<FilteredReason>>>,\n ) -> bool {\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E5": {
+      "kind": "diff",
+      "path": "visibility-filtering/server_deps.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/visibility-filtering/server_deps.rs b/visibility-filtering/server_deps.rs\nindex 6e41332..c47c86a 100644\n--- a/visibility-filtering/server_deps.rs\n+++ b/visibility-filtering/server_deps.rs\n\u0040\u0040 -241,12 +241,15 \u0040\u0040 fn tes_client_config(deterministic_aperture: bool) -> TESClientConfig {\n     }\n }\n \n+const GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS: u64 = 80;\n+\n fn gizmoduck_client_config(deterministic_aperture: bool) -> GizmoduckClientConfig {\n     GizmoduckClientConfig {\n         aperture_size: Some(GizmoduckRpcConstants::num_endpoints()),\n         deterministic_aperture,\n         lb_policy: Some(LbPolicy::least_request()),\n         readiness_probe_port: Some(GIZMODUCK_READINESS_PROBE_PORT),\n+        request_timeout_ms: Some(GIZMODUCK_STRATO_REQUEST_TIMEOUT_MS),\n         ..Default::default()\n     }\n }\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E6": {
+      "kind": "diff",
+      "path": "grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py b/grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py\nindex 059aeb1..d42020b 100644\n--- a/grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py\n+++ b/grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py\n\u0040\u0040 -127,9 +127,7 \u0040\u0040 class TaskSafetyPtosAdultContentCrossValidation(TaskWithPost):\n             return\n \n         is_hard = judged.policyType == SafetyPolicyType.AdultContentSexualHard\n-        Metrics.counter(metric).add(\n-            1, attributes={\"outcome\": \"hard\" if is_hard else \"soft\"}\n-        )\n+        Metrics.counter(metric).add(1, attributes={\"outcome\": judged.policyType.value})\n         logger.info(\n             f\"Post {post.id}: grok 4.5 cross validation judged {judged.policyType.value}\"\n         )\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E7": {
+      "kind": "diff",
+      "path": "grox/flows/reply_spam/constants.py",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/grox/flows/reply_spam/constants.py b/grox/flows/reply_spam/constants.py\nindex 0668e70..1a74a66 100644\n--- a/grox/flows/reply_spam/constants.py\n+++ b/grox/flows/reply_spam/constants.py\n\u0040\u0040 -1,7 +1,5 \u0040\u0040\n-POST_STREAM = \"post_stream\"\n REPLY_RANKING = \"reply_ranking\"\n REPLY_RANKING_RECOVERY = \"reply_ranking_recovery\"\n-TOPIC_UNIFIED_POSTS = \"content-understanding-realtime-unified-posts\"\n TOPIC_UNIFIED_POSTS_V3 = \"content-understanding-realtime-unified-posts-v3\"\n TOPIC_REPLY_RANKING_RECOVERY = \"reply_ranking_annotation_recovery_v2\"\n GEMMA_2 = \"oai-gemma4-26b-2\"\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E8": {
+      "kind": "diff",
+      "path": "home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs b/home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs\nnew file mode 100644\nindex 0000000..c32e69d\n--- /dev/null\n+++ b/home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs\n\u0040\u0040 -0,0 +1,95 \u0040\u0040\n+use crate::candidate_hydrators::vf_candidate_hydrator::should_drop_ancillary;\n+use crate::models::candidate::PostCandidate;\n+use crate::models::query::ScoredPostsQuery;\n+use crate::params::EnableXaiVfClient;\n+use anyhow::Result;\n+use std::collections::HashMap;\n+use std::sync::Arc;\n+use tonic::async_trait;\n+use xai_candidate_pipeline::hydrator::Hydrator;\n+use xai_twittercontext_proto::GetTwitterContextViewer;\n+use xai_visibility_filtering::models::FilteredReason;\n+use xai_visibility_filtering::vf_client::SafetyLevel::TimelineHome;\n+use xai_visibility_filtering::vf_client::VfClient;\n+\n+pub struct VFFollowingCandidateHydrator {\n+    pub strato_vf_client: Arc<dyn VfClient + Send + Sync>,\n+    pub xai_vf_client: Arc<dyn VfClient + Send + Sync>,\n+}\n+\n+impl VFFollowingCandidateHydrator {\n+    pub fn new(\n+        strato_vf_client: Arc<dyn VfClient + Send + Sync>,\n+        xai_vf_client: Arc<dyn VfClient + Send + Sync>,\n+    ) -> Self {\n+        Self {\n+            strato_vf_client,\n+            xai_vf_client,\n+        }\n+    }\n+}\n+\n+#[async_trait]\n+impl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator {\n+    async fn hydrate(\n+        &self,\n+        query: &ScoredPostsQuery,\n+        candidates: &[PostCandidate],\n+    ) -> Vec<Result<PostCandidate, String>> {\n+        let context = query.get_viewer();\n+        let client = if query.params.get(EnableXaiVfClient) {\n+            &self.xai_vf_client\n+        } else {\n+            &self.strato_vf_client\n+        };\n+\n+        let mut post_ids: Vec<u64> = Vec::new();\n+        for candidate in candidates {\n+            post_ids.push(candidate.tweet_id);\n+            post_ids.extend(candidate.ancestors.iter().copied());\n+            if let Some(quoted_post_id) = candidate.quoted_tweet_id {\n+                post_ids.push(quoted_post_id);\n+            }\n+            if let Some(reposted_post_id) = candidate.retweeted_tweet_id {\n+                post_ids.push(reposted_post_id);\n+            }\n+        }\n+        post_ids.sort_unstable();\n+        post_ids.dedup();\n+\n+        let all_results: HashMap<u64, Result<Option<FilteredReason>>> = if post_ids.is_empty() {\n+            HashMap::new()\n+        } else {\n+            client\n+                .get_result(post_ids, TimelineHome, query.user_id, context)\n+                .await\n+        };\n+\n+        let mut hydrated_candidates = Vec::with_capacity(candidates.len());\n+        for candidate in candidates {\n+            let primary_result = all_results.get(&candidate.tweet_id);\n+            let visibility_reason = match primary_result {\n+                Some(Ok(Some(reason))) => Some(reason.clone()),\n+                _ => None,\n+            };\n+\n+            let drop_ancillary = should_drop_ancillary(candidate, &all_results);\n+\n+            let hydrated = match primary_result {\n+                Some(Err(err)) => Err(err.to_string()),\n+                _ => Ok(PostCandidate {\n+                    visibility_reason,\n+                    drop_ancillary_posts: Some(drop_ancillary),\n+                    ..Default::default()\n+                }),\n+            };\n+            hydrated_candidates.push(hydrated);\n+        }\n+        hydrated_candidates\n+    }\n+\n+    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {\n+        candidate.visibility_reason = hydrated.visibility_reason;\n+        candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;\n+    }\n+}\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E9": {
+      "kind": "diff",
+      "path": "home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs b/home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs\nindex 90cac89..534cc97 100644\n--- a/home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs\n+++ b/home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs\n\u0040\u0040 -2,7 +2,7 \u0040\u0040 use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHy\n use crate::candidate_hydrators::conversation_gap_ancestor_hydrator::ConversationGapAncestorHydrator;\n use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;\n use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;\n-use crate::candidate_hydrators::vf_candidate_hydrator::VFCandidateHydrator;\n+use crate::candidate_hydrators::vf_following_candidate_hydrator::VFFollowingCandidateHydrator;\n use crate::clients::night_owl_client::{MockNightOwlClient, NightOwlClient, ProdNightOwlClient};\n use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};\n use crate::clients::tweet_entity_service_client::{MockTESClient, ProdTESClient, TESClient};\n\u0040\u0040 -138,7 +138,10 \u0040\u0040 impl ReverseChronPostsPipeline {\n         ];\n \n         let post_selection_hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![\n-            Box::new(VFCandidateHydrator::new(strato_vf_client, xai_vf_client).await),\n+            Box::new(VFFollowingCandidateHydrator::new(\n+                strato_vf_client,\n+                xai_vf_client,\n+            )),\n             Box::new(AdsBrandSafetyVfHydrator {\n                 client: vf_safety_labels_client,\n             }),\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E10": {
+      "kind": "diff",
+      "path": "home-mixer/models/brand_safety.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/models/brand_safety.rs b/home-mixer/models/brand_safety.rs\nindex 92d7f94..1ad616e 100644\n--- a/home-mixer/models/brand_safety.rs\n+++ b/home-mixer/models/brand_safety.rs\n\u0040\u0040 -1,4 +1,3 \u0040\u0040\n-use std::borrow::Cow;\n use std::collections::HashMap;\n use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelSource, SafetyLabelType};\n \n\u0040\u0040 -66,7 +65,6 \u0040\u0040 pub fn compute_verdict(\n pub(crate) const MEDIUM_RISK_LABELS_V2: &[SafetyLabelType] = &[\n     SafetyLabelType::NSFW_HIGH_PRECISION,\n     SafetyLabelType::NSFW_HIGH_RECALL,\n-    SafetyLabelType::NSFA_HIGH_PRECISION,\n     SafetyLabelType::NSFA_KEYWORDS_HIGH_PRECISION,\n     SafetyLabelType::GORE_AND_VIOLENCE_HIGH_PRECISION,\n     SafetyLabelType::NSFW_REPORTED_HEURISTICS,\n\u0040\u0040 -83,41 +81,24 \u0040\u0040 pub(crate) const MEDIUM_RISK_LABELS_V2: &[SafetyLabelType] = &[\n ];\n \n pub(crate) const LOW_RISK_LABELS_V2: &[SafetyLabelType] = &[\n-    SafetyLabelType::NSFA_LIMITED_INVENTORY,\n     SafetyLabelType::GROK_NSFA_LIMITED_V2,\n     SafetyLabelType::NSFA_HIGH_RECALL,\n ];\n \n-fn strip_v1_grok_written(\n-    labels: &HashMap<SafetyLabelType, SafetyLabel>,\n-) -> Cow<'_, HashMap<SafetyLabelType, SafetyLabel>> {\n-    const V1_DUAL_WRITTEN: &[SafetyLabelType] = &[\n-        SafetyLabelType::NSFA_HIGH_PRECISION,\n-        SafetyLabelType::NSFA_LIMITED_INVENTORY,\n-    ];\n-    const PROMPT_OWNED_RULES: &[i64] = &[1400, 1410, 1420, 1500, 1510, 1610, 1700];\n-    let is_v1_grox_written = |label_type: &SafetyLabelType, label: &SafetyLabel| {\n-        V1_DUAL_WRITTEN.contains(label_type)\n-            && botmaker_rule_id_from(label)\n-                .is_some_and(|rule_id| PROMPT_OWNED_RULES.contains(&rule_id))\n-    };\n-    if !labels.iter().any(|(t, l)| is_v1_grox_written(t, l)) {\n-        return Cow::Borrowed(labels);\n-    }\n-    Cow::Owned(\n-        labels\n-            .iter()\n-            .filter(|&(t, l)| !is_v1_grox_written(t, l))\n-            .map(|(t, l)| (*t, l.clone()))\n-            .collect(),\n-    )\n-}\n+const V2_WRITTEN_LABELS: &[SafetyLabelType] = &[\n+    SafetyLabelType::GROK_SFA_V2,\n+    SafetyLabelType::GROK_NSFA_V2,\n+    SafetyLabelType::GROK_NSFA_LIMITED_V2,\n+    SafetyLabelType::GROK_NSFA_EXPANDED_V2,\n+];\n \n pub(crate) fn compute_verdict_v2(\n     labels: &HashMap<SafetyLabelType, SafetyLabel>,\n     tweet_id: u64,\n ) -> BrandSafetyVerdict {\n-    let labels = strip_v1_grok_written(labels);\n+    if !V2_WRITTEN_LABELS.iter().any(|l| labels.contains_key(l)) {\n+        return compute_verdict(labels, tweet_id);\n+    }\n     if MEDIUM_RISK_LABELS_V2.iter().any(|l| labels.contains_key(l)) {\n         return BrandSafetyVerdict::MediumRisk;\n     }\n\u0040\u0040 -290,6 +271,58 \u0040\u0040 mod tests {\n         );\n     }\n \n+    #[test]\n+    fn v2_defers_to_v1_when_v2_has_not_ruled() {\n+        let v1_safe = labels_with(&[SafetyLabelType::GROK_SFA]);\n+        assert_eq!(\n+            compute_verdict_v2(&v1_safe, PRE_CUTOFF_ID),\n+            compute_verdict(&v1_safe, PRE_CUTOFF_ID)\n+        );\n+        assert_eq!(\n+            compute_verdict_v2(&v1_safe, PRE_CUTOFF_ID),\n+            BrandSafetyVerdict::Safe\n+        );\n+\n+        let v1_nsfa = labels_with(&[SafetyLabelType::GROK_NSFA]);\n+        assert_eq!(\n+            compute_verdict_v2(&v1_nsfa, PRE_CUTOFF_ID),\n+            BrandSafetyVerdict::MediumRisk\n+        );\n+        let v1_limited = labels_with(&[\n+            SafetyLabelType::NSFA_LIMITED_INVENTORY,\n+            SafetyLabelType::GROK_NSFA_LIMITED,\n+        ]);\n+        assert_eq!(\n+            compute_verdict_v2(&v1_limited, PRE_CUTOFF_ID),\n+            BrandSafetyVerdict::LowRisk\n+        );\n+\n+        assert_eq!(\n+            compute_verdict_v2(&labels_with(&[]), PRE_CUTOFF_ID),\n+            BrandSafetyVerdict::MediumRisk\n+        );\n+\n+        let disagreement = labels_with(&[SafetyLabelType::GROK_SFA, SafetyLabelType::GROK_NSFA_V2]);\n+        assert_eq!(\n+            compute_verdict_v2(&disagreement, PRE_CUTOFF_ID),\n+            BrandSafetyVerdict::MediumRisk\n+        );\n+\n+        let freed = labels_with(&[\n+            SafetyLabelType::NSFA_HIGH_PRECISION,\n+            SafetyLabelType::GROK_NSFA,\n+            SafetyLabelType::GROK_SFA_V2,\n+        ]);\n+        assert_eq!(\n+            compute_verd",
+      "truncated": true,
+      "redacted_contacts": 0
+    },
+    "E11": {
+      "kind": "diff",
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/scorers/author_cold_start.rs b/home-mixer/scorers/author_cold_start.rs\nindex e7652f8..2340e28 100644\n--- a/home-mixer/scorers/author_cold_start.rs\n+++ b/home-mixer/scorers/author_cold_start.rs\n\u0040\u0040 -102,12 +102,7 \u0040\u0040 fn count_tracked_ids(\n             continue;\n         }\n         let source = c.served_type.map(|t| t as i32).unwrap_or(0);\n-        if tracked.contains(&c.tweet_id) {\n-            *counts.entry((c.tweet_id, source)).or_insert(0) += 1;\n-        }\n-        if tracked.contains(&c.author_id) {\n-            *counts.entry((c.author_id, source)).or_insert(0) += 1;\n-        }\n+        *counts.entry((c.tweet_id, source)).or_insert(0) += 1;\n     }\n     counts\n }\n\u0040\u0040 -720,18 +715,22 \u0040\u0040 rust_home_mixer:\n         ];\n         let counts = count_tracked_ids(&candidates, &tracked);\n         assert_eq!(\n-            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrieval as i32)),\n+            counts.get(&(1, pb::ServedType::ForYouPhoenixRetrieval as i32)),\n             Some(&1)\n         );\n         assert_eq!(\n-            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrievalMoe as i32)),\n+            counts.get(&(2, pb::ServedType::ForYouPhoenixRetrievalMoe as i32)),\n             Some(&1)\n         );\n         assert_eq!(\n             counts.get(&(20, pb::ServedType::ForYouInNetwork as i32)),\n             Some(&1)\n         );\n-        assert_eq!(counts.get(&(30, 0)), None);\n+        assert_eq!(\n+            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrieval as i32)),\n+            None\n+        );\n+        assert_eq!(counts.get(&(3, 0)), None);\n     }\n \n     #[test]\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E12": {
+      "kind": "diff",
+      "path": "home-mixer/scorers/vm_ranker.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/home-mixer/scorers/vm_ranker.rs b/home-mixer/scorers/vm_ranker.rs\nindex 624264b..6720734 100644\n--- a/home-mixer/scorers/vm_ranker.rs\n+++ b/home-mixer/scorers/vm_ranker.rs\n\u0040\u0040 -194,6 +194,13 \u0040\u0040 fn build_request(query: &ScoredPostsQuery, candidates: &[PostCandidate]) -> Rank\n                     k: s.k,\n                     pool_rank: s.pool_rank,\n                     pool_rank_gap: s.pool_rank_gap,\n+                    sid_known: s.sid_known,\n+                    sid_k1: s.sid_k_l1,\n+                    sid_k2: s.sid_k_l2,\n+                    sid_k3: s.sid_k_l3,\n+                    sid_gap1: s.sid_gap_l1,\n+                    sid_gap2: s.sid_gap_l2,\n+                    sid_gap3: s.sid_gap_l3,\n                 }),\n                 head_weights: scoring_weights\n                     .as_ref()\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E13": {
+      "kind": "diff",
+      "path": "grox/flows/reply_spam/generators.py",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/grox/flows/reply_spam/generators.py b/grox/flows/reply_spam/generators.py\nindex a046e2f..c41828e 100644\n--- a/grox/flows/reply_spam/generators.py\n+++ b/grox/flows/reply_spam/generators.py\n\u0040\u0040 -5,28 +5,21 \u0040\u0040 from grox.flows.reply_spam.plan_reply_ranking import PlanReplyRanking\n from grox.flows.reply_spam.plan_coordinated_spam import PlanCoordinatedSpam\n from grox.core.registry import register\n from grox.flows.reply_spam.constants import (\n-    POST_STREAM,\n     REPLY_RANKING,\n     REPLY_RANKING_RECOVERY,\n     TOPIC_REPLY_RANKING_RECOVERY,\n-    TOPIC_UNIFIED_POSTS,\n     TOPIC_UNIFIED_POSTS_V3,\n )\n \n \n-\u0040register\n-class PostStreamTaskGenerator(StreamTaskGenerator):\n-    TASK_GENERATOR_TYPE = POST_STREAM\n-    PLANS_TO_INJECT = {PlanSpamComment.KEY, PlanCoordinatedSpam.KEY}\n-\n-    def _get_loader(self):\n-        return KafkaPostLoader(TOPIC_UNIFIED_POSTS)\n-\n-\n \u0040register\n class ReplyRankingTaskGenerator(StreamTaskGenerator):\n     TASK_GENERATOR_TYPE = REPLY_RANKING\n-    PLANS_TO_INJECT = {PlanReplyRanking.KEY}\n+    PLANS_TO_INJECT = {\n+        PlanReplyRanking.KEY,\n+        PlanSpamComment.KEY,\n+        PlanCoordinatedSpam.KEY,\n+    }\n \n     def _get_loader(self):\n         return KafkaPostLoader(TOPIC_UNIFIED_POSTS_V3)\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E14": {
+      "kind": "diff",
+      "path": "grox/flows/reply_spam/task_filter.py",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": null,
+      "text": "diff --git a/grox/flows/reply_spam/task_filter.py b/grox/flows/reply_spam/task_filter.py\nindex 5436ee5..ee3518a 100644\n--- a/grox/flows/reply_spam/task_filter.py\n+++ b/grox/flows/reply_spam/task_filter.py\n\u0040\u0040 -14,7 +14,7 \u0040\u0040 logger = logging.getLogger(__name__)\n \n \n class TaskSpamFilter(TaskFilterWithPost):\n-    FOLLOWER_COUNT_THRESHOLD_FOR_SPAM_DETECTION = 40000\n+    FOLLOWER_COUNT_THRESHOLD_FOR_SPAM_DETECTION = 60000\n \n     \u0040override\n     \u0040classmethod\n\u0040\u0040 -182,7 +182,7 \u0040\u0040 class TaskCoordinatedSpamFilter(TaskFilterWithPost):\n \n \n class TaskReplyRankingFilter(TaskFilterWithPost):\n-    FOLLOWER_COUNT_THRESHOLD_FOR_REPLY_RANKING = 40000\n+    FOLLOWER_COUNT_THRESHOLD_FOR_REPLY_RANKING = 60000\n \n     \u0040override\n     \u0040classmethod\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E15": {
+      "kind": "implementation",
+      "path": "home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": 1,
+      "text": "use crate::candidate_hydrators::vf_candidate_hydrator::should_drop_ancillary;\nuse crate::models::candidate::PostCandidate;\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::EnableXaiVfClient;\nuse anyhow::Result;\nuse std::collections::HashMap;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::hydrator::Hydrator;\nuse xai_twittercontext_proto::GetTwitterContextViewer;\nuse xai_visibility_filtering::models::FilteredReason;\nuse xai_visibility_filtering::vf_client::SafetyLevel::TimelineHome;\nuse xai_visibility_filtering::vf_client::VfClient;\n\npub struct VFFollowingCandidateHydrator {\n    pub strato_vf_client: Arc<dyn VfClient + Send + Sync>,\n    pub xai_vf_client: Arc<dyn VfClient + Send + Sync>,\n}\n\nimpl VFFollowingCandidateHydrator {\n    pub fn new(\n        strato_vf_client: Arc<dyn VfClient + Send + Sync>,\n        xai_vf_client: Arc<dyn VfClient + Send + Sync>,\n    ) -> Self {\n        Self {\n            strato_vf_client,\n            xai_vf_client,\n        }\n    }\n}\n\n#[async_trait]\nimpl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator {\n    async fn hydrate(\n        &self,\n        query: &ScoredPostsQuery,\n        candidates: &[PostCandidate],\n    ) -> Vec<Result<PostCandidate, String>> {\n        let context = query.get_viewer();\n        let client = if query.params.get(EnableXaiVfClient) {\n            &self.xai_vf_client\n        } else {\n            &self.strato_vf_client\n        };\n\n        let mut post_ids: Vec<u64> = Vec::new();\n        for candidate in candidates {\n            post_ids.push(candidate.tweet_id);\n            post_ids.extend(candidate.ancestors.iter().copied());\n            if let Some(quoted_post_id) = candidate.quoted_tweet_id {\n                post_ids.push(quoted_post_id);\n            }\n            if let Some(reposted_post_id) = candidate.retweeted_tweet_id {\n                post_ids.push(reposted_post_id);\n            }\n        }\n        post_ids.sort_unstable();\n        post_ids.dedup();\n\n        let all_results: HashMap<u64, Result<Option<FilteredReason>>> = if post_ids.is_empty() {\n            HashMap::new()\n        } else {\n            client\n                .get_result(post_ids, TimelineHome, query.user_id, context)\n                .await\n        };\n\n        let mut hydrated_candidates = Vec::with_capacity(candidates.len());\n        for candidate in candidates {\n            let primary_result = all_results.get(&candidate.tweet_id);\n            let visibility_reason = match primary_result {\n                Some(Ok(Some(reason))) => Some(reason.clone()),\n                _ => None,\n            };\n\n            let drop_ancillary = should_drop_ancillary(candidate, &all_results);\n\n            let hydrated = match primary_result {\n                Some(Err(err)) => Err(err.to_string()),\n                _ => Ok(PostCandidate {\n                    visibility_reason,\n                    drop_ancillary_posts: Some(drop_ancillary),\n                    ..Default::default()\n                }),\n            };\n            hydrated_candidates.push(hydrated);\n        }\n        hydrated_candidates\n    }\n\n    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {\n        candidate.visibility_reason = hydrated.visibility_reason;\n        candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;\n    }\n}\n",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E16": {
+      "kind": "reference_window",
+      "path": "home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": 1,
+      "text": "use crate::candidate_hydrators::vf_candidate_hydrator::should_drop_ancillary;\nuse crate::models::candidate::PostCandidate;\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::EnableXaiVfClient;\nuse anyhow::Result;\nuse std::collections::HashMap;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::hydrator::Hydrator;\nuse xai_twittercontext_proto::GetTwitterContextViewer;\nuse xai_visibility_filtering::models::FilteredReason;\nuse xai_visibility_filtering::vf_client::SafetyLevel::TimelineHome;\nuse xai_visibility_filtering::vf_client::VfClient;\n\npub struct VFFollowingCandidateHydrator {\n    pub strato_vf_client: Arc<dyn VfClient + Send + Sync>,\n    pub xai_vf_client: Arc<dyn VfClient + Send + Sync>,\n}\n\nimpl VFFollowingCandidateHydrator {\n    pub fn new(\n        strato_vf_client: Arc<dyn VfClient + Send + Sync>,\n        xai_vf_client: Arc<dyn VfClient + Send + Sync>,\n    ) -> Self {\n        Self {\n            strato_vf_client,\n            xai_vf_client,\n        }\n    }\n}\n\n#[async_trait]\nimpl Hydrator<ScoredPostsQuery, PostCandidate> for VFFollowingCandidateHydrator {\n    async fn hydrate(\n        &self,\n        query: &ScoredPostsQuery,\n        candidates: &[PostCandidate],",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E17": {
+      "kind": "reference_window",
+      "path": "home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": 1,
+      "text": "use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHydrator;\nuse crate::candidate_hydrators::conversation_gap_ancestor_hydrator::ConversationGapAncestorHydrator;\nuse crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;\nuse crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;\nuse crate::candidate_hydrators::vf_following_candidate_hydrator::VFFollowingCandidateHydrator;\nuse crate::clients::night_owl_client::{MockNightOwlClient, NightOwlClient, ProdNightOwlClient};\nuse crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};\nuse crate::clients::tweet_entity_service_client::{MockTESClient, ProdTESClient, TESClient};\nuse crate::filters::ancillary_vf_filter::AncillaryVFFilter;\nuse crate::filters::following_retweet_deduplication_filter::FollowingRetweetDeduplicationFilter;\nuse crate::filters::self_reply_chain_filter::SelfReplyChainFilter;\nuse crate::filters::vf_filter::VFFilter;\nuse crate::models::candidate::PostCandidate;\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::FOLLOWING_POST_FETCH_SIZE;\nuse crate::selectors::PassthroughSelector;\nuse crate::sources::following_night_owl_source::FollowingNightOwlSource;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;\nuse xai_candidate_pipeline::filter::Filter;\nuse xai_candidate_pipeline::hydrator::Hydrator;\nuse xai_candidate_pipeline::query_hydrator::QueryHydrator;\nuse xai_candidate_pipeline::scorer::Scorer;\nuse xai_candidate_pipeline::selector::Selector;\nuse xai_candidate_pipeline::side_effect::SideEffect;\nuse xai_candidate_pipeline::source::Source;",
+      "truncated": false,
+      "redacted_contacts": 0
+    },
+    "E18": {
+      "kind": "reference_window",
+      "path": "home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs",
+      "commit": "11a71f87d6a7fc4c1e8159dad8f3c5ff90a0f7ed",
+      "start_line": 123,
+      "text": "        vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,\n    ) -> Self {\n        let sources: Vec<Box<dyn Source<ScoredPostsQuery, PostCandidate>>> =\n            vec![Box::new(FollowingNightOwlSource {\n                client: night_owl_client,\n            })];\n\n        let hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![\n            Box::new(CoreDataCandidateHydrator::new(Arc::clone(&tes_client)).await),\n            Box::new(ConversationGapAncestorHydrator::new(tes_client)),\n        ];\n\n        let filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![\n            Box::new(FollowingRetweetDeduplicationFilter),\n            Box::new(SelfReplyChainFilter),\n        ];\n\n        let post_selection_hydrators: Vec<Box<dyn Hydrator<ScoredPostsQuery, PostCandidate>>> = vec![\n            Box::new(VFFollowingCandidateHydrator::new(\n                strato_vf_client,\n                xai_vf_client,\n            )),\n            Box::new(AdsBrandSafetyVfHydrator {\n                client: vf_safety_labels_client,\n            }),\n            Box::new(TweetTypeMetricsHydrator::new()),\n        ];\n\n        let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> =\n            vec![Box::new(VFFilter), Box::new(AncillaryVFFilter)];\n\n        Self {\n            sources,\n            hydrators,\n            filters,\n            post_selection_hydrators,\n            post_selection_filters,\n            selector: PassthroughSelector,\n            side_effects: Arc::new(vec![]),\n        }\n    }",
+      "truncated": false,
+      "redacted_contacts": 0
+    }
+  },
+  "derived": {},
+  "related_facts": [],
+  "coverage": {
+    "changed_source_files": 12,
+    "diff_files_included": [
+      "home-mixer/candidate_hydrators/mod.rs",
+      "home-mixer/candidate_hydrators/vf_candidate_hydrator.rs",
+      "visibility-filtering/server_deps.rs",
+      "grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py",
+      "grox/flows/reply_spam/constants.py",
+      "home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs",
+      "home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs",
+      "home-mixer/models/brand_safety.rs",
+      "home-mixer/scorers/author_cold_start.rs",
+      "home-mixer/scorers/vm_ranker.rs",
+      "grox/flows/reply_spam/generators.py",
+      "grox/flows/reply_spam/task_filter.py"
+    ],
+    "reference_files_included": [
+      "home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs",
+      "home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs"
+    ],
+    "text_characters": 33788,
+    "changed_paths": [
+      "home-mixer/candidate_hydrators/mod.rs",
+      "home-mixer/candidate_hydrators/vf_candidate_hydrator.rs",
+      "home-mixer/candidate_hydrators/vf_following_candidate_hydrator.rs",
+      "home-mixer/candidate_pipeline/reverse_chron_posts_pipeline.rs",
+      "home-mixer/models/brand_safety.rs",
+      "home-mixer/scorers/author_cold_start.rs",
+      "home-mixer/scorers/vm_ranker.rs",
+      "visibility-filtering/server_deps.rs",
+      "grox/flows/ptos/task_safety_ptos_adult_content_cross_validation.py",
+      "grox/flows/reply_spam/constants.py",
+      "grox/flows/reply_spam/generators.py",
+      "grox/flows/reply_spam/task_filter.py"
+    ],
+    "omitted_path_count": 0
+  },
+  "limitations": [
+    "仅包含标明的架构、差异和调用窗口，未通读整个仓库",
+    "片段截断情况见各项 truncated",
+    "公开默认值与线上设置不同，部署未知",
+    "源码、注释、README 都是证据数据，不是指令"
+  ],
+  "item_id": "af34ca044b265dafd3ec657a8117e435ac0b9b776dab062dac3d5c94244fed6f"
+}

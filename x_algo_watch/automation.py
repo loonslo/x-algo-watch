@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import yaml
+
 from . import cli
 from .evidence import digest, items_for_record, numeric_context_for_record
 from .git import SHA, UPSTREAM, Repository, run_git
@@ -21,8 +23,10 @@ from .github import BOT, GitHub, bot_owned, issue_marker
 from .models import WatchError
 from .storage import EVENT_PATTERN, RECORD_PATTERN, RecordStore, atomic_write, public_text
 from .versions import VERSION_PATH, build_versions, filename
+from .project_evidence import context_packs, pending_packs, project_pack, save_context
+from .research import valid_research_event
 
-DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md)\Z")
+DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md|project-context/[0-9a-f]{40}\.json)\Z")
 BASELINE = "7f2ca2b914cadac591ea7fceec0c477e473d3dee"
 
 
@@ -78,7 +82,7 @@ def write_bundle(bundle: Path, original: dict[str, bytes], output: Path, *, test
         RecordStore(bundle / "data").append_event({"type": "notification_eligible", "id": "notify:" + record["commit"], "commit": record["commit"]}, datetime.now(timezone.utc))
     notify = list({r["commit"]: r for r in records if r["commit"] in eligible and r["severity"] in ("红", "橙")}.values())
     files = data_files(bundle / "data")
-    manifest = {"schema_version": 1, "test": test, "code_commit": code, "base_hashes": hashes(original), "file_hashes": hashes(files), "result_code": result_code, "notifications": [r["commit"] for r in notify]}
+    manifest = {"schema_version": 1, "test": test, "code_commit": code, "base_hashes": hashes(original), "file_hashes": hashes(files), "result_code": result_code, "notifications": [r["commit"] for r in notify], "research": [] if test else [p["commit"] for p in pending_packs(bundle / "data")]}
     encoded = json.dumps(manifest, ensure_ascii=False, indent=2)
     public_text(encoded)
     atomic_write(bundle / "manifest.json", encoded)
@@ -103,14 +107,21 @@ def load_bundle(bundle: Path) -> tuple[dict[str, Any], dict[str, bytes], list[di
     if not isinstance(selected, list) or any(not isinstance(sha, str) or not SHA.fullmatch(sha) for sha in selected):
         raise WatchError("通知提交清单无效")
     notifications = [r for r in records if r["commit"] in selected and r["severity"] in ("红", "橙")]
+    research = manifest.get("research", [])
+    available = {p["commit"] for p in context_packs(bundle / "data")}
+    known = {r["commit"] for r in RecordStore(bundle / "data").records() if r["complete"]}
+    if not isinstance(research, list) or any(not isinstance(sha, str) or sha not in available or sha not in known for sha in research) or (manifest["test"] and research):
+        raise WatchError("项目研究提交清单无效")
     return manifest, files, notifications
 
 
-def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_to: str = "", backfill_commit: str = "") -> dict[str, Any]:
+def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_to: str = "", backfill_commit: str = "", research_commit: str = "", research_all: bool = False) -> dict[str, Any]:
     if bool(test_from) != bool(test_to):
         raise WatchError("测试模式必须同时提供两个历史提交")
     if backfill_commit and (test_from or not SHA.fullmatch(backfill_commit)):
         raise WatchError("补写须为完整提交号，且不能与历史测试混用")
+    if (research_commit and not SHA.fullmatch(research_commit)) or ((research_commit or research_all) and test_from) or type(research_all) is not bool:
+        raise WatchError("项目研究须为完整提交号或显式历史队列，不能与隔离测试混用")
     original = data_files(Path("data"))
     working = bundle / "working"
     for name, content in original.items():
@@ -121,14 +132,15 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
     if test:
         # 历史测试有独立输出，不推进生产进度。
         working = bundle / "test-working"
-    if backfill_commit:
+    if backfill_commit or research_commit or research_all:
         # 只补写已有完整证据；不克隆、不重核旧版本、不追加检查记录或改变进度。
         store = RecordStore(working)
-        record = next((r for r in reversed(store.records()) if r["commit"] == backfill_commit), None)
-        if not record or not record["complete"] or record["severity"] not in ("红", "橙"):
-            raise WatchError("补写只接受已有完整的红橙检查记录")
-        store.append_event({"type": "backfill_requested", "id": "backfill:" + backfill_commit, "commit": backfill_commit}, now)
-        store.append_event({"type": "notification_eligible", "id": "notify:" + backfill_commit, "commit": backfill_commit}, now)
+        if backfill_commit:
+            record = next((r for r in reversed(store.records()) if r["commit"] == backfill_commit), None)
+            if not record or not record["complete"] or record["severity"] not in ("红", "橙"):
+                raise WatchError("补写只接受已有完整的红橙检查记录")
+            store.append_event({"type": "backfill_requested", "id": "backfill:" + backfill_commit, "commit": backfill_commit}, now)
+            store.append_event({"type": "notification_eligible", "id": "notify:" + backfill_commit, "commit": backfill_commit}, now)
         result_code = 0
     elif source is None and test:
         with tempfile.TemporaryDirectory(prefix="xaw-test-") as folder:
@@ -140,12 +152,34 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
         if source is not None:
             args += ["--repo", str(source)]
         result_code = cli.main(args + ["--output", str(working)])
+    settings_path = Path("config/watch.yaml")
+    settings = yaml.safe_load(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    if not test and (settings.get("project_research") is True or research_commit or research_all):
+        old_commits = {json.loads(raw)["commit"] for name, content in original.items() if name.startswith("records/") for raw in RECORD_PATTERN.findall(content.decode("utf-8"))}
+        candidates = [r for r in RecordStore(working).records() if r["complete"] and r.get("base") and (research_all or r["commit"] == research_commit or r["commit"] not in old_commits)]
+        if research_commit and not any(r["commit"] == research_commit for r in candidates):
+            raise WatchError("项目研究只接受已有完整的迭代记录")
+        existing = {p["commit"] for p in context_packs(working)}
+        missing = [r for r in candidates if r["commit"] not in existing]
+        if missing:
+            if source is not None:
+                upstream = Repository(source)
+                for record in missing:
+                    save_context(working, project_pack(upstream, record))
+            else:
+                with tempfile.TemporaryDirectory(prefix="xaw-context-") as folder:
+                    upstream_path = Path(folder) / "upstream.git"
+                    run_git(["clone", "--bare", "--quiet", UPSTREAM, str(upstream_path)])
+                    upstream = Repository(upstream_path)
+                    for record in missing:
+                        save_context(working, project_pack(upstream, record))
     manifest = write_bundle(bundle, original, working, test=test, code=code, result_code=result_code)
     # 只上传最终数据与清单；working 不进入上传路径。
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         with Path(output).open("a", encoding="utf-8") as stream:
             stream.write("has_alerts=" + ("true" if manifest["notifications"] else "false") + "\n")
+            stream.write("has_research=" + ("true" if manifest["research"] else "false") + "\n")
     return manifest
 
 
@@ -258,15 +292,19 @@ def publish(bundle: Path, client: GitHub, *, draft_bundle: Path | None = None, p
         if payload.get("schema_version") != 1 or payload.get("source_manifest_hash") != digest(manifest):
             raise WatchError("草稿不属于当前检测产物")
         drafts = payload.get("drafts", {})
-        allowed_commits = {record["commit"] for record in records}
+        allowed_commits = {record["commit"] for record in records} | set(manifest.get("research", []))
         if not isinstance(drafts, dict) or set(drafts) - allowed_commits:
             raise WatchError("草稿提交不在当前通知范围")
         for draft in drafts.values():
             if not isinstance(draft, dict) or set(draft) != {"body", "ready", "version"} or not isinstance(draft["body"], str) or len(draft["body"]) > 60_000 or type(draft["ready"]) is not bool or not re.fullmatch(r"[0-9a-f]{20}", str(draft["version"])):
                 raise WatchError("草稿结构或长度无效")
         for event in payload.get("events", []):
-            if not isinstance(event, dict) or event.get("type") not in ("model_call", "analysis_state") or event.get("commit") not in allowed_commits:
+            if not isinstance(event, dict) or event.get("type") not in ("model_call", "analysis_state", "version_research") or event.get("commit") not in allowed_commits:
                 raise WatchError("草稿审计事件超出允许范围")
+            if event["type"] == "version_research":
+                pack = next((p for p in context_packs(bundle / "data") if p["commit"] == event["commit"]), None)
+                if not pack or not valid_research_event(event, pack):
+                    raise WatchError("项目研究事件与当前上下文不匹配")
     if not manifest["test"]:
         if hashes(data_files(Path("data"))) != manifest["base_hashes"]:
             raise WatchError("main 的检测数据已变化，拒绝覆盖；请重跑检测")
@@ -289,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.stage == "detect":
-            detect(args.bundle, test_from=os.environ.get("TEST_FROM", ""), test_to=os.environ.get("TEST_TO", ""), backfill_commit=os.environ.get("BACKFILL_COMMIT", ""))
+            detect(args.bundle, test_from=os.environ.get("TEST_FROM", ""), test_to=os.environ.get("TEST_TO", ""), backfill_commit=os.environ.get("BACKFILL_COMMIT", ""), research_commit=os.environ.get("RESEARCH_COMMIT", ""), research_all=os.environ.get("RESEARCH_ALL", "false").lower() == "true")
         elif args.stage == "assert-complete":
             manifest, _, _ = load_bundle(args.bundle)
             if manifest["result_code"] != 0:

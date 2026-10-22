@@ -17,6 +17,7 @@ from .versions import build_versions
 
 DRAFT = re.compile(r"<!-- xaw-draft:([0-9a-f]{40}):([0-9a-f]{20}) -->")
 COMMIT = re.compile(r"<!-- xaw-commit:([0-9a-f]{40}) -->")
+RESEARCH = re.compile(r"<!-- xaw-research:([0-9a-f]{64}) -->")
 SHANGHAI = timezone(timedelta(hours=8))
 
 
@@ -56,6 +57,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
     if not any(record["commit"] == commit for record in store.records()):
         raise WatchError("Issue 提交不在可信检查记录中")
     outcome = "confirmed" if decision == "已确认" else "rejected"
+    research_id = None
     if outcome == "confirmed":
         comments = client.comments(number)
         candidates = [comment for comment in comments if bot_owned(comment) and (draft_match := DRAFT.search(comment.get("body", ""))) and draft_match[1] == commit]
@@ -63,11 +65,18 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
             raise WatchError("尚无可确认的机器人草稿；先补起草或人工编辑机器人草稿")
         comment = max(candidates, key=lambda item: int(item["id"]))
         text = DRAFT.sub("", comment["body"]).strip()
+        research_match = RESEARCH.search(text)
+        if research_match:
+            research_id = "research:" + research_match[1]
+            if not any(e["type"] == "version_research" and e["id"] == research_id and e.get("commit") == commit for e in store.events()):
+                raise WatchError("项目解读草稿缺少对应研究审计")
+            text = RESEARCH.sub("", text).strip()
         if "【待补】" in text:
             raise WatchError("草稿仍含待补项；所有者须编辑补全后重新打标签")
         public_text(text)
         date = now.astimezone(SHANGHAI).date().isoformat()
         text = text.replace("未经确认的草稿", "仓库所有者已确认的速报")
+        text = text.replace("模型推测，尚未人工确认", "模型解读，已获所有者人工确认")
         text = re.sub(rf"(?m)^(### [^\n]+ · {commit[:7]} · )源码变化待人工确认$", r"\g<1>源码变化已人工确认", text)
         text = text.replace("仍须仓库所有者人工确认。", "仓库所有者已人工确认。")
         text = text.replace("- 确认：待仓库所有者编辑核对并打标签。", "- 确认：" + date)
@@ -79,7 +88,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
             previous = previous.replace("尚无人工确认的速报。P4 接入草稿与确认流程后追加。\n", "")
             public_text(previous + text)
             atomic_write(path, previous.rstrip() + "\n\n" + marker + "\n" + text + "\n")
-    store.append_event({"type": "decision", "id": "decision:" + commit + ":" + outcome, "commit": commit, "issue": number, "outcome": outcome, "actor": client.owner}, now)
+    store.append_event({"type": "decision", "id": "decision:" + commit + ":" + outcome, "commit": commit, "issue": number, "outcome": outcome, "actor": client.owner, **({"research_id": research_id} if research_id else {})}, now)
     from .cli import code_version
     store.status(now, code_version(root))
     build_versions(root)

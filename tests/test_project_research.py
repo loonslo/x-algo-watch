@@ -1,0 +1,178 @@
+from datetime import date, datetime, timezone
+from pathlib import Path
+import json
+import shutil
+
+import pytest
+import yaml
+
+from tests.fakes import FakeGitHub
+from tests.test_drafting import MODELS, PROMPTS, RecordedClient
+from x_algo_watch.automation import detect, publish, publish_issues
+from x_algo_watch.confirmation import confirm
+from x_algo_watch.drafting import analyze_items, run, validate_analysis
+from x_algo_watch.engine import compare
+from x_algo_watch.evidence import digest
+from x_algo_watch.project_evidence import MAX_TEXT, context_packs, pending_packs, project_pack, save_context
+from x_algo_watch.research import analysis_projection, render_research, research_event, validate_research
+from x_algo_watch.storage import RecordStore
+from x_algo_watch.versions import filename
+
+NOW = datetime(2026, 10, 22, tzinfo=timezone.utc)
+
+
+def prepare(sample_repo):
+    path, repo, base, commit = sample_repo
+    params = path / "home-mixer/params/param.rs"
+    params.write_text(params.read_text(encoding="utf-8").replace('"enable", false', '"enable", true'), encoding="utf-8")
+    logic = path / "home-mixer/sources/example_source.rs"
+    logic.parent.mkdir(parents=True)
+    logic.write_text("// This file is data, never run it.\nfn enabled(query: Query) -> bool { query.params.get(EnableExampleSource) }\n", encoding="utf-8")
+    target = commit()
+    result = compare(repo, base, target, [], date(2026, 10, 22))
+    return repo, result
+
+
+def analysis(pack):
+    return {
+        "item_id": pack["item_id"], "title": "新增候选来源可能改变参与排序的内容构成",
+        "summary": "设置从默认关闭变为默认开启，来源实现也读取这一开关；若该路径运行，候选池构成可能改变。",
+        "changes": [{"mechanism": "候选来源接入", "before": "来源开关默认关闭", "after": "默认开启，并存在读取它的实现", "evidence_refs": ["E1"]}],
+        "hypotheses": [{"hypothesis": "新增来源中的内容可能获得参与排序的机会", "basis": "开关变开且来源代码读取它，候选入口可能放行", "confidence": "medium", "conditions": "线上使用该默认值并调用此来源", "alternative": "调用链可能没有实际接入这一来源", "verify": "检查候选流水线接入情况与线上参数", "creator_impact": "来源能覆盖的内容可能进入候选池，但不承诺最终被展示", "evidence_refs": ["E1"]}],
+        "no_hypothesis_reason": "", "questions": ["该来源是否实际接入候选流水线？"],
+    }
+
+
+def review(pack, agree=True):
+    return {"item_id": pack["item_id"], "agree": agree, "issues": [] if agree else [{"field": "hypotheses", "reason": "尚无调用位置证明已接入流水线", "evidence_refs": ["E1"]}]}
+
+
+def test_project_pack_reads_implementation_diff_and_references_without_execution(sample_repo):
+    repo, result = prepare(sample_repo)
+    before = repo.git("status", "--porcelain")
+    pack = project_pack(repo, result.to_dict())
+    kinds = {e["kind"] for e in pack["evidence"].values()}
+    assert {"project_overview", "diff", "implementation", "reference_window"} <= kinds
+    assert any("query.params.get(EnableExampleSource)" in e["text"] for e in pack["evidence"].values())
+    assert pack["coverage"]["text_characters"] <= MAX_TEXT
+    assert pack["item_id"] == digest({k: v for k, v in pack.items() if k != "item_id"})
+    assert repo.git("status", "--porcelain") == before and repo.resolve("HEAD") == result.commit
+
+
+@pytest.mark.parametrize("problem", ["no_evidence", "missing_alternative", "no_hypothesis_reason", "wrong_number", "deployment", "unknown_path"])
+def test_research_requires_evidence_and_testable_inferences(sample_repo, problem):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    value = analysis(pack)
+    if problem == "no_evidence": value["hypotheses"][0]["evidence_refs"] = ["E999"]
+    if problem == "missing_alternative": value["hypotheses"][0]["alternative"] = ""
+    if problem == "no_hypothesis_reason": value["hypotheses"] = []
+    if problem == "wrong_number": value["summary"] += "曝光上涨 999.9"
+    if problem == "deployment": value["summary"] += "平台确认已上线"
+    if problem == "unknown_path": value["summary"] += "unknown/location.rs"
+    errors = validate_research(value, pack)
+    if not errors:
+        errors += validate_analysis(analysis_projection(value), pack)
+    assert errors
+
+
+def test_project_review_cache_and_quota_resume_remain_separate(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    client = RecordedClient([analysis(pack)])
+    outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, daily_limit=1, project_research=True)
+    assert outputs[pack["item_id"]]["state"] == "pending"
+    next_client = RecordedClient([review(pack)])
+    resumed, resumed_events = analyze_items([pack], events, next_client, MODELS, NOW, PROMPTS, daily_limit=2, project_research=True)
+    assert len(next_client.calls) == 1 and next_client.calls[0][0] == MODELS["review"]
+    assert resumed[pack["item_id"]]["state"] == "pending_confirmation"
+    assert "version-analysis-v1" in next(e for e in events if e["type"] == "model_call")["prompt_version"]
+    assert "version-review-v1" in next(e for e in resumed_events if e["type"] == "model_call")["prompt_version"]
+
+
+def test_project_review_disagreement_is_visible_and_never_confirmed(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    outputs, _ = analyze_items([pack], [], RecordedClient([analysis(pack), review(pack, False)]), MODELS, NOW, PROMPTS, project_research=True)
+    event = research_event(pack, outputs[pack["item_id"]], MODELS)
+    text = render_research(event)
+    assert "复核存在分歧" in text and "尚未人工确认" in text
+    assert "另一种解释" in text and "如何验证" in text and "模型实际读取的完整证据包" in text
+
+
+def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_spam(sample_repo, tmp_path, monkeypatch):
+    repo, result = prepare(sample_repo)
+    workspace = tmp_path / "watch"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    shutil.copytree(PROMPTS, workspace / "prompts")
+    config = workspace / "config/watch.yaml"
+    config.parent.mkdir()
+    config.write_text(yaml.safe_dump({"models": MODELS, "daily_calls": 50, "project_research": True}), encoding="utf-8")
+    RecordStore(Path("data")).append(result, NOW, "uncommitted")
+    bundle = workspace / "bundle"
+    manifest = detect(bundle, source=repo.path, research_commit=result.commit)
+    assert manifest["research"] == [result.commit] and manifest["notifications"] == []
+    assert RecordStore(bundle / "data").last_success() == result.commit
+    pack = context_packs(bundle / "data")[0]
+    output = workspace / "draft.json"
+    model = RecordedClient([analysis(pack), review(pack)])
+    run(bundle, output, config, client=model)
+    client = FakeGitHub()
+    publish(bundle, client, draft_bundle=output, push=False)
+    page = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
+    assert "模型对本次算法迭代的解读" in page and "成立条件" in page and "另一种解释" in page
+    assert "模型推测，尚未人工确认" in page and "新增候选来源可能改变" in page
+    assert not client.rows and not (workspace / "digest.md").exists()
+    assert pending_packs(workspace / "data") == []
+    assert len(model.calls) == 2
+    assert RecordStore(Path("data")).last_success() == result.commit
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    # 可以直接读未确认推测；正式速报仍须单独的所有者确认。
+    publish_issues(client, [result.to_dict()], False, payload["drafts"])
+    client.rows[0]["labels"].append({"name": "已确认"})
+    (workspace / "digest.md").write_text("# Digest\n", encoding="utf-8")
+    event = {"action": "labeled", "sender": {"login": "owner"}, "label": {"name": "已确认"}, "repository": {"full_name": client.repository}, "issue": {"number": 1}}
+    assert confirm(event, client, NOW, workspace, push=False) == "confirmed"
+    text = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
+    assert "模型解读，已获所有者人工确认" in text
+    assert text.count("## 模型对本次算法迭代的解读") == 1
+    assert "模型解读已人工确认" in (workspace / "versions/README.md").read_text(encoding="utf-8")
+
+
+def test_context_identity_tampering_is_rejected(sample_repo, tmp_path):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    save_context(tmp_path, pack)
+    path = tmp_path / "project-context" / (result.commit + ".json")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["evidence"]["E1"]["text"] = "tampered"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    from x_algo_watch.models import WatchError
+    with pytest.raises(WatchError, match="摘要无效"):
+        context_packs(tmp_path)
+
+
+def test_source_contact_redaction_preserves_python_decorators(sample_repo, tmp_path):
+    path, repo, base, commit = sample_repo
+    source = path / "phoenix/xrex/models/example.py"
+    source.parent.mkdir(parents=True)
+    address = "contact" + "@" + "example.test"
+    source.write_text("# " + address + "\n" + "@torch.compile" + "\ndef model(): pass\n", encoding="utf-8")
+    result = compare(repo, base, commit(), [], date(2026, 10, 22))
+    pack = project_pack(repo, result.to_dict())
+    assert address not in json.dumps(pack)
+    assert any("@torch.compile" in e["text"] and e["redacted_contacts"] for e in pack["evidence"].values())
+    save_context(tmp_path, pack)
+    assert context_packs(tmp_path) == [pack]
+
+
+def test_large_source_context_reports_truncation_and_stays_bounded(sample_repo):
+    path, repo, base, commit = sample_repo
+    source = path / "home-mixer/filters/example_filter.rs"
+    source.write_text("// large upstream text\n" * 20_000, encoding="utf-8")
+    result = compare(repo, base, commit(), [], date(2026, 10, 22))
+    pack = project_pack(repo, result.to_dict())
+    assert pack["coverage"]["text_characters"] <= MAX_TEXT
+    assert any(e["truncated"] for e in pack["evidence"].values())
+    assert "未通读整个仓库" in pack["limitations"][0]

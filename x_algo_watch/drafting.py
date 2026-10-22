@@ -17,6 +17,8 @@ from .automation import load_bundle
 from .evidence import digest, items_for_record
 from .models import WatchError
 from .storage import RecordStore, atomic_write, public_text
+from .project_evidence import context_packs
+from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, validate_research
 
 ANALYSIS_FIELDS = {"item_id", "title", "summary", "default_state", "facts", "inferences", "affected_fact_ids", "manual_change", "action", "observe", "questions"}
 NUMBER = re.compile(r"(?<![\w])[-−]?\d+(?:\.\d+)?(?![\w])")
@@ -106,14 +108,14 @@ def validate_analysis(value: Any, pack: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_review(value: Any, pack: dict[str, Any]) -> list[str]:
+def validate_review(value: Any, pack: dict[str, Any], fields: set[str] = ANALYSIS_FIELDS) -> list[str]:
     if not isinstance(value, dict) or set(value) != {"item_id", "agree", "issues"} or value["item_id"] != pack["item_id"] or type(value["agree"]) is not bool or not isinstance(value["issues"], list):
         return ["复核结构无效"]
     errors = []
     if value["agree"] == bool(value["issues"]):
         errors.append("复核结论和分歧列表矛盾")
     for issue in value["issues"]:
-        if not isinstance(issue, dict) or set(issue) != {"field", "reason", "evidence_refs"} or issue.get("field") not in ANALYSIS_FIELDS or not isinstance(issue.get("reason"), str):
+        if not isinstance(issue, dict) or set(issue) != {"field", "reason", "evidence_refs"} or issue.get("field") not in fields or not isinstance(issue.get("reason"), str):
             errors.append("分歧结构无效"); continue
         if not isinstance(issue["evidence_refs"], list) or not issue["evidence_refs"] or any(not isinstance(ref, str) or ref not in pack["evidence"] for ref in issue["evidence_refs"]):
             errors.append("分歧缺少证据")
@@ -141,7 +143,8 @@ class OpenRouter:
             body["reasoning"] = {"effort": "low"}
         request = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + self._key, "Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            timeout = 90 if payload.get("evidence_pack", {}).get("scope") == "project_version" else 30
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 result = json.load(response)
             choice = result["choices"][0]
             content = choice["message"]["content"]
@@ -158,7 +161,7 @@ class OpenRouter:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 
 
-def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False, project_research: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if type(daily_limit) is not int or not 1 <= daily_limit <= 50:
         raise WatchError("免费模型本地每日调用上限须为 1 到 50")
     if type(allow_same_model) is not bool:
@@ -176,8 +179,9 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
         for stage in ("analysis", "review"):
             if stage == "review" and "analysis" not in stages:
                 break
-            prompt = (prompt_root / (stage + "-v1.md")).read_text(encoding="utf-8")
-            version = stage + "-v1:" + digest(prompt)[:16]
+            prompt_name = ("version-" if project_research else "") + stage + "-v1"
+            prompt = (prompt_root / (prompt_name + ".md")).read_text(encoding="utf-8")
+            version = prompt_name + ":" + digest(prompt)[:16]
             payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage == "review" else {})}
             key = digest({"item": item_id, "stage": stage, "model": models[stage], "version": version, "input": payload})
             calls = [e for e in prior + events if e["type"] == "model_call" and e.get("analysis_key") == key]
@@ -203,7 +207,12 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                         value = json.loads(raw)
                     except ValueError:
                         value = None
-                    errors = validate_analysis(value, pack) if stage == "analysis" else validate_review(value, pack)
+                    if project_research and stage == "analysis":
+                        errors = validate_research(value, pack)
+                        if not errors:
+                            errors += validate_analysis(analysis_projection(value), pack)
+                    else:
+                        errors = validate_analysis(value, pack) if stage == "analysis" else validate_review(value, pack, RESEARCH_FIELDS if project_research else ANALYSIS_FIELDS)
                     event.update(output=value, errors=errors, valid=not errors, outcome="valid" if not errors else "invalid")
                 except Deferred as exc:
                     event.update(outcome="deferred", errors=[str(exc)])
@@ -283,6 +292,31 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
         atomic_write(output, json.dumps({"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": {}, "events": []}))
         return
     settings = yaml.safe_load(config.read_text(encoding="utf-8"))
+    if settings.get("project_research") is True:
+        selected = manifest.get("research", [])
+        packs = [p for p in context_packs(bundle / "data") if p["commit"] in selected]
+        prior = RecordStore(bundle / "data").events()
+        try:
+            client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
+            outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True)
+        except Deferred:
+            outputs, events = {}, []
+        drafts = {}
+        for pack in packs:
+            result = outputs.get(pack["item_id"])
+            if not result:
+                continue
+            event = research_event(pack, result, settings["models"])
+            events.append(event)
+            if "review" in result:
+                repository = os.environ.get("GITHUB_REPOSITORY", "")
+                context_base = f"https://github.com/{repository}/blob/main/data/project-context" if repository else "data/project-context"
+                body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base) + "- 确认：待仓库所有者编辑核对并打标签。\n"
+                drafts[pack["commit"]] = {"body": body, "ready": result["state"] == "pending_confirmation", "version": digest({"event": event, "body": body})[:20]}
+        payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": drafts, "events": events}
+        public_text(json.dumps(payload, ensure_ascii=False))
+        atomic_write(output, json.dumps(payload, ensure_ascii=False, indent=2))
+        return
     packs = [pack for record in records for pack in items_for_record(record)]
     prior = RecordStore(bundle / "data").events()
     try:
