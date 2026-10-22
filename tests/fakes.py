@@ -1,5 +1,5 @@
 from copy import deepcopy
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from x_algo_watch.github import BOT, GitHub
 
@@ -35,6 +35,10 @@ class FakeGitHub(GitHub):
                     row.update(data)
                 return deepcopy(row)
             if parts[2] == "labels":
+                if method == "DELETE":
+                    name = unquote(parts[3])
+                    row["labels"] = [label for label in row["labels"] if label["name"] != name]
+                    return deepcopy(row["labels"])
                 row["labels"] += [{"name": name} for name in data["labels"]]
                 return deepcopy(row["labels"])
             if parts[2] == "comments":

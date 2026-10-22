@@ -12,6 +12,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from . import cli
 from .evidence import digest, items_for_record
@@ -206,7 +207,13 @@ def publish_issues(client: GitHub, records: list[dict[str, Any]], test: bool, dr
                 body = comment_marker + "\n\n" + draft["body"]
                 public_text(body)
                 client.request("POST", f"/issues/{number}/comments", {"body": body})
-            client.request("POST", f"/issues/{number}/labels", {"labels": ["待确认" if draft["ready"] else "需人工"]})
+            state = "待确认" if draft["ready"] else "需人工"
+            labels = {label["name"] for label in issue.get("labels", [])}
+            if state not in labels:
+                client.request("POST", f"/issues/{number}/labels", {"labels": [state]})
+            # 只清理程序自己的旧状态，不整体覆盖标签，以保留所有者自定义标签。
+            for obsolete in sorted((labels & {"待起草", "待确认", "需人工"}) - {state}):
+                client.request("DELETE", f"/issues/{number}/labels/{quote(obsolete, safe='')}")
     return numbers
 
 

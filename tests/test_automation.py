@@ -55,6 +55,26 @@ def test_draft_comment_keeps_owner_edit_on_retry():
     assert "所有者编辑" in client.comment_rows[1][0]["body"]
 
 
+@pytest.mark.parametrize("ready", [True, False])
+def test_draft_status_labels_transition_without_removing_custom_labels(ready):
+    client = FakeGitHub(); record = sample_record()
+    publish_issues(client, [record], False)
+    client.rows[0]["labels"].append({"name": "所有者自定义"})
+    draft = {"version": "1" * 20, "body": "未经确认的草稿", "ready": ready}
+    publish_issues(client, [record], False, {record["commit"]: draft})
+    labels = {label["name"] for label in client.rows[0]["labels"]}
+    assert labels & {"待起草", "待确认", "需人工"} == {"待确认" if ready else "需人工"}
+    assert {"所有者自定义", "x-algo-watch", "级别:橙"} <= labels
+    before = len(client.calls)
+    publish_issues(client, [record], False, {record["commit"]: draft})
+    assert not any(method != "GET" and "/labels" in path for method, path, _ in client.calls[before:])
+    draft.update(version="2" * 20, ready=not ready)
+    publish_issues(client, [record], False, {record["commit"]: draft})
+    labels = {label["name"] for label in client.rows[0]["labels"]}
+    assert labels & {"待起草", "待确认", "需人工"} == {"需人工" if ready else "待确认"}
+    assert "所有者自定义" in labels
+
+
 def test_bundle_tamper_and_stale_main_are_rejected(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     original = tmp_path / "data"

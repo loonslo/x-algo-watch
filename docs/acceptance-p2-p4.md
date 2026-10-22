@@ -28,7 +28,7 @@ python -m compileall -q x_algo_watch tests
 - [最新 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39634591048)：提交 f04f916 的 **120 项测试全部通过，8.96 秒**，包含目录发布与大型摘要的新增回归。
 - [摘要修复后的历史测试](https://github.com/loonslo/x-algo-watch/actions/runs/39634645217)：成功；同一测试 Issue #1 已更新，实际正文保留参数 before/after、行号、权重输入和 26→27 的规则差额。
 
-所有者已保存环境密钥，随后已设置 DRAFT_ENABLED=true。只读上线审计的 10 项配置检查全部通过（含环境密钥存在、仓库级无模型 key、main-only）；未读取密钥值。两个固定模型的官方列表均保留免费价格与 JSON 响应支持。Issue 邮件送达、连续 24 小时定时与真实模型质量仍未完成。
+所有者已保存环境密钥，随后已设置 DRAFT_ENABLED=true。只读上线审计的 10 项配置检查全部通过（含环境密钥存在、仓库级无模型 key、main-only）；未读取密钥值。两个固定模型的官方列表均保留免费价格与 JSON 响应支持。Issue #3 邮件送达已由所有者确认；连续 24 小时定时与真实模型质量仍未完成。
 
 密钥交接后的本地补写验证：`python -m pytest -c pyproject.toml tests -q --upstream-repo=../x-algorithm --basetemp=runtime/pytest-backfill-full --tb=short`，**126 passed in 42.89s**。覆盖保持原成功进度、使用既存证据、拒绝不完整/未登记/灰色记录与混合测试模式。改动文件公开内容扫描及 git diff --check 均通过。
 
@@ -40,9 +40,13 @@ python -m compileall -q x_algo_watch tests
 
 通知订阅的只读 API 因现有登录缺少 notifications scope 返回不可读，未扩展登录权限。2026-10-22（北京时间），所有者先反馈收到邮件，随后明确更正为看错；先前的邮件送达验收结论已撤回，恢复为待验证。程序没有直接发送邮件，仅通过 GitHub 创建 Issue。
 
-随后只读查看 GitHub 通知页面，确认默认通知地址已设置、邮件渠道已开启；地址仅在当前对话中说明，不入仓库。仓库原先仅为 Participating and @mentions，现已改为 Custom → Issues 并保存，重新打开选项核实勾选。没有读取邮件。通过[通知复验工作流](https://github.com/loonslo/x-algo-watch/actions/runs/39712551083)创建[历史测试 Issue #3](https://github.com/loonslo/x-algo-watch/issues/3)，北京时间 10:39；draft 跳过，生产数据及 digest 不变。该次邮件是否收到仍待所有者反馈。
+随后只读查看 GitHub 通知页面，确认默认通知地址已设置、邮件渠道已开启；地址仅在当前对话中说明，不入仓库。仓库原先仅为 Participating and @mentions，现已改为 Custom → Issues 并保存，重新打开选项核实勾选。没有读取邮件。通过[通知复验工作流](https://github.com/loonslo/x-algo-watch/actions/runs/39712551083)创建[历史测试 Issue #3](https://github.com/loonslo/x-algo-watch/issues/3)，北京时间 10:39；draft 跳过，生产数据及 digest 不变。所有者随后对这条指定标题、指定 Issue 的邮件明确反馈“已收到这条邮件”，本次邮件送达验收通过；不再沿用先前 Issue #2 的错误反馈，也未验证手机渠道。
 
 [首个定时运行](https://github.com/loonslo/x-algo-watch/actions/runs/39686123877)于北京时间 06:23:21 创建，流程成功，状态提交 797a5ac；本轮第三次 Xing4.0 请求仍为提供方 HTTP 429，保持待起草。此次查询 schedule 专项 API 的 total_count=1，03:17 与 09:17 未查到对应运行。连续 24 小时定时验收仍未通过，不以手动补跑代替。
+
+[北京时间 10:42 的手动正常补跑](https://github.com/loonslo/x-algo-watch/actions/runs/39712839301)成功，数据提交为 49a9b37；生产进度仍为 7f2ca2b。第四次 Xing4.0 请求仍为提供方 HTTP 429，无有效草稿、未调用 NVIDIA。此次补跑不计作 schedule 记录。
+
+在合成发布流程中复现草稿就绪仍同时保留“待起草”和“待确认”的标签问题。现只添加目标状态并逐一删除程序管理的过期状态，不整体替换标签；保留所有者标签、评论编辑与关闭状态。相关发布/确认/流程测试 **29 passed in 1.00s**，包含两个方向的状态切换与重复发布不重复写标签。
 
 ## P2：检测、发布与工作流
 
@@ -54,7 +58,7 @@ python -m compileall -q x_algo_watch tests
 - 检测数据和通知资格先持久化，Issue API 失败后下一轮仍补发；解析失败保留红色证据并使最终工作流报告失败。
 - 网络失败为“本次未检查”，无新提交不会克隆；登记表改变仍会重核。只读上线审计不会把不可读的配置当作已通过。
 
-真实 Linux、正常状态提交与历史测试 Issue 已完成，见上方证据。尚未验收：Issue 通知送达、连续满 24 小时的定时结果。check 已包含可关闭的 P4 draft；MVP 0 模式运行的 detect/publish 不引用 secret，P4 仅 draft 引用专用环境密钥。
+真实 Linux、正常状态提交、历史测试 Issue 与 Issue #3 的邮件送达已完成，见上方证据。尚未验收：连续满 24 小时的定时结果。check 已包含可关闭的 P4 draft；MVP 0 模式运行的 detect/publish 不引用 secret，P4 仅 draft 引用专用环境密钥。
 
 ## P3：事实登记与引用迁移
 
