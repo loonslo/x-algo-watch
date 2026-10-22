@@ -3,8 +3,8 @@ project_id: x-algo-watch
 updated: 2026-10-22
 status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 每日 1,000 次配置、默认值与硬上限已上线，Linux CI 238 项、本地相关 62 项通过；正常流程成功，当日调用从 50 增至 52，原上限解除；本轮格式错误及 HTTP 404 已保存审计，未发布不合格结论。
-next: 后续按规则续跑免费路由，核对格式错误与服务响应，完成新格式三轮复核的真实验收；44 版研究及定时可靠性仍待完成，不因任务成功认定模型质量通过。
+progress: 按用户要求准备 7f2ca2b 新格式三轮审核样例；已修正指定历史版本重跑、发送严格 JSON 协议并生成同源技术专页，相关 74 项测试通过，待新代码实际运行。
+next: 推送并运行指定样例，核对实际起草和三轮裁决后交付通俗页与技术页给用户检查；不把旧阅读稿或排队任务当成新审核结果。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
@@ -15,6 +15,7 @@ evidence:
   - docs/acceptance-reader-format.md
   - docs/reader-output-contract.md
   - docs/acceptance-free-router-reviews.md
+  - docs/acceptance-live-reader-sample.md
   - docs/acceptance-manual-registration.md
   - registry/manual-coverage.yaml
   - registry/code-claim-coverage.yaml
@@ -99,3 +100,5 @@ P3 补充：用户另行授权只读主手册第 3 章，已按四项准入/三�
 日限额更正：用户明确要求改为每日 1,000 次。此前达到的是项目自行设定的 50 次上限，不能据此确认账户免费额度耗尽。本次已同步配置、默认值、入口缺省值及硬上限校验；保留当日已用计数和历史审计，不清零。相关测试 62 passed in 16.26s，覆盖第 50 次后可继续及第 1,000 次后停止；待推送后进行实际续跑。
 
 1,000 次上线复验：e3dd555 已推送且远程配置回读为 daily_calls=1000；Linux CI 39788326962 成功，238 passed in 16.66s，含真实上游历史回放。正常运行 39788333457 的检测、起草、发布均成功，e74f1d1 保存两次新调用，UTC 当日从 50 增至 52，没有重置计数。首次免费路由实际型号为 nvidia/nemotron-3.5-lightning:free，输出根字段不合格被拒绝；纠错请求 HTTP 404 后延期。没有新增合格用户解读或冒充三轮核对通过，44 版仍待继续。本次日限额调整已验证，不代表新路由质量验收完成。
+
+用户要求实际样例：选取当前查看的 7f2ca2b，需新起草及三轮审核后让用户检查，不提前人工确认。检查发现指定版本可能被已完成过滤跳过，以及免费响应不遵守完整字段；现修正选择入口、发送严格结构化协议，并新增自动生成的技术专页。相关 74 passed in 59.88s；首次旧入口排队任务已请求取消，待新代码部署后运行。

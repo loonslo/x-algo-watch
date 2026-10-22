@@ -16,10 +16,10 @@ import yaml
 from .automation import load_bundle
 from .evidence import digest, items_for_record
 from .models import WatchError
-from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
+from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, PROJECT_TRANSPORT, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
-from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, validate_research
+from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, review_schema, validate_research
 
 ANALYSIS_FIELDS = {"item_id", "title", "summary", "default_state", "facts", "inferences", "affected_fact_ids", "manual_change", "action", "observe", "questions"}
 NUMBER = re.compile(r"(?<![\w])[-−]?\d+(?:\.\d+)?(?![\w])")
@@ -148,6 +148,10 @@ class OpenRouter:
             time.sleep(delay)
         self._last_call = time.monotonic()
         body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "max_tokens": 6000, "provider": {"allow_fallbacks": False}}
+        if payload.get("evidence_pack", {}).get("scope") == "project_version":
+            schema = review_schema() if "analysis" in payload else research_schema()
+            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "version_review" if "analysis" in payload else "version_research", "strict": True, "schema": schema}}
+            body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
         if model == "minimax/minimax-m3.1-flash:free":
             # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
             body["reasoning"] = {"effort": "low"}
@@ -204,7 +208,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             if feedback:
                 prompt_name = "version-analysis-repair-v1"
                 prompt += "\n这是唯一一轮依据复核意见的修订。previous_analysis 是上一稿，review_feedback 是对它的质疑。逐条用原始证据核对，修正成立的问题，降低无依据的置信度，删除不能支持的推测；若质疑本身不成立，在对应依据里用证据简要澄清。保留原 JSON schema，不输出修订说明或额外字段。\n"
-            version = prompt_name + ":" + digest(prompt)[:16]
+            version = prompt_name + ":" + digest({"prompt": prompt, "transport": PROJECT_TRANSPORT} if project_research else prompt)[:16]
             payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage != "analysis" else {}), **({"previous_analysis": feedback["analysis"], "review_feedback": feedback["review"]} if feedback else {})}
             if repair_feedback and stage != "analysis":
                 # 修订后所有角色重新核对；即使修订稿与旧稿相同，也不能沿用旧裁决。

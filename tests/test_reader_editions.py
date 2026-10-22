@@ -147,6 +147,22 @@ def test_budget_deferred_new_profile_keeps_previous_reviewed_reading_page(sample
     assert '新版待续写' in (tmp_path/'versions/README.md').read_text(encoding='utf-8')
 
 
+def test_technical_page_uses_same_research_with_working_relative_evidence_links(sample_repo, tmp_path):
+    repo, result = prepare(sample_repo); pack = project_pack(repo,result.to_dict())
+    store=RecordStore(tmp_path/'data'); store.append(result,NOW,'uncommitted')
+    event=research_event(pack,{'state':'pending_confirmation','analysis':analysis(pack),'review':review(pack)},MODELS)
+    store.append_event(event,NOW)
+    build_versions(tmp_path)
+    user_page=next((tmp_path/'versions').glob('20*.md'))
+    technical=tmp_path/'versions/technical'/user_page.name
+    assert 'technical/'+user_page.name in user_page.read_text(encoding='utf-8')
+    text=technical.read_text(encoding='utf-8')
+    assert '../'+user_page.name in text and '../../data/project-context/' in text
+    assert '### 算法机制与技术依据' in text and '### 技术推断与验证办法' in text
+    assert '30 秒摘要' not in text and '普通读者可跳过' not in text
+    assert analysis(pack)['hypotheses'][0]['hypothesis'] in text
+
+
 def test_online_prompt_and_published_schema_use_same_exact_fields(sample_repo):
     root=Path(__file__).resolve().parents[1]
     schema=research_schema()

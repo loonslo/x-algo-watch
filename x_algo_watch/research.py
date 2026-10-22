@@ -39,6 +39,15 @@ def research_schema() -> dict[str, Any]:
                    "questions": {"type": "array", "maxItems": 8, "items": text}})}
 
 
+def review_schema() -> dict[str, Any]:
+    return {"type": "object", "additionalProperties": False, "required": ["item_id", "agree", "issues"], "properties": {
+        "item_id": {"type": "string"}, "agree": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["field", "reason", "evidence_refs"], "properties": {
+                "field": {"type": "string", "enum": sorted(RESEARCH_FIELDS)}, "reason": {"type": "string", "minLength": 1},
+                "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^E[0-9]+$"}}}}}}}
+
+
 def validate_research(value: Any, pack: dict[str, Any], *, require_reader: bool = False) -> list[str]:
     if not isinstance(value, dict) or set(value) not in (LEGACY_RESEARCH_FIELDS, RESEARCH_FIELDS):
         return ["整版本研究字段不完整或含额外字段"]
@@ -154,7 +163,7 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
     return event == research_event(pack, result, models)
 
 
-def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None) -> str:
+def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False) -> str:
     if "analysis" not in event:
         return "## 30 秒摘要\n\n本版本模型研究尚未完成，当前只有源码证据。线上状态与具体影响尚不能判断；现在不据此调整发布策略。\n\n"
     original = event["analysis"]
@@ -187,7 +196,10 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
         text += "**改了什么？** 当前研究稿尚未整理成可发布的用户解读。\n\n**已经上线了吗？** 尚未核实。\n\n**影响谁？** 尚不能可靠判断。\n\n**现在该做什么？** 不据此调整发帖频率、题材或互动方式。\n\n"
         if disputed:
             text += "原稿中已被质疑的标题、摘要和影响推断不继续作为用户结论展示，需先完成修订。\n\n"
-    text += "<details><summary>技术分析（普通读者可跳过）</summary>\n\n"
+    if technical_only:
+        text = ""
+    else:
+        text += "<details><summary>技术分析（普通读者可跳过）</summary>\n\n"
     if not disputed or edition:
         text += "### 算法机制与技术依据\n\n"
         for row in analysis["changes"]:
@@ -205,7 +217,9 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
             text += "### 待核对的技术问题\n\n" + "\n".join("- " + q for q in analysis["questions"]) + "\n\n"
     else:
         text += "该稿仍有未解决的复核问题，技术推断正文暂不发布；原始记录保留在下方研究附录。\n\n"
-    text += "</details>\n\n<details><summary>研究附录：证据、复核与原始记录</summary>\n\n"
+    if not technical_only:
+        text += "</details>\n\n"
+    text += "<details><summary>研究附录：证据、复核与原始记录</summary>\n\n"
     text += {"same_model": "起草与复核为同一型号、两个调用角色。", "different_models": "起草与复核使用不同型号。", "free_router": "起草与各轮复核均通过免费自动路由选择型号；实际型号可能相同，不保证异模型独立复核。"}[event["review_mode"]]
     if event.get("reviews"):
         text += "已完成综合复核、源码事实与遗漏核对、机制推断与读者理解核对。" if event["extra_review_rounds"] == 2 else "已完成综合复核、源码事实与遗漏核对。"

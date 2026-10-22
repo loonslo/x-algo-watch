@@ -315,3 +315,15 @@ def test_explicit_research_target_selects_only_that_version_even_beyond_first_ba
         save_context(working, item)
     manifest = write_bundle(tmp_path / "bundle", {}, working, test=False, code="uncommitted", result_code=0, research_only="b"*40)
     assert manifest["research"] == ["b"*40]
+
+
+def test_explicit_target_can_rerun_previously_agreed_research(sample_repo, tmp_path):
+    repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
+    working = tmp_path / "working"
+    RecordStore(working).append(result, NOW, "uncommitted")
+    save_context(working, pack)
+    event = research_event(pack, {"state":"pending_confirmation", "analysis":analysis(pack), "review":review(pack)}, MODELS)
+    RecordStore(working).append_event(event, NOW)
+    assert pending_packs(working) == []
+    manifest = write_bundle(tmp_path / "bundle", {}, working, test=False, code="uncommitted", result_code=0, research_only=pack["commit"])
+    assert manifest["research"] == [pack["commit"]]

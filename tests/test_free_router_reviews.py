@@ -14,7 +14,7 @@ from x_algo_watch.automation import detect, publish
 from x_algo_watch.drafting import Deferred, OpenRouter, analyze_items, run
 from x_algo_watch.models import WatchError
 from x_algo_watch.project_evidence import context_packs, pending_packs, project_pack, research_profile
-from x_algo_watch.research import render_research, research_event, research_schema, valid_research_event
+from x_algo_watch.research import render_research, research_event, research_schema, review_schema, valid_research_event
 from x_algo_watch.storage import RecordStore
 
 MODELS = {"analysis": "openrouter/free", "review": "openrouter/free"}
@@ -46,6 +46,23 @@ def test_router_transport_does_not_fix_model_and_records_actual_response(monkeyp
 def test_paid_or_other_routers_remain_blocked(model):
     with pytest.raises(WatchError):
         OpenRouter("test-key").call(model, "prompt", {})
+
+
+@pytest.mark.parametrize("is_review", [False, True])
+def test_project_transport_sends_strict_schema_and_supported_free_providers(monkeypatch, is_review):
+    requests = []
+    def respond(request, **kwargs):
+        requests.append(json.loads(request.data))
+        return io.BytesIO(json.dumps({"choices":[{"message":{"content":"{}"}}]}).encode())
+    monkeypatch.setattr("urllib.request.urlopen", respond)
+    payload = {"evidence_pack":{"scope":"project_version"}, **({"analysis":{}} if is_review else {})}
+    OpenRouter("test-key").call("openrouter/free", "prompt", payload)
+    body = requests[0]
+    assert body["response_format"]["type"] == "json_schema"
+    assert body["response_format"]["json_schema"]["strict"] is True
+    assert body["response_format"]["json_schema"]["schema"] == (review_schema() if is_review else research_schema())
+    assert body["provider"] == {"require_parameters":True,"allow_fallbacks":True}
+    assert body["model"] == "openrouter/free"
 
 
 def test_three_reviews_are_independent_inputs_share_schema_and_all_required(sample_repo):

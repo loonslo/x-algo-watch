@@ -164,11 +164,12 @@ def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
 
 def research_profile() -> str:
     from .research import research_schema
+    from .model_policy import PROJECT_TRANSPORT
     paths = [Path("prompts") / ("version-" + stage + "-v1.md") for stage in ("analysis", "review", "facts_review", "reader_review")]
     config = Path("config/watch.yaml")
     settings = (yaml.safe_load(config.read_text(encoding="utf-8")) or {}) if config.exists() else {}
     policy = {"models": settings.get("models"), "extra_review_rounds": settings.get("extra_review_rounds", 0)}
-    return digest([*[path.read_text(encoding="utf-8") if path.exists() else "" for path in paths], research_schema(), policy])
+    return digest([*[path.read_text(encoding="utf-8") if path.exists() else "" for path in paths], research_schema(), policy, PROJECT_TRANSPORT])
 
 
 def save_context(data: Path, pack: dict[str, Any]) -> None:

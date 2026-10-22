@@ -17,7 +17,7 @@ from .storage import RecordStore, atomic_write, public_text
 from .research import render_research
 from .readers import load_edition
 
-VERSION_PATH = re.compile(r"versions/(?:README\.md|\d{4}-\d{2}-\d{2}-[0-9a-f]{40}\.md)\Z")
+VERSION_PATH = re.compile(r"versions/(?:README\.md|(?:technical/)?\d{4}-\d{2}-\d{2}-[0-9a-f]{40}\.md)\Z")
 DIGEST_SECTION = re.compile(r"<!-- xaw-digest:([0-9a-f]{40}) -->\n(.*?)(?=\n<!-- xaw-digest:|\Z)", re.S)
 CONTEXT_ONLY = {"sync", "legacy_levels", "golden_corpus", "baseline", "manual_overdue"}
 LABELS = {
@@ -163,6 +163,8 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     if not record["complete"]:
         status += "；检查未完成"
     text = f"# {filename(record)[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
+    if research and "analysis" in research:
+        text += "技术读者可直接查看[本版本技术解读](technical/" + filename(record) + ")，包含前后实现、调用条件、机制推断、替代解释、验证办法及复核证据。\n\n"
     metadata = f"- 原速报解读状态：**{status}**\n- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
     metadata += f"- 检查级别：{inline(record['severity'])}；级别表示复核优先级，不代表流量影响大小。\n"
     metadata += f"- [查看原始提交]({UPSTREAM}/commit/{sha})"
@@ -273,6 +275,11 @@ def build_versions(root: Path) -> int:
         research = research_by_commit.get(record["commit"])
         edition = load_edition(root, research)
         pages[name] = render_page(record, decision, approved, rechecks, research, edition)
+        if research and "analysis" in research:
+            technical = f"# {name[:10]} · {record['commit'][:7]} · 技术解读\n\n[返回通俗解读](../{name}) · [全部版本](../README.md) · [阅读说明](../../docs/how-to-read.md)\n\n"
+            technical += "本页与通俗页来自同一份研究及复核记录；源码变化与条件性推断不等于线上部署。\n\n"
+            technical += render_research(research, context_base="../../data/project-context", edition=edition, technical_only=True)
+            pages["technical/" + name] = technical
         status = {"pending": "模型研究待续写", "manual": "模型研究需人工", "disputed": "模型复核有分歧", "pending_confirmation": "模型推测·未人工确认"}.get((research or {}).get("state"), "待模型研究")
         if research and latest_research.get(record["commit"], {}).get("id") != research.get("id"):
             status += "；新版待续写，当前页保留上一份研究及修订说明"
@@ -294,7 +301,7 @@ def build_versions(root: Path) -> int:
         raise WatchError("版本档案目录不能是符号链接")
     for name, text in pages.items():
         public_text(text)
-        if (directory / name).is_symlink():
+        if (directory / name).is_symlink() or (name.startswith("technical/") and (directory / "technical").is_symlink()):
             raise WatchError("版本档案不能是符号链接")
     for name, text in pages.items():
         target = directory / name

@@ -63,9 +63,7 @@ def latest_checks(store: RecordStore) -> list[dict[str, Any]]:
 
 
 def write_bundle(bundle: Path, original: dict[str, bytes], output: Path, *, test: bool, code: str, result_code: int, research_only: str = "") -> dict[str, Any]:
-    research = [] if test else pending_packs(output, limit=500 if research_only else 3)
-    if research_only:
-        research = [p for p in research if p["commit"] == research_only]
+    research = [] if test else ([p for p in context_packs(output) if p["commit"] == research_only] if research_only else pending_packs(output))
     for pack in research:
         save_context_snapshot(output, pack)
     files = data_files(output)
@@ -279,6 +277,8 @@ def commit_paths(paths: list[str], message: str, repository: str, token: str) ->
         raise WatchError("发布超出检测数据、速报与版本档案写入边界")
     if Path("versions").is_symlink():
         raise WatchError("版本档案目录不能是符号链接")
+    if Path("versions/technical").is_symlink():
+        raise WatchError("技术档案目录不能是符号链接")
     run_git(["add", "--", *paths], Path.cwd())
     if not run_git(["diff", "--cached", "--name-only"], Path.cwd()).strip():
         return False
