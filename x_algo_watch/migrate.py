@@ -106,7 +106,95 @@ def document_references(repo: Repository, base: str, target: str, documents: dic
     return facts, {"resolved_reference_ranges": len(references), "registered_fragments": len(facts), "unresolved_paths": sorted(unresolved), "requires_manual_mapping": changed}
 
 
-def build(repo: Repository, base: str, target: str, review: str, params_doc: str, mechanisms: str, report: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def revenue_topics(chapter: str, target: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """从已授权的第 3 章摘录登记核对主题，不公开政策原值与原文。"""
+    from .evidence import digest
+
+    if not re.match(r"\s*## 3\. ", chapter) or re.search(r"^## (?!3\. )", chapter, re.M):
+        raise WatchError("收益输入只能是已授权的第 3 章摘录")
+    sections = {}
+    for number in (1, 2):
+        match = re.search(rf"^### 3\.{number} [^\n]*\n(.*?)(?=^### |\Z)", chapter, re.M | re.S)
+        if not match:
+            raise WatchError("收益来源缺少 3.1 或 3.2，需复核输入版本")
+        sections[number] = match[1]
+    rows = []
+    for line in sections[1].splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) == 3 and cells[0] not in ("条件", "---"):
+            rows.append(cells)
+    items = re.findall(r"^(\d+)\. (.+)$", sections[2], re.M)
+    if [row[0] for row in rows] != ["订阅", "粉丝", "展示", "地区与年龄"] or [n for n, _ in items] != ["1", "2", "3"]:
+        raise WatchError("收益来源不符合四项准入/三项统计口径分组，不能假定七条覆盖")
+    urls = list(dict.fromkeys(re.findall(r"https://[^\s)]+", sections[1])))
+    official = "https://help.x.com/en/using-x/original-content-rewards"
+    if official not in urls:
+        raise WatchError("收益来源缺少预期官方入口，需复核输入版本")
+    groups = (
+        ("subscription", "收益计划的订阅条件", "3.1", "table_row_1", rows[0]),
+        ("followers", "收益计划的粉丝资格口径", "3.1", "table_row_2", rows[1]),
+        ("impressions", "收益计划的展示门槛及统计周期", "3.1", "table_row_3", rows[2]),
+        ("region_age", "收益计划的地区及年龄条件", "3.1", "table_row_4", rows[3]),
+        ("post_scope", "合格展示所涵盖的帖子类型", "3.2", "list_item_1", items[0][1]),
+        ("surface_scope", "合格展示所涵盖的流量入口", "3.2", "list_item_2", items[1][1]),
+        ("viewer_counting", "合格展示的观众资格与重复统计口径", "3.2", "list_item_3", items[2][1]),
+    )
+    facts = []; provenance = []
+    for key, title, section, locator, original in groups:
+        identifier = "manual.revenue." + key
+        facts.append({"id": identifier, "claim": "待人工核对的非源码事项：" + title, "value": None,
+                      "source": {"path": official, "name": key}, "external_sources": urls,
+                      "check": "manual", "evidence": "D", "used_in": ["手册 " + section], "basis_commit": target,
+                      "manual_review": {"last_checked": None, "interval_days": 30},
+                      "note": "按授权只读章节的四项准入条件与三项统计口径登记，不复述政策数值。来源文稿说明官方页未读到原文；各外部入口和规则均未核验，D 只表示本登记待核对。"})
+        provenance.append({"id": identifier, "source_section": section, "locator": locator, "source_digest": digest(original)})
+    return facts, {"chapter_digest": digest(chapter), "grouping": "3.1 四项准入条件 + 3.2 三项展示统计口径；原复核表未提供逐条编号，不声称还原其编号。",
+                   "items": provenance, "external_content_verified": False}
+
+
+def manual_topics(review: str, target: str, revenue_chapter: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """登记明确主题；额外授权的章节缺席时保留七条收益缺项。"""
+    match = re.search(r"### 2\.3 源码不可核（(\d+) 条[^\n]*\n(.*?)(?=\n## |\Z)", review, re.S)
+    if not match or int(match[1]) != 15 or not re.search(r"共\s*7\s*条", match[2]):
+        raise WatchError("人工类来源不含预期的 15 项/7 项分组，需核对输入版本")
+    section = re.sub(r"\s+", "", match[2])
+    topics = (
+        ("reposting", "删帖重发", "内容重新发布相关规则", []),
+        ("author_replies", "作者回复", "作者回复与会话排序的关系", []),
+        ("search_entry", "搜索入口", "搜索入口相关判断", []),
+        ("premium_reply_priority", "Premium", "订阅权益与回复优先相关规则", []),
+        ("community_notes_revenue", "社区笔记与收益", "社区笔记与收益的关系", []),
+        ("scheduled_posts", "定时发布", "计划发布相关规则", []),
+        ("giveaways_brands", "抽奖与品牌合作", "抽奖及品牌合作相关规则", ["手册 8.7"]),
+        ("ai_disclosure", "AI生成内容", "生成内容披露相关规则", []),
+    )
+    facts = []
+    for key, required, title, used_in in topics:
+        if required not in section:
+            raise WatchError("人工类来源主题缺失，不能假定覆盖完成")
+        facts.append({"id": "manual.policy." + key, "claim": "待人工核对的非源码事项：" + title, "value": None,
+                      "source": {"path": "registry/manual-coverage.yaml", "name": key}, "check": "manual", "evidence": "D",
+                      "used_in": used_in, "basis_commit": target, "manual_review": {"last_checked": None, "interval_days": 30},
+                      "note": "仅按指定复核表 2.3 登记核对主题，不复制文稿原说法。具体外部依据与原证据级别尚待补齐；D 只表示本条未核验，不对政策作肯定判断。"})
+    from .evidence import digest
+    coverage = {
+        "schema_version": 1, "source_category": "源码复核表", "source_section": "2.3", "source_digest": digest(review),
+        "expected_noncode_items": 15, "registered_noncode_topics": [fact["id"] for fact in facts],
+        "unresolved_items": [{"id": f"pending.revenue.{i:02d}", "used_in": ["手册 3"], "status": "missing_item_detail"} for i in range(1, 8)],
+        "existing_source_entry_ids": ["manual.revenue", "manual.premium", "manual.automation"],
+        "note": "三个外部来源入口不计作 15 条说法的逐项登记。指定资料对收益部分只给出 7 条总数，缺少逐条明细，当前不可宣称覆盖完成；外部内容均未核验。",
+    }
+    if revenue_chapter is not None:
+        revenue, provenance = revenue_topics(revenue_chapter, target)
+        facts.extend(revenue)
+        coverage.update(registered_noncode_topics=[fact["id"] for fact in facts], unresolved_items=[], revenue_provenance=provenance,
+                        note="15 个核对主题均已登记，另保留三个来源入口。收益七项按另行授权章节的四项准入/三项统计口径拆分；登记覆盖不等于外部规则或文稿内容已验证。")
+    return facts, coverage
+
+
+def build(repo: Repository, base: str, target: str, review: str, params_doc: str, mechanisms: str, report: str, revenue_chapter: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     base = repo.resolve(base); target = repo.resolve(target)
     current = snapshot(repo, target)
     facts: list[dict[str, Any]] = []
@@ -164,10 +252,18 @@ def build(repo: Repository, base: str, target: str, review: str, params_doc: str
         ("manual.automation", "自动化规则的外部资料需按月人工核对", "https://help.x.com/en/rules-and-policies/x-automation"),
     ):
         facts.append({"id": identifier, "claim": title, "value": None, "source": {"path": url}, "check": "manual", "evidence": "B", "used_in": [], "basis_commit": target, "manual_review": {"last_checked": None, "interval_days": 30}, "note": "仅登记外部来源入口与周期；尚未人工核对，不声明该链接或资格政策已验证。"})
+    manual_facts, manual_coverage = manual_topics(review, target, revenue_chapter)
+    facts.extend(manual_facts)
+    from .claim_coverage import build_claim_coverage
+    dependencies, code_coverage = build_claim_coverage(repo, base, target, review, facts)
+    facts.extend(dependencies)
+    manual_coverage["code_claim_item_mapping"] = "registry/code-claim-coverage.yaml"
     # 文稿只用于确认输入版本与保留来源摘要；不将其内容写入公开登记表。
     from .evidence import digest
     manifest = {"schema_version": 1, "base_commit": base, "target_commit": target, "rows": rows,
                 "source_digests": {"review": digest(review), "params": digest(params_doc), "mechanisms": digest(mechanisms), "migration_report": digest(report)}, "coverage": coverage,
+                "manual_coverage": manual_coverage,
+                "code_claim_coverage": code_coverage,
                 "note": "29 行预期区间来自指定复核报告；实际位置由原文锚点独立计算。"}
     return facts, manifest
 
@@ -178,13 +274,16 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("review", "params", "mechanisms", "migration-report"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("registry"))
+    parser.add_argument("--manual-chapter3", type=Path, help="另行授权后准备的第 3 章单独摘录；不传入整本手册")
     args = parser.parse_args(argv)
     try:
         destination = args.output / "facts.yaml"
         if destination.exists() and yaml.safe_load(destination.read_text(encoding="utf-8")) not in (None, []):
             raise WatchError("登记表已有人工内容，拒绝覆盖；请使用新的输出目录审阅")
-        facts, manifest = build(Repository(args.repo), "74d49a4", "7f2ca2b", *(path.read_text(encoding="utf-8") for path in (args.review, args.params, args.mechanisms, args.migration_report)))
-        for name, payload in (("facts.yaml", facts), ("migrations.yaml", manifest)):
+        facts, manifest = build(Repository(args.repo), "74d49a4", "7f2ca2b", *(path.read_text(encoding="utf-8") for path in (args.review, args.params, args.mechanisms, args.migration_report)),
+                                revenue_chapter=args.manual_chapter3.read_text(encoding="utf-8") if args.manual_chapter3 else None)
+        for name, payload in (("facts.yaml", facts), ("migrations.yaml", manifest), ("manual-coverage.yaml", manifest["manual_coverage"]),
+                              ("code-claim-coverage.yaml", manifest["code_claim_coverage"])):
             text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, width=120)
             public_text(text)
             atomic_write(args.output / name, text)

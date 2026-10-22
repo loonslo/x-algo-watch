@@ -6,7 +6,7 @@
 
 - `records/2026-10.md`：基线与逐提交证据；月份按检查发生时间（UTC），不是上游提交月份。
 - `status.md`：可以从记录重建的状态。
-- `verification.yaml`：最新目标提交的 420 项登记核验及自动观察表；人工外部来源尚未核对，明确标为 unreviewed。
+- `verification.yaml`：最新目标提交的登记核验及自动观察表（登记项数随人工维护变化）；人工外部来源尚未核对，明确标为 unreviewed。
 - `project-context/提交号.json`：对应版本当前准备的项目证据包。
 - `project-context/提交号-内容摘要.json`：某次模型研究实际读取的不可变证据快照；补证据不会覆盖旧快照。
 

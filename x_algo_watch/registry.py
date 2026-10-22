@@ -13,6 +13,15 @@ from .parsers import literal, uncomment
 from .storage import atomic_write, public_text
 
 
+def tree_digest(repo: Repository, commit: str, path: str) -> str | None:
+    """监测完整文件/目录对象集合；缺失或空目录不视为有效依赖。"""
+    from .evidence import digest
+
+    safe_path(path)
+    entries = {name: oid for name, oid in repo.tree(commit).items() if name == path or (path.endswith("/") and name.startswith(path))}
+    return digest(entries) if entries else None
+
+
 class UniqueLoader(yaml.SafeLoader):
     pass
 
@@ -65,7 +74,7 @@ def load_registry(path: Path) -> list[dict[str, Any]]:
         kind = fact.get("kind", "fact")
         check = fact.get("check")
         source = fact.get("source")
-        if kind not in ("fact", "switch", "ignore") or check not in ("value", "count", "snippet", "manual"):
+        if kind not in ("fact", "switch", "ignore") or check not in ("value", "count", "snippet", "tree", "manual"):
             raise WatchError("登记项 kind / check 不支持")
         if not isinstance(source, dict) or not isinstance(source.get("path"), str):
             raise WatchError("登记项缺少来源路径")
@@ -77,6 +86,8 @@ def load_registry(path: Path) -> list[dict[str, Any]]:
                 raise WatchError("取值或计数项缺少登记值")
             if check == "snippet" and not str(source.get("snippet", "")).strip():
                 raise WatchError("原文比对项缺少非空片段")
+            if check == "tree" and not re.fullmatch(r"[0-9a-f]{64}", str(fact.get("value", ""))):
+                raise WatchError("文件/目录依赖需要有效内容摘要")
         if kind == "ignore" and not str(fact.get("note", "")).strip():
             raise WatchError("忽略项必须写明理由 note")
         if check == "manual":
@@ -115,9 +126,11 @@ def verify(repo: Repository, snapshot: Snapshot, facts: list[dict[str, Any]], to
             if today >= due:
                 findings.append(Finding("manual_overdue", Severity.YELLOW, path, name, "人工核对已到期；尚未核对内容", fact_ids=(fact["id"],)))
         else:
-            text = repo.read(snapshot.commit, path)
+            text = None if check == "tree" else repo.read(snapshot.commit, path)
             actual: Any = None; line: int | None = None; found = False
-            if check == "value" and name in snapshot.params and path == "home-mixer/params/param.rs":
+            if check == "tree":
+                actual = tree_digest(repo, snapshot.commit, path); found = actual is not None
+            elif check == "value" and name in snapshot.params and path == "home-mixer/params/param.rs":
                 parameter = snapshot.params[name]; actual = parameter.value; line = parameter.line; found = True
             elif check == "value" and text is not None:
                 match = re.search(r"\bconst\s+" + re.escape(name) + r"\s*:\s*[^=]+?=\s*([^;]+);", uncomment(text))

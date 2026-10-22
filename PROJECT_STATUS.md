@@ -3,8 +3,8 @@ project_id: x-algo-watch
 updated: 2026-10-22
 status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 已有 6 份真实模型研究通过复核；新上游 989fb91 的发布路径错误已复现修复，原产物隔离恢复成功，准备仅重跑发布；原方案审计另发现 15 条人工类登记覆盖不足。
-next: 恢复新提交与模型审计的真实发布（当日已用 50 次），补齐人工条目的覆盖登记；连续 24 小时定时仍待验收。
+progress: 新上游 989fb91 已恢复发布；460 项登记保留原 420 项，74 条源码依赖与 15 个非源码主题均逐项登记；本地 195 项测试通过，远程复验及连续 24 小时定时仍待完成。
+next: 发布并复验登记补充，审阅人工登记初稿；44 份模型研究等免费额度重置后续写，继续核验定时缺口。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
@@ -12,6 +12,9 @@ evidence:
   - docs/deployment.md
   - docs/acceptance-versions.md
   - docs/acceptance-project-research.md
+  - docs/acceptance-manual-registration.md
+  - registry/manual-coverage.yaml
+  - registry/code-claim-coverage.yaml
   - versions/README.md
   - README.md
   - tests/test_history.py
@@ -74,4 +77,8 @@ MiniMax 实测：结构化分析 valid 并已缓存；NVIDIA 复核请求 HTTP 4
 
 2026-10-22 提交前复验：补齐上下文失败后的持久队列续跑、中文与缩写证据校验、程序计算源码区间长度及起始基线状态；同步 6 份上下文。Windows / Python 3.14.0 完整本地测试为 156 passed、17 skipped，后者因未提供真实上游副本而跳过。本次未复验历史回放、真实模型、Linux CI 或线上发布，详见 docs/acceptance-project-research.md。
 
-尚未完成：连续 24 小时定时证据。13:27 查询仍只有一个 schedule 记录，03:17、09:17、12:17 未查到运行。3 个人工来源明确为未核对。完整目标保持未完成，不以本机测试替代这些线上条件。
+2026-10-22 17:46 复核：失败发布已恢复，Linux CI 181 passed in 13.49s；51 份版本档案、6 份模型复核通过、3 份有分歧及 41 份未开始，共 44 份待继续。UTC 当日 50 次免费调用用满，复核按缓存等待续跑。
+
+P3 补充：用户另行授权只读主手册第 3 章，已按四项准入/三项展示口径登记收益七项，合计 15 个非源码核对主题；74 条源码说法均映射到变化监测依赖，新增 6 个锚点与 19 个文件/目录摘要。登记总数 460，原 420 项逐项保留；没有复制手册政策数值或结论，所有外部核对日期仍为空。Windows 完整测试 195 passed in 51.98s，含真实历史回放；登记补充的远程复验待完成。
+
+尚未完成：连续 24 小时定时证据。17:46 专项 API 仍只有北京时间 06:23、14:08 两次成功 schedule，其他预期时段有缺口。登记初稿仍待所有者审阅，外部政策不在本次 P3 核验范围。完整目标保持未完成，不以本机测试替代这些线上条件。
