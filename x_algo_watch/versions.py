@@ -15,6 +15,7 @@ from .git import SHA, UPSTREAM, safe_path
 from .models import WatchError
 from .storage import RecordStore, atomic_write, public_text
 from .research import render_research
+from .readers import load_edition
 
 VERSION_PATH = re.compile(r"versions/(?:README\.md|\d{4}-\d{2}-\d{2}-[0-9a-f]{40}\.md)\Z")
 DIGEST_SECTION = re.compile(r"<!-- xaw-digest:([0-9a-f]{40}) -->\n(.*?)(?=\n<!-- xaw-digest:|\Z)", re.S)
@@ -156,33 +157,32 @@ def source_link(record: dict[str, Any], finding: dict[str, Any]) -> str:
     return f"[源码位置]({UPSTREAM}/{view}/{commit}/{quote(path, safe='/')}{suffix})"
 
 
-def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str, rechecks: list[dict[str, Any]], research: dict[str, Any] | None = None) -> str:
+def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str, rechecks: list[dict[str, Any]], research: dict[str, Any] | None = None, edition: dict[str, Any] | None = None) -> str:
     sha = record["commit"]
     status = {"confirmed": "已人工确认", "rejected": "解读已驳回"}.get(decision.get("outcome"), "未人工确认")
     if not record["complete"]:
         status += "；检查未完成"
-    text = f"# {filename(record)[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [项目首页](../README.md)\n\n"
-    headline = research["analysis"]["summary"] if research and "analysis" in research else overview(record)
-    text += f"**一句话：{inline(headline)}**\n\n- 原速报解读状态：**{status}**\n- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
-    text += f"- 检查级别：{inline(record['severity'])}；级别表示复核优先级，不代表流量影响大小。\n"
-    text += f"- [查看原始提交]({UPSTREAM}/commit/{sha})"
+    text = f"# {filename(record)[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
+    metadata = f"- 原速报解读状态：**{status}**\n- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
+    metadata += f"- 检查级别：{inline(record['severity'])}；级别表示复核优先级，不代表流量影响大小。\n"
+    metadata += f"- [查看原始提交]({UPSTREAM}/commit/{sha})"
     if record.get("base") and SHA.fullmatch(record["base"]):
-        text += f" · [对比前后代码]({UPSTREAM}/compare/{record['base']}...{sha})"
+        metadata += f" · [对比前后代码]({UPSTREAM}/compare/{record['base']}...{sha})"
     month = datetime.fromisoformat(record["checked_at"]).astimezone(timezone.utc).strftime("%Y-%m")
-    text += f" · [完整检查记录](../data/records/{month}.md)\n\n"
-    text += "公开源码的默认设置不等于平台线上设置。模型研究会结合本版本提供的项目架构、差异、实现与调用窗口，推测推荐机制可能如何变化。\n\n"
+    metadata += f" · [完整检查记录](../data/records/{month}.md)\n\n"
     if research and not (confirmed and decision.get("research_id") == research.get("id")):
-        text += render_research(research)
+        text += render_research(research, edition=edition)
+    elif research and confirmed:
+        text += confirmed.strip() + "\n\n"
     elif not research and not record.get("base"):
-        text += "**这是起始基线，没有前一个版本可供比较，不属于待研究的算法迭代。**\n\n"
+        text += "## 30 秒摘要\n\n**这是起始基线，没有前一个版本可供比较，不属于待研究的算法迭代。**\n\n"
     elif not research:
-        text += "**本版本尚无整版本的模型项目解读。下方程序模板只整理源码证据，不能代替对推荐算法的推测。**\n\n"
-    if confirmed:
-        text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
-    elif decision.get("outcome") == "rejected":
+        text += "## 30 秒摘要\n\n- 改了什么：" + overview(record) + "\n- 已经上线了吗：尚未核实部署。\n- 影响谁：模型研究尚未完成，不能准确判断。\n- 创作者现在要做什么：目前不据此调整发布策略，等待完整解读。\n\n"
+    if decision.get("outcome") == "rejected":
         text += "**先前解读已被所有者驳回，不能作为运营建议。以下仅保留源码变化与待核对问题。**\n\n"
-    else:
-        text += "**本版本尚无人工确认的运营解读。可以先了解变化，调整做法前请等人工核对。**\n\n"
+    text += "<details><summary>检查历史与原始检测数据（普通读者可跳过）</summary>\n\n" + metadata
+    if confirmed and not (research and decision.get("research_id") == research.get("id")):
+        text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
     text += "<details><summary>程序整理的原始变化与阅读提示（不属于模型项目解读）</summary>\n\n## 这次改了什么，可能影响什么\n\n"
     findings = [f for f in record["findings"] if f["category"] not in CONTEXT_ONLY]
     for index, finding in enumerate(findings, 1):
@@ -238,6 +238,7 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         text += "\n"
     text += "<details><summary>技术证据：逐项旧值、新值与历史检查提示</summary>\n\n"
     text += "历史检查提示只代表当时的登记状态；当前是否已登记请另查登记表。\n\n<pre>" + html.escape(json.dumps(record["findings"], ensure_ascii=False, indent=2)) + "</pre>\n</details>\n"
+    text += "\n</details>\n"
     return text
 
 
@@ -247,13 +248,19 @@ def build_versions(root: Path) -> int:
     records = sorted(by_commit.values(), key=lambda r: (datetime.fromisoformat(r["committed_at"]), r["commit"]), reverse=True)
     events = sorted(store.events(), key=lambda e: e.get("created_at", ""))
     decisions = {e["commit"]: e for e in events if e["type"] == "decision"}
-    research_by_commit = {e["commit"]: e for e in events if e["type"] == "version_research"}
+    latest_research = {e["commit"]: e for e in events if e["type"] == "version_research"}
+    research_by_commit: dict[str, Any] = {}
+    for event in events:
+        if event["type"] == "version_research":
+            previous = research_by_commit.get(event["commit"])
+            if "analysis" in event or not previous or "analysis" not in previous:
+                research_by_commit[event["commit"]] = event
     path = root / "digest.md"
     digest = path.read_text(encoding="utf-8") if path.exists() else ""
     confirmed = dict(DIGEST_SECTION.findall(digest))
     pages: dict[str, str] = {}
-    index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [已确认速报汇总](../digest.md)\n\n"
-    index += "从这里逐版阅读模型对推荐算法的机制研究：改动可能在调整什么、影响哪些内容，以及推断依据、成立条件和替代解释。每个上游提交一份独立文件，按提交时间从新到旧排列。\n\n"
+    index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [怎么读这些文档](../docs/how-to-read.md) · [已确认速报汇总](../digest.md)\n\n"
+    index += "面向普通创作者与运营：先读每版的“30 秒摘要”和“影响解读”，了解改了什么、是否上线、可能影响谁、现在该做什么。技术分析、证据和历史记录折叠在页面末尾。每个上游提交一份独立文件，按提交时间从新到旧排列。\n\n"
     index += "标为“待模型研究”的版本只有源码证据，不算已经完成解读。模型推测可以在人工确认前阅读，但不会被写成平台已部署的事实；正式速报仍由所有者确认。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
     index += "| 版本（UTC 日期） | 一句话变化 | 解读状态 | 核对级别 |\n| --- | --- | --- | --- |\n"
     for record in records:
@@ -264,8 +271,11 @@ def build_versions(root: Path) -> int:
             raise WatchError("确认决策缺少对应速报，不能生成已确认版本档案")
         rechecks = [e for e in events if e["type"] == "verification" and e.get("commit") == record["commit"]]
         research = research_by_commit.get(record["commit"])
-        pages[name] = render_page(record, decision, approved, rechecks, research)
+        edition = load_edition(root, research)
+        pages[name] = render_page(record, decision, approved, rechecks, research, edition)
         status = {"pending": "模型研究待续写", "manual": "模型研究需人工", "disputed": "模型复核有分歧", "pending_confirmation": "模型推测·未人工确认"}.get((research or {}).get("state"), "待模型研究")
+        if research and latest_research.get(record["commit"], {}).get("id") != research.get("id"):
+            status += "；新版待续写，当前页保留上一份研究及修订说明"
         if not record.get("base"):
             status = "起始基线·无前版对比"
         if approved:
@@ -274,7 +284,8 @@ def build_versions(root: Path) -> int:
             status += "；原速报解读已驳回"
         if not record["complete"]:
             status += "；检查未完成"
-        summary = research["analysis"]["title"] if research and "analysis" in research else "尚无模型项目研究" if record.get("base") else "起始基线快照"
+        reader = edition["reader"] if edition else (research.get("analysis", {}).get("reader") if research and research.get("state") != "disputed" else None)
+        summary = reader["title"] if reader else "用户版待修订" if research and research.get("state") == "disputed" else research["analysis"]["title"] if research and "analysis" in research else "尚无模型项目研究" if record.get("base") else "起始基线快照"
         index += f"| [{name[:10]} · {record['commit'][:7]}]({name}) | {inline(summary)} | {status} | {inline(record['severity'])} |\n"
     pages["README.md"] = index + f"\n共 {len(records)} 个版本（含起始基线）。没有新上游提交的检查不会新增版本文件。\n\n目录和基础说明由程序重建；人工解读通过 Issue 审核后保存在速报中，不直接编辑这些生成文件。\n"
     # 全量验证后才写入，避免扫描失败产生半套公开页面。

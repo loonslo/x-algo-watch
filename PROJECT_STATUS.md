@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-22
-status: waiting
+status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 460 项登记已上线，保留原 420 项；74 条源码依赖与 15 个非源码主题均逐项登记，Windows/Linux 各 195 项通过；正常发布成功，44 份研究等额度续跑，24 小时定时仍未通过。
-next: 核验北京时间 21:17 及后续实际 schedule；10 月 23 日 08:00 程序日预算重置后续写研究，定时缺口原因仍待外部证据。
+progress: 新增面向非技术读者的线上固定格式协议，起草与复核共用，程序强制 reader 与四层排版；本地完整 206 项通过，9 份旧研究已迁移阅读稿，待发布复验。
+next: 发布固定协议与阅读层，验证 CI 和正常工作流；预算重置后实测新格式 MiniMax 输出，并继续核验定时缺口。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
@@ -12,6 +12,8 @@ evidence:
   - docs/deployment.md
   - docs/acceptance-versions.md
   - docs/acceptance-project-research.md
+  - docs/acceptance-reader-format.md
+  - docs/reader-output-contract.md
   - docs/acceptance-manual-registration.md
   - registry/manual-coverage.yaml
   - registry/code-claim-coverage.yaml
@@ -84,3 +86,5 @@ P3 补充：用户另行授权只读主手册第 3 章，已按四项准入/三�
 尚未完成：连续 24 小时定时证据。17:46 专项 API 仍只有北京时间 06:23、14:08 两次成功 schedule，其他预期时段有缺口。登记初稿仍待所有者审阅，外部政策不在本次 P3 核验范围。完整目标保持未完成，不以本机测试替代这些线上条件。
 
 2026-10-22 20:20 外部状态复查：仓库与 Actions 启用条件正常，定时工作流 active，但 schedule 仍只有两次；当前没有进行中任务。上游 main 与已检查的 989fb91 相同。官方文档允许调度延迟或丢弃，尚无证据确认本项目根因，不盲改 cron、不以手动运行冒充定时验收。当前等待外部运行记录及免费预算重置；完整目标仍未完成。
+
+2026-10-22 用户新规则：非技术创作者与运营为主读者，技术内容收进末尾折叠区。后续线上起草和复核共享精确 JSON 协议，强制 reader 四问、影响、术语和证据，程序统一排版；没有人工改写文件的新版本已通过模拟起草、分歧修订、复核、发布测试。9 份已有研究仅作一次阅读层迁移，未改原模型审计、人工登记和正式速报。完整本地测试 206 项通过；新协议真实 MiniMax 质量仍等预算重置后验证，整体方案未完成。

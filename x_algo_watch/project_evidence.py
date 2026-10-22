@@ -2,6 +2,7 @@
 
 import json
 import re
+import yaml
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -150,13 +151,21 @@ def context_packs(data: Path) -> list[dict[str, Any]]:
 
 def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
     profile = research_profile()
-    finished = {e.get("item_id") for e in RecordStore(data).events() if e["type"] == "version_research" and e.get("profile_hash") == profile and (e.get("state") in ("pending_confirmation", "manual") or (e.get("state") == "disputed" and e.get("repair_attempted")))}
+    config = Path("config/watch.yaml")
+    settings = yaml.safe_load(config.read_text(encoding="utf-8")) if config.exists() else {}
+    compatible = (settings or {}).get("readability_compatible_profiles", [])
+    if not isinstance(compatible, list) or any(not isinstance(p, str) or not re.fullmatch(r"[0-9a-f]{64}", p) for p in compatible):
+        raise WatchError("阅读层兼容研究版本配置无效")
+    finished = {e.get("item_id") for e in RecordStore(data).events() if e["type"] == "version_research" and
+                ((e.get("state") == "pending_confirmation" and e.get("profile_hash") in {profile, *compatible}) or
+                 (e.get("profile_hash") == profile and (e.get("state") == "manual" or (e.get("state") == "disputed" and e.get("repair_attempted")))))}
     return [p for p in context_packs(data) if p["item_id"] not in finished][:limit]
 
 
 def research_profile() -> str:
+    from .research import research_schema
     paths = [Path("prompts") / ("version-" + stage + "-v1.md") for stage in ("analysis", "review")]
-    return digest([path.read_text(encoding="utf-8") if path.exists() else "" for path in paths])
+    return digest([*[path.read_text(encoding="utf-8") if path.exists() else "" for path in paths], research_schema()])
 
 
 def save_context(data: Path, pack: dict[str, Any]) -> None:

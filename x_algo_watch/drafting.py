@@ -18,7 +18,7 @@ from .evidence import digest, items_for_record
 from .models import WatchError
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
-from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, validate_research
+from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, validate_research
 
 ANALYSIS_FIELDS = {"item_id", "title", "summary", "default_state", "facts", "inferences", "affected_fact_ids", "manual_change", "action", "observe", "questions"}
 NUMBER = re.compile(r"(?<![\w])[-−]?\d+(?:\.\d+)?(?![\w])")
@@ -188,6 +188,8 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 break
             prompt_name = ("version-" if project_research else "") + stage + "-v1"
             prompt = (prompt_root / (prompt_name + ".md")).read_text(encoding="utf-8")
+            if project_research:
+                prompt += "\n起草输出与复核对象共用以下完整协议。起草只输出符合协议的 JSON；复核仍只输出 agree/issues，须按此协议检查 analysis。\n" + json.dumps(research_schema(), ensure_ascii=False)
             feedback = (repair_feedback or {}).get(item_id) if stage == "analysis" else None
             if feedback:
                 prompt_name = "version-analysis-repair-v1"
@@ -221,7 +223,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     except ValueError:
                         value = None
                     if project_research and stage == "analysis":
-                        errors = validate_research(value, pack)
+                        errors = validate_research(value, pack, require_reader=True)
                         if not errors:
                             errors += validate_analysis(analysis_projection(value), pack, project_research=True)
                     else:

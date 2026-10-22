@@ -37,6 +37,10 @@ def analysis(pack):
     return {
         "item_id": pack["item_id"], "title": "新增候选来源可能改变参与排序的内容构成",
         "summary": "设置从默认关闭变为默认开启，来源实现也读取这一开关；若该路径运行，候选池构成可能改变。",
+        "reader": {"title": "推荐帖子来源设置有变化", "what_changed": "增加了一路准备参与推荐的帖子。", "who": "可能涉及这一路找到的帖子作者。",
+                   "when": "线上状态未知，需要线上采用新默认值并实际调用这一来源。", "online_status": "unverified", "action": "当前证据不足以支持调整发布策略。",
+                   "impacts": [{"heading": "部分帖子可能多一个参与推荐的入口", "effect": "新来源若运行，可能改变参与推荐的帖子集合。", "conditions": "线上打开且实际调用该来源。", "limits": "不能承诺最后展示或流量增加。", "evidence_refs": ["E1"]}],
+                   "terms": [], "evidence_refs": ["E1"]},
         "changes": [{"mechanism": "候选来源接入", "before": "来源开关默认关闭", "after": "默认开启，并存在读取它的实现", "evidence_refs": ["E1"]}],
         "hypotheses": [{"hypothesis": "新增来源中的内容可能获得参与排序的机会", "basis": "开关变开且来源代码读取它，候选入口可能放行", "confidence": "medium", "conditions": "线上使用该默认值并调用此来源", "alternative": "调用链可能没有实际接入这一来源", "verify": "检查候选流水线接入情况与线上参数", "creator_impact": "来源能覆盖的内容可能进入候选池，但不承诺最终被展示", "evidence_refs": ["E1"]}],
         "no_hypothesis_reason": "", "questions": ["该来源是否实际接入候选流水线？"],
@@ -97,7 +101,8 @@ def test_project_review_disagreement_is_visible_and_never_confirmed(sample_repo)
     event = research_event(pack, outputs[pack["item_id"]], MODELS)
     text = render_research(event)
     assert "复核存在分歧" in text and "尚未人工确认" in text
-    assert "另一种解释" in text and "如何验证" in text and "模型实际读取的完整证据包" in text
+    assert "用户正文待修订" in text and "旧研究稿原文" in text and "模型实际读取的完整证据包" in text
+    assert "新增来源中的内容可能获得参与排序的机会" not in text.split("研究附录：")[0]
 
 
 def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_spam(sample_repo, tmp_path, monkeypatch):
@@ -122,7 +127,7 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     publish(bundle, client, draft_bundle=output, push=False)
     page = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
     assert "模型对本次算法迭代的解读" in page and "成立条件" in page and "另一种解释" in page
-    assert "模型推测，尚未人工确认" in page and "新增候选来源可能改变" in page
+    assert "模型推测，尚未人工确认" in page and "推荐帖子来源设置有变化" in page
     assert not client.rows and not (workspace / "digest.md").exists()
     assert pending_packs(workspace / "data") == []
     assert len(model.calls) == 2
