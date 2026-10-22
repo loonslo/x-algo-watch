@@ -49,10 +49,23 @@ def review(pack, agree=True):
 
 
 def test_exact_decimal_relationships():
-    _, pack = record_and_pack()
+    record, pack = record_and_pack()
     assert pack["derived"]["favorite_multiplier"] == "1.1"
     assert pack["derived"]["not_interested_multiplier"] == "1.1"
     assert pack["derived"]["negative_to_favorite_before"] == pack["derived"]["negative_to_favorite_after"] == "79.2"
+    # 即使模型只描述旧/新值，也必须由程序补上同比变化与不变的比值。
+    value = analysis(pack)
+    value["summary"] = "FavoriteWeight 从 0.6 改为 0.66，NotInterestedWeight 从 -47.52 改为 -52.272。"
+    value["facts"] = [{"text": value["summary"], "evidence_refs": ["E1", "E2"]}]
+    assert not validate_analysis(value, pack)
+    assert "79.2" not in json.dumps(value)
+    outputs = {pack["item_id"]: {"state": "pending_confirmation", "analysis": value, "review": review(pack)}}
+    draft = assemble(record, [pack], outputs)
+    body = draft["body"]
+    assert "点赞权重 ×1.1" in body and "不感兴趣权重 ×1.1" in body
+    assert "两者绝对比值 79.2 → 79.2" in body
+    assert assemble(record, [pack], outputs)["version"] == draft["version"]
+    assert assemble({**record, "committed_at": "2026-10-22T00:00:00+00:00"}, [pack], outputs)["version"] != draft["version"]
 
 
 @pytest.mark.parametrize("mutation", ["wrong_number", "wrong_name", "wrong_path", "no_evidence", "deployment", "experiment_off", "extra_field"])

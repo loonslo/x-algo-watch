@@ -239,6 +239,13 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
         text += "- 状态：" + {"changed": "默认值已改；部署未知", "disabled": "默认关或空值；部署未知", "configured": "配置非空；部署未知", "unknown": "默认状态待人工核对；部署未知"}[analysis["default_state"]] + "\n"
         for claim in analysis["facts"]:
             text += "- 【A】" + claim["text"] + "（" + "、".join(claim["evidence_refs"]) + "）\n"
+        derived = pack.get("derived", {})
+        if derived:
+            relationships = ["点赞权重 ×" + derived["favorite_multiplier"]]
+            if derived.get("not_interested_multiplier") is not None:
+                relationships.append("不感兴趣权重 ×" + derived["not_interested_multiplier"])
+            relationships.append("两者绝对比值 " + derived["negative_to_favorite_before"] + " → " + derived["negative_to_favorite_after"])
+            text += "- 【A】程序计算的数值关系：" + "；".join(relationships) + "。比值为不感兴趣权重绝对值除以点赞权重；输入与精确结果见证据包 numeric_context。\n"
         for claim in analysis["inferences"]:
             text += "- 【C】" + claim["text"] + "（" + "、".join(claim["evidence_refs"]) + "）\n"
         text += "- 现在要不要改做法：" + {"change": "要", "keep": "不用", "observe": "先观察"}[analysis["action"]] + "；" + analysis["observe"] + "\n"
@@ -253,7 +260,7 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
         text += "\n"
     text += "- 确认：待仓库所有者编辑核对并打标签。\n"
     public_text(text)
-    return {"body": text, "ready": ready, "version": digest({"packs": packs, "outputs": outputs})[:20]}
+    return {"body": text, "ready": ready, "version": digest({"packs": packs, "outputs": outputs, "body": text})[:20]}
 
 
 def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> None:

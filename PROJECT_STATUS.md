@@ -3,8 +3,8 @@ project_id: x-algo-watch
 updated: 2026-10-22
 status: waiting
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: Linux CI 130 项通过；Issues 订阅修正后，所有者确认收到指定测试 Issue #3 邮件；草稿状态标签已修复，模型仍遇提供方 HTTP 429。
-next: 按所有者选择改用 MiniMax 免费模型起草、保留 NVIDIA 复核，验收真实草稿与人工确认；继续观察定时缺口及 24 小时运行。
+progress: Linux CI 132 项通过，Issue #3 邮件送达通过；MiniMax 真实分析已校验，NVIDIA 复核遇 HTTP 404；程序组稿已补固定倍率与比值。
+next: 解决 NVIDIA 免费端点不可用后复用已通过分析，验收真实草稿与人工确认；继续观察定时缺口及 24 小时运行。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
@@ -40,5 +40,7 @@ evidence:
 10:42 正常补跑成功，进度仍为 7f2ca2b，第四次模型请求仍遇提供方 HTTP 429；此手动运行不计作定时验收。合成流程发现草稿状态标签重叠，已最小修复，相关 29 项测试通过。
 
 模型调整：所有者明确选择 MiniMax M3.1 Flash 起草、保留 NVIDIA Nemotron 复核；已更改固定免费 ID，正在验证真实调用。
+
+MiniMax 实测：结构化分析 valid 并已缓存；NVIDIA 复核请求 HTTP 404，未生成草稿。公开端点查询显示旧 NVIDIA 免费端点近期可用率为 0。组稿已补入程序计算的倍率及比值，避免真实分析遗漏关键关系；相关 36 项测试通过。
 
 尚未完成：真实模型起草与评论确认、连续 24 小时定时证据。3 个人工来源明确为未核对。完整目标保持未完成，不以本机测试替代这些线上条件。
