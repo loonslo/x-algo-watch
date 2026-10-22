@@ -53,6 +53,7 @@ python -m compileall -q x_algo_watch tests
 - [MiniMax 真实样例运行](https://github.com/loonslo/x-algo-watch/actions/runs/39713369683)：流程完成，MiniMax 对权重组的结构化分析 valid、数字与引用校验无错误；NVIDIA 复核请求为 HTTP 404 / deferred，因此没有发布草稿。审计已随 c539404 提交，MiniMax 的分析缓存可供下轮复用。
 - 随后查询 OpenRouter 的 NVIDIA Nemotron 3 Super 免费模型公开 endpoints API，唯一端点的近 5 分钟、30 分钟、1 天可用率均为 0；未改变账户隐私设置或绕过路由限制。
 - 真实分析正确描述旧/新值但遗漏倍率和不变比值，因此组稿现固定展示程序已计算的倍率及比值，不要求模型自由补算。组稿版本同时绑定实际正文，文字变化会产生新版本，同文重复不会覆盖所有者编辑。相关模型/发布/流程测试 **36 passed in 0.69s**，包括模拟模型完全未提比值的情况。
+- [组稿修复 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39713977597)：提交 680481c 的 **132 passed in 10.01s**。
 
 ## P2：检测、发布与工作流
 
