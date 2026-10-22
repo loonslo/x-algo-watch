@@ -140,6 +140,15 @@ def test_initial_baseline_is_not_a_permanently_pending_model_iteration(tmp_path)
     assert "不属于待研究的算法迭代" in page
 
 
+def test_external_manual_review_warning_is_not_a_source_path_or_algorithm_change(tmp_path):
+    result = record(tmp_path, findings=[Finding("manual_overdue", Severity.YELLOW, "https://help.x.com/en/using-x/x-premium", "manual.premium", "尚未人工核对")])
+    build_versions(tmp_path)
+    page = (tmp_path / "versions" / filename(result)).read_text(encoding="utf-8")
+    assert "人工资料核对提醒：manual.premium" in page
+    assert "不是本次算法逻辑变化" in page
+    assert "监测范围内未发现主要功能设置变化" in page
+
+
 @pytest.mark.parametrize("bad_path", ["versions/unapproved.md", "versions/execute.py", "versions/sub/README.md"])
 def test_archive_publish_whitelist_rejects_other_files(tmp_path, monkeypatch, bad_path):
     monkeypatch.chdir(tmp_path)

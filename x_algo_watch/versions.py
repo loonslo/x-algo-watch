@@ -18,7 +18,7 @@ from .research import render_research
 
 VERSION_PATH = re.compile(r"versions/(?:README\.md|\d{4}-\d{2}-\d{2}-[0-9a-f]{40}\.md)\Z")
 DIGEST_SECTION = re.compile(r"<!-- xaw-digest:([0-9a-f]{40}) -->\n(.*?)(?=\n<!-- xaw-digest:|\Z)", re.S)
-CONTEXT_ONLY = {"sync", "legacy_levels", "golden_corpus", "baseline"}
+CONTEXT_ONLY = {"sync", "legacy_levels", "golden_corpus", "baseline", "manual_overdue"}
 LABELS = {
     "FavoriteWeight": "点赞信号的打分系数", "NotInterestedWeight": "不感兴趣信号的打分系数",
     "ClickWeight": "点击信号的打分系数", "DwellWeight": "停留信号的打分系数",
@@ -225,6 +225,8 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
             if category == "sync":
                 f = grouped[-1]
                 text += f"- 源码同步标记：{value_text(f.get('before'))} → {value_text(f.get('after'))}；时间标记本身不证明功能变化。\n"
+            elif category == "manual_overdue":
+                text += "- 人工资料核对提醒：" + "、".join(inline(f["name"]) for f in grouped) + "；属于登记维护事项，不是本次算法逻辑变化。\n"
             else:
                 text += {"baseline": "- 本次建立基线，未把既有配置当作新增。\n", "legacy_levels": "- 此历史版本采用旧规则布局，没有现代级别名单的计数；未把缺少该文件当作规则清零。\n", "golden_corpus": f"- 有 {len(grouped)} 个测试样例文件变化；测试样例不能证明线上行为已改变。\n"}[category]
         text += "\n"

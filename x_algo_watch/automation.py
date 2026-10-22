@@ -332,10 +332,20 @@ def publish(bundle: Path, client: GitHub, *, draft_bundle: Path | None = None, p
         if draft_bundle is not None and draft_bundle.exists():
             for event in payload.get("events", []):
                 RecordStore(Path("data")).append_event(event, datetime.now(timezone.utc))
-        build_versions(Path.cwd())
         if push:
-            commit_paths(["data", "versions"], "chore: update upstream inspection", client.repository, client._token)
-    return publish_issues(client, records, manifest["test"], drafts)
+            # 检测和调用审计先落盘；派生阅读页出错不能让下一轮丢失已花费的调用。
+            commit_paths(["data"], "chore: update upstream inspection", client.repository, client._token)
+        page_error = None
+        try:
+            build_versions(Path.cwd())
+        except WatchError as exc:
+            page_error = exc
+        if push and page_error is None:
+            commit_paths(["versions"], "docs: update version research pages", client.repository, client._token)
+    numbers = publish_issues(client, records, manifest["test"], drafts)
+    if not manifest["test"] and page_error is not None:
+        raise WatchError("检查证据、调用审计与通知已保留；版本页生成失败，需修复后重建") from page_error
+    return numbers
 
 
 def main(argv: list[str] | None = None) -> int:

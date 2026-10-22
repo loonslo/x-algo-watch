@@ -110,6 +110,30 @@ def test_publish_scans_draft_before_any_write(tmp_path, monkeypatch):
     assert not (tmp_path / "data").exists() and not client.calls
 
 
+def test_reader_page_failure_does_not_lose_inspection_or_skip_notification(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    working = tmp_path / "working"
+    record = sample_record()
+    result = CheckResult(record["base"], record["commit"], record["committed_at"], findings=[Finding("parameter", Severity.ORANGE, "code.rs", "FavoriteWeight", "变化", 0.6, 0.66)])
+    RecordStore(working).append(result, NOW, "uncommitted")
+    bundle = tmp_path / "bundle"
+    write_bundle(bundle, {}, working, test=False, code="uncommitted", result_code=0)
+    commits = []
+    def record_commit(paths, *args):
+        assert RecordStore(Path("data")).last_success() == record["commit"]
+        commits.append(paths)
+    def bad_reader(root):
+        assert commits == [["data"]]
+        raise WatchError("派生页面失败")
+    monkeypatch.setattr("x_algo_watch.automation.commit_paths", record_commit)
+    monkeypatch.setattr("x_algo_watch.automation.build_versions", bad_reader)
+    client = FakeGitHub()
+    with pytest.raises(WatchError, match="调用审计与通知已保留"):
+        publish(bundle, client)
+    assert commits == [["data"]]
+    assert len(client.rows) == 1 and client.rows[0]["state"] == "open"
+
+
 def test_only_approved_data_paths_are_included(tmp_path):
     (tmp_path / "status.md").write_text("safe", encoding="utf-8")
     (tmp_path / "execute.py").write_text("not data", encoding="utf-8")
