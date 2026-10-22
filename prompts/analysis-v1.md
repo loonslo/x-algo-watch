@@ -21,3 +21,5 @@
 }
 
 affected_fact_ids 只能取 related_facts 中的值；inferences / questions 可以为空列表，facts 必须非空。default_state=changed 表示默认值变化，不是线上生效。拿不准就选 unknown / observe，问题交给人。
+
+manual_change 表示“是否需要更新手册”，不表示源码是否由人工修改。只能依据 related_facts、fact_locations 及当前证据提出建议；没有关联登记项或无法判断手册现状时填 unknown。不要推断源码作者身份或提交者意图。inferences 只写对创作者的有限影响；程序给出的倍率与权重绝对比值不是新增代码参数、转化率或新的机制。

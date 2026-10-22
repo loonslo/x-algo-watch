@@ -90,6 +90,8 @@ python -m compileall -q x_algo_watch tests
 - [同模型 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39725170158)：**136 passed in 6.91s**。
 - [同模型真实续跑](https://github.com/loonslo/x-algo-watch/actions/runs/39725180876)：成功，数据提交 31e8b43；复用既有权重分析，MiniMax 复核通过。README 分析首次因未在证据包出现的数字 9/10 被拦，纠错一次后通过，再复核通过；共 4 次新调用。两项状态均为 pending_confirmation、review_mode=same_model；已生成[第一份草稿评论](https://github.com/loonslo/x-algo-watch/issues/2#issuecomment-6333088992)，标签只有待确认而无待起草。
 - 正文核查发现早期持久记录没有 numeric_context，虽然权重旧/新值完整，程序计算行仍缺失。现仅在同条记录有两个权重完整旧/新值时补算，供证据包、Issue 正文和组稿共用，不回写原始历史记录；缺项或空值不猜填。真实 17c96bf 本地复核得到两项倍率 1.1、比值 79.2→79.2。相关模型/发布/流程测试 **43 passed in 0.81s**，实际补齐后草稿待线上复验。
+- [旧记录修复 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39725653184)：**139 passed in 6.78s**。
+- [数值上下文真实复验](https://github.com/loonslo/x-algo-watch/actions/runs/39725662479)：成功，数据提交 678418d；[新版草稿](https://github.com/loonslo/x-algo-watch/issues/2#issuecomment-6333170967)已展示倍率 1.1/1.1、绝对比值 79.2→79.2。权重分析首次结构校验失败，重试通过；复核却把 manual_change 解释为“源码是否由人工修改”，因此 disputed 并正确标需人工。原提示词未清楚定义该字段，现明确它表示是否更新手册，缺少关联登记或现状证据时为 unknown；同时明确运营推断不应猜测提交者意图。原分歧保留审计，提示词摘要改变后重新验证。
 
 本地合成录制响应与端到端联调已验证：
 

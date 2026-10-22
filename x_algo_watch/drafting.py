@@ -256,7 +256,7 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
             text += "- 【C】" + claim["text"] + "（" + "、".join(claim["evidence_refs"]) + "）\n"
         text += "- 现在要不要改做法：" + {"change": "要", "keep": "不用", "observe": "先观察"}[analysis["action"]] + "；" + analysis["observe"] + "\n"
         locations = sorted({location for fact_id in analysis["affected_fact_ids"] for location in pack.get("fact_locations", {}).get(fact_id, [])})
-        text += "- 影响手册：" + ("、".join(locations) or "、".join(analysis["affected_fact_ids"]) or "未关联登记项") + "；是否改手册：" + analysis["manual_change"] + "\n"
+        text += "- 影响手册：" + ("、".join(locations) or "、".join(analysis["affected_fact_ids"]) or "未关联登记项") + "；是否改手册：" + {"yes": "需要", "no": "不用", "unknown": "待人工判断"}[analysis["manual_change"]] + "\n"
         for finding in pack["evidence"].values():
             text += f"- 出处：`{finding['path']}` / `{finding['name']}` @ `{record['commit']}`\n"
         if result.get("state") == "disputed":
