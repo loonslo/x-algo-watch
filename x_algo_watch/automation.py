@@ -20,6 +20,7 @@ from .git import SHA, UPSTREAM, Repository, run_git
 from .github import BOT, GitHub, bot_owned, issue_marker
 from .models import WatchError
 from .storage import EVENT_PATTERN, RECORD_PATTERN, RecordStore, atomic_write, public_text
+from .versions import VERSION_PATH, build_versions, filename
 
 DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md)\Z")
 BASELINE = "7f2ca2b914cadac591ea7fceec0c477e473d3dee"
@@ -170,6 +171,8 @@ def evidence_body(record: dict[str, Any], repository: str, test: bool) -> str:
         raise WatchError("证据摘要仍超出 Issue 上限；保留完整检查记录，需人工拆分")
     body = prefix + "```json\n" + details + "\n```\n\n"
     body += f"完整记录：[data/records](https://github.com/{repository}/tree/main/data/records)。\n\n"
+    if not test:
+        body += f"通俗说明与可能影响：[本次版本档案](https://github.com/{repository}/blob/main/versions/{filename(record)}) · [全部版本](https://github.com/{repository}/blob/main/versions/README.md)。\n\n"
     body += "模型不可用时保留证据，下一轮补起草。请仅对机器人草稿使用 `已确认` / `驳回` 标签。"
     public_text(body)
     return body
@@ -219,14 +222,23 @@ def publish_issues(client: GitHub, records: list[dict[str, Any]], test: bool, dr
 
 
 def commit_paths(paths: list[str], message: str, repository: str, token: str) -> bool:
-    if any(path not in ("data", "digest.md") and not path.startswith("data/") for path in paths):
-        raise WatchError("发布超出 data/ 与 digest.md 写入边界")
+    if any(path not in ("data", "digest.md", "versions") and not path.startswith("data/") and not VERSION_PATH.fullmatch(path) for path in paths):
+        raise WatchError("发布超出检测数据、速报与版本档案写入边界")
+    if Path("versions").is_symlink():
+        raise WatchError("版本档案目录不能是符号链接")
     run_git(["add", "--", *paths], Path.cwd())
     if not run_git(["diff", "--cached", "--name-only"], Path.cwd()).strip():
         return False
     staged = run_git(["diff", "--cached", "--name-only"], Path.cwd()).decode().splitlines()
-    if any(path != "digest.md" and not (path.startswith("data/") and DATA_PATH.fullmatch(path[5:])) for path in staged):
+    if any(path != "digest.md" and not (path.startswith("data/") and DATA_PATH.fullmatch(path[5:])) and not VERSION_PATH.fullmatch(path) for path in staged):
         raise WatchError("暂存区包含发布范围外文件")
+    for path in staged:
+        if VERSION_PATH.fullmatch(path):
+            target = Path(path)
+            if target.is_symlink():
+                raise WatchError("版本档案不能是符号链接")
+            if target.exists():
+                public_text(target.read_text(encoding="utf-8"))
     run_git(["-c", "user.name=github-actions[bot]", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com", "commit", "-m", message], Path.cwd())
     header = base64.b64encode(("x-access-token:" + token).encode()).decode()
     env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader", "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic " + header, "GIT_TERMINAL_PROMPT": "0"}
@@ -263,8 +275,9 @@ def publish(bundle: Path, client: GitHub, *, draft_bundle: Path | None = None, p
         if draft_bundle is not None and draft_bundle.exists():
             for event in payload.get("events", []):
                 RecordStore(Path("data")).append_event(event, datetime.now(timezone.utc))
+        build_versions(Path.cwd())
         if push:
-            commit_paths(["data"], "chore: update upstream inspection", client.repository, client._token)
+            commit_paths(["data", "versions"], "chore: update upstream inspection", client.repository, client._token)
     return publish_issues(client, records, manifest["test"], drafts)
 
 

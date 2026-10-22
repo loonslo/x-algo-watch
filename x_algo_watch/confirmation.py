@@ -13,6 +13,7 @@ from .github import GitHub, bot_owned, issue_marker
 from .git import run_git
 from .models import WatchError
 from .storage import RecordStore, atomic_write, public_text
+from .versions import build_versions
 
 DRAFT = re.compile(r"<!-- xaw-draft:([0-9a-f]{40}):([0-9a-f]{20}) -->")
 COMMIT = re.compile(r"<!-- xaw-commit:([0-9a-f]{40}) -->")
@@ -81,8 +82,9 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
     store.append_event({"type": "decision", "id": "decision:" + commit + ":" + outcome, "commit": commit, "issue": number, "outcome": outcome, "actor": client.owner}, now)
     from .cli import code_version
     store.status(now, code_version(root))
+    build_versions(root)
     if push:
-        commit_paths(["digest.md", "data"], "docs: record reviewed upstream change", client.repository, client._token)
+        commit_paths(["digest.md", "data", "versions"], "docs: record reviewed upstream change", client.repository, client._token)
     marker = "<!-- xaw-decision:" + commit + ":" + outcome + " -->"
     if not any(bot_owned(comment) and marker in comment.get("body", "") for comment in client.comments(number)):
         client.request("POST", f"/issues/{number}/comments", {"body": marker + "\n\n所有者已" + ("确认并归档到 digest.md。" if outcome == "confirmed" else "驳回；保留源码证据供追溯。")})
