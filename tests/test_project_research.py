@@ -13,7 +13,7 @@ from x_algo_watch.confirmation import confirm
 from x_algo_watch.drafting import analyze_items, run, validate_analysis
 from x_algo_watch.engine import compare
 from x_algo_watch.evidence import digest
-from x_algo_watch.project_evidence import MAX_TEXT, code_range_lengths, context_packs, pending_packs, project_pack, save_context
+from x_algo_watch.project_evidence import MAX_TEXT, code_range_lengths, context_packs, pending_packs, project_pack, save_context, save_context_snapshot
 from x_algo_watch.research import analysis_projection, render_research, research_event, validate_research
 from x_algo_watch.storage import RecordStore
 from x_algo_watch.versions import filename
@@ -218,3 +218,17 @@ def test_project_grounding_understands_acronyms_chinese_boundaries_and_negation(
 def test_range_examples_are_computed_from_literal_source_not_model_arithmetic():
     ranges = code_range_lengths({"E1": {"text": "candidates(10_000..10_220); candidates(0..440); float = 1.0..2; inclusive = 0..=5;"}})
     assert ranges == [{"evidence_ref": "E1", "start": 10000, "end_exclusive": 10220, "length": 220}, {"evidence_ref": "E1", "start": 0, "end_exclusive": 440, "length": 440}]
+
+
+def test_actual_model_input_snapshot_survives_context_revision(sample_repo, tmp_path):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    save_context(tmp_path, pack)
+    save_context_snapshot(tmp_path, pack)
+    archived = tmp_path / "project-context" / (pack["commit"] + "-" + pack["item_id"] + ".json")
+    previous = archived.read_bytes()
+    pack["derived"]["new_context_fact"] = "additional evidence"
+    pack["item_id"] = digest({k:v for k,v in pack.items() if k!='item_id'})
+    save_context(tmp_path, pack)
+    assert archived.read_bytes() == previous
+    assert context_packs(tmp_path) == [pack]

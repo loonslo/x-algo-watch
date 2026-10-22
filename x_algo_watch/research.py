@@ -125,6 +125,6 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
             continue
         anchor = "#L" + str(source["start_line"]) if source.get("start_line") else ""
         text += f"- {key}：{source['kind']} · [{source['path']}]({UPSTREAM}/blob/{source['commit']}/{quote(source['path'], safe='/')}{anchor})" + ("（片段截断）" if source["truncated"] else "") + "\n"
-    text += f"\n[模型实际读取的完整证据包]({context_base}/{event['commit']}.json)\n\n</details>\n\n"
+    text += f"\n[模型实际读取的完整证据包]({context_base}/{event['commit']}-{event['item_id']}.json)\n\n</details>\n\n"
     public_text(text)
     return text

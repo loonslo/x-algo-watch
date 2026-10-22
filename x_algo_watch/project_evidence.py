@@ -134,6 +134,8 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
 def context_packs(data: Path) -> list[dict[str, Any]]:
     packs = []
     for path in sorted((data / "project-context").glob("*.json")):
+        if re.fullmatch(r"[0-9a-f]{40}-[0-9a-f]{64}\.json", path.name):
+            continue  # 模型输入的不可变快照不重复进入研究队列。
         pack = json.loads(path.read_text(encoding="utf-8"))
         identity = pack.get("item_id")
         if pack.get("scope") != "project_version" or pack.get("schema_version") != CONTEXT_SCHEMA or path.stem != pack.get("commit") or not SHA.fullmatch(path.stem) or identity != digest({k: v for k, v in pack.items() if k != "item_id"}):
@@ -159,3 +161,15 @@ def save_context(data: Path, pack: dict[str, Any]) -> None:
     text = json.dumps(pack, ensure_ascii=False, indent=2).replace("@", "\\u0040")
     public_text(text)
     atomic_write(data / "project-context" / (pack["commit"] + ".json"), text + "\n")
+
+
+def save_context_snapshot(data: Path, pack: dict[str, Any]) -> None:
+    if pack.get("item_id") != digest({k: v for k, v in pack.items() if k != "item_id"}) or not SHA.fullmatch(pack.get("commit", "")):
+        raise WatchError("模型输入快照摘要无效")
+    text = json.dumps(pack, ensure_ascii=False, indent=2).replace("@", "\\u0040") + "\n"
+    public_text(text)
+    path = data / "project-context" / (pack["commit"] + "-" + pack["item_id"] + ".json")
+    if path.exists() and path.read_text(encoding="utf-8") != text:
+        raise WatchError("拒绝覆盖不同内容的模型输入快照")
+    if not path.exists():
+        atomic_write(path, text)

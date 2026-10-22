@@ -23,10 +23,10 @@ from .github import BOT, GitHub, bot_owned, issue_marker
 from .models import WatchError
 from .storage import EVENT_PATTERN, RECORD_PATTERN, RecordStore, atomic_write, public_text
 from .versions import VERSION_PATH, build_versions, filename
-from .project_evidence import context_packs, pending_packs, project_pack, save_context
+from .project_evidence import context_packs, pending_packs, project_pack, save_context, save_context_snapshot
 from .research import valid_research_event
 
-DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md|project-context/[0-9a-f]{40}\.json)\Z")
+DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md|project-context/[0-9a-f]{40}(?:-[0-9a-f]{64})?\.json)\Z")
 BASELINE = "7f2ca2b914cadac591ea7fceec0c477e473d3dee"
 
 
@@ -63,6 +63,9 @@ def latest_checks(store: RecordStore) -> list[dict[str, Any]]:
 
 
 def write_bundle(bundle: Path, original: dict[str, bytes], output: Path, *, test: bool, code: str, result_code: int) -> dict[str, Any]:
+    research = [] if test else pending_packs(output)
+    for pack in research:
+        save_context_snapshot(output, pack)
     files = data_files(output)
     for name, content in files.items():
         text = content.decode("utf-8")
@@ -82,7 +85,7 @@ def write_bundle(bundle: Path, original: dict[str, bytes], output: Path, *, test
         RecordStore(bundle / "data").append_event({"type": "notification_eligible", "id": "notify:" + record["commit"], "commit": record["commit"]}, datetime.now(timezone.utc))
     notify = list({r["commit"]: r for r in records if r["commit"] in eligible and r["severity"] in ("红", "橙")}.values())
     files = data_files(bundle / "data")
-    manifest = {"schema_version": 1, "test": test, "code_commit": code, "base_hashes": hashes(original), "file_hashes": hashes(files), "result_code": result_code, "notifications": [r["commit"] for r in notify], "research": [] if test else [p["commit"] for p in pending_packs(bundle / "data")]}
+    manifest = {"schema_version": 1, "test": test, "code_commit": code, "base_hashes": hashes(original), "file_hashes": hashes(files), "result_code": result_code, "notifications": [r["commit"] for r in notify], "research": [p["commit"] for p in research]}
     encoded = json.dumps(manifest, ensure_ascii=False, indent=2)
     public_text(encoded)
     atomic_write(bundle / "manifest.json", encoded)
