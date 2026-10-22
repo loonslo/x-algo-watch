@@ -11,7 +11,9 @@ from x_algo_watch.automation import publish
 from x_algo_watch.drafting import run
 from x_algo_watch.models import WatchError
 from x_algo_watch.project_evidence import project_pack, save_context
-from x_algo_watch.sample import prepare_sample
+from x_algo_watch.sample import prepare_sample, write_owner_preview
+from x_algo_watch.research import research_event
+from x_algo_watch.model_policy import aggregate_reviews
 from x_algo_watch.storage import RecordStore
 
 
@@ -62,3 +64,18 @@ def test_reviewed_sample_can_publish_locally_without_issue_or_key_access(sample_
     assert event['state']=='pending_confirmation' and len(event['reviews'])==3
     assert any(e['id']=='keep-new-record' for e in RecordStore(data).events())
     assert (root/'versions/technical').is_dir() and not (root/'digest.md').exists()
+
+
+def test_owner_preview_preserves_disputed_original_and_escapes_html(sample_repo,tmp_path):
+    repo,result=prepare(sample_repo);pack=project_pack(repo,result.to_dict())
+    value=analysis(pack);value['reader']['what_changed']='<script>原稿文本</script>'
+    reviews={'review':review(pack,False),'facts_review':review(pack,False),'reader_review':review(pack)}
+    event=research_event(pack,{'state':'disputed','analysis':value,'review':aggregate_reviews(pack['item_id'],reviews),'reviews':reviews,'extra_review_rounds':2},MODELS)
+    output=tmp_path/'owner-preview';write_owner_preview(event,pack,output)
+    user=(output/'index.html').read_text(encoding='utf-8')
+    assert '1 轮同意，2 轮不同意' in user and '暂不可作为可发布结论' in user
+    assert '<script>' not in user and '&lt;script&gt;原稿文本&lt;/script&gt;' in user
+    assert 'technical.html' in user and '技术审阅页' in (output/'technical.html').read_text(encoding='utf-8')
+    assert json.loads((output/'research.json').read_text(encoding='utf-8'))==event
+    with pytest.raises(WatchError,match='完整三轮'):
+        write_owner_preview({**event,'reviews':{}},pack,tmp_path/'invalid')
