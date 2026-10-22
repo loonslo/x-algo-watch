@@ -44,6 +44,8 @@ Windows / Python 3.14.0 相关回归：**74 passed in 59.88s**。覆盖指定版
 
 本地审阅生成与发布相关回归：**37 passed in 15.97s**，含缺少三轮时拒绝生成、争议状态不能冒充通过、原文不改写及 HTML 注入转义。复核预算改造的 [Linux CI 39799010973](https://github.com/loonslo/x-algo-watch/actions/runs/39799010973) 为 **249 passed in 15.76s**，包含真实上游历史回放；这些程序测试不能代替模型稿质量验收。
 
+最终审阅实现提交 8a39542 的 [Linux CI 39803906367](https://github.com/loonslo/x-algo-watch/actions/runs/39803906367) 成功，**250 passed in 16.70s**，包含真实上游历史回放。两份本地审阅页已在浏览器核对并打开，公开仓库保存实际三轮分歧与全部调用记录，等待所有者检查本轮稿件。
+
 ## 供用户检查的质量判断
 
 - 非技术阅读目标尚未达到：实际原稿仍使用 FairShareRankingFilter、候选筛选、served_type、检索模型等术语，行动建议要求普通创作者确认线上参数，操作边界不清楚。读者理解角色虽同意，不能据此认定通俗性通过。
