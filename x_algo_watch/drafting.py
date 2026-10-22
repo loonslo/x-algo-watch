@@ -1,4 +1,4 @@
-"""固定模型、逐项结构校验、单独复核调用、可恢复的调用审计。"""
+"""免费模型路由、结构校验、分工复核和可恢复的调用审计。"""
 
 import argparse
 import json
@@ -16,6 +16,7 @@ import yaml
 from .automation import load_bundle
 from .evidence import digest, items_for_record
 from .models import WatchError
+from .model_policy import FREE_ROUTER, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
 from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, validate_research
@@ -136,10 +137,12 @@ class OpenRouter:
             raise Deferred("模型密钥尚未在专用环境配置；仅保留证据")
         self._key = key
         self._last_call = 0.0
+        self.last_response_model: str | None = None
 
     def call(self, model: str, system: str, payload: dict[str, Any]) -> str:
-        if not model.endswith(":free"):
-            raise WatchError("只允许显式 :free 模型，不使用付费或随机路由")
+        self.last_response_model = None
+        if not free_model(model):
+            raise WatchError("只允许 :free 型号或 openrouter/free 免费自动路由")
         delay = 3.1 - (time.monotonic() - self._last_call)
         if delay > 0:
             time.sleep(delay)
@@ -153,6 +156,9 @@ class OpenRouter:
             timeout = 90 if payload.get("evidence_pack", {}).get("scope") == "project_version" else 30
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 result = json.load(response)
+            actual_model = result.get("model")
+            if isinstance(actual_model, str) and re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", actual_model):
+                self.last_response_model = actual_model
             choice = result["choices"][0]
             content = choice["message"]["content"]
             if not isinstance(content, str) or not content.strip():
@@ -168,24 +174,28 @@ class OpenRouter:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 
 
-def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None, extra_review_rounds: int = 0, call_deadline: float | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if type(daily_limit) is not int or not 1 <= daily_limit <= 50:
         raise WatchError("免费模型本地每日调用上限须为 1 到 50")
     if type(allow_same_model) is not bool:
         raise WatchError("allow_same_model 必须为布尔值")
     same_model = models.get("analysis") == models.get("review")
-    if (same_model and not allow_same_model) or any(not models.get(stage, "").endswith(":free") for stage in ("analysis", "review")):
-        raise WatchError("只允许固定免费模型；同模型复核须显式启用 allow_same_model")
-    review_mode = "same_model" if same_model else "different_models"
+    if (same_model and not allow_same_model and models.get("analysis") != FREE_ROUTER) or any(not free_model(models.get(stage)) for stage in ("analysis", "review")):
+        raise WatchError("只允许免费型号或免费自动路由；固定同模型复核须显式启用 allow_same_model")
+    review_mode = model_review_mode(models)
+    checks = review_stages(extra_review_rounds)
+    if extra_review_rounds and not project_research:
+        raise WatchError("额外复核仅用于整版本研究")
     outputs: dict[str, Any] = {}; events: list[dict[str, Any]] = []
     used = sum(e["type"] == "model_call" and e.get("day") == now.date().isoformat() for e in prior)
     deferred_all = False
     for pack in packs:
         item_id = pack["item_id"]
-        stages: dict[str, Any] = {}; state = "pending"
-        for stage in ("analysis", "review"):
-            if stage == "review" and "analysis" not in stages:
+        stages: dict[str, Any] = {}; state = "pending"; resolved_models = {}
+        for stage in ("analysis", *checks):
+            if stage != "analysis" and "analysis" not in stages:
                 break
+            model = models["analysis" if stage == "analysis" else "review"]
             prompt_name = ("version-" if project_research else "") + stage + "-v1"
             prompt = (prompt_root / (prompt_name + ".md")).read_text(encoding="utf-8")
             if project_research:
@@ -195,12 +205,16 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 prompt_name = "version-analysis-repair-v1"
                 prompt += "\n这是唯一一轮依据复核意见的修订。previous_analysis 是上一稿，review_feedback 是对它的质疑。逐条用原始证据核对，修正成立的问题，降低无依据的置信度，删除不能支持的推测；若质疑本身不成立，在对应依据里用证据简要澄清。保留原 JSON schema，不输出修订说明或额外字段。\n"
             version = prompt_name + ":" + digest(prompt)[:16]
-            payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage == "review" else {}), **({"previous_analysis": feedback["analysis"], "review_feedback": feedback["review"]} if feedback else {})}
-            key = digest({"item": item_id, "stage": stage, "model": models[stage], "version": version, "input": payload})
+            payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage != "analysis" else {}), **({"previous_analysis": feedback["analysis"], "review_feedback": feedback["review"]} if feedback else {})}
+            if repair_feedback and stage != "analysis":
+                # 修订后所有角色重新核对；即使修订稿与旧稿相同，也不能沿用旧裁决。
+                payload["revision_context"] = digest(repair_feedback[item_id])
+            key = digest({"item": item_id, "stage": stage, "model": model, "version": version, "input": payload})
             calls = [e for e in prior + events if e["type"] == "model_call" and e.get("analysis_key") == key]
             passed = next((e for e in reversed(calls) if e.get("valid")), None)
             if passed:
                 stages[stage] = passed["output"]
+                resolved_models[stage] = passed.get("resolved_model")
                 if project_research:
                     print(pack["commit"][:7] + " " + stage + " reused", flush=True)
                 continue
@@ -208,14 +222,16 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             if len(invalid) >= 2:
                 state = "manual"; break
             while len(invalid) < 2:
-                if used >= daily_limit or deferred_all:
+                if used >= daily_limit or deferred_all or (call_deadline is not None and time.monotonic() >= call_deadline):
                     state = "pending"; break
                 errors = invalid[-1].get("errors", []) if invalid else []
                 request_payload = {**payload, **({"previous_validation_errors": errors} if errors else {})}
-                event = {"type": "model_call", "id": key + ":" + str(len(calls)) + ":" + now.isoformat(), "analysis_key": key, "item_id": item_id, "commit": pack["commit"], "stage": stage, "model": models[stage], "prompt_version": version, "input_hash": digest(request_payload), "day": now.date().isoformat(), "valid": False}
+                event = {"type": "model_call", "id": key + ":" + str(len(calls)) + ":" + now.isoformat(), "analysis_key": key, "item_id": item_id, "commit": pack["commit"], "stage": stage, "model": model, "prompt_version": version, "input_hash": digest(request_payload), "day": now.date().isoformat(), "valid": False}
                 used += 1
                 try:
-                    raw = client.call(models[stage], prompt, request_payload)
+                    raw = client.call(model, prompt, request_payload)
+                    if review_mode == "free_router":
+                        event["resolved_model"] = getattr(client, "last_response_model", None)
                     public_text(raw)
                     event["raw_output"] = raw
                     try:
@@ -240,7 +256,9 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 if project_research:
                     print(pack["commit"][:7] + " " + stage + " " + event["outcome"], flush=True)
                 if event["valid"]:
-                    stages[stage] = event["output"]; break
+                    stages[stage] = event["output"]
+                    resolved_models[stage] = event.get("resolved_model")
+                    break
                 if event["outcome"] == "deferred":
                     break
                 invalid.append(event)
@@ -248,15 +266,25 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 if len(invalid) >= 2:
                     state = "manual"
                 break
-        if "review" in stages:
+        complete = all(stage in stages for stage in checks)
+        if complete:
+            reviews = {stage: stages[stage] for stage in checks}
+            stages = {"analysis": stages["analysis"], "review": aggregate_reviews(item_id, reviews)}
+            if extra_review_rounds:
+                stages.update(reviews=reviews, extra_review_rounds=extra_review_rounds)
             state = "pending_confirmation" if stages["review"]["agree"] else "disputed"
+        else:
+            # 不能把第一关通过误标成三关通过。
+            stages = {"analysis": stages["analysis"]} if "analysis" in stages else {}
+        if review_mode == "free_router":
+            stages["resolved_models"] = resolved_models
         outputs[item_id] = {"state": state, **stages}
         status_event = {"type": "analysis_state", "id": "state:" + digest({"item": item_id, "state": state, "stages": stages, "review_mode": review_mode}), "item_id": item_id, "commit": pack["commit"], "state": state, "review_mode": review_mode}
         events.append(status_event)
     return outputs, events
 
 
-def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[str, Any], *, same_model_review: bool = False) -> dict[str, Any] | None:
+def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[str, Any], *, same_model_review: bool = False, free_router: bool = False) -> dict[str, Any] | None:
     # 额度耗尽或网络不可用时仅发证据，不把尚未经过复核调用的分析发成草稿。
     if any(outputs.get(pack["item_id"], {}).get("state", "pending") == "pending" for pack in packs):
         return None
@@ -265,7 +293,9 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
         return None
     ready = all(outputs.get(pack["item_id"], {}).get("state") == "pending_confirmation" for pack in packs)
     text = "**未经确认的草稿。公开代码默认值不等于线上值；部署未知。**\n\n"
-    if same_model_review:
+    if free_router:
+        text += "**复核方式：免费自动路由；实际型号可能相同，不能保证异模型独立复核。**\n\n"
+    elif same_model_review:
         text += "**复核方式：同一模型的两次调用，不属于不同模型的独立复核；仍须仓库所有者人工确认。**\n\n"
     text += f"### {record['committed_at'][:10]} · {record['commit'][:7]} · 源码变化待人工确认\n\n"
     for pack in packs:
@@ -313,20 +343,19 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
         selected = manifest.get("research", [])
         packs = [p for p in context_packs(bundle / "data") if p["commit"] in selected]
         prior = RecordStore(bundle / "data").events()
+        # 多关核对最多主动运行 20 分钟，再留出一次请求和落盘时间；避免 35 分钟任务被强杀而丢失调用审计。
+        call_deadline = time.monotonic() + 20 * 60
         try:
             client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
-            outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True)
+            outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
             disputed = [p for p in packs if outputs.get(p["item_id"], {}).get("state") == "disputed"]
             if disputed:
                 feedback = {p["item_id"]: outputs[p["item_id"]] for p in disputed}
-                repaired, repair_events = analyze_items(disputed, prior + events, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True, repair_feedback=feedback)
+                repaired, repair_events = analyze_items(disputed, prior + events, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True, repair_feedback=feedback, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
                 events.extend(repair_events)
                 for pack in disputed:
                     result = repaired[pack["item_id"]]
-                    if "review" in result:
-                        outputs[pack["item_id"]] = {**result, "repair_attempted": True}
-                    elif result["state"] == "manual":
-                        outputs[pack["item_id"]]["repair_attempted"] = True
+                    outputs[pack["item_id"]] = {**result, "repair_attempted": True}
         except Deferred:
             outputs, events = {}, []
         drafts = {}
@@ -354,7 +383,7 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
         outputs, events = {}, []
     drafts = {}
     for record in records:
-        draft = assemble(record, items_for_record(record), outputs, same_model_review=settings["models"]["analysis"] == settings["models"]["review"])
+        draft = assemble(record, items_for_record(record), outputs, same_model_review=settings["models"]["analysis"] == settings["models"]["review"], free_router=model_review_mode(settings["models"]) == "free_router")
         if draft:
             drafts[record["commit"]] = draft
     payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": drafts, "events": events}

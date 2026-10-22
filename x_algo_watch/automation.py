@@ -322,7 +322,9 @@ def publish(bundle: Path, client: GitHub, *, draft_bundle: Path | None = None, p
                 raise WatchError("草稿审计事件超出允许范围")
             if event["type"] == "version_research":
                 pack = next((p for p in context_packs(bundle / "data") if p["commit"] == event["commit"]), None)
-                if not pack or not valid_research_event(event, pack):
+                config = Path("config/watch.yaml")
+                settings = yaml.safe_load(config.read_text(encoding="utf-8")) if config.exists() else {}
+                if not pack or not valid_research_event(event, pack, required_extra_reviews=(settings or {}).get("extra_review_rounds", 0)):
                     raise WatchError("项目研究事件与当前上下文不匹配")
     if not manifest["test"]:
         if hashes(data_files(Path("data"))) != manifest["base_hashes"]:

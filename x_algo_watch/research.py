@@ -8,6 +8,7 @@ from .evidence import digest
 from .storage import public_text
 from .project_evidence import research_profile
 from .readers import evidence_links, validate_reader
+from .model_policy import aggregate_reviews, free_model, review_mode, review_stages
 
 LEGACY_RESEARCH_FIELDS = {"item_id", "title", "summary", "changes", "hypotheses", "no_hypothesis_reason", "questions"}
 RESEARCH_FIELDS = LEGACY_RESEARCH_FIELDS | {"reader"}
@@ -98,17 +99,22 @@ def research_event(pack: dict[str, Any], result: dict[str, Any], models: dict[st
         "profile_hash": research_profile(),
         "state": result["state"], "models": models,
         "repair_attempted": result.get("repair_attempted", False),
-        "review_mode": "same_model" if models["analysis"] == models["review"] else "different_models",
+        "review_mode": review_mode(models),
         "coverage": pack["coverage"], "sources": {key: {k: v for k, v in e.items() if k != "text"} for key, e in pack["evidence"].items()},
         **({"analysis": result["analysis"], "review": result["review"]} if "review" in result else {}),
+        **{key: result[key] for key in ("reviews", "extra_review_rounds", "resolved_models") if key in result},
     }
     payload["id"] = "research:" + digest(payload)
     return payload
 
 
-def valid_research_event(event: dict[str, Any], pack: dict[str, Any]) -> bool:
+def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, required_extra_reviews: int = 0) -> bool:
     models = event.get("models")
-    if not isinstance(models, dict) or set(models) != {"analysis", "review"} or any(not isinstance(m, str) or not m.endswith(":free") for m in models.values()):
+    if not isinstance(models, dict) or set(models) != {"analysis", "review"} or any(not free_model(m) for m in models.values()):
+        return False
+    review_stages(required_extra_reviews)
+    rounds = event.get("extra_review_rounds", 0)
+    if type(rounds) is not int or not 0 <= rounds <= 2:
         return False
     if event.get("state") not in ("pending", "manual", "disputed", "pending_confirmation"):
         return False
@@ -125,7 +131,26 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any]) -> bool:
         return False
     if type(event.get("repair_attempted")) is not bool:
         return False
-    result = {"state": event["state"], "repair_attempted": event["repair_attempted"], **({"analysis": event["analysis"], "review": event["review"]} if "analysis" in event else {})}
+    if "review" in event:
+        if rounds < required_extra_reviews:
+            return False
+        if rounds:
+            from .drafting import validate_review
+            reviews = event.get("reviews")
+            if not isinstance(reviews, dict) or set(reviews) != set(review_stages(rounds)) or any(validate_review(r, pack, RESEARCH_FIELDS) for r in reviews.values()):
+                return False
+            if event["review"] != aggregate_reviews(pack["item_id"], reviews):
+                return False
+        elif "reviews" in event:
+            return False
+    elif "reviews" in event or rounds:
+        return False
+    if "resolved_models" in event:
+        resolved = event["resolved_models"]
+        import re
+        if not isinstance(resolved, dict) or set(resolved) - {"analysis", *review_stages(2)} or any(m is not None and (not isinstance(m, str) or not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", m)) for m in resolved.values()):
+            return False
+    result = {"state": event["state"], "repair_attempted": event["repair_attempted"], **({"analysis": event["analysis"], "review": event["review"]} if "analysis" in event else {}), **{key: event[key] for key in ("reviews", "extra_review_rounds", "resolved_models") if key in event}}
     return event == research_event(pack, result, models)
 
 
@@ -181,7 +206,14 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     else:
         text += "该稿仍有未解决的复核问题，技术推断正文暂不发布；原始记录保留在下方研究附录。\n\n"
     text += "</details>\n\n<details><summary>研究附录：证据、复核与原始记录</summary>\n\n"
-    text += ("起草与复核为同一型号、两个调用角色。" if event["review_mode"] == "same_model" else "起草与复核使用不同型号。")
+    text += {"same_model": "起草与复核为同一型号、两个调用角色。", "different_models": "起草与复核使用不同型号。", "free_router": "起草与各轮复核均通过免费自动路由选择型号；实际型号可能相同，不保证异模型独立复核。"}[event["review_mode"]]
+    if event.get("reviews"):
+        text += "已完成综合复核、源码事实与遗漏核对、机制推断与读者理解核对。" if event["extra_review_rounds"] == 2 else "已完成综合复核、源码事实与遗漏核对。"
+        text += "修订后须重新通过全部要求的复核，不能用多数票覆盖异议。"
+    if event.get("resolved_models"):
+        text += "\n\n实际响应型号（接口未返回时记为未知）：\n" + "\n".join("- " + {"analysis":"起草", "review":"综合复核", "facts_review":"事实与遗漏核对", "reader_review":"推断与读者理解核对"}[stage] + "：`" + (model or "未知") + "`" for stage, model in event["resolved_models"].items())
+    if event.get("reviews"):
+        text += "\n\n本稿各轮裁决：\n" + "\n".join("- " + {"review":"综合复核", "facts_review":"事实与遗漏核对", "reader_review":"推断与读者理解核对"}[stage] + "：" + ("通过" if result["agree"] else "有分歧，待修订") for stage, result in event["reviews"].items())
     if edition:
         text += "本页按用户阅读规则重写并补充源码核对，未新增远程模型复核；没有更改原模型审计或将改写标为人工确认。"
     text += "\n\n"
