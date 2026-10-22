@@ -53,7 +53,12 @@ def test_reviewed_sample_can_publish_locally_without_issue_or_key_access(sample_
     draft=root/'runtime/draft.json'
     run(bundle,draft,config,client=RecordedClient([analysis(pack),review(pack),review(pack),review(pack)]))
     monkeypatch.setattr('x_algo_watch.automation.publish_issues',lambda *args: pytest.fail('不应访问 Issue'))
-    assert publish(bundle,None,draft_bundle=draft,push=False,notify_issues=False)==[]
+    # 模型运行期间 main 新增记录时，只能追加同源研究事件，不能回写旧快照。
+    RecordStore(data).append_event({'type':'manual_note','id':'keep-new-record'},NOW)
+    with pytest.raises(WatchError,match='已变化'):
+        publish(bundle,None,draft_bundle=draft,push=False,notify_issues=False)
+    assert publish(bundle,None,draft_bundle=draft,push=False,notify_issues=False,merge_research=True)==[]
     event=[e for e in RecordStore(data).events() if e['type']=='version_research'][-1]
     assert event['state']=='pending_confirmation' and len(event['reviews'])==3
+    assert any(e['id']=='keep-new-record' for e in RecordStore(data).events())
     assert (root/'versions/technical').is_dir() and not (root/'digest.md').exists()

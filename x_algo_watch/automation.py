@@ -302,9 +302,11 @@ def commit_paths(paths: list[str], message: str, repository: str, token: str) ->
     return True
 
 
-def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = None, push: bool = True, notify_issues: bool = True) -> list[int]:
+def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = None, push: bool = True, notify_issues: bool = True, merge_research: bool = False) -> list[int]:
     if client is None and (push or notify_issues):
         raise WatchError("远程推送或 Issue 发布需要 GitHub 客户端")
+    if merge_research and (push or notify_issues):
+        raise WatchError("样例合并只允许本地研究记录，不推送或操作 Issue")
     manifest, files, records = load_bundle(bundle)
     drafts: dict[str, Any] = {}
     if draft_bundle is not None and draft_bundle.exists():
@@ -328,13 +330,28 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
                 settings = yaml.safe_load(config.read_text(encoding="utf-8")) if config.exists() else {}
                 if not pack or not valid_research_event(event, pack, required_extra_reviews=(settings or {}).get("extra_review_rounds", 0)):
                     raise WatchError("项目研究事件与当前上下文不匹配")
+    if merge_research:
+        selected = manifest.get('research', [])
+        if manifest['test'] or len(selected) != 1 or draft_bundle is None or not draft_bundle.exists():
+            raise WatchError('只允许合并一个已审核的研究样例产物')
+        current = {p['commit']:p for p in context_packs(Path('data'))}
+        incoming = {p['commit']:p for p in context_packs(bundle/'data')}
+        commit = selected[0]
+        if commit not in current or incoming.get(commit) != current[commit]:
+            raise WatchError('样例输入与当前可信上下文不一致')
+        if any(e.get('commit') != commit or e.get('item_id') != current[commit]['item_id'] for e in payload.get('events', [])):
+            raise WatchError('样例事件超出当前版本上下文')
     if not manifest["test"]:
-        if hashes(data_files(Path("data"))) != manifest["base_hashes"]:
-            raise WatchError("main 的检测数据已变化，拒绝覆盖；请重跑检测")
-        for name, content in files.items():
-            atomic_write(Path("data") / name, content.decode("utf-8"))
+        if not merge_research:
+            if hashes(data_files(Path("data"))) != manifest["base_hashes"]:
+                raise WatchError("main 的检测数据已变化，拒绝覆盖；请重跑检测")
+            for name, content in files.items():
+                atomic_write(Path("data") / name, content.decode("utf-8"))
         if draft_bundle is not None and draft_bundle.exists():
             for event in payload.get("events", []):
+                if merge_research and event['type']=='version_research' and event.get('state')=='pending':
+                    # 晚取回的旧样例只补调用审计，不把较新的完整研究覆盖为待续写。
+                    continue
                 RecordStore(Path("data")).append_event(event, datetime.now(timezone.utc))
         if push:
             # 检测和调用审计先落盘；派生阅读页出错不能让下一轮丢失已花费的调用。
