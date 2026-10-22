@@ -14,6 +14,8 @@
 
 先在 Actions 手动触发历史测试：`test_from=862a123`、`test_to=74d49a4`。预期出现 `测试` 标签、源码证据和规则数 26→27；真实 `data/` 与 digest 不改变。随后手动运行正常检查，核对 main 的状态提交与本机结果。
 
+通知需单独配置：在仓库的 Watch 菜单选择 Custom，勾选 Issues 并 Apply；在个人 Notifications 设置确认邮件通知已开启、默认接收地址正确。仅选择 Participating and @mentions 时，机器人创建的新 Issue 未必会提醒所有者。不要把接收地址写入公开文件；Issue 创建成功与邮件实际送达分别验收。
+
 MVP 1 使用用户选定的两个免费模型：
 
 - 起草：`xingchen-agi/xing4.0-29b-a4b:free`
