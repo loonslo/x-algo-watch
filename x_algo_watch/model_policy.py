@@ -5,6 +5,7 @@ from typing import Any
 from .models import WatchError
 
 FREE_ROUTER = "openrouter/free"
+MAX_DAILY_CALLS = 1000
 REVIEW_STAGES = ("review", "facts_review", "reader_review")
 
 

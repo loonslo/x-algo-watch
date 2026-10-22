@@ -16,7 +16,7 @@ import yaml
 from .automation import load_bundle
 from .evidence import digest, items_for_record
 from .models import WatchError
-from .model_policy import FREE_ROUTER, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
+from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
 from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, validate_research
@@ -174,9 +174,9 @@ class OpenRouter:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 
 
-def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None, extra_review_rounds: int = 0, call_deadline: float | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if type(daily_limit) is not int or not 1 <= daily_limit <= 50:
-        raise WatchError("免费模型本地每日调用上限须为 1 到 50")
+def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = MAX_DAILY_CALLS, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None, extra_review_rounds: int = 0, call_deadline: float | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if type(daily_limit) is not int or not 1 <= daily_limit <= MAX_DAILY_CALLS:
+        raise WatchError(f"免费模型本地每日调用上限须为 1 到 {MAX_DAILY_CALLS}")
     if type(allow_same_model) is not bool:
         raise WatchError("allow_same_model 必须为布尔值")
     same_model = models.get("analysis") == models.get("review")
@@ -347,11 +347,11 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
         call_deadline = time.monotonic() + 20 * 60
         try:
             client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
-            outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
+            outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", MAX_DAILY_CALLS), allow_same_model=settings.get("allow_same_model", False), project_research=True, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
             disputed = [p for p in packs if outputs.get(p["item_id"], {}).get("state") == "disputed"]
             if disputed:
                 feedback = {p["item_id"]: outputs[p["item_id"]] for p in disputed}
-                repaired, repair_events = analyze_items(disputed, prior + events, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True, repair_feedback=feedback, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
+                repaired, repair_events = analyze_items(disputed, prior + events, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", MAX_DAILY_CALLS), allow_same_model=settings.get("allow_same_model", False), project_research=True, repair_feedback=feedback, extra_review_rounds=settings.get("extra_review_rounds", 0), call_deadline=call_deadline)
                 events.extend(repair_events)
                 for pack in disputed:
                     result = repaired[pack["item_id"]]
@@ -378,7 +378,7 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
     prior = RecordStore(bundle / "data").events()
     try:
         client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
-        outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False))
+        outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", MAX_DAILY_CALLS), allow_same_model=settings.get("allow_same_model", False))
     except Deferred:
         outputs, events = {}, []
     drafts = {}

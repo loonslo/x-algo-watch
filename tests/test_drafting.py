@@ -138,8 +138,27 @@ def test_quota_defers_review_then_resumes_without_repeating_analysis():
 def test_daily_budget_only_evidence_no_calls():
     record, pack = record_and_pack(); client = RecordedClient([])
     prior = [{"type": "model_call", "day": NOW.date().isoformat()} for _ in range(50)]
-    outputs, _ = analyze_items([pack], prior, client, MODELS, NOW, PROMPTS)
+    outputs, _ = analyze_items([pack], prior, client, MODELS, NOW, PROMPTS, daily_limit=50)
     assert not client.calls and assemble(record, [pack], outputs) is None
+
+
+@pytest.mark.parametrize('used', [50, 998, 999, 1000])
+def test_thousand_call_budget_continues_past_fifty_and_stops_exactly(used):
+    _, pack = record_and_pack()
+    remaining = min(2, 1000 - used)
+    client = RecordedClient([analysis(pack), review(pack)][:remaining])
+    prior = [{'type': 'model_call', 'day': NOW.date().isoformat()} for _ in range(used)]
+    outputs, events = analyze_items([pack], prior, client, MODELS, NOW, PROMPTS)
+    assert len(client.calls) == remaining
+    assert len([e for e in events if e['type'] == 'model_call']) == remaining
+    assert outputs[pack['item_id']]['state'] == ('pending_confirmation' if remaining == 2 else 'pending')
+
+
+@pytest.mark.parametrize('limit', [True, 0, -1, 1001, '1000'])
+def test_daily_budget_rejects_invalid_or_over_thousand_limits(limit):
+    _, pack = record_and_pack()
+    with pytest.raises(WatchError, match='1000'):
+        analyze_items([pack], [], RecordedClient([]), MODELS, NOW, PROMPTS, daily_limit=limit)
 
 
 def test_disagreement_and_manual_failure_states():
