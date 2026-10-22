@@ -87,6 +87,10 @@ python -m compileall -q x_algo_watch tests
 
 随后执行包含真实上游回放的完整本地测试：`python -m pytest -c pyproject.toml tests -q --upstream-repo=../x-algorithm --basetemp=runtime/pytest-same-minimax-full --tb=short`，**136 passed in 34.00s**；公开内容扫描与 git diff --check 通过。
 
+- [同模型 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39725170158)：**136 passed in 6.91s**。
+- [同模型真实续跑](https://github.com/loonslo/x-algo-watch/actions/runs/39725180876)：成功，数据提交 31e8b43；复用既有权重分析，MiniMax 复核通过。README 分析首次因未在证据包出现的数字 9/10 被拦，纠错一次后通过，再复核通过；共 4 次新调用。两项状态均为 pending_confirmation、review_mode=same_model；已生成[第一份草稿评论](https://github.com/loonslo/x-algo-watch/issues/2#issuecomment-6333088992)，标签只有待确认而无待起草。
+- 正文核查发现早期持久记录没有 numeric_context，虽然权重旧/新值完整，程序计算行仍缺失。现仅在同条记录有两个权重完整旧/新值时补算，供证据包、Issue 正文和组稿共用，不回写原始历史记录；缺项或空值不猜填。真实 17c96bf 本地复核得到两项倍率 1.1、比值 79.2→79.2。相关模型/发布/流程测试 **43 passed in 0.81s**，实际补齐后草稿待线上复验。
+
 本地合成录制响应与端到端联调已验证：
 
 - 数字由 Decimal 精确计算：10-14 的两项权重倍率都是 1.1，绝对比值 79.2 保持不变；模型不能自由计算新数。

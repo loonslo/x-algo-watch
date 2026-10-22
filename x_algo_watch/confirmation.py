@@ -67,6 +67,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
         public_text(text)
         date = now.astimezone(SHANGHAI).date().isoformat()
         text = text.replace("未经确认的草稿", "仓库所有者已确认的速报")
+        text = text.replace("仍须仓库所有者人工确认。", "仓库所有者已人工确认。")
         text = text.replace("- 确认：待仓库所有者编辑核对并打标签。", "- 确认：" + date)
         text += f"\n- Issue：[#{number}](https://github.com/{client.repository}/issues/{number})；确认日期：{date}\n"
         marker = f"<!-- xaw-digest:{commit} -->"

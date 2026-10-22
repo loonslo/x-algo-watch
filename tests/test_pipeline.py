@@ -47,4 +47,8 @@ def test_full_detect_draft_publish_owner_edit_confirm_pipeline(tmp_path, monkeyp
     event = {"action": "labeled", "sender": {"login": "owner"}, "label": {"name": "已确认"}, "repository": {"full_name": client.repository}, "issue": {"number": 1}}
     assert confirm(event, client, datetime.now(timezone.utc), tmp_path, push=False) == "confirmed"
     assert "人工补充" in (tmp_path / "digest.md").read_text(encoding="utf-8")
+    if same_model:
+        confirmed = (tmp_path / "digest.md").read_text(encoding="utf-8")
+        assert "同一模型的两次调用" in confirmed and "仓库所有者已人工确认" in confirmed
+        assert "仍须仓库所有者人工确认" not in confirmed
     assert client.rows[0]["state"] == "closed"

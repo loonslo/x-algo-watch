@@ -31,13 +31,23 @@ def weight_math(parameters_before: dict[str, Any], parameters_after: dict[str, A
         return {}
 
 
+def numeric_context_for_record(record: dict[str, Any]) -> dict[str, Any]:
+    if record.get("numeric_context"):
+        return record["numeric_context"]
+    # 早期记录未保存计算上下文；只在同条证据具有两个权重的完整旧/新值时补算。
+    weights = [f for f in record["findings"] if f["category"] == "parameter" and f["name"] in ("FavoriteWeight", "NotInterestedWeight")]
+    if len(weights) != 2 or len({f["name"] for f in weights}) != 2:
+        return {}
+    return weight_math({f["name"]: f.get("before") for f in weights}, {f["name"]: f.get("after") for f in weights})
+
+
 def items_for_record(record: dict[str, Any]) -> list[dict[str, Any]]:
     findings = record["findings"]
     relevant = [f for f in findings if f["severity"] in ("红", "橙")]
     weight_changes = [f for f in relevant if f["category"] == "parameter" and "Weight" in f["name"]]
     other = [f for f in relevant if f not in weight_changes]
     groups = ([weight_changes] if weight_changes else []) + [[finding] for finding in other]
-    context = record.get("numeric_context", {})
+    context = numeric_context_for_record(record)
     result: list[dict[str, Any]] = []
     for group in groups:
         evidence = {f"E{i}": finding for i, finding in enumerate(group, 1)}

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from x_algo_watch.drafting import Deferred, OpenRouter, analyze_items, assemble, validate_analysis
+from x_algo_watch.automation import evidence_body
 from x_algo_watch.evidence import items_for_record, weight_math
 from x_algo_watch.models import CheckResult, Finding, Severity, WatchError
 
@@ -66,6 +67,32 @@ def test_exact_decimal_relationships():
     assert "两者绝对比值 79.2 → 79.2" in body
     assert assemble(record, [pack], outputs)["version"] == draft["version"]
     assert assemble({**record, "committed_at": "2026-10-22T00:00:00+00:00"}, [pack], outputs)["version"] != draft["version"]
+
+
+def test_legacy_record_recovers_math_from_complete_weight_evidence():
+    record, expected_pack = record_and_pack()
+    del record["numeric_context"]
+    original = deepcopy(record)
+    pack = items_for_record(record)[0]
+    assert pack["derived"] == expected_pack["derived"]
+    assert pack["derived"]["favorite_multiplier"] == pack["derived"]["not_interested_multiplier"] == "1.1"
+    assert pack["derived"]["negative_to_favorite_before"] == pack["derived"]["negative_to_favorite_after"] == "79.2"
+    issue = evidence_body(record, "owner/x-algo-watch", False)
+    assert json.loads(issue.split("```json\n")[1].split("\n```")[0])["numeric_context"] == pack["derived"]
+    outputs = {pack["item_id"]: {"state": "pending_confirmation", "analysis": analysis(pack), "review": review(pack)}}
+    assert "两者绝对比值 79.2 → 79.2" in assemble(record, [pack], outputs)["body"]
+    assert record == original
+
+
+@pytest.mark.parametrize("missing", ["finding", "old_value"])
+def test_legacy_record_does_not_invent_missing_weight_inputs(missing):
+    record, _ = record_and_pack()
+    del record["numeric_context"]
+    if missing == "finding":
+        record["findings"].pop()
+    else:
+        record["findings"][1]["before"] = None
+    assert items_for_record(record)[0]["derived"] == {}
 
 
 @pytest.mark.parametrize("mutation", ["wrong_number", "wrong_name", "wrong_path", "no_evidence", "deployment", "experiment_off", "extra_field"])

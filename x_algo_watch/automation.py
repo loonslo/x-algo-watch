@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import quote
 
 from . import cli
-from .evidence import digest, items_for_record
+from .evidence import digest, items_for_record, numeric_context_for_record
 from .git import SHA, UPSTREAM, Repository, run_git
 from .github import BOT, GitHub, bot_owned, issue_marker
 from .models import WatchError
@@ -154,7 +154,8 @@ def evidence_body(record: dict[str, Any], repository: str, test: bool) -> str:
     prefix += "公开源码证据；默认值不代表线上值，部署未知。\n\n"
     prefix += f"- 提交：[{record['commit'][:7]}]({UPSTREAM}/commit/{record['commit']})\n"
     prefix += f"- 级别：{record['severity']}；完整检查：{record['complete']}\n\n"
-    details = json.dumps({"base": record["base"], "commit": record["commit"], "counts": record.get("counts", {}), "findings": record["findings"], "numeric_context": record.get("numeric_context", {})}, ensure_ascii=False, indent=2)
+    numeric_context = numeric_context_for_record(record)
+    details = json.dumps({"base": record["base"], "commit": record["commit"], "counts": record.get("counts", {}), "findings": record["findings"], "numeric_context": numeric_context}, ensure_ascii=False, indent=2)
     if len(details) > 55_000:
         # 不把截断后的 JSON 冒充完整证据。
         def compact(value: Any) -> Any:
@@ -163,7 +164,7 @@ def evidence_body(record: dict[str, Any], repository: str, test: bool) -> str:
             if isinstance(value, str) and len(value) > 800:
                 return {"prefix": value[:800], "full_value_in_record": True}
             return value
-        details = json.dumps({"base": record["base"], "commit": record["commit"], "counts": record.get("counts", {}), "numeric_context": record.get("numeric_context", {}), "findings": [{k: compact(f.get(k)) for k in ("category", "severity", "path", "name", "message", "before", "after", "line_before", "line_after")} for f in record["findings"]]}, ensure_ascii=False, indent=2)
+        details = json.dumps({"base": record["base"], "commit": record["commit"], "counts": record.get("counts", {}), "numeric_context": numeric_context, "findings": [{k: compact(f.get(k)) for k in ("category", "severity", "path", "name", "message", "before", "after", "line_before", "line_after")} for f in record["findings"]]}, ensure_ascii=False, indent=2)
         prefix += "完整 diff 较长；请在检查记录查看原始证据。\n\n"
     if len(details) > 55_000:
         raise WatchError("证据摘要仍超出 Issue 上限；保留完整检查记录，需人工拆分")
