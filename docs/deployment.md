@@ -16,18 +16,18 @@
 
 通知需单独配置：在仓库的 Watch 菜单选择 Custom，勾选 Issues 并 Apply；在个人 Notifications 设置确认邮件通知已开启、默认接收地址正确。仅选择 Participating and @mentions 时，机器人创建的新 Issue 未必会提醒所有者。不要把接收地址写入公开文件；Issue 创建成功与邮件实际送达分别验收。
 
-MVP 1 使用用户选定的两个免费模型：
+MVP 1 当前按所有者选择，使用同一固定免费型号的两个调用角色：
 
 - 起草：`minimax/minimax-m3.1-flash:free`
-- 复核：`nvidia/nemotron-3-super-120b-a12b:free`
+- 复核：`minimax/minimax-m3.1-flash:free`
 
-只接受固定的不同模型，均须以 `:free` 结尾；不做付费或随机模型回退。本地最大每天 50 次、调用间隔至少 3.1 秒；失败请求也记入审计。OpenRouter 的服务端额度仍是最终约束。模型名单截至 2026-10-21 的官方 API；实际输出质量尚须线上验收。
+默认要求起草、复核使用不同型号；所有者已明确改为同一 MiniMax，因此配置显式设置 `allow_same_model: true`。同模型仍执行两次独立请求和两种提示词，但不能称为不同模型的独立复核；审计记录 review_mode，草稿醒目标注并保留人工确认。所有型号仍须以 `:free` 结尾，不做付费或随机模型回退。本地最大每天 50 次、调用间隔至少 3.1 秒；失败请求也记入审计。OpenRouter 的服务端额度仍是最终约束，实际输出质量须线上验收。
 
 启用前，在 GitHub 创建 `openrouter` 环境，将 deployment branch policy 设为 **仅 main 分支**；不要使用会允许标签匹配的宽泛规则。在 OpenRouter 为项目创建限额专用 key，由所有者直接存成环境 secret `OPENROUTER_API_KEY`。密钥不发到聊天、不放在本机或仓库文件中。最后将 repository variable `DRAFT_ENABLED` 设为 `true`。
 
 只有 draft 任务使用该环境，只有调用模型的步骤传入 key。定时和手动任务仅在 main 运行；Issue 标签事件不能触发带 key 的任务。确认工作流只接受所有者标签，并重新读取 Issue 和机器人评论。所有 action 已固定到官方仓库提交号。
 
-补写历史样例时，手动运行 check，填写 `backfill_commit` 为已有完整红橙检查记录的完整 SHA；不要同时填写 `test_from` / `test_to`。例如 `17c96bf346df3d62b90f1bb01830d432dba74485` 是两项权重同比增加的样例。补写不重跑上游、不改变最后成功检查位置，只追加补写与通知资格事件；之后沿用正式起草、独立复核和所有者确认流程。与隔离的历史测试不同，确认后可进入真实速报。
+补写历史样例时，手动运行 check，填写 `backfill_commit` 为已有完整红橙检查记录的完整 SHA；不要同时填写 `test_from` / `test_to`。例如 `17c96bf346df3d62b90f1bb01830d432dba74485` 是两项权重同比增加的样例。补写不重跑上游、不改变最后成功检查位置，只追加补写与通知资格事件；之后沿用正式起草、复核和所有者确认流程。与隔离的历史测试不同，确认后可进入真实速报。
 
 只读检查配置：
 
@@ -39,7 +39,7 @@ python -m x_algo_watch.deployment --repository OWNER/x-algo-watch
 
 ## 记录与故障
 
-检查记录是检测进度唯一来源；同一提交不重复追加。模型调用、独立复核、登记表重核和确认决策以带版本的事件追加到同一月记录。草稿正文只发 Issue 评论；模型输出的审计 JSON 留在记录中。确认后才追加 `digest.md`。
+检查记录是检测进度唯一来源；同一提交不重复追加。模型调用、复核方式、登记表重核和确认决策以带版本的事件追加到同一月记录。草稿正文只发 Issue 评论；模型输出的审计 JSON 留在记录中。确认后才追加 `digest.md`。
 
 检测产物包含数据哈希。publish 拉取 main 后先比较原始数据哈希，再校验产物和敏感信息，防止起草期间 main 的新数据被覆盖。只提交白名单内的 `data/` 文件；confirm 另可追加 digest。推送不使用 force，不将令牌写 Git 配置或 URL。
 

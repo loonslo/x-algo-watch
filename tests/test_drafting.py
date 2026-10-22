@@ -134,6 +134,33 @@ def test_same_or_paid_model_rejected():
             analyze_items([pack], [], RecordedClient([]), models, NOW, PROMPTS)
 
 
+def test_explicit_same_model_mode_keeps_review_and_resume_boundaries():
+    record, pack = record_and_pack()
+    models = {"analysis": MODELS["analysis"], "review": MODELS["analysis"]}
+    client = RecordedClient([analysis(pack), review(pack)])
+    outputs, events = analyze_items([pack], [], client, models, NOW, PROMPTS, allow_same_model=True)
+    assert len(client.calls) == 2 and client.calls[0][0] == client.calls[1][0]
+    assert client.calls[0][1] != client.calls[1][1]
+    assert client.calls[1][2]["analysis"] == analysis(pack)
+    assert {e["stage"] for e in events if e["type"] == "model_call"} == {"analysis", "review"}
+    assert next(e for e in events if e["type"] == "analysis_state")["review_mode"] == "same_model"
+    draft = assemble(record, [pack], outputs, same_model_review=True)
+    assert draft["ready"] and "同一模型的两次调用" in draft["body"]
+    assert "仍须仓库所有者人工确认" in draft["body"]
+    no_calls = RecordedClient([])
+    repeated, _ = analyze_items([pack], events, no_calls, models, NOW, PROMPTS, allow_same_model=True)
+    assert repeated == outputs and not no_calls.calls
+    with pytest.raises(WatchError):
+        analyze_items([pack], [], no_calls, {"analysis": "paid", "review": "paid"}, NOW, PROMPTS, allow_same_model=True)
+
+
+@pytest.mark.parametrize("value", ["true", 1])
+def test_same_model_override_requires_a_real_boolean(value):
+    _, pack = record_and_pack()
+    with pytest.raises(WatchError, match="布尔值"):
+        analyze_items([pack], [], RecordedClient([]), MODELS, NOW, PROMPTS, allow_same_model=value)
+
+
 @pytest.mark.parametrize(("message", "reason"), [("Rate limit exceeded: free-models-per-day", "每日额度"), ("Rate limit exceeded: free-models-per-min", "每分钟限流"), ("Model is temporarily rate-limited upstream", "提供方暂时拥堵"), ("Unrecognized failure", "原因未细分")])
 def test_http_failure_classifies_without_echoing_server_text(monkeypatch, message, reason):
     secret = "sk-or-v1-" + "x" * 40

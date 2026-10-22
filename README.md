@@ -2,7 +2,7 @@
 
 只读检查 [xai-org/x-algorithm](https://github.com/xai-org/x-algorithm) 的公开源码，抽取变化、给出红橙黄灰级别，并保留可追溯的证据。
 
-目前已实现 **P1–P4 的代码与测试**：检测、Actions 任务隔离、Issue 发布、事实登记、免费模型起草与独立复核、所有者标签确认。公开仓库已部署，Linux CI 132 项测试、手动正常检查、历史测试 Issue 与邮件通知均通过；MiniMax 的真实分析已通过校验，NVIDIA 复核暂遇 HTTP 404，仅保留证据与调用审计。完整草稿、人工确认及连续 24 小时定时运行仍待验收。
+目前已实现 **P1–P4 的代码与测试**：检测、Actions 任务隔离、Issue 发布、事实登记、免费模型起草与复核、所有者标签确认。公开仓库已部署，Linux CI 132 项测试、手动正常检查、历史测试 Issue 与邮件通知均通过；MiniMax 的真实分析已通过校验，现按所有者选择由同一 MiniMax 型号再次调用复核。完整草稿、人工确认及连续 24 小时定时运行仍待验收。
 
 `registry/facts.yaml` 有 420 项代码事实、开关、忽略初稿和人工来源登记，另有 29 行独立行号迁移样本。外部资料的人工核对日期留空，避免把资料创建日期写成已经核对。
 
@@ -74,7 +74,7 @@ python -m x_algo_watch verify --repo ../x-algorithm --to 7f2ca2b --output runtim
 | `storage.py` | 防泄漏检查、原子写入、去重、从记录恢复进度 |
 | `cli.py` | 比较、回放、增量流程；临时克隆生命周期 |
 | `automation.py` / `github.py` | 数据产物校验、白名单发布、幂等 Issue 与评论 |
-| `evidence.py` / `drafting.py` | 精确数字、证据编号、逐项校验与独立复核、额度续跑 |
+| `evidence.py` / `drafting.py` | 精确数字、证据编号、逐项校验与复核、额度续跑 |
 | `confirmation.py` | 仅所有者标签、机器人草稿、追加速报与决策审计 |
 | `migrate.py` | 一次性只读资料迁移工具，不属于定时程序 |
 | `deployment.py` | 只读核查 GitHub 权限、环境与启用条件 |
@@ -83,7 +83,7 @@ python -m x_algo_watch verify --repo ../x-algorithm --to 7f2ca2b --output runtim
 
 ## 模型与发布
 
-用户选择的起草模型为 MiniMax M3.1 Flash，复核模型为 NVIDIA Nemotron 3 Super，固定免费 ID 见 `config/watch.yaml`。每日最多 50 次，校验失败只重试一次；额度不足时只留证据，下轮从已有有效结果继续。草稿只在机器人评论中出现，只有所有者编辑并确认后进入速报。
+用户选择由 MiniMax M3.1 Flash 免费版承担起草、复核两个调用角色，固定 ID 及显式 `allow_same_model: true` 见 `config/watch.yaml`。两次调用分别使用起草、复核提示词；这是同模型复核，不属于不同模型的独立复核，草稿会标注。每日最多 50 次，校验失败只重试一次；额度不足时只留证据，下轮从已有有效结果继续。草稿只在机器人评论中出现，只有所有者编辑并确认后进入速报。
 
 部署默认关闭模型；仅 draft 任务使用 `openrouter` 环境，仅模型调用步骤拿密钥。模型 key 由所有者直接存入 GitHub，不能放到本机、聊天或项目文件。发布与回滚步骤见 [部署说明](docs/deployment.md)。
 

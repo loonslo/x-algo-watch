@@ -81,7 +81,11 @@ python -m compileall -q x_algo_watch tests
 
 ## P4：模型、复核与确认
 
-当前两个固定免费模型写入 config/watch.yaml：MiniMax M3.1 Flash 起草、NVIDIA Nemotron 3 Super 复核。Xing4.0 四次请求均为提供方 HTTP 429 后，所有者已明确选择改用 MiniMax 起草；仅改变固定模型配置，未增加随机或付费回退。新的真实调用结果待补录。
+当前由同一固定 MiniMax M3.1 Flash 免费型号承担起草、复核两个调用角色，写入 config/watch.yaml。所有者先授权 MiniMax 起草，再在旧 NVIDIA 端点不可用后明确选择“也用 minimax 复核”，覆盖原方案的不同型号要求。代码通过显式 allow_same_model=true 启用，两次请求和提示词仍分开、按角色缓存，审计记录 same_model，草稿标注非不同模型的独立复核；人工确认仍保留。未增加随机或付费回退，实际复核结果待补录。
+
+同模型配置的相关测试 **40 passed in 0.86s**，覆盖默认拒绝同型号、显式布尔值启用、两阶段及续跑保留、付费不因开关而放行，以及同/异型号的完整确认流程。
+
+随后执行包含真实上游回放的完整本地测试：`python -m pytest -c pyproject.toml tests -q --upstream-repo=../x-algorithm --basetemp=runtime/pytest-same-minimax-full --tb=short`，**136 passed in 34.00s**；公开内容扫描与 git diff --check 通过。
 
 本地合成录制响应与端到端联调已验证：
 

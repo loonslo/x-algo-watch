@@ -21,9 +21,9 @@
 | P3 29 行迁移一致 | tests/test_registry_migration.py 独立预期区间 | 全部通过 |
 | P3 26→27、10-16→10-19 | 真实历史定值断言 | 通过 |
 | P3 人工类只登记、不伪装核对 | last_checked=null、unreviewed；monthly 刷新逻辑 | 登记完成，内容未核对（方案允许） |
-| P4 两个固定免费模型 | 所有者已授权 MiniMax M3.1 Flash 起草、NVIDIA Nemotron 复核；config/watch.yaml 固定免费 ID | MiniMax 真实分析 valid，NVIDIA 复核 HTTP 404，尚未完成两模型链路 |
+| P4 固定免费模型的两个调用角色 | 所有者已明确将不同型号要求改为同一 MiniMax；config/watch.yaml 固定免费 ID 与 allow_same_model=true，草稿标注方式 | 同模型配置及合成流程通过；真实复核待验，不宣称异模型独立复核 |
 | P4 专用环境、main-only、只有 draft 拿 key | check.yml、安全测试、实际环境 main 分支规则；所有者已存密钥，审计 10 项全通过 | 配置完成，模型已启用 |
-| P4 8 步处理与数字/证据校验、一次纠错、独立复核、程序组稿 | drafting.py、prompts/、合成录制响应及完整联调 | 本地通过，真实质量未验 |
+| P4 8 步处理与数字/证据校验、一次纠错、复核调用、程序组稿 | drafting.py、prompts/、同/异型号合成录制响应及完整联调；复核方式按所有者新选择标注 | 本地通过，真实完整草稿待验 |
 | P4 不重复调用、留痕、额度用尽只发证据、下轮续写 | 事件审计、调用计数、续跑测试；真实 HTTP 429 / 404 仅发证据，MiniMax 分析已缓存 | 本地通过，真实降级通过；真实复核续写待验 |
 | P4 所有者编辑机器人评论后确认，其他人不动 | confirmation.py；确认、驳回、假作者、冲突、重复事件测试 | 本地通过，真实工作流未验 |
 | 草稿不直接改手册、不自动改事实、确认后才入 digest | 数据流与端到端测试、文件白名单 | 本地通过 |

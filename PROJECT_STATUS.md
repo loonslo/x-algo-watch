@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-22
-status: waiting
+status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: Linux CI 132 项通过，Issue #3 邮件送达通过；MiniMax 真实分析已校验，NVIDIA 复核遇 HTTP 404；程序组稿已补固定倍率与比值。
-next: 解决 NVIDIA 免费端点不可用后复用已通过分析，验收真实草稿与人工确认；继续观察定时缺口及 24 小时运行。
+progress: 既有 Linux CI 132 项通过，Issue #3 邮件送达通过；同一 MiniMax 起草和复核的配置已完成，含真实回放的本地 136 项通过，正在真实验收。
+next: 复用已通过分析，由 MiniMax 再次调用复核，验收草稿与所有者人工确认；继续观察定时缺口及 24 小时运行。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
@@ -42,5 +42,7 @@ evidence:
 模型调整：所有者明确选择 MiniMax M3.1 Flash 起草、保留 NVIDIA Nemotron 复核；已更改固定免费 ID，正在验证真实调用。
 
 MiniMax 实测：结构化分析 valid 并已缓存；NVIDIA 复核请求 HTTP 404，未生成草稿。公开端点查询显示旧 NVIDIA 免费端点近期可用率为 0。组稿已补入程序计算的倍率及比值，避免真实分析遗漏关键关系；相关 36 项测试通过，修复后的 Linux CI 为 132 passed in 10.01s。
+
+最新选择：所有者明确要求 MiniMax 同时复核，覆盖原不同型号要求。现已显式启用同模型模式，保持两次请求、不同角色提示词、数字证据校验及人工确认；审计与草稿说明同型号复核方式。40 项相关测试通过，正在验证真实续跑。
 
 尚未完成：真实模型起草与评论确认、连续 24 小时定时证据。3 个人工来源明确为未核对。完整目标保持未完成，不以本机测试替代这些线上条件。

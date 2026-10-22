@@ -1,4 +1,4 @@
-"""固定模型、逐项结构校验、独立复核、可恢复的调用审计。"""
+"""固定模型、逐项结构校验、单独复核调用、可恢复的调用审计。"""
 
 import argparse
 import json
@@ -150,11 +150,15 @@ class OpenRouter:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 
 
-def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if type(daily_limit) is not int or not 1 <= daily_limit <= 50:
         raise WatchError("免费模型本地每日调用上限须为 1 到 50")
-    if models.get("analysis") == models.get("review") or any(not models.get(stage, "").endswith(":free") for stage in ("analysis", "review")):
-        raise WatchError("起草与复核必须使用两个固定且不同的免费模型")
+    if type(allow_same_model) is not bool:
+        raise WatchError("allow_same_model 必须为布尔值")
+    same_model = models.get("analysis") == models.get("review")
+    if (same_model and not allow_same_model) or any(not models.get(stage, "").endswith(":free") for stage in ("analysis", "review")):
+        raise WatchError("只允许固定免费模型；同模型复核须显式启用 allow_same_model")
+    review_mode = "same_model" if same_model else "different_models"
     outputs: dict[str, Any] = {}; events: list[dict[str, Any]] = []
     used = sum(e["type"] == "model_call" and e.get("day") == now.date().isoformat() for e in prior)
     deferred_all = False
@@ -213,13 +217,13 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
         if "review" in stages:
             state = "pending_confirmation" if stages["review"]["agree"] else "disputed"
         outputs[item_id] = {"state": state, **stages}
-        status_event = {"type": "analysis_state", "id": "state:" + digest({"item": item_id, "state": state, "stages": stages}), "item_id": item_id, "commit": pack["commit"], "state": state}
+        status_event = {"type": "analysis_state", "id": "state:" + digest({"item": item_id, "state": state, "stages": stages, "review_mode": review_mode}), "item_id": item_id, "commit": pack["commit"], "state": state, "review_mode": review_mode}
         events.append(status_event)
     return outputs, events
 
 
-def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[str, Any]) -> dict[str, Any] | None:
-    # 额度耗尽或网络不可用时仅发证据，不把尚未独立复核的分析发成草稿。
+def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[str, Any], *, same_model_review: bool = False) -> dict[str, Any] | None:
+    # 额度耗尽或网络不可用时仅发证据，不把尚未经过复核调用的分析发成草稿。
     if any(outputs.get(pack["item_id"], {}).get("state", "pending") == "pending" for pack in packs):
         return None
     completed = [pack for pack in packs if "review" in outputs.get(pack["item_id"], {})]
@@ -227,6 +231,8 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
         return None
     ready = all(outputs.get(pack["item_id"], {}).get("state") == "pending_confirmation" for pack in packs)
     text = "**未经确认的草稿。公开代码默认值不等于线上值；部署未知。**\n\n"
+    if same_model_review:
+        text += "**复核方式：同一模型的两次调用，不属于不同模型的独立复核；仍须仓库所有者人工确认。**\n\n"
     text += f"### {record['committed_at'][:10]} · {record['commit'][:7]} · 源码变化待人工确认\n\n"
     for pack in packs:
         result = outputs.get(pack["item_id"], {})
@@ -273,12 +279,12 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
     prior = RecordStore(bundle / "data").events()
     try:
         client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
-        outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50))
+        outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False))
     except Deferred:
         outputs, events = {}, []
     drafts = {}
     for record in records:
-        draft = assemble(record, items_for_record(record), outputs)
+        draft = assemble(record, items_for_record(record), outputs, same_model_review=settings["models"]["analysis"] == settings["models"]["review"])
         if draft:
             drafts[record["commit"]] = draft
     payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": drafts, "events": events}
