@@ -95,6 +95,9 @@ python -m compileall -q x_algo_watch tests
 - [字段语义 CI](https://github.com/loonslo/x-algo-watch/actions/runs/39726253151)：**139 passed in 8.00s**。
 - [字段语义真实复验](https://github.com/loonslo/x-algo-watch/actions/runs/39726262272)：流程完成、数据提交 c6fefab；权重项分析/复核均通过。README 分析再次经过一次数字表述纠错后通过，最终复核被旧版传输层判为空或超长响应并 deferred，未发布新稿，旧分歧评论保留。旧日志不能区分具体原因，不将其直接认定为推理预算耗尽。
 - 官方模型元数据确认 MiniMax 强制推理、默认 effort=max 且支持 low；OpenRouter 文档说明推理会占用输出预算。现将 MiniMax 请求设为 low、总输出上限 6000，分别诊断空内容、超长及 finish_reason=length；预算不足只是本次待验证假设。相关模型/发布/确认测试 **58 passed in 0.96s**，覆盖空/截断响应留待续写、有效 JSON 和请求设置。
+- [输出预算修复 CI](https://github.com/loonslo/x-algo-watch/actions/runs/39726855056)：**144 passed in 8.55s**。
+- [最终复核续跑](https://github.com/loonslo/x-algo-watch/actions/runs/39726863887)：成功，数据提交 461bd32；只有 1 次新的 review 调用且 valid，其余分析/复核均复用，两个条目均待确认。[当前草稿](https://github.com/loonslo/x-algo-watch/issues/2#issuecomment-6333306874)已保留同型号声明、倍率、比值与中文的手册待判断状态；Issue 标签恢复待确认。此结果证明该配置下续跑成功，不能反推先前失败必为预算耗尽。
+- 人工确认前核对 registry/facts.yaml，发现模型把历史检查时“未登记”误写成当前状态。现有 param.FavoriteWeight=0.66、param.NotInterestedWeight=-52.272，均关联手册 9.1。已准备修订稿：删除当前未登记的说法，明确历史/当前登记状态并补固定版本出处，仍保留是否修改手册由所有者核对。尚未改写远程评论、未添加确认标签、未写 digest，等待所有者确认这份具体修订内容。
 
 本地合成录制响应与端到端联调已验证：
 
