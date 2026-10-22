@@ -12,7 +12,7 @@
 
 “待模型研究”表示当前只有源码证据，不能算已完成解读。模型推测经格式、数字、引用校验及另一次模型调用复核后可直接阅读，明确标注尚未人工确认；正式速报仍须所有者确认。原有固定模板折叠为证据阅读提示，不能冒充模型分析。
 
-目前已实现 **P1–P4 的代码与测试**及整版本项目研究：检测、Actions 任务隔离、Issue 发布、事实登记、免费模型研究与复核、所有者标签确认。公开仓库已部署，Linux CI 174 项测试、手动正常检查、历史测试 Issue 与邮件通知均通过；最新三个版本已产出真实模型机制推测，复核分歧明确展示，正在验证一次反馈修订。原历史样例经人工确认写入[速报](digest.md)；连续 24 小时定时运行仍待验收。
+目前已实现 **P1–P4 的代码与测试**及整版本项目研究：检测、Actions 任务隔离、Issue 发布、事实登记、免费模型研究与复核、所有者标签确认。公开仓库已部署，Linux CI 179 项测试通过；项目级机制推测、反馈修订、历史续写及单版本研究均已真实运行验证，当前结果与待研究状态见上方版本目录。模型复核通过后仍须人工确认才能归档[正式速报](digest.md)。连续 24 小时定时运行仍待验收。
 
 `registry/facts.yaml` 有 420 项代码事实、开关、忽略初稿和人工来源登记，另有 29 行独立行号迁移样本。外部资料的人工核对日期留空，避免把资料创建日期写成已经核对。
 
@@ -111,7 +111,7 @@ python -m pytest -c pyproject.toml tests -q --upstream-repo=../x-algorithm
 
 第一条运行可独立复现的单元和合成 Git 集成测试，跳过需要真实上游的历史验收。第二条额外执行完整历史回放，并检查上游 HEAD、工作区状态保持不变。也可用 `X_ALGO_UPSTREAM` 提供上游路径。Windows 若默认临时目录不可访问，用 `--basetemp=runtime/pytest-本次唯一名称` 指定新的项目内测试目录。
 
-详细结果见 [P1 历史验收](docs/acceptance-p1.md)、[后续阶段验收](docs/acceptance-p2-p4.md)、[逐版本档案验收](docs/acceptance-versions.md)、[需求核对](docs/requirements-audit.md) 和 [项目状态](PROJECT_STATUS.md)。CI 在 Linux / Python 3.14 运行相同测试，只有实际工作流结果才能证明线上通过。
+详细结果见 [P1 历史验收](docs/acceptance-p1.md)、[后续阶段验收](docs/acceptance-p2-p4.md)、[逐版本档案验收](docs/acceptance-versions.md)、[项目机制研究验收](docs/acceptance-project-research.md)、[需求核对](docs/requirements-audit.md) 和 [项目状态](PROJECT_STATUS.md)。CI 在 Linux / Python 3.14 运行相同测试，只有实际工作流结果才能证明线上通过。
 
 ## 公开与许可
 
