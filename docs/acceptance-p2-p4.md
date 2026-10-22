@@ -74,7 +74,7 @@ python -m compileall -q x_algo_watch tests
 
 ## P4：模型、复核与确认
 
-用户已选择两个固定免费模型，写入 config/watch.yaml：Xing4.0 起草、NVIDIA Nemotron 3 Super 复核。已启用，真实调用结果待下方补录。
+当前两个固定免费模型写入 config/watch.yaml：MiniMax M3.1 Flash 起草、NVIDIA Nemotron 3 Super 复核。Xing4.0 四次请求均为提供方 HTTP 429 后，所有者已明确选择改用 MiniMax 起草；仅改变固定模型配置，未增加随机或付费回退。新的真实调用结果待补录。
 
 本地合成录制响应与端到端联调已验证：
 

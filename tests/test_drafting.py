@@ -12,7 +12,7 @@ from x_algo_watch.evidence import items_for_record, weight_math
 from x_algo_watch.models import CheckResult, Finding, Severity, WatchError
 
 PROMPTS = Path(__file__).resolve().parents[1] / "prompts"
-MODELS = {"analysis": "xingchen-agi/xing4.0-29b-a4b:free", "review": "nvidia/nemotron-3-super-120b-a12b:free"}
+MODELS = {"analysis": "minimax/minimax-m3.1-flash:free", "review": "nvidia/nemotron-3-super-120b-a12b:free"}
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
 

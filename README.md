@@ -83,7 +83,7 @@ python -m x_algo_watch verify --repo ../x-algorithm --to 7f2ca2b --output runtim
 
 ## 模型与发布
 
-用户选择的起草模型为 Xing4.0，复核模型为 NVIDIA Nemotron 3 Super，固定 ID 见 `config/watch.yaml`。每日最多 50 次，校验失败只重试一次；额度不足时只留证据，下轮从已有有效结果继续。草稿只在机器人评论中出现，只有所有者编辑并确认后进入速报。
+用户选择的起草模型为 MiniMax M3.1 Flash，复核模型为 NVIDIA Nemotron 3 Super，固定免费 ID 见 `config/watch.yaml`。每日最多 50 次，校验失败只重试一次；额度不足时只留证据，下轮从已有有效结果继续。草稿只在机器人评论中出现，只有所有者编辑并确认后进入速报。
 
 部署默认关闭模型；仅 draft 任务使用 `openrouter` 环境，仅模型调用步骤拿密钥。模型 key 由所有者直接存入 GitHub，不能放到本机、聊天或项目文件。发布与回滚步骤见 [部署说明](docs/deployment.md)。
 

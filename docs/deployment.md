@@ -18,7 +18,7 @@
 
 MVP 1 使用用户选定的两个免费模型：
 
-- 起草：`xingchen-agi/xing4.0-29b-a4b:free`
+- 起草：`minimax/minimax-m3.1-flash:free`
 - 复核：`nvidia/nemotron-3-super-120b-a12b:free`
 
 只接受固定的不同模型，均须以 `:free` 结尾；不做付费或随机模型回退。本地最大每天 50 次、调用间隔至少 3.1 秒；失败请求也记入审计。OpenRouter 的服务端额度仍是最终约束。模型名单截至 2026-10-21 的官方 API；实际输出质量尚须线上验收。
