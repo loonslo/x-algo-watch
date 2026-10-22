@@ -62,8 +62,10 @@ def latest_checks(store: RecordStore) -> list[dict[str, Any]]:
     return list(by_commit.values())
 
 
-def write_bundle(bundle: Path, original: dict[str, bytes], output: Path, *, test: bool, code: str, result_code: int) -> dict[str, Any]:
-    research = [] if test else pending_packs(output)
+def write_bundle(bundle: Path, original: dict[str, bytes], output: Path, *, test: bool, code: str, result_code: int, research_only: str = "") -> dict[str, Any]:
+    research = [] if test else pending_packs(output, limit=500 if research_only else 3)
+    if research_only:
+        research = [p for p in research if p["commit"] == research_only]
     for pack in research:
         save_context_snapshot(output, pack)
     files = data_files(output)
@@ -164,7 +166,7 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
         if research_commit and not any(r["commit"] == research_commit for r in candidates):
             raise WatchError("项目研究只接受已有完整的迭代记录")
         existing = {p["commit"] for p in context_packs(working)}
-        missing = [r for r in candidates if r["commit"] not in existing]
+        missing = [r for r in candidates if r["commit"] not in existing or r["commit"] == research_commit]
         for record in missing:
             RecordStore(working).append_event({"type": "research_context_requested", "id": "context-request:" + record["commit"], "commit": record["commit"]}, now)
 
@@ -190,7 +192,7 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
                 except WatchError:
                     for record in missing:
                         deferred_context(record)
-    manifest = write_bundle(bundle, original, working, test=test, code=code, result_code=result_code)
+    manifest = write_bundle(bundle, original, working, test=test, code=code, result_code=result_code, research_only=research_commit)
     # 只上传最终数据与清单；working 不进入上传路径。
     output = os.environ.get("GITHUB_OUTPUT")
     if output:

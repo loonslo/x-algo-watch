@@ -8,7 +8,7 @@ import yaml
 
 from tests.fakes import FakeGitHub
 from tests.test_drafting import MODELS, PROMPTS, RecordedClient
-from x_algo_watch.automation import detect, publish, publish_issues
+from x_algo_watch.automation import detect, publish, publish_issues, write_bundle
 from x_algo_watch.confirmation import confirm
 from x_algo_watch.drafting import analyze_items, run, validate_analysis
 from x_algo_watch.engine import compare
@@ -279,3 +279,34 @@ def test_repair_budget_resumes_from_corrected_analysis_without_repeating_calls(s
     done, _ = analyze_items([pack], first + calls, later, MODELS, NOW, PROMPTS, daily_limit=4, project_research=True, repair_feedback=feedback)
     assert len(later.calls) == 1 and later.calls[0][0] == MODELS["review"]
     assert done[pack["item_id"]]["state"] == "pending_confirmation"
+
+
+def test_related_file_catalog_supports_real_verification_paths_without_inventing_code(sample_repo):
+    path, repo, base, commit = sample_repo
+    util = path / "home-mixer/util/video_carousel.rs"
+    util.parent.mkdir(parents=True)
+    util.write_text("pub fn select_videos() {}\n", encoding="utf-8")
+    source = path / "home-mixer/filters/example_filter.rs"
+    source.write_text("use crate::util::video_carousel;\n", encoding="utf-8")
+    result = compare(repo, base, commit(), [], date(2026, 10, 22))
+    pack = project_pack(repo, result.to_dict())
+    catalog = next(e for e in pack["evidence"].values() if e["kind"] == "related_path_catalog")
+    assert "home-mixer/util/video_carousel.rs" in catalog["text"]
+    assert "只证明文件存在" in catalog["text"]
+    assert "fake/location.rs" not in catalog["text"]
+
+
+def test_explicit_research_target_selects_only_that_version_even_beyond_first_batch(sample_repo, tmp_path):
+    from x_algo_watch.models import CheckResult
+    repo, result = prepare(sample_repo)
+    template = project_pack(repo, result.to_dict())
+    working = tmp_path / "working"
+    for index, letter in enumerate("bcde"):
+        item = json.loads(json.dumps(template))
+        item["commit"] = letter * 40
+        item["committed_at"] = f"2026-10-{index+1:02d}T00:00:00+00:00"
+        item["item_id"] = digest({k:v for k,v in item.items() if k!='item_id'})
+        RecordStore(working).append(CheckResult("a"*40, item["commit"], item["committed_at"]), NOW, "uncommitted")
+        save_context(working, item)
+    manifest = write_bundle(tmp_path / "bundle", {}, working, test=False, code="uncommitted", result_code=0, research_only="b"*40)
+    assert manifest["research"] == ["b"*40]

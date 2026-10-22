@@ -126,7 +126,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     text += "<details><summary>模型引用的证据与上下文范围</summary>\n\n"
     for key, source in event["sources"].items():
         if not source["path"]:
-            text += "- " + key + "：检测器记录的旧值、新值及计算关系。\n"
+            text += "- " + key + "：" + ("相关模块的实际文件路径目录，仅证明路径存在。" if source["kind"] == "related_path_catalog" else "检测器记录的旧值、新值及计算关系。") + "\n"
             continue
         anchor = "#L" + str(source["start_line"]) if source.get("start_line") else ""
         text += f"- {key}：{source['kind']} · [{source['path']}]({UPSTREAM}/blob/{source['commit']}/{quote(source['path'], safe='/')}{anchor})" + ("（片段截断）" if source["truncated"] else "") + "\n"

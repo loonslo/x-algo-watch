@@ -103,6 +103,10 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
             add("implementation", path, commit, after, 6500, 1)
             if used > 63_000:
                 break
+    tokens = set(re.findall(r"[a-z][a-z0-9_]+", "\n".join(e["text"] for e in evidence.values())))
+    generic = {"mod", "lib", "main", "test", "tests", "config", "build", "types", "utils", "util"}
+    related_paths = sorted((p for p in repo.tree(commit) if p.endswith((".rs", ".py")) and Path(p).stem in tokens - generic), key=priority)[:150]
+    add("related_path_catalog", "", commit, "下列是片段涉及模块在当前仓库中的实际路径；只证明文件存在，不代表已读取其实现：\n" + "\n".join(related_paths), 6500)
     for path in sorted(hits, key=priority)[:7]:
         if "/params/" in path:
             continue
