@@ -146,7 +146,7 @@ def context_packs(data: Path) -> list[dict[str, Any]]:
 
 def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
     profile = research_profile()
-    finished = {e.get("item_id") for e in RecordStore(data).events() if e["type"] == "version_research" and e.get("profile_hash") == profile and e.get("state") in ("pending_confirmation", "disputed", "manual")}
+    finished = {e.get("item_id") for e in RecordStore(data).events() if e["type"] == "version_research" and e.get("profile_hash") == profile and (e.get("state") in ("pending_confirmation", "manual") or (e.get("state") == "disputed" and e.get("repair_attempted")))}
     return [p for p in context_packs(data) if p["item_id"] not in finished][:limit]
 
 

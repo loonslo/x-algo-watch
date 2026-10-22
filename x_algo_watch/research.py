@@ -63,6 +63,7 @@ def research_event(pack: dict[str, Any], result: dict[str, Any], models: dict[st
         "type": "version_research", "commit": pack["commit"], "item_id": pack["item_id"],
         "profile_hash": research_profile(),
         "state": result["state"], "models": models,
+        "repair_attempted": result.get("repair_attempted", False),
         "review_mode": "same_model" if models["analysis"] == models["review"] else "different_models",
         "coverage": pack["coverage"], "sources": {key: {k: v for k, v in e.items() if k != "text"} for key, e in pack["evidence"].items()},
         **({"analysis": result["analysis"], "review": result["review"]} if "review" in result else {}),
@@ -88,7 +89,9 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any]) -> bool:
                 return False
     elif event["state"] in ("disputed", "pending_confirmation"):
         return False
-    result = {"state": event["state"], **({"analysis": event["analysis"], "review": event["review"]} if "analysis" in event else {})}
+    if type(event.get("repair_attempted")) is not bool:
+        return False
+    result = {"state": event["state"], "repair_attempted": event["repair_attempted"], **({"analysis": event["analysis"], "review": event["review"]} if "analysis" in event else {})}
     return event == research_event(pack, result, models)
 
 
@@ -99,7 +102,9 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     disputed = not event["review"]["agree"]
     text = "## 模型对本次算法迭代的解读\n\n"
     text += "**模型推测，尚未人工确认" + ("；复核存在分歧" if disputed else "；已完成模型复核") + "。**\n\n"
-    text += ("起草和复核为同一型号的两次调用。" if event["review_mode"] == "same_model" else "起草和复核使用不同型号。") + "公开源码不能证明线上部署。\n\n"
+    text += ("起草和复核使用同一型号，分角色调用。" if event["review_mode"] == "same_model" else "起草和复核使用不同型号。") + "公开源码不能证明线上部署。\n\n"
+    if event.get("repair_attempted"):
+        text += "已进行一次依据复核意见的修订尝试；未解决的分歧会继续标出，历史分析保留在检查记录中。\n\n"
     text += "### " + analysis["title"] + "\n\n" + analysis["summary"] + "\n\n"
     text += "### 算法机制可能改在哪里\n\n"
     for row in analysis["changes"]:

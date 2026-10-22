@@ -168,7 +168,7 @@ class OpenRouter:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
 
 
-def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False, project_research: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = 50, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if type(daily_limit) is not int or not 1 <= daily_limit <= 50:
         raise WatchError("免费模型本地每日调用上限须为 1 到 50")
     if type(allow_same_model) is not bool:
@@ -188,8 +188,12 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 break
             prompt_name = ("version-" if project_research else "") + stage + "-v1"
             prompt = (prompt_root / (prompt_name + ".md")).read_text(encoding="utf-8")
+            feedback = (repair_feedback or {}).get(item_id) if stage == "analysis" else None
+            if feedback:
+                prompt_name = "version-analysis-repair-v1"
+                prompt += "\n这是唯一一轮依据复核意见的修订。previous_analysis 是上一稿，review_feedback 是对它的质疑。逐条用原始证据核对，修正成立的问题，降低无依据的置信度，删除不能支持的推测；若质疑本身不成立，在对应依据里用证据简要澄清。保留原 JSON schema，不输出修订说明或额外字段。\n"
             version = prompt_name + ":" + digest(prompt)[:16]
-            payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage == "review" else {})}
+            payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage == "review" else {}), **({"previous_analysis": feedback["analysis"], "review_feedback": feedback["review"]} if feedback else {})}
             key = digest({"item": item_id, "stage": stage, "model": models[stage], "version": version, "input": payload})
             calls = [e for e in prior + events if e["type"] == "model_call" and e.get("analysis_key") == key]
             passed = next((e for e in reversed(calls) if e.get("valid")), None)
@@ -310,6 +314,17 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None) -> 
         try:
             client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
             outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True)
+            disputed = [p for p in packs if outputs.get(p["item_id"], {}).get("state") == "disputed"]
+            if disputed:
+                feedback = {p["item_id"]: outputs[p["item_id"]] for p in disputed}
+                repaired, repair_events = analyze_items(disputed, prior + events, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", 50), allow_same_model=settings.get("allow_same_model", False), project_research=True, repair_feedback=feedback)
+                events.extend(repair_events)
+                for pack in disputed:
+                    result = repaired[pack["item_id"]]
+                    if "review" in result:
+                        outputs[pack["item_id"]] = {**result, "repair_attempted": True}
+                    elif result["state"] == "manual":
+                        outputs[pack["item_id"]]["repair_attempted"] = True
         except Deferred:
             outputs, events = {}, []
         drafts = {}

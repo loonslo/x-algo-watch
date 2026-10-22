@@ -232,3 +232,50 @@ def test_actual_model_input_snapshot_survives_context_revision(sample_repo, tmp_
     save_context(tmp_path, pack)
     assert archived.read_bytes() == previous
     assert context_packs(tmp_path) == [pack]
+
+
+@pytest.mark.parametrize("review_agrees", [True, False])
+def test_project_run_repairs_disagreement_once_and_keeps_history(sample_repo, tmp_path, monkeypatch, review_agrees):
+    repo, result = prepare(sample_repo)
+    workspace = tmp_path / "watch"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    shutil.copytree(PROMPTS, workspace / "prompts")
+    config = workspace / "config/watch.yaml"
+    config.parent.mkdir()
+    config.write_text(yaml.safe_dump({"models": MODELS, "project_research": True}), encoding="utf-8")
+    RecordStore(Path("data")).append(result, NOW, "uncommitted")
+    bundle = workspace / "bundle"
+    detect(bundle, source=repo.path, research_commit=result.commit)
+    pack = context_packs(bundle / "data")[0]
+    revised = analysis(pack)
+    revised["summary"] = "按调用位置核对后，候选来源开关改变可能扩大参与排序的内容范围。"
+    model = RecordedClient([analysis(pack), review(pack, False), revised, review(pack, review_agrees)])
+    output = workspace / "draft.json"
+    run(bundle, output, config, client=model)
+    assert len(model.calls) == 4
+    assert model.calls[2][2]["previous_analysis"] == analysis(pack)
+    assert model.calls[2][2]["review_feedback"] == review(pack, False)
+    publish(bundle, FakeGitHub(), draft_bundle=output, push=False)
+    store = RecordStore(Path("data"))
+    event = next(e for e in store.events() if e["type"] == "version_research")
+    assert event["repair_attempted"] is True
+    assert event["state"] == ("pending_confirmation" if review_agrees else "disputed")
+    assert event["analysis"]["summary"] == revised["summary"]
+    assert len([e for e in store.events() if e["type"] == "model_call"]) == 4
+    assert pending_packs(Path("data")) == []
+
+
+def test_repair_budget_resumes_from_corrected_analysis_without_repeating_calls(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    outputs, first = analyze_items([pack], [], RecordedClient([analysis(pack), review(pack, False)]), MODELS, NOW, PROMPTS, project_research=True)
+    feedback = {pack["item_id"]: outputs[pack["item_id"]]}
+    revised = analysis(pack)
+    revised["summary"] = "修订后的机制推测仍以调用证据和线上开关为条件。"
+    partial, calls = analyze_items([pack], first, RecordedClient([revised]), MODELS, NOW, PROMPTS, daily_limit=3, project_research=True, repair_feedback=feedback)
+    assert partial[pack["item_id"]]["state"] == "pending"
+    later = RecordedClient([review(pack)])
+    done, _ = analyze_items([pack], first + calls, later, MODELS, NOW, PROMPTS, daily_limit=4, project_research=True, repair_feedback=feedback)
+    assert len(later.calls) == 1 and later.calls[0][0] == MODELS["review"]
+    assert done[pack["item_id"]]["state"] == "pending_confirmation"
