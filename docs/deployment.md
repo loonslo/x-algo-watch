@@ -23,6 +23,8 @@ MVP 1 当前按所有者选择，使用同一固定免费型号的两个调用�
 
 默认要求起草、复核使用不同型号；所有者已明确改为同一 MiniMax，因此配置显式设置 `allow_same_model: true`。同模型仍执行两次独立请求和两种提示词，但不能称为不同模型的独立复核；审计记录 review_mode，草稿醒目标注并保留人工确认。所有型号仍须以 `:free` 结尾，不做付费或随机模型回退。本地最大每天 50 次、调用间隔至少 3.1 秒；失败请求也记入审计。OpenRouter 的服务端额度仍是最终约束，实际输出质量须线上验收。
 
+MiniMax 当前使用其支持的 reasoning effort=low、总输出上限 6000，给结构化 JSON 留出空间。空响应、超长或预算截断均延期，不视为合格分析；下轮复用已通过的阶段继续。推理也占用总输出预算，参见 [OpenRouter 推理设置](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)。
+
 启用前，在 GitHub 创建 `openrouter` 环境，将 deployment branch policy 设为 **仅 main 分支**；不要使用会允许标签匹配的宽泛规则。在 OpenRouter 为项目创建限额专用 key，由所有者直接存成环境 secret `OPENROUTER_API_KEY`。密钥不发到聊天、不放在本机或仓库文件中。最后将 repository variable `DRAFT_ENABLED` 设为 `true`。
 
 只有 draft 任务使用该环境，只有调用模型的步骤传入 key。定时和手动任务仅在 main 运行；Issue 标签事件不能触发带 key 的任务。确认工作流只接受所有者标签，并重新读取 Issue 和机器人评论。所有 action 已固定到官方仓库提交号。

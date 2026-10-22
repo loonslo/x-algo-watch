@@ -201,3 +201,25 @@ def test_http_failure_classifies_without_echoing_server_text(monkeypatch, messag
         OpenRouter(secret).call(MODELS["analysis"], "prompt", {})
     assert reason in str(caught.value) and "60" in str(caught.value)
     assert secret not in str(caught.value) and message not in str(caught.value)
+
+
+@pytest.mark.parametrize(("content", "finish", "reason"), [(None, "length", "输出预算用尽"), (None, "stop", "未返回可用"), ("", "stop", "未返回可用"), ("x" * 25_001, "stop", "超长")])
+def test_empty_or_oversized_transport_response_is_deferred(monkeypatch, content, finish, reason):
+    response = {"choices": [{"finish_reason": finish, "message": {"content": content}}]}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: io.BytesIO(json.dumps(response).encode()))
+    with pytest.raises(Deferred, match=reason):
+        OpenRouter("test-key").call(MODELS["analysis"], "prompt", {})
+
+
+def test_minimax_request_reserves_budget_for_json(monkeypatch):
+    requests = []
+
+    def respond(request, **kwargs):
+        requests.append(json.loads(request.data))
+        return io.BytesIO(json.dumps({"choices": [{"message": {"content": '{"agree": true}'}}]}).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", respond)
+    assert OpenRouter("test-key").call(MODELS["analysis"], "prompt", {}) == '{"agree": true}'
+    assert requests[0]["max_tokens"] == 6000
+    assert requests[0]["reasoning"] == {"effort": "low"}
+    assert requests[0]["response_format"] == {"type": "json_object"}

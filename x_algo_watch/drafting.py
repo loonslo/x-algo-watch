@@ -135,14 +135,22 @@ class OpenRouter:
         if delay > 0:
             time.sleep(delay)
         self._last_call = time.monotonic()
-        body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "max_tokens": 3000, "provider": {"allow_fallbacks": False}}
+        body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "max_tokens": 6000, "provider": {"allow_fallbacks": False}}
+        if model == "minimax/minimax-m3.1-flash:free":
+            # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
+            body["reasoning"] = {"effort": "low"}
         request = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + self._key, "Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 result = json.load(response)
-            content = result["choices"][0]["message"]["content"]
-            if not isinstance(content, str) or len(content) > 25_000:
-                raise Deferred("模型返回空内容或超长内容；下一轮再补")
+            choice = result["choices"][0]
+            content = choice["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                if choice.get("finish_reason") == "length":
+                    raise Deferred("模型输出预算用尽（finish_reason=length），未返回完整 JSON；下一轮再补")
+                raise Deferred("模型未返回可用 JSON 内容；下一轮再补")
+            if len(content) > 25_000:
+                raise Deferred("模型返回超长内容；下一轮再补")
             return content
         except urllib.error.HTTPError as exc:
             raise http_failure(exc) from None

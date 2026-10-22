@@ -92,6 +92,9 @@ python -m compileall -q x_algo_watch tests
 - 正文核查发现早期持久记录没有 numeric_context，虽然权重旧/新值完整，程序计算行仍缺失。现仅在同条记录有两个权重完整旧/新值时补算，供证据包、Issue 正文和组稿共用，不回写原始历史记录；缺项或空值不猜填。真实 17c96bf 本地复核得到两项倍率 1.1、比值 79.2→79.2。相关模型/发布/流程测试 **43 passed in 0.81s**，实际补齐后草稿待线上复验。
 - [旧记录修复 Linux CI](https://github.com/loonslo/x-algo-watch/actions/runs/39725653184)：**139 passed in 6.78s**。
 - [数值上下文真实复验](https://github.com/loonslo/x-algo-watch/actions/runs/39725662479)：成功，数据提交 678418d；[新版草稿](https://github.com/loonslo/x-algo-watch/issues/2#issuecomment-6333170967)已展示倍率 1.1/1.1、绝对比值 79.2→79.2。权重分析首次结构校验失败，重试通过；复核却把 manual_change 解释为“源码是否由人工修改”，因此 disputed 并正确标需人工。原提示词未清楚定义该字段，现明确它表示是否更新手册，缺少关联登记或现状证据时为 unknown；同时明确运营推断不应猜测提交者意图。原分歧保留审计，提示词摘要改变后重新验证。
+- [字段语义 CI](https://github.com/loonslo/x-algo-watch/actions/runs/39726253151)：**139 passed in 8.00s**。
+- [字段语义真实复验](https://github.com/loonslo/x-algo-watch/actions/runs/39726262272)：流程完成、数据提交 c6fefab；权重项分析/复核均通过。README 分析再次经过一次数字表述纠错后通过，最终复核被旧版传输层判为空或超长响应并 deferred，未发布新稿，旧分歧评论保留。旧日志不能区分具体原因，不将其直接认定为推理预算耗尽。
+- 官方模型元数据确认 MiniMax 强制推理、默认 effort=max 且支持 low；OpenRouter 文档说明推理会占用输出预算。现将 MiniMax 请求设为 low、总输出上限 6000，分别诊断空内容、超长及 finish_reason=length；预算不足只是本次待验证假设。相关模型/发布/确认测试 **58 passed in 0.96s**，覆盖空/截断响应留待续写、有效 JSON 和请求设置。
 
 本地合成录制响应与端到端联调已验证：
 
