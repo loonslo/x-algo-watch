@@ -302,7 +302,9 @@ def commit_paths(paths: list[str], message: str, repository: str, token: str) ->
     return True
 
 
-def publish(bundle: Path, client: GitHub, *, draft_bundle: Path | None = None, push: bool = True) -> list[int]:
+def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = None, push: bool = True, notify_issues: bool = True) -> list[int]:
+    if client is None and (push or notify_issues):
+        raise WatchError("远程推送或 Issue 发布需要 GitHub 客户端")
     manifest, files, records = load_bundle(bundle)
     drafts: dict[str, Any] = {}
     if draft_bundle is not None and draft_bundle.exists():
@@ -344,7 +346,7 @@ def publish(bundle: Path, client: GitHub, *, draft_bundle: Path | None = None, p
             page_error = exc
         if push and page_error is None:
             commit_paths(["versions"], "docs: update version research pages", client.repository, client._token)
-    numbers = publish_issues(client, records, manifest["test"], drafts)
+    numbers = publish_issues(client, records, manifest["test"], drafts) if notify_issues else []
     if not manifest["test"] and page_error is not None:
         raise WatchError("检查证据、调用审计与通知已保留；版本页生成失败，需修复后重建") from page_error
     return numbers

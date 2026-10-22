@@ -1,0 +1,59 @@
+import json
+import shutil
+import yaml
+
+import pytest
+
+from tests.test_project_research import NOW, prepare
+from tests.test_project_research import analysis, review
+from tests.test_drafting import RecordedClient, PROMPTS, MODELS
+from x_algo_watch.automation import publish
+from x_algo_watch.drafting import run
+from x_algo_watch.models import WatchError
+from x_algo_watch.project_evidence import project_pack, save_context
+from x_algo_watch.sample import prepare_sample
+from x_algo_watch.storage import RecordStore
+
+
+def test_sample_uses_existing_context_without_changing_progress(sample_repo, tmp_path):
+    repo, result = prepare(sample_repo)
+    root = tmp_path / "watch"; data = root / "data"
+    store = RecordStore(data); store.append(result,NOW,"uncommitted")
+    save_context(data,project_pack(repo,result.to_dict()))
+    before = {p:p.read_bytes() for p in data.rglob('*') if p.is_file()}
+    bundle = root / "runtime/sample"
+    prepare_sample(root,result.commit,bundle)
+    manifest = json.loads((bundle/'manifest.json').read_text(encoding='utf-8'))
+    assert manifest['research'] == [result.commit]
+    assert all(p.read_bytes()==body for p,body in before.items())
+    assert store.last_success() == result.commit
+    with pytest.raises(WatchError, match='已存在'):
+        prepare_sample(root,result.commit,bundle)
+
+
+@pytest.mark.parametrize('commit',['main','a'*40])
+def test_sample_rejects_unrecorded_or_non_sha_target(tmp_path,commit):
+    with pytest.raises(WatchError):
+        prepare_sample(tmp_path,commit,tmp_path/'sample')
+
+
+def test_sample_cannot_write_into_source_data(tmp_path):
+    with pytest.raises(WatchError,match='runtime'):
+        prepare_sample(tmp_path,'a'*40,tmp_path/'data/sample')
+
+
+def test_reviewed_sample_can_publish_locally_without_issue_or_key_access(sample_repo,tmp_path,monkeypatch):
+    repo,result=prepare(sample_repo); root=tmp_path/'watch'; data=root/'data'
+    RecordStore(data).append(result,NOW,'uncommitted')
+    pack=project_pack(repo,result.to_dict());save_context(data,pack)
+    shutil.copytree(PROMPTS,root/'prompts');monkeypatch.chdir(root)
+    config=root/'config/watch.yaml';config.parent.mkdir()
+    config.write_text(yaml.safe_dump({'models':MODELS,'project_research':True,'extra_review_rounds':2}),encoding='utf-8')
+    bundle=root/'runtime/sample';prepare_sample(root,result.commit,bundle)
+    draft=root/'runtime/draft.json'
+    run(bundle,draft,config,client=RecordedClient([analysis(pack),review(pack),review(pack),review(pack)]))
+    monkeypatch.setattr('x_algo_watch.automation.publish_issues',lambda *args: pytest.fail('不应访问 Issue'))
+    assert publish(bundle,None,draft_bundle=draft,push=False,notify_issues=False)==[]
+    event=[e for e in RecordStore(data).events() if e['type']=='version_research'][-1]
+    assert event['state']=='pending_confirmation' and len(event['reviews'])==3
+    assert (root/'versions/technical').is_dir() and not (root/'digest.md').exists()
