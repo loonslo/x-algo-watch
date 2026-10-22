@@ -126,3 +126,15 @@ openrouter 的 main 限制与密钥存在已通过实际 API 核验。手动 bac
 ## 交付边界
 
 代码、工作流、登记表、提示词、测试和发布/回滚说明均已准备。公开发布、平台配置和通知仍须用真实外部状态验证；当前不能将整个方案标为完成。逐条缺口见 requirements-audit.md。
+
+## 定时缺口排查（2026-10-22 20:20 北京时间）
+
+本次只读核查真实 GitHub API 与固定上游 main，没有重新触发工作流、修改 cron 或调用模型。
+
+- `actions/permissions`：enabled=true；仓库 default_branch=main、archived=false、disabled=false；`actions/workflows/check.yml`：state=active，路径正确。本次未发现停用或归档状态；这只是当前快照，不能代替缺失时刻的原因证据。
+- 专项 `event=schedule` 查询仍只有两次成功运行：39686123877（2026-10-21 22:23:21 UTC）、39732074948（2026-10-22 06:08:09 UTC）。间隔为 7 小时 44 分 48 秒；截至查询，最近一次距今已超过 6 小时。其他最近任务均为已结束的手动运行，没有可继续等待的进行中任务。
+- 当前 cron 为 `17 1-22/3 * * *`，UTC 计划时刻为 01:17、04:17、07:17、10:17、13:17、16:17、19:17、22:17；北京时间对应 09:17、12:17、15:17、18:17、21:17、次日 00:17、03:17、06:17。已错开整点，不能在没有证据时把更换分钟当作已修复。
+- [GitHub 官方 schedule 文档](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)说明默认分支与高负载延迟/丢弃行为。[公开状态接口](https://www.githubstatus.com/api/v2/status.json)本次返回 All Systems Operational；全局状态不能证明本仓库定时器正常，也不能将文档中的可能原因写成已确认根因。
+- 固定上游 main 实测仍为 989fb91254d461bf4b9df53fb12d5c9a61c2b354，与本项目成功进度相同。没有因为缺少定时记录而漏掉当前可见的新提交。
+
+结论：基本启用条件已核对，定时缺口的直接原因仍未知，连续 24 小时验收未通过。下一次北京时间计划时刻为 21:17，是否产生实际运行须以后续 API 记录为准。模型队列仍有 44 版，UTC 当日程序调用预算 50 次已满；程序日预算在北京时间 10 月 23 日 08:00 重置，不能据此保证免费提供方届时可用。
