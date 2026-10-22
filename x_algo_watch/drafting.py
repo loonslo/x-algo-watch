@@ -16,7 +16,7 @@ import yaml
 from .automation import load_bundle
 from .evidence import digest, items_for_record
 from .models import WatchError
-from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, PROJECT_TRANSPORT, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
+from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, PROJECT_TRANSPORT, REVIEW_TRANSPORT, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
 from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, review_schema, validate_research
@@ -138,9 +138,11 @@ class OpenRouter:
         self._key = key
         self._last_call = 0.0
         self.last_response_model: str | None = None
+        self.last_response_usage: dict[str, int] = {}
 
     def call(self, model: str, system: str, payload: dict[str, Any]) -> str:
         self.last_response_model = None
+        self.last_response_usage = {}
         if not free_model(model):
             raise WatchError("只允许 :free 型号或 openrouter/free 免费自动路由")
         delay = 3.1 - (time.monotonic() - self._last_call)
@@ -152,6 +154,9 @@ class OpenRouter:
             schema = review_schema() if "analysis" in payload else research_schema()
             body["response_format"] = {"type": "json_schema", "json_schema": {"name": "version_review" if "analysis" in payload else "version_research", "strict": True, "schema": schema}}
             body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
+            if model == FREE_ROUTER and "analysis" in payload:
+                body["max_tokens"] = 12000
+                body["reasoning"] = {"max_tokens": 3000}
         if model == "minimax/minimax-m3.1-flash:free":
             # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
             body["reasoning"] = {"effort": "low"}
@@ -163,6 +168,13 @@ class OpenRouter:
             actual_model = result.get("model")
             if isinstance(actual_model, str) and re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", actual_model):
                 self.last_response_model = actual_model
+            usage = result.get("usage")
+            if isinstance(usage, dict):
+                counts = {key: usage.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+                details = usage.get("completion_tokens_details")
+                if isinstance(details, dict):
+                    counts["reasoning_tokens"] = details.get("reasoning_tokens")
+                self.last_response_usage = {k: v for k, v in counts.items() if type(v) is int and 0 <= v <= 1_000_000_000}
             choice = result["choices"][0]
             content = choice["message"]["content"]
             if not isinstance(content, str) or not content.strip():
@@ -208,7 +220,8 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             if feedback:
                 prompt_name = "version-analysis-repair-v1"
                 prompt += "\n这是唯一一轮依据复核意见的修订。previous_analysis 是上一稿，review_feedback 是对它的质疑。逐条用原始证据核对，修正成立的问题，降低无依据的置信度，删除不能支持的推测；若质疑本身不成立，在对应依据里用证据简要澄清。保留原 JSON schema，不输出修订说明或额外字段。\n"
-            version = prompt_name + ":" + digest({"prompt": prompt, "transport": PROJECT_TRANSPORT} if project_research else prompt)[:16]
+            transport = PROJECT_TRANSPORT if stage == "analysis" else REVIEW_TRANSPORT
+            version = prompt_name + ":" + digest({"prompt": prompt, "transport": transport} if project_research else prompt)[:16]
             payload = {"evidence_pack": pack, **({"analysis": stages["analysis"]} if stage != "analysis" else {}), **({"previous_analysis": feedback["analysis"], "review_feedback": feedback["review"]} if feedback else {})}
             if repair_feedback and stage != "analysis":
                 # 修订后所有角色重新核对；即使修订稿与旧稿相同，也不能沿用旧裁决。
@@ -256,6 +269,11 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     # 疑似敏感输出不留原文；发布扫描依然会再次检查全部产物。
                     event.pop("raw_output", None)
                     event.update(outcome="invalid", errors=["模型输出含疑似敏感内容，已拦截"])
+                if review_mode == "free_router":
+                    event["resolved_model"] = getattr(client, "last_response_model", None)
+                    usage = getattr(client, "last_response_usage", {})
+                    if usage:
+                        event["usage"] = usage
                 events.append(event); calls.append(event)
                 if project_research:
                     print(pack["commit"][:7] + " " + stage + " " + event["outcome"], flush=True)

@@ -63,6 +63,20 @@ def test_project_transport_sends_strict_schema_and_supported_free_providers(monk
     assert body["response_format"]["json_schema"]["schema"] == (review_schema() if is_review else research_schema())
     assert body["provider"] == {"require_parameters":True,"allow_fallbacks":True}
     assert body["model"] == "openrouter/free"
+    if is_review:
+        assert body['reasoning']=={'max_tokens':3000} and body['max_tokens']==12000
+    else:
+        assert 'reasoning' not in body and body['max_tokens']==6000
+
+
+def test_failed_content_keeps_resolved_model_and_safe_usage_in_audit(sample_repo,monkeypatch):
+    repo,result=prepare(sample_repo);pack=project_pack(repo,result.to_dict())
+    responses=[{"model":"vendor/reasoner:free","choices":[{"finish_reason":"length","message":{"content":None}}],"usage":{"completion_tokens":6000,"completion_tokens_details":{"reasoning_tokens":6000},"untrusted":"ignored"}}]
+    monkeypatch.setattr('urllib.request.urlopen',lambda *args,**kwargs:io.BytesIO(json.dumps(responses.pop(0)).encode()))
+    _,events=analyze_items([pack],[],OpenRouter('test-key'),MODELS,NOW,PROMPTS,**OPTIONS)
+    call=next(e for e in events if e['type']=='model_call')
+    assert call['outcome']=='deferred' and call['resolved_model']=='vendor/reasoner:free'
+    assert call['usage']=={'completion_tokens':6000,'reasoning_tokens':6000}
 
 
 def test_three_reviews_are_independent_inputs_share_schema_and_all_required(sample_repo):

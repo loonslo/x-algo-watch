@@ -7,6 +7,7 @@ from .models import WatchError
 FREE_ROUTER = "openrouter/free"
 MAX_DAILY_CALLS = 1000
 PROJECT_TRANSPORT = "json-schema-v1"
+REVIEW_TRANSPORT = "json-schema-review-budget-v2"
 REVIEW_STAGES = ("review", "facts_review", "reader_review")
 
 

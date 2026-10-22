@@ -18,3 +18,7 @@ Windows / Python 3.14.0 相关回归：**74 passed in 59.88s**。覆盖指定版
 北京时间 22:37 核查，[GitHub 官方故障](https://www.githubstatus.com/incidents/q29p76qtnkyk)正在调查 Actions 结果、步骤结果及部分仓库更新处理延迟（22:18 开始）。CI 已有完成日志而 API 状态仍显示 queued，检测产物也已上传但后续结果未出现；这与官方故障现象相符，不据此推测模型已完成或失败。
 
 增加只读 `sample.yml` 作为单任务样例入口，复用已有可信上下文及同一 drafting 代码，不访问上游、推进进度或写 Issue；模型密钥仍仅在 GitHub 的 main 专用环境调用步骤可用。保持主串行组，避免并发调用漏计预算。产物取回后沿用原 publish 的完整性、三轮审核及证据校验，可只落盘审核结果与两类页面，不触发无关 Issue；发布在模型任务之外进行。相关准备、只读权限、单步密钥及无 Issue 本地发布回归 **28 passed in 4.01s**。
+
+后续拿到 39796189143 的 draft 产物：起草实际型号 dots-studio/dots-3-note-preview:free，结构及证据校验 valid；第一轮复核因 finish_reason=length 未返回完整 JSON，延期，尚未进行后两轮。01e6e4f/2a77747 保存审计和待续写状态。不能将其写为三轮通过。只读入口 39798062991 已发起。
+
+针对真实复核截断，将免费路由的复核总输出上限设为 12,000，并通过通用 reasoning.max_tokens=3,000 为可见 JSON 留出空间；起草仍沿用原请求及有效缓存，不固定型号。[官方推理预算说明](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)指出推理通常与可见输出共用 max_tokens，且不支持精确推理预算的模型可能映射为 effort。保留本地与三轮校验，不把预算变化当质量改善已验证。复核调用键更新，内容协议与研究指纹不变；通过的三轮稿仍保留当时请求审计。新增安全 token 统计与失败响应型号记录，便于验证后续截断原因，不保存推理原文。相关 **72 passed in 24.05s**。
