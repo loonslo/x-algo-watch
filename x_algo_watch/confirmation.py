@@ -67,6 +67,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
         public_text(text)
         date = now.astimezone(SHANGHAI).date().isoformat()
         text = text.replace("未经确认的草稿", "仓库所有者已确认的速报")
+        text = re.sub(rf"(?m)^(### [^\n]+ · {commit[:7]} · )源码变化待人工确认$", r"\g<1>源码变化已人工确认", text)
         text = text.replace("仍须仓库所有者人工确认。", "仓库所有者已人工确认。")
         text = text.replace("- 确认：待仓库所有者编辑核对并打标签。", "- 确认：" + date)
         text += f"\n- Issue：[#{number}](https://github.com/{client.repository}/issues/{number})；确认日期：{date}\n"
@@ -74,6 +75,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
         path = root / "digest.md"
         previous = path.read_text(encoding="utf-8")
         if marker not in previous:
+            previous = previous.replace("尚无人工确认的速报。P4 接入草稿与确认流程后追加。\n", "")
             public_text(previous + text)
             atomic_write(path, previous.rstrip() + "\n\n" + marker + "\n" + text + "\n")
     store.append_event({"type": "decision", "id": "decision:" + commit + ":" + outcome, "commit": commit, "issue": number, "outcome": outcome, "actor": client.owner}, now)

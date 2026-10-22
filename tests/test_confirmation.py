@@ -38,9 +38,14 @@ def test_only_owner_label_event_accepted(tmp_path, actor, label):
 
 def test_owner_edited_bot_comment_appended_once_and_closed(tmp_path):
     client, record = prepare(tmp_path)
+    (tmp_path / "digest.md").write_text("# Digest\n\n尚无人工确认的速报。P4 接入草稿与确认流程后追加。\n", encoding="utf-8")
+    client.comment_rows[1][0]["body"] += f"\n### 2026-10-14 · {record['commit'][:7]} · 源码变化待人工确认\n"
     assert confirm(event(client), client, NOW, tmp_path, push=False) == "confirmed"
     first = (tmp_path / "digest.md").read_text(encoding="utf-8")
     assert "所有者编辑后的文字" in first and "2026-10-22" in first
+    assert "尚无人工确认的速报" not in first
+    assert "源码变化待人工确认" not in first
+    assert "源码变化已人工确认" in first
     assert client.rows[0]["state"] == "closed"
     assert confirm(event(client), client, NOW, tmp_path, push=False) == "confirmed"
     assert (tmp_path / "digest.md").read_text(encoding="utf-8") == first
