@@ -23,6 +23,7 @@ from .research import RESEARCH_FIELDS, analysis_projection, render_research, res
 ANALYSIS_FIELDS = {"item_id", "title", "summary", "default_state", "facts", "inferences", "affected_fact_ids", "manual_change", "action", "observe", "questions"}
 NUMBER = re.compile(r"(?<![\w])[-−]?\d+(?:\.\d+)?(?![\w])")
 CODE_NAME = re.compile(r"\b(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*\b|\b[A-Z][A-Z0-9_]{2,}\b|\b[a-z]\w*_[a-z_]\w*\b")
+PROJECT_CODE_NAME = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{2,}(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])[a-z][A-Za-z0-9_]*_[a-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])")
 PATH_TOKEN = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+")
 
 
@@ -62,7 +63,7 @@ def narrative_strings(value: Any) -> list[str]:
     return []
 
 
-def validate_analysis(value: Any, pack: dict[str, Any]) -> list[str]:
+def validate_analysis(value: Any, pack: dict[str, Any], *, project_research: bool = False) -> list[str]:
     errors: list[str] = []
     if not isinstance(value, dict) or set(value) != ANALYSIS_FIELDS:
         return ["分析字段不完整或含额外字段"]
@@ -95,11 +96,17 @@ def validate_analysis(value: Any, pack: dict[str, Any]) -> list[str]:
     for number in NUMBER.findall(narrative):
         if number.replace("−", "-") not in allowed_numbers:
             errors.append("数字不在证据包：" + number)
-    for token in set(CODE_NAME.findall(narrative) + PATH_TOKEN.findall(narrative)):
-        if token not in evidence and not re.fullmatch(r"E\d+", token):
+    names = (PROJECT_CODE_NAME if project_research else CODE_NAME).findall(narrative)
+    paths = PATH_TOKEN.findall(narrative)
+    for token in set(names + paths):
+        known_acronym = project_research and token not in paths and token.isupper() and token.casefold() in evidence.casefold()
+        if token not in evidence and not known_acronym and not re.fullmatch(r"E\d+", token):
             errors.append("名字或路径不在证据包：" + token)
-    if any(phrase in narrative for phrase in ("所有人", "一定会", "平台确认", "已生效", "已上线", "全量启用")):
-        errors.append("包含无依据的确定性或部署表述")
+    for phrase in ("所有人", "一定会", "平台确认", "已生效", "已上线", "全量启用"):
+        for match in re.finditer(phrase, narrative):
+            negated = project_research and re.search(r"(?:不|未|无法|未知|不能|尚无)[^。；\n]{0,18}$", narrative[:match.start()])
+            if not negated:
+                errors.append("包含无依据的确定性或部署表述")
     if value["default_state"] == "disabled":
         after = [f.get("after") for f in pack["evidence"].values()]
         if not any(item is False or item == 0 or item == "" or item == [] for item in after):
@@ -188,6 +195,8 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             passed = next((e for e in reversed(calls) if e.get("valid")), None)
             if passed:
                 stages[stage] = passed["output"]
+                if project_research:
+                    print(pack["commit"][:7] + " " + stage + " reused", flush=True)
                 continue
             invalid = [e for e in calls if e.get("outcome") == "invalid"]
             if len(invalid) >= 2:
@@ -210,7 +219,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     if project_research and stage == "analysis":
                         errors = validate_research(value, pack)
                         if not errors:
-                            errors += validate_analysis(analysis_projection(value), pack)
+                            errors += validate_analysis(analysis_projection(value), pack, project_research=True)
                     else:
                         errors = validate_analysis(value, pack) if stage == "analysis" else validate_review(value, pack, RESEARCH_FIELDS if project_research else ANALYSIS_FIELDS)
                     event.update(output=value, errors=errors, valid=not errors, outcome="valid" if not errors else "invalid")
@@ -222,6 +231,8 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     event.pop("raw_output", None)
                     event.update(outcome="invalid", errors=["模型输出含疑似敏感内容，已拦截"])
                 events.append(event); calls.append(event)
+                if project_research:
+                    print(pack["commit"][:7] + " " + stage + " " + event["outcome"], flush=True)
                 if event["valid"]:
                     stages[stage] = event["output"]; break
                 if event["outcome"] == "deferred":

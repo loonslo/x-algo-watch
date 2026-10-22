@@ -130,6 +130,16 @@ def test_history_test_publish_never_writes_archive(tmp_path, monkeypatch):
     assert not (tmp_path / "versions").exists()
 
 
+def test_initial_baseline_is_not_a_permanently_pending_model_iteration(tmp_path):
+    result = CheckResult(None, "b" * 40, NOW.isoformat(), mode="baseline", findings=[Finding("baseline", Severity.GRAY, "", "baseline", "建立基线")])
+    RecordStore(tmp_path / "data").append(result, NOW, "uncommitted")
+    build_versions(tmp_path)
+    index = (tmp_path / "versions/README.md").read_text(encoding="utf-8")
+    page = (tmp_path / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
+    assert "起始基线·无前版对比" in index
+    assert "不属于待研究的算法迭代" in page
+
+
 @pytest.mark.parametrize("bad_path", ["versions/unapproved.md", "versions/execute.py", "versions/sub/README.md"])
 def test_archive_publish_whitelist_rejects_other_files(tmp_path, monkeypatch, bad_path):
     monkeypatch.chdir(tmp_path)

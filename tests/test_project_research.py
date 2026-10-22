@@ -13,7 +13,7 @@ from x_algo_watch.confirmation import confirm
 from x_algo_watch.drafting import analyze_items, run, validate_analysis
 from x_algo_watch.engine import compare
 from x_algo_watch.evidence import digest
-from x_algo_watch.project_evidence import MAX_TEXT, context_packs, pending_packs, project_pack, save_context
+from x_algo_watch.project_evidence import MAX_TEXT, code_range_lengths, context_packs, pending_packs, project_pack, save_context
 from x_algo_watch.research import analysis_projection, render_research, research_event, validate_research
 from x_algo_watch.storage import RecordStore
 from x_algo_watch.versions import filename
@@ -176,3 +176,45 @@ def test_large_source_context_reports_truncation_and_stays_bounded(sample_repo):
     assert pack["coverage"]["text_characters"] <= MAX_TEXT
     assert any(e["truncated"] for e in pack["evidence"].values())
     assert "未通读整个仓库" in pack["limitations"][0]
+
+
+def test_context_failure_preserves_detection_and_retries_from_durable_queue(sample_repo, tmp_path, monkeypatch):
+    from x_algo_watch.models import WatchError
+    repo, result = prepare(sample_repo)
+    workspace = tmp_path / "watch"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    (workspace / "config").mkdir()
+    (workspace / "config/watch.yaml").write_text("project_research: true\n", encoding="utf-8")
+    RecordStore(Path("data")).append(result, NOW, "uncommitted")
+    actual = project_pack
+    def unavailable(*args):
+        raise WatchError("暂不可用")
+    monkeypatch.setattr("x_algo_watch.automation.project_pack", unavailable)
+    bundle = workspace / "failed-context"
+    manifest = detect(bundle, source=repo.path, research_commit=result.commit)
+    assert manifest["research"] == [] and manifest["result_code"] == 0
+    publish(bundle, FakeGitHub(), push=False)
+    store = RecordStore(Path("data"))
+    assert store.last_success() == result.commit
+    assert {"research_context_requested", "research_context_deferred"} <= {e["type"] for e in store.events()}
+    monkeypatch.setattr("x_algo_watch.automation.project_pack", actual)
+    monkeypatch.setattr("x_algo_watch.automation.cli.main", lambda args: 0)
+    later = detect(workspace / "retry", source=repo.path)
+    assert later["research"] == [result.commit]
+
+
+def test_project_grounding_understands_acronyms_chinese_boundaries_and_negation(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    pack["evidence"]["E1"]["text"] += "\nserde_json ttl_cache side_effect selected_candidates md5 sid"
+    value = analysis_projection(analysis(pack))
+    value["summary"] = "读取JSON，沿side_effect读取selected_candidates并观察TTL与MD5；不能据此断言线上已生效。"
+    assert validate_analysis(value, pack, project_research=True) == []
+    value["summary"] = "平台确认已上线，所有人一定会受影响。"
+    assert validate_analysis(value, pack, project_research=True)
+
+
+def test_range_examples_are_computed_from_literal_source_not_model_arithmetic():
+    ranges = code_range_lengths({"E1": {"text": "candidates(10_000..10_220); candidates(0..440); float = 1.0..2; inclusive = 0..=5;"}})
+    assert ranges == [{"evidence_ref": "E1", "start": 10000, "end_exclusive": 10220, "length": 220}, {"evidence_ref": "E1", "start": 0, "end_exclusive": 440, "length": 440}]

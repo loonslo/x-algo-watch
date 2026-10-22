@@ -156,23 +156,37 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
     settings = yaml.safe_load(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
     if not test and (settings.get("project_research") is True or research_commit or research_all):
         old_commits = {json.loads(raw)["commit"] for name, content in original.items() if name.startswith("records/") for raw in RECORD_PATTERN.findall(content.decode("utf-8"))}
-        candidates = [r for r in RecordStore(working).records() if r["complete"] and r.get("base") and (research_all or r["commit"] == research_commit or r["commit"] not in old_commits)]
+        requested = {e["commit"] for e in RecordStore(working).events() if e["type"] == "research_context_requested"}
+        candidates = [r for r in RecordStore(working).records() if r["complete"] and r.get("base") and (research_all or r["commit"] == research_commit or r["commit"] not in old_commits or r["commit"] in requested)]
         if research_commit and not any(r["commit"] == research_commit for r in candidates):
             raise WatchError("项目研究只接受已有完整的迭代记录")
         existing = {p["commit"] for p in context_packs(working)}
         missing = [r for r in candidates if r["commit"] not in existing]
+        for record in missing:
+            RecordStore(working).append_event({"type": "research_context_requested", "id": "context-request:" + record["commit"], "commit": record["commit"]}, now)
+
+        def deferred_context(record: dict[str, Any]) -> None:
+            RecordStore(working).append_event({"type": "research_context_deferred", "id": "context-deferred:" + record["commit"] + ":" + now.date().isoformat(), "commit": record["commit"], "reason": "项目上下文暂不可用；检测证据仍保留，后续重试"}, now)
+
+        def prepare_contexts(upstream: Repository) -> None:
+            for record in missing:
+                try:
+                    save_context(working, project_pack(upstream, record))
+                except (WatchError, UnicodeError):
+                    deferred_context(record)
+
         if missing:
             if source is not None:
-                upstream = Repository(source)
-                for record in missing:
-                    save_context(working, project_pack(upstream, record))
+                prepare_contexts(Repository(source))
             else:
-                with tempfile.TemporaryDirectory(prefix="xaw-context-") as folder:
-                    upstream_path = Path(folder) / "upstream.git"
-                    run_git(["clone", "--bare", "--quiet", UPSTREAM, str(upstream_path)])
-                    upstream = Repository(upstream_path)
+                try:
+                    with tempfile.TemporaryDirectory(prefix="xaw-context-") as folder:
+                        upstream_path = Path(folder) / "upstream.git"
+                        run_git(["clone", "--bare", "--quiet", UPSTREAM, str(upstream_path)])
+                        prepare_contexts(Repository(upstream_path))
+                except WatchError:
                     for record in missing:
-                        save_context(working, project_pack(upstream, record))
+                        deferred_context(record)
     manifest = write_bundle(bundle, original, working, test=test, code=code, result_code=result_code)
     # 只上传最终数据与清单；working 不进入上传路径。
     output = os.environ.get("GITHUB_OUTPUT")

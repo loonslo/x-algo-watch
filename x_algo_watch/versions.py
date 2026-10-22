@@ -173,6 +173,8 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     text += "公开源码的默认设置不等于平台线上设置。模型研究会结合本版本提供的项目架构、差异、实现与调用窗口，推测推荐机制可能如何变化。\n\n"
     if research and not (confirmed and decision.get("research_id") == research.get("id")):
         text += render_research(research)
+    elif not research and not record.get("base"):
+        text += "**这是起始基线，没有前一个版本可供比较，不属于待研究的算法迭代。**\n\n"
     elif not research:
         text += "**本版本尚无整版本的模型项目解读。下方程序模板只整理源码证据，不能代替对推荐算法的推测。**\n\n"
     if confirmed:
@@ -262,6 +264,8 @@ def build_versions(root: Path) -> int:
         research = research_by_commit.get(record["commit"])
         pages[name] = render_page(record, decision, approved, rechecks, research)
         status = {"pending": "模型研究待续写", "manual": "模型研究需人工", "disputed": "模型复核有分歧", "pending_confirmation": "模型推测·未人工确认"}.get((research or {}).get("state"), "待模型研究")
+        if not record.get("base"):
+            status = "起始基线·无前版对比"
         if approved:
             status = "模型解读已人工确认" if research and decision.get("research_id") == research.get("id") else status + "；原速报已人工确认"
         elif decision.get("outcome") == "rejected":
