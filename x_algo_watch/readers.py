@@ -2,6 +2,7 @@
 
 import json
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -12,6 +13,42 @@ from .models import WatchError
 from .storage import public_text
 
 READER_FIELDS = {"title", "what_changed", "who", "when", "online_status", "action", "impacts", "terms", "evidence_refs"}
+SUMMARY_LIMITS = {"title": 80, "what_changed": 200, "who": 160, "when": 220, "action": 160}
+
+
+def reader_repair_fields(errors: list[str], previous: Any) -> list[str]:
+    """只有纯四问校验错误允许定点修补，其他错误继续整稿修订。"""
+    if not isinstance(previous, dict) or not isinstance(previous.get("reader"), dict):
+        return []
+    fields: set[str] = set()
+    for error in errors:
+        if error == "用户摘要四问与标题合计不得超过 420 字符":
+            fields.update(SUMMARY_LIMITS)
+            continue
+        match = re.fullmatch(r"(?:用户摘要含技术术语或代码标识，请移到技术分析：|用户阅读层 )(title|what_changed|who|when|action)(?: 无效)?", error)
+        if match is None:
+            return []
+        fields.add(match[1])
+    return [key for key in SUMMARY_LIMITS if key in fields]
+
+
+def reader_repair_schema(fields: list[str]) -> dict[str, Any]:
+    if not fields or len(set(fields)) != len(fields) or set(fields) - SUMMARY_LIMITS.keys():
+        raise WatchError("阅读层修补字段不合法")
+    patch = {"type": "object", "required": fields, "additionalProperties": False,
+             "properties": {key: {"type": "string", "minLength": 1, "maxLength": SUMMARY_LIMITS[key]} for key in fields}}
+    return {"type": "object", "required": ["reader_patch"], "additionalProperties": False,
+            "properties": {"reader_patch": patch}}
+
+
+def apply_reader_patch(previous: dict[str, Any], value: Any, fields: list[str]) -> dict[str, Any] | None:
+    if (not fields or set(fields) - SUMMARY_LIMITS.keys() or not isinstance(value, dict) or set(value) != {"reader_patch"}
+            or not isinstance(value["reader_patch"], dict) or set(value["reader_patch"]) != set(fields)
+            or any(not isinstance(v, str) or not v.strip() or len(v) > SUMMARY_LIMITS[k] for k, v in value["reader_patch"].items())):
+        return None
+    result = deepcopy(previous)
+    result["reader"].update(value["reader_patch"])
+    return result
 
 
 def validate_reader(reader: Any, evidence: dict[str, Any]) -> list[str]:
@@ -21,7 +58,7 @@ def validate_reader(reader: Any, evidence: dict[str, Any]) -> list[str]:
     if reader["online_status"] != "unverified":
         errors.append("公开源码不能验证线上部署；online_status 必须为 unverified")
     for key in ("title", "what_changed", "who", "when", "action"):
-        maximum = {"title": 80, "what_changed": 200, "who": 160, "when": 220, "action": 160}[key]
+        maximum = SUMMARY_LIMITS[key]
         if not isinstance(reader[key], str) or not reader[key].strip() or len(reader[key]) > maximum:
             errors.append("用户阅读层 " + key + " 无效")
         elif re.search(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|(?:Enable|Disable)[A-Z][A-Za-z0-9]*|Phoenix|VMRanker|水合|kill switch", reader[key]):
