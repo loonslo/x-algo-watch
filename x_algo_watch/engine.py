@@ -30,7 +30,12 @@ def snapshot(repo: Repository, commit: str) -> Snapshot:
         raise ParseError(f"{FILTER_PATH}:1 声明的模块文件缺失：{', '.join(sorted(missing))}")
     levels_text = repo.read(commit, LEVEL_PATH)
     if levels_text is not None:
-        levels, style = parse_levels(levels_text)
+        if "Expansion::" in levels_text:
+            levels, style = parse_levels(levels_text,
+                expansion_text=required(repo, commit, "visibility-filtering/rules/expansion.rs"),
+                tweet_rules_text=required(repo, commit, "visibility-filtering/rules/tweet_rules.rs"))
+        else:
+            levels, style = parse_levels(levels_text)
     else:
         try:
             historical = commit != LEVELS_INTRODUCED and repo.is_ancestor(commit, LEVELS_INTRODUCED)

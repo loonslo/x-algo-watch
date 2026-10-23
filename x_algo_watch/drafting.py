@@ -260,6 +260,9 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     state = "pending"; break
                 errors = invalid[-1].get("errors", []) if invalid else []
                 request_payload = {**payload, **({"previous_validation_errors": errors} if errors else {})}
+                if errors and isinstance(invalid[-1].get("output"), dict):
+                    # 已通过 public_text 扫描的上一稿只作为数据，换路由也能逐项纠错。
+                    request_payload["previous_invalid_output"] = invalid[-1]["output"]
                 event = {"type": "model_call", "id": key + ":" + str(len(calls)) + ":" + now.isoformat(), "analysis_key": key, "item_id": item_id, "commit": pack["commit"], "stage": stage, "model": model, "prompt_version": version, "input_hash": digest(request_payload), "day": now.date().isoformat(), "valid": False}
                 used += 1
                 failure_stage = "request"

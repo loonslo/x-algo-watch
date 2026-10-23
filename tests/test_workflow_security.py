@@ -57,3 +57,17 @@ def test_sample_job_is_read_only_owner_main_and_key_only_in_model_step():
     key_steps=[step for step in job['steps'] if 'OPENROUTER_API_KEY' in step.get('env',{})]
     assert len(key_steps)==1 and 'x_algo_watch.drafting' in key_steps[0]['run']
     assert not any('x_algo_watch.automation publish' in step.get('run','') for step in job['steps'])
+
+
+def test_queued_detection_uses_fresh_main_and_draft_uses_that_source():
+    jobs = read("check.yml")["jobs"]
+    detect = jobs["detect"]
+    checkout = next(s for s in detect["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["ref"] == "main"
+    source = next(s for s in detect["steps"] if s.get("id") == "source")
+    assert "git rev-parse HEAD" in source["run"]
+    assert detect["outputs"]["source_commit"] == "${{ steps.source.outputs.commit }}"
+    draft = next(s for s in jobs["draft"]["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+    assert draft["with"]["ref"] == "${{ needs.detect.outputs.source_commit }}"
+    publish = next(s for s in jobs["publish"]["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+    assert publish["with"]["ref"] == "main"

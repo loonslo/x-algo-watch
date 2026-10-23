@@ -174,7 +174,8 @@ def test_source_contact_redaction_preserves_python_decorators(sample_repo, tmp_p
 
 def test_large_source_context_reports_truncation_and_stays_bounded(sample_repo):
     path, repo, base, commit = sample_repo
-    source = path / "home-mixer/filters/example_filter.rs"
+    source = path / "phoenix/xrex/models/large.py"
+    source.parent.mkdir(parents=True)
     source.write_text("// large upstream text\n" * 20_000, encoding="utf-8")
     result = compare(repo, base, commit(), [], date(2026, 10, 22))
     pack = project_pack(repo, result.to_dict())
@@ -299,6 +300,33 @@ def test_related_file_catalog_supports_real_verification_paths_without_inventing
     assert "home-mixer/util/video_carousel.rs" in catalog["text"]
     assert "只证明文件存在" in catalog["text"]
     assert "fake/location.rs" not in catalog["text"]
+
+
+def test_live_fair_share_and_hydrator_failure_implementations_are_complete(upstream):
+    target = upstream.resolve("989fb91254d461bf4b9df53fb12d5c9a61c2b354")
+    result = compare(upstream, upstream.parent(target), target, [], date(2026, 10, 23))
+    pack = project_pack(upstream, result.to_dict())
+    required = {
+        "home-mixer/filters/fair_share_ranking_filter.rs": "fn selection_mask",
+        "home-mixer/candidate_hydrators/new_user_soft_nsfw_label_hydrator.rs": "fn update(",
+        "candidate-pipeline/hydrator.rs": "fn update_all",
+        "candidate-pipeline/candidate_pipeline.rs": "async fn execute_stages",
+    }
+    for path, symbol in required.items():
+        entry = next(e for e in pack["evidence"].values() if e["path"] == path and e.get("scope") == "complete_production_before_tests")
+        assert symbol in entry["text"] and not entry["truncated"]
+    assert pack["coverage"]["text_characters"] <= MAX_TEXT
+
+
+def test_required_implementation_budget_stops_context_instead_of_clipping(sample_repo, monkeypatch):
+    from x_algo_watch.models import WatchError
+    path, repo, base, commit = sample_repo
+    logic = path / "home-mixer/filters/example_filter.rs"
+    logic.write_text("pub fn important() {}\n" * 100, encoding="utf-8")
+    result = compare(repo, base, commit(), [], date(2026, 10, 23))
+    monkeypatch.setattr("x_algo_watch.project_evidence.MAX_TEXT", 200)
+    with pytest.raises(WatchError, match="核心实现"):
+        project_pack(repo, result.to_dict())
 
 
 def test_explicit_research_target_selects_only_that_version_even_beyond_first_batch(sample_repo, tmp_path):

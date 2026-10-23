@@ -83,3 +83,45 @@ def test_count_guard():
         guard_count(100, 49, "example")
     with pytest.raises(ParseError):
         guard_count(0, 0, "example")
+
+
+def expansion_sources():
+    return {
+        "expansion_text": (FIXTURES / "expansion-07d159b.rs.txt").read_text(encoding="utf-8"),
+        "tweet_rules_text": (FIXTURES / "reacted-to-rules-07d159b.rs.txt").read_text(encoding="utf-8"),
+    }
+
+
+def test_actual_reacted_to_expansion_preserves_rule_order():
+    source = (FIXTURES / "levels-07d159b.rs.txt").read_text(encoding="utf-8")
+    levels, style = parse_levels(source, **expansion_sources())
+    hydration = levels["TIMELINE_HOME_HYDRATION"]
+    assert style == "PostRules+Expansion"
+    assert hydration[:2] == ("ERASED_AUTHOR_DROP_INACTIVE", "DEACTIVATED_AUTHOR_DROP")
+    assert hydration[6:9] == (
+        "ORIGINAL_TWEET_ADULT_MEDIA_PROPAGATION_BLUR_SENSITIVE",
+        "ORIGINAL_TWEET_GORE_MEDIA_PROPAGATION_BLUR_VIOLENCE",
+        "FOSNR_HATEFUL_CONDUCT_DROP_UNDESIRABLE",
+    )
+    assert hydration[-1] == "PROTECTED_ORIGINAL_AUTHOR_DROP"
+    assert len(hydration) == len(set(hydration))
+
+
+@pytest.mark.parametrize("problem", ["missing_source", "changed_placement", "unknown_expansion", "wrong_length", "missing_parent", "unknown_action"])
+def test_expansion_rejects_unknown_or_incomplete_dependencies(problem):
+    source = (FIXTURES / "levels-07d159b.rs.txt").read_text(encoding="utf-8")
+    dependencies = expansion_sources()
+    if problem == "missing_source":
+        dependencies["expansion_text"] = None
+    elif problem == "changed_placement":
+        dependencies["expansion_text"] = dependencies["expansion_text"].replace("!withholds", "withholds")
+    elif problem == "unknown_expansion":
+        source = source.replace("Expansion::ReactedTo", "Expansion::Unknown")
+    elif problem == "wrong_length":
+        source = source.replace("TIMELINE_HOME_HYDRATION_OWN.len()", "999")
+    elif problem == "missing_parent":
+        source = source.replace("const TIMELINE_HOME_HYDRATION_OWN:", "const OTHER:")
+    else:
+        dependencies["tweet_rules_text"] = dependencies["tweet_rules_text"].replace("drop_post(", "unknown_action(")
+    with pytest.raises(ParseError):
+        parse_levels(source, **dependencies)

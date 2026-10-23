@@ -2,6 +2,7 @@
 
 import json
 import re
+from hashlib import sha256
 from typing import Any
 
 from .models import Parameter, ParseError
@@ -150,7 +151,46 @@ def rules_list(body: str, refs: bool) -> tuple[str, ...]:
     return tuple(result)
 
 
-def parse_levels(text: str) -> tuple[dict[str, tuple[str, ...]], str]:
+# 07d159b 的已核实 Expansion::ReactedTo 实现（去注释/空白，不含测试）。
+# placed 或 spec 改变时必须重新核实，不能猜测新表达式的名单与顺序。
+REACTED_TO_EXPANSION_DIGEST = "6afb1d6d14da0d7bc9d79eb7e4b581ae36e746c3fc2013c9c20f814933eadafc"
+
+
+def expanded_post_rules(clean: str, name: str, expansion_text: str | None, tweet_rules_text: str | None) -> tuple[str, ...]:
+    if expansion_text is None or tweet_rules_text is None:
+        raise ParseError(f"{LEVEL_PATH} {name} 缺少展开实现或规则动作来源")
+    implementation = uncomment(expansion_text).split("#[cfg(test)]", 1)[0]
+    if sha256(re.sub(r"\s+", "", implementation).encode()).hexdigest() != REACTED_TO_EXPANSION_DIGEST:
+        raise ParseError(f"{LEVEL_PATH} {name} Expansion 实现尚未核实")
+    pattern = (
+        r"\bconst\s+" + re.escape(name) + r"\s*:\s*\[\s*&Rule\s*;\s*"
+        r"([A-Z][A-Z0-9_]*)\.len\(\)\s*\+\s*Expansion::ReactedTo\.spec\(\)\.rules\.len\(\)\s*\]"
+        r"\s*=\s*Expansion::ReactedTo\.placed\(\1\)\s*;"
+    )
+    matches = re.findall(pattern, clean)
+    if len(matches) != 1:
+        raise ParseError(f"{LEVEL_PATH} {name} 展开数组写法不支持或重复")
+    def array(identifier: str) -> tuple[str, ...]:
+        bodies = re.findall(r"\bconst\s+" + re.escape(identifier) + r"\s*:\s*&\s*\[\s*&Rule\s*\]\s*=\s*&\s*\[([^\[\]]*)\]\s*;", clean, re.S)
+        if len(bodies) != 1:
+            raise ParseError(f"{LEVEL_PATH} {identifier} 引用缺失、重复或写法不支持")
+        return rules_list(bodies[0], True)
+    parent, expansion = array(matches[0]), array("REACTED_TO_RULES")
+    if not parent or set(parent) & set(expansion):
+        raise ParseError(f"{LEVEL_PATH} {name} 展开父表为空或规则重复")
+    before: list[str] = []
+    after: list[str] = []
+    rules_source = uncomment(tweet_rules_text)
+    for rule in expansion:
+        definitions = re.findall(r"pub\(super\)\s+const\s+" + re.escape(rule) + r"\s*:\s*Rule\s*=\s*Rule\s*\{(.*?)\n\};", rules_source, re.S)
+        actions = re.findall(r"\baction\s*:\s*(drop_post|blur)\s*\(", definitions[0]) if len(definitions) == 1 else []
+        if len(actions) != 1:
+            raise ParseError(f"{LEVEL_PATH} {rule} 展开规则动作未知")
+        (after if actions[0] == "drop_post" else before).append(rule)
+    return (*before, *parent, *after)
+
+
+def parse_levels(text: str, *, expansion_text: str | None = None, tweet_rules_text: str | None = None) -> tuple[dict[str, tuple[str, ...]], str]:
     clean = uncomment(text)
     levels: dict[str, tuple[str, ...]] = {}
     macro = re.search(r"(?<!\w)levels!\s*\{(.*?)\n\}", clean, re.S)
@@ -177,14 +217,17 @@ def parse_levels(text: str) -> tuple[dict[str, tuple[str, ...]], str]:
                 levels[name] = rules_list(match[1], True)
                 styles.add("array")
             elif typ.strip() == "PostRules":
-                match = re.fullmatch(r"PostRules\s*\{\s*user:\s*&\s*\[([^\[\]]*)\],\s*post:\s*&\s*\[([^\[\]]*)\],?\s*\}", body.strip(), re.S)
+                match = re.fullmatch(r"PostRules\s*\{\s*user:\s*&\s*\[([^\[\]]*)\],\s*post:\s*&\s*(?:\[([^\[\]]*)\]|([A-Z][A-Z0-9_]*)),?\s*\}", body.strip(), re.S)
                 if not match:
                     raise ParseError(f"{LEVEL_PATH} {name} PostRules 写法不支持")
-                levels[name] = rules_list(match[1], True) + rules_list(match[2], True)
+                post = rules_list(match[2], True) if match[2] is not None else expanded_post_rules(clean, match[3], expansion_text, tweet_rules_text)
+                levels[name] = rules_list(match[1], True) + post
+                if match[3]:
+                    styles.add("Expansion")
                 styles.add("PostRules")
             else:
                 raise ParseError(f"{LEVEL_PATH} {name} 未知常量类型")
-        style = "PostRules" if "PostRules" in styles else "array"
+        style = "PostRules+Expansion" if "Expansion" in styles else ("PostRules" if "PostRules" in styles else "array")
     if not REQUIRED_LEVELS.issubset(levels) or any(not levels[name] for name in REQUIRED_LEVELS):
         raise ParseError(f"{LEVEL_PATH}:1 必需的级别缺失或为空")
     return levels, style
