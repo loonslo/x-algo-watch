@@ -53,3 +53,7 @@ Windows / Python 3.14 相关测试 **101 passed in 29.53s**，包含新增 9 项
 共享异常修复 `ab04857` 的 [Linux CI 39895422404](https://github.com/loonslo/x-algo-watch/actions/runs/39895422404) 成功，**278 passed in 13.39s**。真实恢复 [39895431780](https://github.com/loonslo/x-algo-watch/actions/runs/39895431780) 收到 HTTP 200，型号 dots-studio/dots-3-note-preview:free，因 finish_reason=length、输出预算 6,000 耗尽而 Deferred；正确保存为 pending/waiting_service，resume_count=2，候选仍为 V1。未出现新的扫描命中或误报。该检查点已正常落盘，当日预算记账为 5（含前述两次取消预留）。
 
 根据这次实际截断，将免费整版本起草也调整为审核已使用的 max_tokens=12,000、reasoning.max_tokens=3,000，不调整 420 字摘要或发布门槛；提供方可能映射或忽略推理设置，不能保证实际推理 token 数。finish_reason=length 即使含部分正文也统一延期，防止残缺 JSON 被算为格式错误。相关回归 **75 passed in 17.28s**。下一次沿用当前检查点自动续跑，不开启新候选或清零调用。
+
+预算调整 `142b2ce` 的 [Linux CI 39895894611](https://github.com/loonslo/x-algo-watch/actions/runs/39895894611) 成功，**280 passed in 12.53s**。最终续跑 [39895902875](https://github.com/loonslo/x-algo-watch/actions/runs/39895902875) 沿用 resume_count=2、V1，收到 HTTP 404，固定分类为模型提供方暂时拥堵；正确记录 transport_deferred/request，未标安全命中、未消耗格式无效机会，也未增加候选号。
+
+已将最终调用追加到主记录并保留 pending/waiting_service 检查点，UTC 当日预算记账 6（其中 2 为取消预留）。生产检测成功进度、Issue、确认标签和正式 digest 均未改变；新稿尚未合格，不冒充完成三角色审核。新本地双页只展示实际待续跑状态，经 HTTP 回读确认；此前本地静态服务已退出，现仅绑定本机环回地址恢复服务。旧页面和旧审计均保留。后续现有定时/手动任务可从该缺少阶段继续，服务是否可用仍由实际请求验证。

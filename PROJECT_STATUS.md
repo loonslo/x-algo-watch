@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-23
-status: active
+status: waiting
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: CLI 异常类重复加载误报已修复，Linux CI 278 项通过。真实恢复 39895431780 已正确区分 HTTP 200 输出截断并保存 pending，不再误报安全命中；现将起草输出预算与审核对齐，相关 75 项通过，继续沿 V1 续跑。
-next: 核对预算调整 CI 并取回下一次实际续跑结果；安全误报根因已查明，成功收敛和双读者内容质量仍未验收。
+progress: 已查明并修复 CLI 异常类重复加载误报，起草输出预算与审核对齐，Linux CI 280 项通过。最终续跑 39895902875 是 HTTP 404 提供方拥堵，正确保存 pending，未有安全命中或新合格稿；V1、原审计和当日预算保留。
+next: 等服务恢复后由现有定时或手动任务从同一 V1 缺少阶段续跑；本轮错误原因调查与重跑已记录，成功收敛及双读者内容质量仍待验收。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
