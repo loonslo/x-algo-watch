@@ -15,7 +15,7 @@ import yaml
 
 from .automation import load_bundle
 from .evidence import digest, items_for_record
-from .models import UnsafePublicText, WatchError
+from .models import Deferred, UnsafePublicText, WatchError
 from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, PROJECT_TRANSPORT, REVIEW_TRANSPORT, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
@@ -26,10 +26,6 @@ NUMBER = re.compile(r"(?<![\w])[-−]?\d+(?:\.\d+)?(?![\w])")
 CODE_NAME = re.compile(r"\b(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*\b|\b[A-Z][A-Z0-9_]{2,}\b|\b[a-z]\w*_[a-z_]\w*\b")
 PROJECT_CODE_NAME = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{2,}(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])[a-z][A-Za-z0-9_]*_[a-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])")
 PATH_TOKEN = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+")
-
-
-class Deferred(WatchError):
-    pass
 
 
 def http_failure(exc: urllib.error.HTTPError) -> Deferred:

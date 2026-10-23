@@ -39,3 +39,13 @@ Windows / Python 3.14：新增循环专项 **17 passed in 17.16s**，全部使�
 最小修正：公开文本扫描仍使用原来的全部正则，抛出带固定类别的 `UnsafePublicText`；调用审计区分扫描命中和普通本地错误，记录请求、输出扫描、结构或证据校验阶段，以及是否收到 HTTP 响应和数字状态码。真正命中时不保存原文、匹配值或未知异常消息；普通错误也不回显异常原文。没有修改模型、候选和审核门槛，没有清空旧记录或预算，使用现有显式恢复入口重跑。
 
 Windows / Python 3.14 相关测试 **101 passed in 29.53s**，包含新增 9 项分类、不泄漏和误报回归：所有原扫描类别仍拦截；普通 WatchError 不再伪装成安全命中；即使接口不返回型号，也可区分是否已收到正常 HTTP 响应。真实重跑结果待补。
+
+补丁已合入远程定时任务生成的新记录后推送为 `a921b01`。[Linux CI 39894755982](https://github.com/loonslo/x-algo-watch/actions/runs/39894755982) 成功，实际日志 **277 passed in 14.64s**。首次推送因远程 main 更新被拒绝，随后误发的旧代码任务 39894680600 已取消，不用其结果冒充新诊断；新代码恢复任务为 [39894771634](https://github.com/loonslo/x-algo-watch/actions/runs/39894771634)，`resume_iterations=true`，保留 V1 及旧预算。
+
+诊断结果：第一次已收到 **HTTP 404**，但被归为 `local_validation_error`，发生在 request 阶段，非公开文本扫描命中；第二次 **HTTP 200**，实际型号 `dots-studio/dots-3-note-preview:free`，有 JSON 草稿，但四问加标题超出 420 字符，触发正常格式拒绝。两次完整审计和 resume_count=1 检查点已合并，仍为 V1/manual，没有审核通过。
+
+根因已离线复现：`python -m x_algo_watch.drafting` 的入口以 `__main__` 创建 OpenRouter；新增循环又导入 `x_algo_watch.drafting`，原本定义在 drafting 的 Deferred 因此出现两个不同的类。入口抛出的 Deferred 无法被循环所用模块的 Deferred 捕获，落到 WatchError 分支，旧代码误标为安全命中。复现中异常类身份为 false、Deferred 捕获为 false、WatchError 捕获为 true。这能解释旧误报机制，但旧两次响应未保留，不能反向确认它们具体的 HTTP 状态。
+
+最小修复将 Deferred 移到共享 models 模块，drafting 保留导入兼容。新增 runpy 双入口回归，模拟入口客户端 HTTP 404，验证只产生一次 deferred、状态 pending、不会计入格式无效或冒充敏感内容。修复相关 **91 passed in 28.42s**。将继续显式恢复 V1，保留前述诊断。
+
+取消的旧任务日志有一次 analysis invalid，随后在下一次尝试期间终止，没有可用产物。为避免漏算，追加两条明确标为 conservative_budget_reservation 的预算记录，不设置缓存键，不冒充已取得响应或研究结论。加上新诊断两次请求，UTC 10 月 23 日当前预算记账为 4 次；旧日期记录不变。

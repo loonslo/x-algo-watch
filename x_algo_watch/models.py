@@ -18,6 +18,10 @@ class WatchError(Exception):
     """可公开的错误信息；不包含本机命令、路径或认证信息。"""
 
 
+class Deferred(WatchError):
+    """可恢复的外部服务失败；由模块入口和导入调用共享同一异常类。"""
+
+
 class UnsafePublicText(WatchError):
     """只携带固定命中类别，不保存匹配到的内容。"""
 

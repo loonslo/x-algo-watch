@@ -2,6 +2,9 @@
 
 import io
 import json
+import runpy
+import urllib.error
+import warnings
 
 import pytest
 
@@ -65,3 +68,24 @@ def test_successful_http_response_records_safe_status_even_when_output_is_blocke
     calls = [e for e in events if e['type'] == 'model_call']
     assert all(e['response_received'] is True and e['response_status'] == 200 for e in calls)
     assert all(e['resolved_model'] is None and e['error_code'] == 'sensitive_email' for e in calls)
+
+
+def test_module_entrypoint_and_imported_loop_share_deferred_exception(monkeypatch):
+    """复现 -m 入口创建客户端、iteration 导入 drafting 后异常类不一致的问题。"""
+    from x_algo_watch import drafting
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        entry = runpy.run_module('x_algo_watch.drafting', run_name='entrypoint_probe')
+    assert entry['Deferred'] is drafting.Deferred
+
+    def unavailable(*_args, **_kwargs):
+        raise urllib.error.HTTPError('https://openrouter.ai/api/v1/chat/completions',404,'unavailable',{},io.BytesIO(b'{}'))
+    monkeypatch.setattr('urllib.request.urlopen',unavailable)
+    _, pack = record_and_pack()
+    models = {'analysis':'openrouter/free', 'review':'openrouter/free'}
+    outputs, events = analyze_items([pack], [], entry['OpenRouter']('test-key'), models, NOW, PROMPTS)
+    call = next(e for e in events if e['type']=='model_call')
+    assert outputs[pack['item_id']]['state']=='pending'
+    assert call['outcome']=='deferred' and call['error_code']=='transport_deferred'
+    assert call['failure_stage']=='request' and call['response_status']==404
+    assert len([e for e in events if e['type']=='model_call'])==1
