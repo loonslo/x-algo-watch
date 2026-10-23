@@ -15,7 +15,7 @@ import yaml
 
 from .automation import load_bundle
 from .evidence import digest, items_for_record
-from .models import WatchError
+from .models import UnsafePublicText, WatchError
 from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, PROJECT_TRANSPORT, REVIEW_TRANSPORT, aggregate_reviews, free_model, review_mode as model_review_mode, review_stages
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
@@ -139,10 +139,14 @@ class OpenRouter:
         self._last_call = 0.0
         self.last_response_model: str | None = None
         self.last_response_usage: dict[str, int] = {}
+        self.last_response_received = False
+        self.last_response_status: int | None = None
 
     def call(self, model: str, system: str, payload: dict[str, Any]) -> str:
         self.last_response_model = None
         self.last_response_usage = {}
+        self.last_response_received = False
+        self.last_response_status = None
         if not free_model(model):
             raise WatchError("只允许 :free 型号或 openrouter/free 免费自动路由")
         delay = 3.1 - (time.monotonic() - self._last_call)
@@ -164,6 +168,9 @@ class OpenRouter:
         try:
             timeout = 90 if payload.get("evidence_pack", {}).get("scope") == "project_version" else 30
             with urllib.request.urlopen(request, timeout=timeout) as response:
+                self.last_response_received = True
+                status = getattr(response, "status", None)
+                self.last_response_status = status if type(status) is int and 100 <= status <= 599 else None
                 result = json.load(response)
             actual_model = result.get("model")
             if isinstance(actual_model, str) and re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", actual_model):
@@ -185,6 +192,8 @@ class OpenRouter:
                 raise Deferred("模型返回超长内容；下一轮再补")
             return content
         except urllib.error.HTTPError as exc:
+            self.last_response_received = True
+            self.last_response_status = exc.code if type(exc.code) is int and 100 <= exc.code <= 599 else None
             raise http_failure(exc) from None
         except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise Deferred("免费模型连接或响应异常；下一轮补起草") from exc
@@ -257,36 +266,50 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                 request_payload = {**payload, **({"previous_validation_errors": errors} if errors else {})}
                 event = {"type": "model_call", "id": key + ":" + str(len(calls)) + ":" + now.isoformat(), "analysis_key": key, "item_id": item_id, "commit": pack["commit"], "stage": stage, "model": model, "prompt_version": version, "input_hash": digest(request_payload), "day": now.date().isoformat(), "valid": False}
                 used += 1
+                failure_stage = "request"
                 try:
                     raw = client.call(model, prompt, request_payload)
                     if review_mode == "free_router":
                         event["resolved_model"] = getattr(client, "last_response_model", None)
+                    failure_stage = "output_scan"
                     public_text(raw)
                     event["raw_output"] = raw
                     try:
                         value = json.loads(raw)
                     except ValueError:
                         value = None
+                    failure_stage = "schema_validation"
                     if project_research and stage == "analysis":
                         errors = validate_research(value, pack, require_reader=True)
                         if not errors:
+                            failure_stage = "grounding_validation"
                             errors += validate_analysis(analysis_projection(value), pack, project_research=True)
                     else:
                         errors = validate_analysis(value, pack) if stage == "analysis" else validate_review(value, pack, RESEARCH_FIELDS if project_research else ANALYSIS_FIELDS)
                     event.update(output=value, errors=errors, valid=not errors, outcome="valid" if not errors else "invalid")
                 except Deferred as exc:
-                    event.update(outcome="deferred", errors=[str(exc)])
+                    event.update(outcome="deferred", errors=[str(exc)], error_code="transport_deferred", failure_stage=failure_stage)
                     suspension = {"reason": "service", "stage": stage}
                     deferred_all = True
-                except WatchError:
+                except UnsafePublicText as exc:
                     # 疑似敏感输出不留原文；发布扫描依然会再次检查全部产物。
                     event.pop("raw_output", None)
-                    event.update(outcome="invalid", errors=["模型输出含疑似敏感内容，已拦截"])
+                    event.pop("output", None)
+                    category = exc.category if exc.category in {"credential", "private_key", "local_path", "email"} else "unknown"
+                    event.update(outcome="invalid", errors=["模型输出未通过公开文本扫描，已拦截；类别：" + category], error_code="sensitive_" + category, failure_stage=failure_stage)
+                except WatchError:
+                    # 其他本地错误不能冒充敏感内容命中，也不回显未知异常原文。
+                    event.pop("raw_output", None)
+                    event.pop("output", None)
+                    event.update(outcome="invalid", errors=["请求或本地校验失败；未确认敏感内容命中"], error_code="local_validation_error", failure_stage=failure_stage)
                 if review_mode == "free_router":
                     event["resolved_model"] = getattr(client, "last_response_model", None)
                     usage = getattr(client, "last_response_usage", {})
                     if usage:
                         event["usage"] = usage
+                if hasattr(client, "last_response_received"):
+                    event["response_received"] = client.last_response_received is True
+                    event["response_status"] = getattr(client, "last_response_status", None)
                 events.append(event); calls.append(event)
                 if project_research:
                     print(pack["commit"][:7] + " " + stage + " " + event["outcome"], flush=True)

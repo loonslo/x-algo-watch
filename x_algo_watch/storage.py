@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from .git import SHA
-from .models import CheckResult, Severity, WatchError
+from .models import CheckResult, Severity, UnsafePublicText, WatchError
 
 RECORD_PATTERN = re.compile(r"<!-- xaw-record -->\n```json\n(.*?)\n```\n<!-- /xaw-record -->", re.S)
 EVENT_PATTERN = re.compile(r"<!-- xaw-event -->\n```json\n(.*?)\n```\n<!-- /xaw-event -->", re.S)
@@ -17,13 +17,14 @@ EVENT_PATTERN = re.compile(r"<!-- xaw-event -->\n```json\n(.*?)\n```\n<!-- /xaw-
 
 def public_text(text: str) -> None:
     patterns = (
-        r"sk-or-v1-[A-Za-z0-9_-]{12,}", r"gh[pousr]_[A-Za-z0-9]{20,}",
-        r"github_pat_[A-Za-z0-9_]{20,}", r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-        r"[A-Za-z]:[\\/](?:Users|workspace|home)[\\/]", r"/(?:Users|home)/[^/\s]+/",
-        r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}",
+        ("credential", r"sk-or-v1-[A-Za-z0-9_-]{12,}"), ("credential", r"gh[pousr]_[A-Za-z0-9]{20,}"),
+        ("credential", r"github_pat_[A-Za-z0-9_]{20,}"), ("private_key", r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+        ("local_path", r"[A-Za-z]:[\\/](?:Users|workspace|home)[\\/]"), ("local_path", r"/(?:Users|home)/[^/\s]+/"),
+        ("email", r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"),
     )
-    if any(re.search(pattern, text) for pattern in patterns):
-        raise WatchError("输出含疑似凭据、本机路径或邮箱，已阻止写入；需人工复核")
+    for category, pattern in patterns:
+        if re.search(pattern, text):
+            raise UnsafePublicText(category)
 
 
 def atomic_write(path: Path, text: str) -> None:
