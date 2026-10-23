@@ -3,8 +3,8 @@ project_id: x-algo-watch
 updated: 2026-10-23
 status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 已编辑核心实现证据优先、原稿纠错反馈、排队源码固定和 ReactedTo 规则表解析四项调整，并补回归用例；尚待 GitHub 验证。此前调用、检查点和预算保留，没有新合格稿。
-next: 在 GitHub 运行完整 CI 与真实历史回放，随后隔离检测 07d159b 并进行新流程真实模型复验；核对输入覆盖、三角色结果、预算及队列发布，不能将代码通过当作内容通过。
+progress: 已合入核心完整证据、原稿与定点阅读修补、排队源码固定、新规则表解析及精确配置率派生；GitHub CI 306 项通过，07d159b 隔离检测成功。最终真实模型运行 39939113105 正在执行，尚无本轮合格稿。
+next: 回读 GitHub 最终模型原文、补丁及三角色结果，核对预算和检查点；任何失败继续按现有边界暂停或续跑，正式速报仍须所有者确认。
 evidence:
   - docs/acceptance-flow-adjustments.md
   - docs/acceptance-github-flow-cards.md
