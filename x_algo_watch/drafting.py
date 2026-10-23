@@ -103,7 +103,8 @@ def validate_analysis(value: Any, pack: dict[str, Any], *, project_research: boo
     for phrase in ("所有人", "一定会", "平台确认", "已生效", "已上线", "全量启用"):
         for match in re.finditer(phrase, narrative):
             negated = project_research and re.search(r"(?:不|未|无法|未知|不能|尚无)[^。；\n]{0,18}$", narrative[:match.start()])
-            if not negated:
+            questioned = project_research and re.search(r"是否[ \t]*$", narrative[:match.start()])
+            if not negated and not questioned:
                 errors.append("包含无依据的确定性或部署表述")
     if value["default_state"] == "disabled":
         after = [f.get("after") for f in pack["evidence"].values()]
