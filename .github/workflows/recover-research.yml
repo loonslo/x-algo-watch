@@ -1,0 +1,86 @@
+name: Recover one GitHub research artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: '本仓库 check.yml 已完成运行的数字 ID'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: x-algo-watch-main
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+      - run: python -m pip install --require-hashes -r requirements.txt
+      - name: Validate source run and download data artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          mkdir -p runtime/recovery
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > runtime/recovery/run.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          run = json.loads(Path("runtime/recovery/run.json").read_text())
+          assert run["head_repository"]["full_name"] == os.environ["GITHUB_REPOSITORY"]
+          assert run["path"] == ".github/workflows/check.yml"
+          assert run["event"] == "workflow_dispatch" and run["status"] == "completed"
+          PY
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" -n inspection -D runtime/recovery/inspection
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" -n draft -D runtime/recovery/draft
+      - name: Append validated audit and preserve current progress
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from x_algo_watch.automation import load_bundle, publish, commit_paths
+          from x_algo_watch.storage import RecordStore
+          from x_algo_watch.versions import build_versions
+          bundle = Path("runtime/recovery/inspection")
+          draft = Path("runtime/recovery/draft/draft.json")
+          manifest, _, _ = load_bundle(bundle)
+          assert not manifest["test"] and len(manifest["research"]) == 1
+          commit = manifest["research"][0]
+          def latest(events):
+              return next((e for e in reversed(events) if e["type"] == "version_research" and e["commit"] == commit), None)
+          current = RecordStore(Path("data"))
+          prior = latest(current.events())
+          baseline = latest(RecordStore(bundle / "data").events())
+          pending = [e for e in json.loads(draft.read_text())["events"] if e["type"] == "version_research" and e.get("state") == "pending"]
+          can_restore = (prior or {}).get("id") == (baseline or {}).get("id")
+          before_calls = {e["id"] for e in current.events() if e["type"] == "model_call"}
+          publish(bundle, None, draft_bundle=draft, push=False, notify_issues=False, merge_research=True)
+          if can_restore:
+              for event in pending:
+                  current.append_event(event, datetime.now(timezone.utc))
+              build_versions(Path.cwd())
+          after_calls = {e["id"] for e in current.events() if e["type"] == "model_call"}
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write(f"Recovered {len(after_calls-before_calls)} model-call audit events. New model requests: 0. Pending checkpoint restored: {can_restore}.\n")
+          commit_paths(["data", "versions"], "chore: recover validated GitHub research audit", os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"])
+          PY
