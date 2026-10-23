@@ -161,6 +161,9 @@ class OpenRouter:
             if model == FREE_ROUTER:
                 body["max_tokens"] = 12000
                 body["reasoning"] = {"max_tokens": 3000}
+                if "analysis" in payload:
+                    body["max_tokens"] = 24000
+                    body["reasoning"] = {"effort": "low"}
         if model == "minimax/minimax-m3.1-flash:free":
             # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
             body["reasoning"] = {"effort": "low"}
