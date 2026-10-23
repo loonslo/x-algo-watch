@@ -3,9 +3,11 @@ project_id: x-algo-watch
 updated: 2026-10-23
 status: waiting
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 已查明并修复 CLI 异常类重复加载误报，起草输出预算与审核对齐，Linux CI 280 项通过。最终续跑 39895902875 是 HTTP 404 提供方拥堵，正确保存 pending，未有安全命中或新合格稿；V1、原审计和当日预算保留。
-next: 等服务恢复后由现有定时或手动任务从同一 V1 缺少阶段续跑；本轮错误原因调查与重跑已记录，成功收敛及双读者内容质量仍待验收。
+progress: GitHub 三版测试卡已执行：7f2ca2b 两次输出校验失败；989fb91 的 V1/V2 三角色有分歧、V3 事实核对截断；07d159b 解析失败。CI 280 项通过；GitHub 已恢复 G2 全部 12 条调用及 V3 检查点，0 新请求，当天记账 21 次，仍无新合格稿。
+next: 先补核心实现证据、纠错原稿反馈、排队任务读取最新可信状态及新规则表解析，再在 GitHub 复验；当前 V3 从 facts_review 续跑，正式速报仍待所有者确认。
 evidence:
+  - docs/acceptance-github-flow-cards.md
+  - docs/samples/2026-10-23-github-flow.md
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
   - docs/requirements-audit.md
