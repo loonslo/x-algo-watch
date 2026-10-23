@@ -24,7 +24,7 @@ def research_schema() -> dict[str, Any]:
         return {"type": "object", "required": list(properties), "additionalProperties": False, "properties": properties}
     reader = obj({**{name: {**text, "maxLength": maximum} for name, maximum in SUMMARY_LIMITS.items()},
                   "online_status": {"const": "unverified"},
-                  "impacts": {"type": "array", "maxItems": 4, "items": obj({**{name: text for name in ("heading", "effect", "conditions", "limits")}, "evidence_refs": refs})},
+                  "impacts": {"type": "array", "maxItems": 4, "items": obj({**{name: dict(text) for name in ("heading", "effect", "conditions", "limits")}, "evidence_refs": refs})},
                   "terms": {"type": "array", "maxItems": 5, "items": obj({"term": text, "meaning": text, "evidence_refs": refs})}, "evidence_refs": refs})
     reader["properties"]["what_changed"]["description"] = "版本更新重点：概括最值得关注的实际机制变化，普通中文，不罗列文件名。"
     impact = reader["properties"]["impacts"]["items"]["properties"]

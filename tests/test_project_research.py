@@ -126,7 +126,7 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     client = FakeGitHub()
     publish(bundle, client, draft_bundle=output, push=False)
     page = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
-    assert "模型对本次算法迭代的解读" in page and "成立条件" in page and "另一种解释" in page
+    assert "算法版本更新公告" in page and "成立条件" in page and "另一种解释" in page
     assert "模型推测，尚未人工确认" in page and "推荐帖子来源设置有变化" in page
     assert not client.rows and not (workspace / "digest.md").exists()
     assert pending_packs(workspace / "data") == []
@@ -141,7 +141,7 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     assert confirm(event, client, NOW, workspace, push=False) == "confirmed"
     text = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
     assert "模型解读，已获所有者人工确认" in text
-    assert text.count("## 模型对本次算法迭代的解读") == 1
+    assert text.count("## 算法版本更新公告") == 1
     assert "模型解读已人工确认" in (workspace / "versions/README.md").read_text(encoding="utf-8")
 
 
