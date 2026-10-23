@@ -14,3 +14,17 @@
 新增真实 07d159b 级别表与展开实现夹具、三条规则原文片段，并在 NOTICE 登记来源。回归覆盖实际顺序、未知/缺失依赖拒绝、完整 Fair Share/错误处理证据、核心预算不足停止、换路由纠错原稿，以及队列源码固定契约。现有 50 提交历史回放保持执行。
 
 当前仅完成编辑，尚未执行 GitHub CI、隔离检测或新流程真实模型复验。结果将在本记录追加；不得将编辑完成写成质量通过。人工 registry、正式 digest 及旧模型裁决不由这次修改自动确认。
+
+## 首轮远程复验
+
+[PR #6](https://github.com/loonslo/x-algo-watch/pull/6) 已合入 main 的 7a41b72。PR CI 39935434358：291 passed in 18.41s；合入后 CI 39935598458：291 passed in 17.84s。新增真实历史、核心完整性、拒绝路径及队列契约均在 GitHub 执行，本机未运行 pytest 或模型。
+
+[隔离检测 39935600865](https://github.com/loonslo/x-algo-watch/actions/runs/39935600865) 成功：test=true、result_code=0，07d159b 已能完整解析；隔离测试不推进生产进度。
+
+[真实模型 39935607359](https://github.com/loonslo/x-algo-watch/actions/runs/39935607359) 的实际输入上下文为 1f430a3b…，总正文 85000 字符；包含完整生产区段：Fair Share 111 行、新用户过滤器 40 行、标签水合器 92 行、水合框架 222 行、候选管线框架 457 行，均未截断。旧 2d95a04c… 快照保留。起草被 who/when/action 技术词校验拒绝，纠错遇 HTTP 429，保存同一 V1 等待服务；detect/draft/publish 均成功。
+
+[续跑 39936041954](https://github.com/loonslo/x-algo-watch/actions/runs/39936041954) 从已有稿件纠错。实际输入保留前次两条调用审计，当天预算为 23，没有清零；模型返回正常响应，技术词错误未再触发，但将配置率 0.5 写为 50%，被未提供百分比派生值的数字白名单拒绝。已达两次格式失败，按规则 V1/waiting_manual/invalid_output 暂停，未冒充三角色通过。
+
+## 精确配置率派生补充
+
+上述 50% 是配置值单位转换，不应当作模型凭空捏造线上流量。新增程序派生函数，仅对白名单参数 ShadowTrafficPhoenixClusterRates 中合法的集群:率条目，用 Decimal 换算百分比并注明不证明线上实际比例；不转换任意权重、不放宽数字校验。新增精确换算、非法输入、权重隔离及 50 允许/51 仍拒绝的回归。该补充尚待 GitHub CI 与真实模型复验。
