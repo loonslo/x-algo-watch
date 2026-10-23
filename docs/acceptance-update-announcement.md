@@ -16,3 +16,16 @@
 已通过远程只读查询核对上游 main 为 07d159b69109f069c85f84d39dd38e38adc040f0，项目已有该提交完整检测记录。计划指定该 SHA 执行正常研究工作流，仅研究已有版本，不推进检查进度；生成结果仍待人工确认。
 
 首轮 GitHub CI 39985811028：311 passed、2 failed。旧标题断言未同步；新增协议回归发现字段说明复用同一字典导致 effect 说明被 limits 覆盖，现为各字段创建独立字典并重新导出协议。真实模型尚未启动，待修复后 CI。
+
+## GitHub 实测结果（2026-10-24，北京时间）
+
+- 修复提交 a04716a 的 [CI 39985950418](https://github.com/loonslo/x-algo-watch/actions/runs/39985950418)：Linux / Python 3.14.8，313 passed in 18.56s，包含真实上游历史回放。本机未运行 pytest 或模型。
+- [首次真实运行 39986053139](https://github.com/loonslo/x-algo-watch/actions/runs/39986053139)：detect/draft/publish 均成功，明确只选 07d159b。初稿 what_changed/when 含技术标识被拒，字段修补请求 HTTP 404 后等待服务，实际请求 2 次。
+- [续跑 39986471568](https://github.com/loonslo/x-algo-watch/actions/runs/39986471568)：复用初稿，仅补字段修补；合并后的完整校验发现数字 24、50 不在该断言所引用证据允许范围，以及正文包含 online_status 标识，达到两次格式无效后按规则暂停。修补有效不能替代完整校验，也不证明未校验原稿其余内容正确。
+- 本轮共 3 次真实新请求，实际响应型号分别为 dots-studio/dots-3-note-preview:free、未知（HTTP 404）、xingchen-agi/xing4.0-29b-a4b:free；没有更换路由规则。UTC 2026-10-23 累计记账 44，未清零。
+- 回读 main 的事件 research:339882274af158ce4205b7e9d22925487388d7e39b8b162bf644369cca169ca7，为 manual / V1 / waiting_manual / invalid_output，历史为空，尚无完成审核的候选。三个审核角色尚未执行，不能称三角色通过。
+- [最新版本页](../versions/2026-10-23-07d159b69109f069c85f84d39dd38e38adc040f0.md)已保存暂停原因及恢复条件；原始响应和修补轨迹保留在追加记录。本轮未发布该版本的新公告正文，未人工确认，未修改正式 digest 或人工 registry。
+
+## 未验证项与下一步
+
+表达方式代码和自动排版回归已验证，真实公告质量尚未验收。204 个变化源码文件的上下文正文上限 85000 字符，只包含部分 diff 与实现，不能称完整版本审计。需处理原稿数字引用与协议标识问题后，指定同一 SHA 并显式 resume_iterations 恢复，再完整通过三角色审核；不能仅改标记解除暂停。其他历史研究、外部政策、连续 24 小时定时可靠性不在本轮验收范围。
