@@ -76,3 +76,15 @@ def test_unrecognized_historical_formats_are_red(upstream, monkeypatch):
         result = compare(upstream, upstream.parent(target), target, [], date(2026, 10, 21))
         assert not result.complete and result.severity == Severity.RED
         assert not any(f.category == "visibility" for f in result.findings)
+
+
+def test_oct23_expansion_snapshot_is_complete_and_read_only(upstream):
+    from x_algo_watch.engine import snapshot
+    target = upstream.resolve("07d159b69109f069c85f84d39dd38e38adc040f0")
+    before = upstream.git("status", "--porcelain=v1", "--untracked-files=all")
+    result = compare(upstream, upstream.parent(target), target, [], date(2026, 10, 23))
+    assert result.complete
+    current = snapshot(upstream, target)
+    assert current.level_format == "PostRules+Expansion"
+    assert current.levels["TIMELINE_HOME_HYDRATION"][-1] == "PROTECTED_ORIGINAL_AUTHOR_DROP"
+    assert upstream.git("status", "--porcelain=v1", "--untracked-files=all") == before

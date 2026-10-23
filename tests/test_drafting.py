@@ -116,6 +116,7 @@ def test_analysis_retry_review_and_idempotence():
     assert len(client.calls) == 3
     assert client.calls[0][0] != client.calls[-1][0]
     assert "previous_validation_errors" in client.calls[1][2]
+    assert client.calls[1][2]["previous_invalid_output"] == bad
     assert outputs[pack["item_id"]]["state"] == "pending_confirmation"
     assert assemble(record, [pack], outputs)["ready"]
     no_calls = RecordedClient([])
