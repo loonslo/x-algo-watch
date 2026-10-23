@@ -1,15 +1,17 @@
 ---
 project_id: x-algo-watch
-updated: 2026-10-23
+updated: 2026-10-24
 status: waiting
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
 progress: 流程调整已合入 GitHub main；GitHub CI 311 项通过，07d159b 隔离检测成功。真实恢复运行 39941029391 的 V2 定点修补后三个角色全部同意，待人工确认；5 条新调用均保存，当天记账 37，原审计、预算和 V1 历史保留。
 next: 所有者检查新用户过滤豁免、影子配置口径和非技术可读性后决定是否确认；07d159b 等待正常检查重核，其他历史研究及 24 小时定时可靠性独立待验收。
 evidence:
-  - docs/samples/2026-10-23-adjusted-flow.md
+  - docs/acceptance-branch-cleanup.md
   - docs/acceptance-flow-adjustments.md
+  - docs/samples/2026-10-23-adjusted-flow.md
   - docs/acceptance-github-flow-cards.md
   - docs/samples/2026-10-23-github-flow.md
+  - docs/review-issue-4.md
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
   - docs/requirements-audit.md
@@ -29,6 +31,10 @@ evidence:
   - tests/test_history.py
   - data/README.md
 ---
+
+2026-10-23 分支清理：所有者确认保留 main；四个功能分支的改动均已通过 PR #6–#9 合入主线，备份并删除本地及远程残留分支，两端分支列表均只剩 main。保留原有未提交修改，本地 main 尚未快进远程的 37 个提交。此次不涉及业务验收，详见 docs/acceptance-branch-cleanup.md。
+
+2026-10-24 主线同步：已备份原有本地修改并快进到远程 main，将尚未发布的本地审阅记录与分支清理验收一并保留；共享文件核对后提交同步。业务验收状态沿用既有记录，本次仅验证 Git 同步、文档格式与证据路径。
 
 # 项目进度
 
