@@ -80,3 +80,19 @@ def test_patch_response_uses_the_narrow_transport_schema(monkeypatch):
     schema = captured[0]["response_format"]["json_schema"]
     assert schema["name"] == "version_reader_patch" and schema["schema"] == reader_repair_schema(["who"])
     assert set(schema["schema"]["properties"]["reader_patch"]["properties"]) == {"who"}
+
+
+def test_summary_and_grounding_errors_are_reported_together_for_full_repair(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    bad = make_bad(pack)
+    bad['summary'] += ' 此次变化为 987654321。'
+    client = RecordedClient([bad, analysis(pack), review(pack), review(pack), review(pack)])
+    result, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
+    errors = client.calls[1][2]['previous_validation_errors']
+    assert any('技术术语' in e for e in errors)
+    assert '数字不在证据包：987654321' in errors
+    assert 'reader_repair_fields' not in client.calls[1][2]
+    assert client.calls[1][2]['previous_invalid_output'] == bad
+    assert result[pack['item_id']]['state'] == 'pending_confirmation'
+    assert len(client.calls) == 5

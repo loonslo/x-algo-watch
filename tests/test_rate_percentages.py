@@ -45,3 +45,12 @@ def test_derived_rate_allows_exact_conversion_without_relaxing_numeric_guard(sam
     unsupported = deepcopy(value)
     unsupported["summary"] = unsupported["summary"].replace("50%", "51%")
     assert "数字不在证据包：51" in validate_analysis(analysis_projection(unsupported), pack, project_research=True)
+
+
+def test_both_version_rates_are_exact_and_keep_their_version_identity():
+    record = rate_record('Group:0.3')
+    record['findings'][0]['before'] = ['Group:0.5']
+    values = configuration_rate_percentages(record)
+    assert {(v['version'], v['configured_percent']) for v in values} == {('before', '50'), ('after', '30')}
+    record['findings'][0]['before'] = ['Group:1.1']
+    assert [v['version'] for v in configuration_rate_percentages(record)] == ['after']

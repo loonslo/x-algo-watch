@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-24
-status: waiting
+status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据与面向创作者的算法版本更新公告。
 progress: 公告表达已推送 GitHub，CI 313 项通过并含真实历史回放；最新 07d159b 经一次运行和缺失阶段续跑共 3 次新调用，因两次格式无效暂停，尚未进入三角色审核，未发布新正文。
-next: 处理 07d159b 原稿数字引用与正文协议标识问题，显式恢复后完成全部三角色审核；其他历史研究与定时可靠性独立待验收。
+next: 用户已明确要求继续；修复混合错误反馈和前后配置率证据，GitHub 验证后恢复 07d159b，持续处理到交付可阅读公告。
 evidence:
   - docs/acceptance-update-announcement.md
   - docs/acceptance-branch-cleanup.md

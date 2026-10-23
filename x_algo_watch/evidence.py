@@ -45,22 +45,26 @@ def numeric_context_for_record(record: dict[str, Any]) -> dict[str, Any]:
 def configuration_rate_percentages(record: dict[str, Any]) -> list[dict[str, str]]:
     """仅换算已知采样率配置，不把任意权重或源码小数解释为比例。"""
     result: list[dict[str, str]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for finding in record["findings"]:
         if (finding.get("category") not in {"parameter", "registry_mismatch"}
                 or finding.get("path") != "home-mixer/params/param.rs"
                 or finding.get("name") != "ShadowTrafficPhoenixClusterRates"
                 or not isinstance(finding.get("after"), list)):
             continue
-        for entry in finding["after"]:
-            match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]*):(0(?:\.\d+)?|1(?:\.0+)?)", entry) if isinstance(entry, str) else None
-            if match is None or entry in seen:
+        for side in ("after", "before"):
+            entries = finding.get(side)
+            if not isinstance(entries, list):
                 continue
-            seen.add(entry)
-            rate = Decimal(match[2])
-            result.append({"parameter": finding["name"], "entry": entry, "configured_rate": str(rate),
-                "configured_percent": format((rate * 100).normalize(), "f"),
-                "meaning": "仅为配置采样率换算，不证明线上启用、请求命中率或曝光比例"})
+            for entry in entries:
+                match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]*):(0(?:\.\d+)?|1(?:\.0+)?)", entry) if isinstance(entry, str) else None
+                if match is None or (side, entry) in seen:
+                    continue
+                seen.add((side, entry))
+                rate = Decimal(match[2])
+                result.append({"parameter": finding["name"], "version": side, "entry": entry, "configured_rate": str(rate),
+                    "configured_percent": format((rate * 100).normalize(), "f"),
+                    "meaning": "仅为配置采样率换算，不证明线上启用、请求命中率或曝光比例"})
     return result
 
 
