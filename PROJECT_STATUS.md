@@ -1,12 +1,13 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-24
-status: active
+status: waiting
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据与面向创作者的算法版本更新公告。
-progress: 公告表达已推送 GitHub，CI 313 项通过并含真实历史回放；最新 07d159b 经一次运行和缺失阶段续跑共 3 次新调用，因两次格式无效暂停，尚未进入三角色审核，未发布新正文。
-next: 用户已明确要求继续；修复混合错误反馈和前后配置率证据，GitHub 验证后恢复 07d159b，持续处理到交付可阅读公告。
+progress: 公告表达及修复已提交 GitHub，最新 CI 317 项通过并含真实历史回放；07d159b 经 V1–V4 修订达到三角色全部同意，通俗与技术页已生成。本次继续处理的 30 条新调用全部保存，正式速报仍未人工确认。
+next: 所有者阅读 07d159b 的 V4 公告并验收事实边界与可读性；其他历史研究、完整上下文覆盖及 24 小时定时可靠性独立待验收。
 evidence:
   - docs/acceptance-update-announcement.md
+  - docs/samples/2026-10-24-update-announcement.md
   - docs/acceptance-branch-cleanup.md
   - docs/acceptance-flow-adjustments.md
   - docs/samples/2026-10-23-adjusted-flow.md
@@ -38,6 +39,8 @@ evidence:
 2026-10-24 主线同步：已备份原有本地修改并快进到远程 main，将尚未发布的本地审阅记录与分支清理验收一并保留；共享文件核对后提交同步。业务验收状态沿用既有记录，本次仅验证 Git 同步、文档格式与证据路径。
 
 2026-10-24 公告表达：起草、三角色提示、共享协议及自动排版已更新。GitHub CI 39985950418 为 313 passed；真实运行 39986053139 与续跑 39986471568 均保存审计，最终 V1/waiting_manual/invalid_output，三角色尚未执行，不将工作流成功当作内容通过。详见 docs/acceptance-update-announcement.md。
+
+2026-10-24 继续处理结果：修复混合错误反馈、前后配置率换算、审核推理截断及状态字面表达；317 项 GitHub 回归通过，最终 39996178159 的 V4 三角色均同意且零问题。通俗页与技术页已生成，原 V1–V3 与 30 条新增调用保留，UTC 当日 74 次；仍未人工确认，不把模型裁决视为线上部署证明。详见公告验收。
 
 # 项目进度
 
