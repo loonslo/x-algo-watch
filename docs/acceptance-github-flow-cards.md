@@ -14,7 +14,7 @@
 
 入口：check.yml，research_commit 指定目标，resume_iterations=true。
 
-[实际运行 39923486204](https://github.com/loonslo/x-algo-watch/actions/runs/39923486204)。已发起，结果待运行结束后记录；不得提前写通过。
+[实际运行 39923486204](https://github.com/loonslo/x-algo-watch/actions/runs/39923486204)。已完成，Actions 为 success，但本轮两次起草均被输出校验拒绝，未进入三角色审核：第一次为 nvidia/nemotron-3.5-super-vl:free，when 含 online_status；纠错稿为 dots-studio/dots-3-note-preview:free，who 含 Phoenix。两次均 HTTP 200，最终 V1/manual/waiting_manual/invalid_output。运行成功不能记成稿件通过。[未经改写的实际输出](samples/2026-10-23-github-flow.md)。
 
 核对：本轮是否产生新调用、实际响应型号、阶段失败原因、是否进入全部三角色、争议后是否修订、是否保存检查点与预算、最终通俗/技术页是否绑定本轮结果。
 
@@ -32,13 +32,13 @@
 
 基线：989fb91254d461bf4b9df53fb12d5c9a61c2b354；目标：07d159b69109f069c85f84d39dd38e38adc040f0。
 
-计划使用 check.yml 的 test_from/test_to 隔离历史检测；等待前两项主串行任务结束后发起，当前尚未运行本卡。
+新增 detection-test.yml，使用既有 detect 的 test_from/test_to 隔离检测，不调用模型、不发布生产结果，也不占用模型主串行组。[实际运行 39923981236](https://github.com/loonslo/x-algo-watch/actions/runs/39923981236) 已完成。
 
-已知待验证阻塞：visibility-filtering/rules/levels.rs 的 TIMELINE_HOME_HYDRATION 引用由 Expansion::ReactedTo.placed 构造的规则数组，当前严格解析器不支持。预期应红色、complete=false、不推进生产进度、不用不完整证据起草模型结论。不能把这种安全停止写成算法无变化或完整测试通过。
+已知待验证阻塞：visibility-filtering/rules/levels.rs 的 TIMELINE_HOME_HYDRATION 引用由 Expansion::ReactedTo.placed 构造的规则数组，当前严格解析器不支持。实际产物 test=true、result_code=2、complete=false，记录同一 PostRules 解析失败；证据上传成功，Require a complete inspection 步骤退出 2，Actions 为 failure。红色停止、不推进生产进度、不用不完整证据起草模型结论的边界成立；完整检测与模型研究仍未通过。不能把这种安全停止写成算法无变化或完整测试通过。
 
 ## G4：现有程序与真实历史回放回归
 
-[GitHub CI 39923666690](https://github.com/loonslo/x-algo-watch/actions/runs/39923666690)：已执行成功；具体测试数量以该任务日志为准，待回读补充。该 CI 克隆只读上游对象并执行 pytest，不能替代 G1/G2 的实际模型稿质量验收。
+[GitHub CI 39923666690](https://github.com/loonslo/x-algo-watch/actions/runs/39923666690)：已执行成功，实际日志 280 passed in 18.21s；新增隔离检测工作流后的 CI 39923977756 同样 280 passed in 17.29s。该 CI 克隆只读上游对象并执行 pytest，不能替代 G1/G2 的实际模型稿质量验收。
 
 ## 本轮结果
 
