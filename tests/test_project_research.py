@@ -311,10 +311,14 @@ def test_live_fair_share_and_hydrator_failure_implementations_are_complete(upstr
         "home-mixer/candidate_hydrators/new_user_soft_nsfw_label_hydrator.rs": "fn update(",
         "candidate-pipeline/hydrator.rs": "fn update_all",
         "candidate-pipeline/candidate_pipeline.rs": "async fn execute_stages",
+        "home-mixer/candidate_hydrators/in_network_candidate_hydrator.rs": "candidate.in_network = hydrated.in_network",
     }
     for path, symbol in required.items():
         entry = next(e for e in pack["evidence"].values() if e["path"] == path and e.get("scope") == "complete_production_before_tests")
         assert symbol in entry["text"] and not entry["truncated"]
+    calls = "\n".join(e["text"] for e in pack["evidence"].values() if e["kind"] == "core_call_sites")
+    assert "Box::new(FairShareRankingFilter)" in calls
+    assert "Box::new(NewUserSoftNsfwFilter)" in calls
     assert pack["coverage"]["text_characters"] <= MAX_TEXT
 
 

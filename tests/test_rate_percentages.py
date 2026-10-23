@@ -40,7 +40,7 @@ def test_derived_rate_allows_exact_conversion_without_relaxing_numeric_guard(sam
     record["findings"].extend(rate_record("Experiment18Fou:0.5")["findings"])
     pack = project_pack(repo, record)
     value = analysis(pack)
-    value["summary"] += " 配置采样率为50%，线上状态未知。"
+    value["summary"] += " 配置采样率为 50%，线上状态未知。"
     assert not validate_analysis(analysis_projection(value), pack, project_research=True)
     unsupported = deepcopy(value)
     unsupported["summary"] = unsupported["summary"].replace("50%", "51%")
