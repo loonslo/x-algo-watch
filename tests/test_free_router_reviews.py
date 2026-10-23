@@ -63,10 +63,7 @@ def test_project_transport_sends_strict_schema_and_supported_free_providers(monk
     assert body["response_format"]["json_schema"]["schema"] == (review_schema() if is_review else research_schema())
     assert body["provider"] == {"require_parameters":True,"allow_fallbacks":True}
     assert body["model"] == "openrouter/free"
-    if is_review:
-        assert body['reasoning']=={'max_tokens':3000} and body['max_tokens']==12000
-    else:
-        assert 'reasoning' not in body and body['max_tokens']==6000
+    assert body['reasoning']=={'max_tokens':3000} and body['max_tokens']==12000
 
 
 def test_failed_content_keeps_resolved_model_and_safe_usage_in_audit(sample_repo,monkeypatch):

@@ -154,7 +154,7 @@ class OpenRouter:
             schema = review_schema() if "analysis" in payload else research_schema()
             body["response_format"] = {"type": "json_schema", "json_schema": {"name": "version_review" if "analysis" in payload else "version_research", "strict": True, "schema": schema}}
             body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
-            if model == FREE_ROUTER and "analysis" in payload:
+            if model == FREE_ROUTER:
                 body["max_tokens"] = 12000
                 body["reasoning"] = {"max_tokens": 3000}
         if model == "minimax/minimax-m3.1-flash:free":
@@ -180,9 +180,9 @@ class OpenRouter:
                 self.last_response_usage = {k: v for k, v in counts.items() if type(v) is int and 0 <= v <= 1_000_000_000}
             choice = result["choices"][0]
             content = choice["message"]["content"]
+            if choice.get("finish_reason") == "length":
+                raise Deferred("模型输出预算用尽（finish_reason=length），未返回完整 JSON；下一轮再补")
             if not isinstance(content, str) or not content.strip():
-                if choice.get("finish_reason") == "length":
-                    raise Deferred("模型输出预算用尽（finish_reason=length），未返回完整 JSON；下一轮再补")
                 raise Deferred("模型未返回可用 JSON 内容；下一轮再补")
             if len(content) > 25_000:
                 raise Deferred("模型返回超长内容；下一轮再补")

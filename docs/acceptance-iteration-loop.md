@@ -49,3 +49,7 @@ Windows / Python 3.14 相关测试 **101 passed in 29.53s**，包含新增 9 项
 最小修复将 Deferred 移到共享 models 模块，drafting 保留导入兼容。新增 runpy 双入口回归，模拟入口客户端 HTTP 404，验证只产生一次 deferred、状态 pending、不会计入格式无效或冒充敏感内容。修复相关 **91 passed in 28.42s**。将继续显式恢复 V1，保留前述诊断。
 
 取消的旧任务日志有一次 analysis invalid，随后在下一次尝试期间终止，没有可用产物。为避免漏算，追加两条明确标为 conservative_budget_reservation 的预算记录，不设置缓存键，不冒充已取得响应或研究结论。加上新诊断两次请求，UTC 10 月 23 日当前预算记账为 4 次；旧日期记录不变。
+
+共享异常修复 `ab04857` 的 [Linux CI 39895422404](https://github.com/loonslo/x-algo-watch/actions/runs/39895422404) 成功，**278 passed in 13.39s**。真实恢复 [39895431780](https://github.com/loonslo/x-algo-watch/actions/runs/39895431780) 收到 HTTP 200，型号 dots-studio/dots-3-note-preview:free，因 finish_reason=length、输出预算 6,000 耗尽而 Deferred；正确保存为 pending/waiting_service，resume_count=2，候选仍为 V1。未出现新的扫描命中或误报。该检查点已正常落盘，当日预算记账为 5（含前述两次取消预留）。
+
+根据这次实际截断，将免费整版本起草也调整为审核已使用的 max_tokens=12,000、reasoning.max_tokens=3,000，不调整 420 字摘要或发布门槛；提供方可能映射或忽略推理设置，不能保证实际推理 token 数。finish_reason=length 即使含部分正文也统一延期，防止残缺 JSON 被算为格式错误。相关回归 **75 passed in 17.28s**。下一次沿用当前检查点自动续跑，不开启新候选或清零调用。

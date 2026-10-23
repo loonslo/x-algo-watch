@@ -89,3 +89,12 @@ def test_module_entrypoint_and_imported_loop_share_deferred_exception(monkeypatc
     assert call['outcome']=='deferred' and call['error_code']=='transport_deferred'
     assert call['failure_stage']=='request' and call['response_status']==404
     assert len([e for e in events if e['type']=='model_call'])==1
+
+
+@pytest.mark.parametrize('content', ['{"item_id":', '{}'])
+def test_length_finish_is_deferred_even_with_visible_content(monkeypatch, content):
+    from x_algo_watch.models import Deferred
+    result={'choices':[{'finish_reason':'length','message':{'content':content}}]}
+    monkeypatch.setattr('urllib.request.urlopen',lambda *_args,**_kwargs:io.BytesIO(json.dumps(result).encode()))
+    with pytest.raises(Deferred,match='输出预算用尽'):
+        OpenRouter('test-key').call('openrouter/free','prompt',{'evidence_pack':{'scope':'project_version'}})

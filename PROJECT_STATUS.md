@@ -3,8 +3,8 @@ project_id: x-algo-watch
 updated: 2026-10-23
 status: active
 overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 已定位循环 CLI 双重加载导致 Deferred 类不一致，把 HTTP 失败误报为安全拦截；共享异常类修复及入口复现回归 91 项通过。真实诊断先 HTTP 404、后 HTTP 200 草稿超摘要长度，审计与恢复点已合并；正在再次恢复 V1。
-next: 推送共享异常类修复并核对完整 CI，恢复 V1 让真实格式纠错和三个角色继续；成功收敛和双读者内容质量仍未验收。
+progress: CLI 异常类重复加载误报已修复，Linux CI 278 项通过。真实恢复 39895431780 已正确区分 HTTP 200 输出截断并保存 pending，不再误报安全命中；现将起草输出预算与审核对齐，相关 75 项通过，继续沿 V1 续跑。
+next: 核对预算调整 CI 并取回下一次实际续跑结果；安全误报根因已查明，成功收敛和双读者内容质量仍未验收。
 evidence:
   - docs/acceptance-p1.md
   - docs/acceptance-p2-p4.md
