@@ -96,3 +96,29 @@ def test_summary_and_grounding_errors_are_reported_together_for_full_repair(samp
     assert client.calls[1][2]['previous_invalid_output'] == bad
     assert result[pack['item_id']]['state'] == 'pending_confirmation'
     assert len(client.calls) == 5
+
+
+def test_known_status_literal_normalizes_before_validation_and_keeps_raw_audit(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    bad = analysis(pack)
+    bad['reader']['when'] = 'online_status 为 unverified；仅在实际调用时生效。'
+    client = RecordedClient([bad, review(pack), review(pack), review(pack)])
+    outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
+    call = next(e for e in events if e['type'] == 'model_call')
+    assert json.loads(call['raw_output']) == bad
+    assert call['output']['reader']['when'] == '线上状态尚未核实；仅在实际调用时生效。'
+    assert call['output']['changes'] == bad['changes']
+    assert call['normalizations'] == ['reader.when:unverified_status_literal']
+    assert len(client.calls) == 4 and outputs[pack['item_id']]['state'] == 'pending_confirmation'
+
+
+def test_status_normalization_does_not_hide_other_identifiers_or_claims():
+    from x_algo_watch.readers import normalize_reader_status
+    value = {'reader': {'online_status': 'unverified', 'when': 'online_status 为 unverified；Phoenix；已上线。'}}
+    result, edits = normalize_reader_status(value)
+    assert result['reader']['when'] == '线上状态尚未核实；Phoenix；已上线。'
+    assert value['reader']['when'].startswith('online_status')
+    assert edits
+    wrong = {'reader': {'online_status': 'verified', 'when': 'online_status 为 unverified'}}
+    assert normalize_reader_status(wrong) == (wrong, [])

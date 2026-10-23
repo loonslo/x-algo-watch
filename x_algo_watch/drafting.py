@@ -20,7 +20,7 @@ from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS, PROJECT_TRANSPORT, REVIE
 from .storage import RecordStore, atomic_write, public_text
 from .project_evidence import context_packs
 from .research import RESEARCH_FIELDS, analysis_projection, render_research, research_event, research_schema, review_schema, validate_research
-from .readers import apply_reader_patch, reader_repair_fields, reader_repair_schema
+from .readers import normalize_reader_status, apply_reader_patch, reader_repair_fields, reader_repair_schema
 
 ANALYSIS_FIELDS = {"item_id", "title", "summary", "default_state", "facts", "inferences", "affected_fact_ids", "manual_change", "action", "observe", "questions"}
 NUMBER = re.compile(r"(?<![\w])[-−]?\d+(?:\.\d+)?(?![\w])")
@@ -295,6 +295,9 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     if patch_fields:
                         value = apply_reader_patch(invalid[-1]["output"], value, patch_fields)
                     if project_research and stage == "analysis":
+                        value, normalizations = normalize_reader_status(value)
+                        if normalizations:
+                            event["normalizations"] = normalizations
                         errors = validate_research(value, pack, require_reader=True)
                         safe_reader_errors = reader_repair_fields(errors, value)
                         if not errors or (safe_reader_errors and all(isinstance(value["reader"][k], str) for k in safe_reader_errors)):

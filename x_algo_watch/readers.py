@@ -51,6 +51,23 @@ def apply_reader_patch(previous: dict[str, Any], value: Any, fields: list[str]) 
     return result
 
 
+def normalize_reader_status(value: Any) -> tuple[Any, list[str]]:
+    """仅将已知部署状态的机器字面值转成人话；原始响应由调用审计保留。"""
+    if (not isinstance(value, dict) or not isinstance(value.get("reader"), dict)
+            or value["reader"].get("online_status") != "unverified"
+            or not isinstance(value["reader"].get("when"), str)):
+        return value, []
+    text, count = re.subn(
+        r"(?<![A-Za-z0-9_])`?online_status`?\s*(?:[:：=]|(?:固定)?为)\s*`?unverified`?(?![A-Za-z0-9_])",
+        "线上状态尚未核实", value["reader"]["when"],
+    )
+    if not count:
+        return value, []
+    result = deepcopy(value)
+    result["reader"]["when"] = text
+    return result, ["reader.when:unverified_status_literal"]
+
+
 def validate_reader(reader: Any, evidence: dict[str, Any]) -> list[str]:
     if not isinstance(reader, dict) or set(reader) != READER_FIELDS:
         return ["用户阅读层缺少四问、影响或证据字段"]
