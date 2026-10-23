@@ -7,7 +7,7 @@ from typing import Any
 from .evidence import digest
 from .storage import public_text
 from .project_evidence import research_profile
-from .readers import evidence_links, validate_reader
+from .readers import SUMMARY_LIMITS, evidence_links, validate_reader
 from .model_policy import aggregate_reviews, free_model, review_mode, review_stages
 
 LEGACY_RESEARCH_FIELDS = {"item_id", "title", "summary", "changes", "hypotheses", "no_hypothesis_reason", "questions"}
@@ -22,7 +22,7 @@ def research_schema() -> dict[str, Any]:
     refs = {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^E[0-9]+$"}}
     def obj(properties: dict[str, Any]) -> dict[str, Any]:
         return {"type": "object", "required": list(properties), "additionalProperties": False, "properties": properties}
-    reader = obj({**{name: {**text, "maxLength": maximum} for name, maximum in (("title",80),("what_changed",200),("who",160),("when",220),("action",160))},
+    reader = obj({**{name: {**text, "maxLength": maximum} for name, maximum in SUMMARY_LIMITS.items()},
                   "online_status": {"const": "unverified"},
                   "impacts": {"type": "array", "maxItems": 4, "items": obj({**{name: text for name in ("heading", "effect", "conditions", "limits")}, "evidence_refs": refs})},
                   "terms": {"type": "array", "maxItems": 5, "items": obj({"term": text, "meaning": text, "evidence_refs": refs})}, "evidence_refs": refs})
