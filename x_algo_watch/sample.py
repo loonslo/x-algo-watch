@@ -65,12 +65,13 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
     analysis=event['analysis'];reader=analysis['reader']
     def page(title: str, body: str) -> str:
         return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+esc(title)+'</title><style>'+css+'</style></head><body><main><nav><a href="index.html">通俗审阅页</a><a href="technical.html">技术审阅页与审核意见</a><a href="research.json">完整研究 JSON</a></nav>'+top+body+'</main></body></html>'
-    user='<h1>'+esc(reader['title'])+'</h1><h2>30 秒摘要：模型原稿</h2>'
-    for field,label in [('what_changed','改了什么？'),('when','是否上线、何时可能生效？'),('who','可能影响谁？'),('action','现在该做什么？')]:
+    user='<h1>'+esc(reader['title'])+'</h1><h2>30 秒摘要：本次更新重点（模型原稿）</h2>'
+    for field,label in [('what_changed','改了什么？'),('when','是否上线、何时可能生效？'),('who','可能影响谁？')]:
         user+='<h3>'+label+'</h3><p>'+esc(reader[field])+'</p>'
-    user+='<p>摘要依据：'+refs(reader['evidence_refs'])+'</p><h2>影响解读：模型原稿</h2>'
+    user+='<p>摘要依据：'+refs(reader['evidence_refs'])+'</p><h2>具体调整与影响解读：模型原稿</h2>'
     for row in reader['impacts']:
         user+='<section class="card"><h3>'+esc(row['heading'])+'</h3><p>'+esc(row['effect'])+'</p><p><strong>成立条件：</strong>'+esc(row['conditions'])+'</p><p><strong>不能下的结论：</strong>'+esc(row['limits'])+'</p>'+refs(row['evidence_refs'])+'</section>'
+    user+='<h2>现在该怎么做</h2><p>'+esc(reader['action'])+'</p>'
     if reader['terms']:
         user+='<details><summary>原稿的术语解释（可检查是否易懂）</summary>'
         for row in reader['terms']:user+='<p><strong>'+esc(row['term'])+'</strong>：'+esc(row['meaning'])+' '+refs(row['evidence_refs'])+'</p>'

@@ -26,6 +26,12 @@ def research_schema() -> dict[str, Any]:
                   "online_status": {"const": "unverified"},
                   "impacts": {"type": "array", "maxItems": 4, "items": obj({**{name: text for name in ("heading", "effect", "conditions", "limits")}, "evidence_refs": refs})},
                   "terms": {"type": "array", "maxItems": 5, "items": obj({"term": text, "meaning": text, "evidence_refs": refs})}, "evidence_refs": refs})
+    reader["properties"]["what_changed"]["description"] = "版本更新重点：概括最值得关注的实际机制变化，普通中文，不罗列文件名。"
+    impact = reader["properties"]["impacts"]["items"]["properties"]
+    impact["heading"]["description"] = "按实际机制命名的具体调整标题；不强套新增、优化或修复分类。"
+    impact["effect"]["description"] = "一条完整公告：以前怎样、现在怎样、因而哪些内容或创作者可能受何影响。源码未提供旧行为时明确缺口，不编造对比；纯重构说明尚无行为变化证据。"
+    impact["conditions"]["description"] = "这条效果成立所需的默认设置、调用或实验条件。"
+    impact["limits"]["description"] = "证据未支持的结论或尚待确认的效果；不把源码变化当作线上部署。"
     reader["description"] = "普通创作者优先；标题与四问合计不超过 420 字符，代码名、Phoenix、VMRanker、水合及 kill switch 移到技术部分。线上状态只允许 unverified。"
     change = obj({**{name: {"type": "string", "minLength": 1, "maxLength": 1000} for name in ("mechanism", "before", "after")}, "evidence_refs": refs})
     hypothesis = obj({**{name: {"type": "string", "minLength": 1, "maxLength": 1000} for name in ("hypothesis", "basis", "conditions", "alternative", "verify", "creator_impact")},
@@ -187,20 +193,21 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     context_url = f"{context_base}/{event['commit']}-{event['item_id']}.json"
     refs = lambda values: evidence_links(values, sources, context_url)
     reader = edition["reader"] if edition else (analysis.get("reader") if not disputed else None)
-    text = progress + "## 模型对本次算法迭代的解读\n\n"
-    text += "普通创作者与运营：先读“30 秒摘要”和“影响解读”。技术分析、证据与历史记录折叠在末尾，可按需展开。\n\n"
-    text += "### 30 秒摘要\n\n"
+    text = progress + "## 算法版本更新公告\n\n非官方源码解读；机制效果属于推测，线上部署尚未核实。\n\n"
+    text += "普通创作者与运营：先读“30 秒摘要：本次更新重点”和“具体调整与影响解读”，最后看“现在该怎么做”。技术分析、证据与历史记录折叠在末尾，可按需展开。\n\n"
+    text += "### 30 秒摘要：本次更新重点\n\n"
     text += "| 核对项目 | 当前情况 |\n| --- | --- |\n| 源码变化 | 已发现公开源码改动 |\n"
     mechanism = ("原稿复核存在分歧；本页已按证据改写，改写稿待复核与人工确认" if disputed else "原研究已完成同型号模型复核；通俗改写尚未人工确认") if edition else ("模型推测，尚未人工确认；已完成模型复核" if not disputed else "复核存在分歧，用户正文待修订；尚未人工确认")
     text += "| 机制推断 | " + mechanism + " |\n| 线上状态 | 尚未核实部署；默认配置不等于线上状态 |\n\n"
     if reader:
         text += "**" + reader["title"] + "**\n\n"
-        for field, label in (("what_changed", "改了什么？"), ("when", "已经上线了吗？何时可能生效？"), ("who", "可能影响谁？"), ("action", "现在该做什么？")):
+        for field, label in (("what_changed", "改了什么？"), ("when", "已经上线了吗？何时可能生效？"), ("who", "可能影响谁？")):
             text += "**" + label + "** " + reader[field] + "\n\n"
-        text += "摘要依据：" + refs(reader["evidence_refs"]) + "。\n\n## 影响解读\n\n"
+        text += "摘要依据：" + refs(reader["evidence_refs"]) + "。\n\n## 具体调整与影响解读\n\n"
         for row in reader["impacts"]:
             text += "### " + row["heading"] + "\n\n" + row["effect"] + "\n\n"
             text += "- 何时可能发生：" + row["conditions"] + "\n- 还不能下的结论：" + row["limits"] + "\n- 依据：" + refs(row["evidence_refs"]) + "\n\n"
+        text += "## 现在该怎么做\n\n**现在该做什么？** " + reader["action"] + "\n\n"
         if reader["terms"]:
             text += "### 文中用词\n\n"
             for term in reader["terms"]:

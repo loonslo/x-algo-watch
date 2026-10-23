@@ -211,3 +211,32 @@ def test_future_version_generates_reader_then_review_repairs_it_without_editoria
     assert fixed['reader']['who'] in front and bad['reader']['who'] not in front
     assert all(label in front for label in ('30 秒摘要','源码变化','机制推断','线上状态','改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
     assert '影响解读' in front and '研究附录：' in page
+
+
+def test_announcement_keeps_same_evidence_and_action_after_adjustments(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    value = analysis(pack)
+    event = research_event(pack, {'state': 'pending_confirmation', 'analysis': value, 'review': review(pack)}, MODELS)
+    page = render_research(event)
+    front = page.split('<details><summary>技术分析')[0]
+    assert '算法版本更新公告' in front and '非官方源码解读' in front
+    assert front.index('### 30 秒摘要：本次更新重点') < front.index('## 具体调整与影响解读') < front.index('## 现在该怎么做')
+    assert front.count(value['reader']['action']) == 1
+    for row in value['reader']['impacts']:
+        assert all(row[field] in front for field in ('heading', 'effect', 'conditions', 'limits'))
+        assert all('[' + ref + ']' in front for ref in row['evidence_refs'])
+    disputed = research_event(pack, {'state': 'disputed', 'analysis': value, 'review': review(pack, False)}, MODELS)
+    blocked = render_research(disputed).split('<details><summary>技术分析')[0]
+    assert value['reader']['title'] not in blocked
+    assert '## 具体调整与影响解读' not in blocked
+
+
+def test_announcement_contract_reaches_all_model_roles():
+    root = Path(__file__).resolve().parents[1]
+    for role in ('analysis', 'review', 'facts_review', 'reader_review'):
+        prompt = (root / 'prompts' / ('version-' + role + '-v1.md')).read_text(encoding='utf-8')
+        assert '以前怎样 → 现在怎样' in prompt
+        assert '权重提高不能直接叫流量加强' in prompt
+    effect = research_schema()['properties']['reader']['properties']['impacts']['items']['properties']['effect']
+    assert '旧行为' in effect['description']

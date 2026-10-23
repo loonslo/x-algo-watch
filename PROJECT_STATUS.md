@@ -1,11 +1,12 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-24
-status: waiting
-overview: 只读监测 X 推荐算法公开源码变化，生成分级证据，辅助创作者手册人工复核。
-progress: 流程调整已合入 GitHub main；GitHub CI 311 项通过，07d159b 隔离检测成功。真实恢复运行 39941029391 的 V2 定点修补后三个角色全部同意，待人工确认；5 条新调用均保存，当天记账 37，原审计、预算和 V1 历史保留。
-next: 所有者检查新用户过滤豁免、影子配置口径和非技术可读性后决定是否确认；07d159b 等待正常检查重核，其他历史研究及 24 小时定时可靠性独立待验收。
+status: active
+overview: 只读监测 X 推荐算法公开源码变化，生成分级证据与面向创作者的算法版本更新公告。
+progress: 正在将起草、三角色审核和自动排版统一为版本更新公告；本次 GitHub 回归与最新 07d159b 真实研究待执行，旧研究及人工确认状态保留。
+next: 回读 GitHub CI 与 07d159b 真实研究结果，记录实际审核结论及未验证项。
 evidence:
+  - docs/acceptance-update-announcement.md
   - docs/acceptance-branch-cleanup.md
   - docs/acceptance-flow-adjustments.md
   - docs/samples/2026-10-23-adjusted-flow.md
