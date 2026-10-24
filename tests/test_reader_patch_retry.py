@@ -28,6 +28,9 @@ def test_reader_patch_preserves_technical_analysis_and_still_runs_all_reviews(sa
     assert final["state"] == "pending_confirmation"
     assert len(client.calls) == 5 and set(final["reviews"]) == {"review", "facts_review", "reader_review"}
     assert client.calls[1][2]["reader_repair_fields"] == ["who"]
+    assert "普通用户写更新说明的编辑" in client.calls[1][1]
+    assert "350字" in client.calls[1][1]
+    assert "previous_analysis" not in client.calls[1][2]
     assert client.calls[1][2]["previous_invalid_output"] == bad
     call = next(e for e in events if e.get("valid") and e.get("stage") == "analysis")
     assert json.loads(call["raw_output"]) == patch and call["reader_repair_fields"] == ["who"]
