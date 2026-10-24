@@ -44,6 +44,29 @@ def priority(path: str) -> tuple[int, str]:
     return (5, path)
 
 
+def detection_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """保持 JSON 完整；长规则表只提供精确差集，避免截断使关键变化消失。"""
+    rows = []
+    excluded = 0
+    for finding in record["findings"]:
+        if finding["category"] in {"registry_mismatch", "manual_overdue", "golden_corpus"}:
+            excluded += 1
+            continue
+        row = {k: finding[k] for k in ("category", "path", "name")}
+        before, after = finding.get("before"), finding.get("after")
+        if finding["category"] in {"visibility", "filters"} and isinstance(before, list) and isinstance(after, list):
+            row.update(before_count=len(before), after_count=len(after),
+                       added=[v for v in after if v not in before], removed=[v for v in before if v not in after],
+                       order_changed=before != after and set(before) == set(after))
+        elif finding["category"] not in {"watched_file", "enforcement"}:
+            row.update(before=before, after=after)
+        else:
+            row["scope"] = "文件检测摘要；行为变化须核对前后 diff 和调用处"
+        rows.append(row)
+    return {"findings": rows, "excluded_administrative_or_test_findings": excluded,
+            "scope": "仅为检测事实；规则数量和名称不能证明实际调用或用户效果"}
+
+
 def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
     commit, base = record["commit"], record.get("base")
     if not record["complete"] or not SHA.fullmatch(commit) or not SHA.fullmatch(base or ""):
@@ -68,7 +91,7 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
         evidence[f"E{len(evidence) + 1}"] = {"kind": kind, "path": path, "commit": revision, "start_line": start_line, "text": clipped, "truncated": len(clipped) < len(text), "redacted_contacts": redacted, "scope": scope}
         used += len(clipped)
 
-    add("detected_changes", "", commit, json.dumps({"findings": record["findings"], "derived": numeric_context_for_record(record)}, ensure_ascii=False), 9000)
+    add("detected_changes", "", commit, json.dumps(detection_summary(record), ensure_ascii=False), 16000, required=True)
     readme = repo.read(commit, "README.md") or ""
     architecture = readme.find("## Overview")
     add("project_overview", "README.md", commit, readme[architecture:] if architecture >= 0 else readme, 8500, readme[:architecture].count("\n") + 1 if architecture >= 0 else 1)
@@ -82,6 +105,8 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
         + re.findall(r"\b(?:struct|class)\s+([A-Z][A-Za-z0-9_]+)", "\n".join(diffs.values()))
     ))[:12]
     hits: dict[str, list[int]] = {}
+    parameter_names = [f["name"] for f in record["findings"] if f["category"] == "parameter"]
+    parameter_paths: set[str] = set()
     if symbols:
         args = ["grep", "-n", "-I", "-F"]
         for symbol in symbols:
@@ -91,10 +116,13 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
             parts = line.split(":", 3)
             if len(parts) == 4 and parts[2].isdigit() and parts[1].endswith((".rs", ".py")):
                 hits.setdefault(parts[1], []).append(int(parts[2]))
+                if any(re.search(r"\b" + re.escape(name) + r"\b", parts[3]) for name in parameter_names):
+                    parameter_paths.add(parts[1])
     # 先放完整生产实现，避免未变更、但被新开关调用的核心逻辑被挤成窗口。
     core_paths = sorted({
         path for path in [*selected, *hits]
-        if path.endswith(".rs") and Path(path).name != "mod.rs"
+        if (path in changed or path in parameter_paths)
+        and path.endswith(".rs") and Path(path).name != "mod.rs"
         and (path.startswith("home-mixer/filters/") or path.startswith("home-mixer/candidate_hydrators/"))
     }, key=priority)
     network_source = "home-mixer/candidate_hydrators/in_network_candidate_hydrator.rs"
@@ -170,7 +198,7 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
     if rates:
         pack["derived"]["configuration_rate_percentages"] = rates
     pack["coverage"]["complete_implementation_paths"] = sorted(complete_paths)
-    pack["coverage"]["evidence_policy"] = "core-before-diff-v2"
+    pack["coverage"]["evidence_policy"] = "change-focused-complete-deltas-v3"
     if ranges:
         pack["derived"]["code_range_lengths"] = ranges
     pack["item_id"] = digest(pack)

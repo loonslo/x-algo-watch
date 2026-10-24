@@ -49,7 +49,7 @@ def test_reader_first_technical_details_last_no_duplicate_summary(sample_repo):
     text = render_research(event)
     front, tail = text.split('<details><summary>技术分析', 1)
     assert all(q in front for q in ('改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
-    assert all(state in front for state in ('源码变化','机制推断','线上状态'))
+    assert '线上部署尚未核实' in front and '生成与审核记录' not in front
     assert 'TECHNICAL_SUMMARY_SENTINEL' not in text
     assert '另一种解释' in tail and '如何验证' in tail
     assert '[E1](' in front and '证据强度' not in front
@@ -209,7 +209,7 @@ def test_future_version_generates_reader_then_review_repairs_it_without_editoria
     page=next((workspace/'versions').glob('20*.md')).read_text(encoding='utf-8')
     front=page.split('<details><summary>技术分析')[0]
     assert fixed['reader']['who'] in front and bad['reader']['who'] not in front
-    assert all(label in front for label in ('30 秒摘要','源码变化','机制推断','线上状态','改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
+    assert all(label in front for label in ('30 秒摘要','改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
     assert '影响解读' in front and '研究附录：' in page
 
 
@@ -221,7 +221,7 @@ def test_announcement_keeps_same_evidence_and_action_after_adjustments(sample_re
     page = render_research(event)
     front = page.split('<details><summary>技术分析')[0]
     assert '算法版本更新公告' in front and '非官方源码解读' in front
-    assert front.index('### 30 秒摘要：本次更新重点') < front.index('## 具体调整与影响解读') < front.index('## 现在该怎么做')
+    assert front.index('### 30 秒摘要：本次更新重点') < front.index('## 你可能感受到的变化（影响解读）') < front.index('## 现在该怎么做')
     assert front.count(value['reader']['action']) == 1
     for row in value['reader']['impacts']:
         assert all(row[field] in front for field in ('heading', 'effect', 'conditions', 'limits'))
@@ -229,14 +229,49 @@ def test_announcement_keeps_same_evidence_and_action_after_adjustments(sample_re
     disputed = research_event(pack, {'state': 'disputed', 'analysis': value, 'review': review(pack, False)}, MODELS)
     blocked = render_research(disputed).split('<details><summary>技术分析')[0]
     assert value['reader']['title'] not in blocked
-    assert '## 具体调整与影响解读' not in blocked
+    assert '## 你可能感受到的变化（影响解读）' not in blocked
 
 
 def test_announcement_contract_reaches_all_model_roles():
     root = Path(__file__).resolve().parents[1]
     for role in ('analysis', 'review', 'facts_review', 'reader_review'):
         prompt = (root / 'prompts' / ('version-' + role + '-v1.md')).read_text(encoding='utf-8')
-        assert '以前怎样 → 现在怎样' in prompt
-        assert '权重提高不能直接叫流量加强' in prompt
+        assert 'before/after 对照同一场景' in prompt
+        assert '用户影响优先流程' in prompt
     effect = research_schema()['properties']['reader']['properties']['impacts']['items']['properties']['effect']
-    assert '旧行为' in effect['description']
+    assert '普通用户' in effect['description']
+
+
+def test_new_reader_requires_user_before_after_and_checks_entire_body(sample_repo):
+    from copy import deepcopy
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    value = analysis(pack)
+    assert not validate_research(value, pack, require_reader=True, user_impact=True)
+    old = deepcopy(value)
+    old['reader']['impacts'][0].pop('before')
+    old['reader']['impacts'][0].pop('after')
+    assert not validate_research(old, pack)  # 历史研究仍可读取。
+    assert validate_research(old, pack, user_impact=True)
+    for key in ('heading', 'before', 'after', 'effect', 'conditions', 'limits'):
+        wrong = deepcopy(value)
+        wrong['reader']['impacts'][0][key] = 'TIMELINE_HOME_HYDRATION 名单发生变化'
+        assert any('用户正文' in e for e in validate_research(wrong, pack, user_impact=True))
+    wrong = deepcopy(value)
+    wrong['reader']['terms'] = [{'term': '规则', 'meaning': 'after 被截断，无法核对。', 'evidence_refs': ['E1']}]
+    assert any('用户正文' in e for e in validate_research(wrong, pack, user_impact=True))
+    value['reader']['impacts'] = []  # 没有直接用户影响时，不强迫编造。
+    assert not validate_research(value, pack, user_impact=True)
+
+
+def test_before_after_numbers_are_grounded_and_process_follows_content(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    value = analysis(pack)
+    value['reader']['impacts'][0]['before'] += ' 987654321'
+    assert '数字不在证据包：987654321' in validate_analysis(analysis_projection(value), pack, project_research=True)
+    event = research_event(pack, {'state':'pending_confirmation', 'analysis':analysis(pack), 'review':review(pack)}, MODELS)
+    page = render_research(event)
+    assert '| 以前 | 现在的代码如何处理 |' in page
+    assert page.index('对你的影响') < page.index('研究附录：')
+    assert '核对项目 | 当前情况' not in page

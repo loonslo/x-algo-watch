@@ -68,7 +68,7 @@ def normalize_reader_status(value: Any) -> tuple[Any, list[str]]:
     return result, ["reader.when:unverified_status_literal"]
 
 
-def validate_reader(reader: Any, evidence: dict[str, Any]) -> list[str]:
+def validate_reader(reader: Any, evidence: dict[str, Any], *, user_impact: bool = False) -> list[str]:
     if not isinstance(reader, dict) or set(reader) != READER_FIELDS:
         return ["用户阅读层缺少四问、影响或证据字段"]
     errors = []
@@ -88,15 +88,32 @@ def validate_reader(reader: Any, evidence: dict[str, Any]) -> list[str]:
         if not isinstance(rows, list) or len(rows) > maximum:
             errors.append("用户阅读层 " + key + " 列表无效"); continue
         for row in rows:
-            if not isinstance(row, dict) or set(row) != fields:
+            accepted = (fields, fields | {"before", "after"}) if key == "impacts" else (fields,)
+            if not isinstance(row, dict) or set(row) not in accepted:
                 errors.append("用户阅读层 " + key + " 条目无效"); continue
-            for name in fields - {"evidence_refs"}:
+            if user_impact and key == "impacts" and not {"before", "after"} <= row.keys():
+                errors.append("用户影响条目缺少可感知的以前/现在对比")
+            for name in set(row) - {"evidence_refs"}:
                 if not isinstance(row[name], str) or not row[name].strip() or len(row[name]) > 600:
                     errors.append("用户阅读层 " + name + " 无效")
             if not valid_refs(row["evidence_refs"], evidence):
                 errors.append("用户阅读层引用无效")
     if not valid_refs(reader["evidence_refs"], evidence):
         errors.append("用户阅读层摘要引用无效")
+    if user_impact:
+        def check(text: Any, field: str) -> None:
+            if isinstance(text, str) and re.search(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|\b[A-Z]{3,}\b|Phoenix|VMRanker|水合|kill switch|\b(?:before|after|derived|truncated)\b|证据包|截断", text):
+                errors.append("用户正文含代码标识或研究过程，改写为用户体验：" + field)
+        for key in SUMMARY_LIMITS:
+            if not any(error.endswith("：" + key) for error in errors):
+                check(reader.get(key), key)
+        for key in ("impacts", "terms"):
+            if isinstance(reader.get(key), list):
+                for index, row in enumerate(reader[key]):
+                    if isinstance(row, dict):
+                        for name, text in row.items():
+                            if name != "evidence_refs":
+                                check(text, f"{key}.{index}.{name}")
     public_text(json.dumps(reader, ensure_ascii=False))
     return errors
 

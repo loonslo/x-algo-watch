@@ -24,19 +24,21 @@ def research_schema() -> dict[str, Any]:
         return {"type": "object", "required": list(properties), "additionalProperties": False, "properties": properties}
     reader = obj({**{name: {**text, "maxLength": maximum} for name, maximum in SUMMARY_LIMITS.items()},
                   "online_status": {"const": "unverified"},
-                  "impacts": {"type": "array", "maxItems": 4, "items": obj({**{name: dict(text) for name in ("heading", "effect", "conditions", "limits")}, "evidence_refs": refs})},
+                  "impacts": {"type": "array", "maxItems": 4, "items": obj({**{name: dict(text) for name in ("heading", "before", "after", "effect", "conditions", "limits")}, "evidence_refs": refs})},
                   "terms": {"type": "array", "maxItems": 5, "items": obj({"term": text, "meaning": text, "evidence_refs": refs})}, "evidence_refs": refs})
     reader["properties"]["what_changed"]["description"] = "版本更新重点：概括最值得关注的实际机制变化，普通中文，不罗列文件名。"
     impact = reader["properties"]["impacts"]["items"]["properties"]
-    impact["heading"]["description"] = "按实际机制命名的具体调整标题；不强套新增、优化或修复分类。"
-    impact["effect"]["description"] = "一条完整公告：以前怎样、现在怎样、因而哪些内容或创作者可能受何影响。源码未提供旧行为时明确缺口，不编造对比；纯重构说明尚无行为变化证据。"
+    impact["heading"]["description"] = "用户场景及感知变化，例如浏览推荐时更少看到某类帖子；不得使用代码名或研究过程。"
+    impact["before"]["description"] = "改动前在该场景中发生什么；只写已提供证据支持的行为，未知则用普通中文说明不知道旧行为。"
+    impact["after"]["description"] = "改动后相同场景如何处理；保留会改变读者判断的关键条件，不声称已经部署。"
+    impact["effect"]["description"] = "普通用户可能看到、收到或操作上的具体变化及原因；假设场景明确写如果，不虚构实测。内部实验、代码重构及缺乏用户因果链的变化不放此处。"
     impact["conditions"]["description"] = "这条效果成立所需的默认设置、调用或实验条件。"
     impact["limits"]["description"] = "证据未支持的结论或尚待确认的效果；不把源码变化当作线上部署。"
     reader["description"] = "普通创作者优先；标题与四问合计不超过 420 字符，代码名、Phoenix、VMRanker、水合及 kill switch 移到技术部分。线上状态只允许 unverified。"
     change = obj({**{name: {"type": "string", "minLength": 1, "maxLength": 1000} for name in ("mechanism", "before", "after")}, "evidence_refs": refs})
     hypothesis = obj({**{name: {"type": "string", "minLength": 1, "maxLength": 1000} for name in ("hypothesis", "basis", "conditions", "alternative", "verify", "creator_impact")},
                       "confidence": {"enum": ["high", "medium", "low"]}, "evidence_refs": refs})
-    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "X algorithm version research — reader format v2",
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": "X algorithm version research — user impact v3",
             **obj({"item_id": {"type": "string"}, "title": {"type": "string", "minLength": 1, "maxLength": 1200},
                    "summary": {"type": "string", "minLength": 1, "maxLength": 1200}, "reader": reader,
                    "changes": {"type": "array", "minItems": 1, "maxItems": 6, "items": change},
@@ -54,12 +56,12 @@ def review_schema() -> dict[str, Any]:
                 "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^E[0-9]+$"}}}}}}}
 
 
-def validate_research(value: Any, pack: dict[str, Any], *, require_reader: bool = False) -> list[str]:
+def validate_research(value: Any, pack: dict[str, Any], *, require_reader: bool = False, user_impact: bool = False) -> list[str]:
     if not isinstance(value, dict) or set(value) not in (LEGACY_RESEARCH_FIELDS, RESEARCH_FIELDS):
         return ["整版本研究字段不完整或含额外字段"]
     errors: list[str] = []
     if "reader" in value:
-        errors += validate_reader(value["reader"], pack["evidence"])
+        errors += validate_reader(value["reader"], pack["evidence"], user_impact=user_impact)
     elif require_reader:
         errors.append("新研究缺少面向非技术读者的阅读层")
     if value["item_id"] != pack["item_id"]:
@@ -103,7 +105,7 @@ def analysis_projection(value: dict[str, Any]) -> dict[str, Any]:
     if "reader" in value:
         reader = value["reader"]
         result["facts"].append({"text": "；".join(reader[k] for k in ("title", "what_changed", "who", "when", "action")), "evidence_refs": reader["evidence_refs"]})
-        result["inferences"].extend({"text": "；".join(row[k] for k in ("heading", "effect", "conditions", "limits")), "evidence_refs": row["evidence_refs"]} for row in reader["impacts"])
+        result["inferences"].extend({"text": "；".join(row[k] for k in ("heading", "before", "after", "effect", "conditions", "limits") if k in row), "evidence_refs": row["evidence_refs"]} for row in reader["impacts"])
         result["facts"].extend({"text": row["term"] + "：" + row["meaning"], "evidence_refs": row["evidence_refs"]} for row in reader["terms"])
     return result
 
@@ -181,7 +183,7 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
 
 def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False) -> str:
     from .iteration import render_iteration
-    progress = render_iteration(event["iteration"]) if "iteration" in event else ""
+    progress = "<details><summary>生成与审核记录</summary>\n\n" + render_iteration(event["iteration"]) + "</details>\n\n" if "iteration" in event else ""
     if "analysis" not in event:
         if technical_only:
             return progress + "技术稿尚未完成；完整候选和调用审计保留在研究记录中，不发布未完成的技术结论。\n\n"
@@ -193,19 +195,19 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     context_url = f"{context_base}/{event['commit']}-{event['item_id']}.json"
     refs = lambda values: evidence_links(values, sources, context_url)
     reader = edition["reader"] if edition else (analysis.get("reader") if not disputed else None)
-    text = progress + "## 算法版本更新公告\n\n非官方源码解读；机制效果属于推测，线上部署尚未核实。\n\n"
-    text += "普通创作者与运营：先读“30 秒摘要：本次更新重点”和“具体调整与影响解读”，最后看“现在该怎么做”。技术分析、证据与历史记录折叠在末尾，可按需展开。\n\n"
-    text += "### 30 秒摘要：本次更新重点\n\n"
-    text += "| 核对项目 | 当前情况 |\n| --- | --- |\n| 源码变化 | 已发现公开源码改动 |\n"
-    mechanism = ("原稿复核存在分歧；本页已按证据改写，改写稿待复核与人工确认" if disputed else "原研究已完成同型号模型复核；通俗改写尚未人工确认") if edition else ("模型推测，尚未人工确认；已完成模型复核" if not disputed else "复核存在分歧，用户正文待修订；尚未人工确认")
-    text += "| 机制推断 | " + mechanism + " |\n| 线上状态 | 尚未核实部署；默认配置不等于线上状态 |\n\n"
+    text = "## 算法版本更新公告\n\n非官方源码解读；机制效果属于推测，线上部署尚未核实。\n\n"
     if reader:
-        text += "**" + reader["title"] + "**\n\n"
+        text += "### " + reader["title"] + "\n\n### 30 秒摘要：本次更新重点\n\n"
         for field, label in (("what_changed", "改了什么？"), ("when", "已经上线了吗？何时可能生效？"), ("who", "可能影响谁？")):
             text += "**" + label + "** " + reader[field] + "\n\n"
-        text += "摘要依据：" + refs(reader["evidence_refs"]) + "。\n\n## 具体调整与影响解读\n\n"
+        text += "摘要依据：" + refs(reader["evidence_refs"]) + "。\n\n## 你可能感受到的变化（影响解读）\n\n"
+        if not reader["impacts"]:
+            text += "当前没有足够证据解释普通用户会感受到什么变化；已发现的内部调整见技术分析。\n\n"
         for row in reader["impacts"]:
-            text += "### " + row["heading"] + "\n\n" + row["effect"] + "\n\n"
+            text += "### " + row["heading"] + "\n\n"
+            if "before" in row and "after" in row:
+                text += "| 以前 | 现在的代码如何处理 |\n| --- | --- |\n| " + row["before"].replace("|", "\\|").replace("\n", " ") + " | " + row["after"].replace("|", "\\|").replace("\n", " ") + " |\n\n"
+            text += "**对你的影响：** " + row["effect"] + "\n\n"
             text += "- 何时可能发生：" + row["conditions"] + "\n- 还不能下的结论：" + row["limits"] + "\n- 依据：" + refs(row["evidence_refs"]) + "\n\n"
         text += "## 现在该怎么做\n\n**现在该做什么？** " + reader["action"] + "\n\n"
         if reader["terms"]:
@@ -218,7 +220,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
         if disputed:
             text += "原稿中已被质疑的标题、摘要和影响推断不继续作为用户结论展示，需先完成修订。\n\n"
     if technical_only:
-        text = progress
+        text = ""
     else:
         text += "<details><summary>技术分析（普通读者可跳过）</summary>\n\n"
     if not disputed or edition:
@@ -240,7 +242,8 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
         text += "该稿仍有未解决的复核问题，技术推断正文暂不发布；原始记录保留在下方研究附录。\n\n"
     if not technical_only:
         text += "</details>\n\n"
-    text += "<details><summary>研究附录：证据、复核与原始记录</summary>\n\n"
+    text += "<details><summary>研究附录：证据、复核与原始记录</summary>\n\n" + progress
+    text += "源码变化已检测；机制推断仍是模型解释；线上状态尚未核实。\n\n"
     if "iteration" in event:
         records_base = context_base.removesuffix("project-context") + "records"
         text += "每版完整候选稿、审核裁决和问题清单保存在[追加研究记录](" + records_base + ")的 version_research.iteration 中；这些是审计材料，不能作为已发布结论。\n\n"

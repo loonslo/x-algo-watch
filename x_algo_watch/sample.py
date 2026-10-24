@@ -70,6 +70,8 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
         user+='<h3>'+label+'</h3><p>'+esc(reader[field])+'</p>'
     user+='<p>摘要依据：'+refs(reader['evidence_refs'])+'</p><h2>具体调整与影响解读：模型原稿</h2>'
     for row in reader['impacts']:
+        if 'before' in row and 'after' in row:
+            user+='<p><strong>以前：</strong>'+esc(row['before'])+'</p><p><strong>现在的代码如何处理：</strong>'+esc(row['after'])+'</p>'
         user+='<section class="card"><h3>'+esc(row['heading'])+'</h3><p>'+esc(row['effect'])+'</p><p><strong>成立条件：</strong>'+esc(row['conditions'])+'</p><p><strong>不能下的结论：</strong>'+esc(row['limits'])+'</p>'+refs(row['evidence_refs'])+'</section>'
     user+='<h2>现在该怎么做</h2><p>'+esc(reader['action'])+'</p>'
     if reader['terms']:

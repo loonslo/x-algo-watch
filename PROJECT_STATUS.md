@@ -1,11 +1,12 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-24
-status: waiting
-overview: 只读监测 X 推荐算法公开源码变化，生成分级证据与面向创作者的算法版本更新公告。
-progress: 公告表达及修复已提交 GitHub，最新 CI 317 项通过并含真实历史回放；07d159b 经 V1–V4 修订达到三角色全部同意，通俗与技术页已生成。本次继续处理的 30 条新调用全部保存，正式速报仍未人工确认。
-next: 所有者阅读 07d159b 的 V4 公告并验收事实边界与可读性；其他历史研究、完整上下文覆盖及 24 小时定时可靠性独立待验收。
+status: active
+overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
+progress: 用户反馈 V4 不够直观；已修改用户影响优先流程、前后对比协议、全文标识校验及证据差集准备，GitHub 验证与真实样例待执行。旧稿和原审核历史保留。
+next: 执行 GitHub 回归及真实上游历史回放，核对新协议用户场景与证据覆盖后交付实际验证结果。
 evidence:
+  - docs/acceptance-user-impact.md
   - docs/acceptance-update-announcement.md
   - docs/samples/2026-10-24-update-announcement.md
   - docs/acceptance-branch-cleanup.md

@@ -39,7 +39,7 @@ def analysis(pack):
         "summary": "设置从默认关闭变为默认开启，来源实现也读取这一开关；若该路径运行，候选池构成可能改变。",
         "reader": {"title": "推荐帖子来源设置有变化", "what_changed": "增加了一路准备参与推荐的帖子。", "who": "可能涉及这一路找到的帖子作者。",
                    "when": "线上状态未知，需要线上采用新默认值并实际调用这一来源。", "online_status": "unverified", "action": "当前证据不足以支持调整发布策略。",
-                   "impacts": [{"heading": "部分帖子可能多一个参与推荐的入口", "effect": "新来源若运行，可能改变参与推荐的帖子集合。", "conditions": "线上打开且实际调用该来源。", "limits": "不能承诺最后展示或流量增加。", "evidence_refs": ["E1"]}],
+                   "impacts": [{"before": "此前这一来源的帖子不能经此入口参与推荐。", "after": "若来源开启并接入，帖子可以经此入口参与推荐。", "heading": "部分帖子可能多一个参与推荐的入口", "effect": "新来源若运行，可能改变参与推荐的帖子集合。", "conditions": "线上打开且实际调用该来源。", "limits": "不能承诺最后展示或流量增加。", "evidence_refs": ["E1"]}],
                    "terms": [], "evidence_refs": ["E1"]},
         "changes": [{"mechanism": "候选来源接入", "before": "来源开关默认关闭", "after": "默认开启，并存在读取它的实现", "evidence_refs": ["E1"]}],
         "hypotheses": [{"hypothesis": "新增来源中的内容可能获得参与排序的机会", "basis": "开关变开且来源代码读取它，候选入口可能放行", "confidence": "medium", "conditions": "线上使用该默认值并调用此来源", "alternative": "调用链可能没有实际接入这一来源", "verify": "检查候选流水线接入情况与线上参数", "creator_impact": "来源能覆盖的内容可能进入候选池，但不承诺最终被展示", "evidence_refs": ["E1"]}],
@@ -359,3 +359,28 @@ def test_explicit_target_can_rerun_previously_agreed_research(sample_repo, tmp_p
     assert pending_packs(working) == []
     manifest = write_bundle(tmp_path / "bundle", {}, working, test=False, code="uncommitted", result_code=0, research_only=pack["commit"])
     assert manifest["research"] == [pack["commit"]]
+
+
+def test_detection_summary_keeps_complete_long_list_deltas_without_raw_json_cut():
+    from x_algo_watch.project_evidence import detection_summary
+    before = ['RULE_' + str(i) for i in range(100)]
+    after = before[1:] + ['NEW_RULE']
+    record = {'findings': [{'category':'visibility', 'path':'rules.rs', 'name':'HOME', 'before':before, 'after':after}]}
+    row = detection_summary(record)['findings'][0]
+    assert row['added'] == ['NEW_RULE'] and row['removed'] == ['RULE_0']
+    assert row['before_count'] == row['after_count'] == 100
+    assert not row['order_changed']
+
+
+def test_latest_context_has_complete_rule_delta_and_does_not_prioritize_unrelated_video(upstream):
+    target = upstream.resolve('07d159b69109f069c85f84d39dd38e38adc040f0')
+    result = compare(upstream, upstream.parent(target), target, [], date(2026, 10, 24))
+    pack = project_pack(upstream, result.to_dict())
+    first = pack['evidence']['E1']
+    assert not first['truncated']
+    facts = json.loads(first['text'])['findings']
+    home = next(row for row in facts if row['name'] == 'TIMELINE_HOME_HYDRATION')
+    assert home['before_count'] == 91 and home['after_count'] == 93
+    assert home['added']
+    assert 'home-mixer/filters/video_carousel_filter.rs' not in pack['coverage']['complete_implementation_paths']
+    assert len(pack['coverage']['diff_files_included']) > 1

@@ -164,7 +164,9 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         status += "；检查未完成"
     text = f"# {filename(record)[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
     if research and ("analysis" in research or "iteration" in research):
-        text += "技术读者可直接查看[本版本技术解读](technical/" + filename(record) + ")，包含前后实现、调用条件、机制推断、替代解释、验证办法及复核证据。\n\n"
+        technical_navigation = "技术读者可直接查看[本版本技术解读](technical/" + filename(record) + ")，包含前后实现、调用条件、机制推断、替代解释、验证办法及复核证据。\n\n"
+    else:
+        technical_navigation = ""
     metadata = f"- 原速报解读状态：**{status}**\n- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
     metadata += f"- 检查级别：{inline(record['severity'])}；级别表示复核优先级，不代表流量影响大小。\n"
     metadata += f"- [查看原始提交]({UPSTREAM}/commit/{sha})"
@@ -180,6 +182,7 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         text += "## 30 秒摘要\n\n**这是起始基线，没有前一个版本可供比较，不属于待研究的算法迭代。**\n\n"
     elif not research:
         text += "## 30 秒摘要\n\n- 改了什么：" + overview(record) + "\n- 已经上线了吗：尚未核实部署。\n- 影响谁：模型研究尚未完成，不能准确判断。\n- 创作者现在要做什么：目前不据此调整发布策略，等待完整解读。\n\n"
+    text += technical_navigation
     if decision.get("outcome") == "rejected":
         text += "**先前解读已被所有者驳回，不能作为运营建议。以下仅保留源码变化与待核对问题。**\n\n"
     text += "<details><summary>检查历史与原始检测数据（普通读者可跳过）</summary>\n\n" + metadata
