@@ -151,14 +151,29 @@ def test_body_term_repairs_patch_only_reader_lists_and_preserve_technical_findin
     bad = analysis(pack)
     bad['reader']['impacts'][0]['after'] = 'TIMELINE_HOME_HYDRATION 发生变化'
     good = analysis(pack)['reader']['impacts']
-    patch = {'reader_patch': {'impacts': good}}
+    patch = {'reader_patch': {'impacts.0.after': good[0]['after']}}
     client = RecordedClient([bad, patch, review(pack), review(pack), review(pack)])
     outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
-    assert client.calls[1][2]['reader_repair_fields'] == ['impacts']
+    assert client.calls[1][2]['reader_repair_fields'] == ['impacts.0.after']
     assert any('（命中：TIMELINE_HOME_HYDRATION）' in error for error in client.calls[1][2]['previous_validation_errors'])
     assert '暂不能判断全部规则会怎样影响你' in client.calls[1][1]
     assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
     assert outputs[pack['item_id']]['analysis']['reader']['impacts'] == good
     assert len(client.calls) == 5 and outputs[pack['item_id']]['state'] == 'pending_confirmation'
-    assert set(reader_repair_schema(['impacts'])['properties']['reader_patch']['properties']) == {'impacts'}
+    assert set(reader_repair_schema(['impacts.0.after'])['properties']['reader_patch']['properties']) == {'impacts.0.after'}
     assert reader_repair_fields(['数字不在证据包：51'], bad) == []
+
+
+def test_sentence_patch_cannot_delete_other_impact_scenarios_or_change_evidence():
+    previous = {'reader': {'impacts': [
+        {'heading':'通知场景', 'limits':'原限制', 'evidence_refs':['E1']},
+        {'heading':'首页场景', 'limits':'材料被截断', 'evidence_refs':['E2']},
+        {'heading':'账号场景', 'limits':'另一个限制', 'evidence_refs':['E3']}]}}
+    patched = apply_reader_patch(previous, {'reader_patch':{'impacts.1.limits':'暂不能判断全部规则会怎样影响你。'}}, ['impacts.1.limits'])
+    assert len(patched['reader']['impacts']) == 3
+    assert patched['reader']['impacts'][0] == previous['reader']['impacts'][0]
+    assert patched['reader']['impacts'][2] == previous['reader']['impacts'][2]
+    assert patched['reader']['impacts'][1]['evidence_refs'] == ['E2']
+    assert previous['reader']['impacts'][1]['limits'] == '材料被截断'
+    assert apply_reader_patch(previous, {'reader_patch':{'impacts':[]}}, ['impacts.1.limits']) is None
+    assert apply_reader_patch(previous, {'reader_patch':{'impacts.1.evidence_refs':'E9'}}, ['impacts.1.evidence_refs']) is None

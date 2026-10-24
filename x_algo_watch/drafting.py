@@ -293,7 +293,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                         "只保留读者能感知的场景、前后处理及影响。内部日志、接口、采样比例已留在原技术层，不要重写进摘要。"
                         "when 只说明线上尚未核实和本项用户影响必需的条件，不列内部实验参数；不臆测默认关闭。"
                         "标题及四问合计目标不超过350字：标题30字、改动100字、对象70字、何时60字、行动80字以内。"
-                        "列表保留 before/after/effect/conditions/limits 和原证据。证据不足写用户能懂的边界，不编造行为。"
+                        "带点的键是精确句子路径，例如impacts.1.limits，只返回该键对应的新字符串，不返回列表。其他条目及证据由程序保留。证据不足写用户能懂的边界，不编造行为。"
                         "不要引入新数值或扩大结论；技术部分不在输出内。合并后完整校验并执行全部三角色审核。\n"
                         + json.dumps(reader_repair_schema(patch_fields), ensure_ascii=False)
                     )
