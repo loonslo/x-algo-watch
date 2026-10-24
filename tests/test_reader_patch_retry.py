@@ -140,3 +140,20 @@ def test_explicit_recovery_carries_invalid_draft_instead_of_starting_over(sample
     assert len(client.calls) == 4
     assert outputs[pack['item_id']]['state'] == 'pending_confirmation'
     assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
+
+
+def test_body_term_repairs_patch_only_reader_lists_and_preserve_technical_findings(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    bad = analysis(pack)
+    bad['reader']['impacts'][0]['after'] = 'TIMELINE_HOME_HYDRATION 发生变化'
+    good = analysis(pack)['reader']['impacts']
+    patch = {'reader_patch': {'impacts': good}}
+    client = RecordedClient([bad, patch, review(pack), review(pack), review(pack)])
+    outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
+    assert client.calls[1][2]['reader_repair_fields'] == ['impacts']
+    assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
+    assert outputs[pack['item_id']]['analysis']['reader']['impacts'] == good
+    assert len(client.calls) == 5 and outputs[pack['item_id']]['state'] == 'pending_confirmation'
+    assert set(reader_repair_schema(['impacts'])['properties']['reader_patch']['properties']) == {'impacts'}
+    assert reader_repair_fields(['数字不在证据包：51'], bad) == []

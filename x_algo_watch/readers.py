@@ -13,6 +13,7 @@ from .models import WatchError
 from .storage import public_text
 
 READER_FIELDS = {"title", "what_changed", "who", "when", "online_status", "action", "impacts", "terms", "evidence_refs"}
+REPAIRABLE_READER_FIELDS = ("title", "what_changed", "who", "when", "action", "impacts", "terms")
 SUMMARY_LIMITS = {"title": 80, "what_changed": 200, "who": 160, "when": 220, "action": 160}
 
 
@@ -26,25 +27,32 @@ def reader_repair_fields(errors: list[str], previous: Any) -> list[str]:
             fields.update(SUMMARY_LIMITS)
             continue
         match = re.fullmatch(r"(?:用户摘要含技术术语或代码标识，请移到技术分析：|用户阅读层 )(title|what_changed|who|when|action)(?: 无效)?", error)
-        if match is None:
+        if match is not None:
+            fields.add(match[1])
+            continue
+        body = re.fullmatch(r"用户正文含代码标识或研究过程，改写为用户体验：(title|what_changed|who|when|action|impacts\.\d+\.[a-z_]+|terms\.\d+\.[a-z_]+)", error)
+        if body is None:
             return []
-        fields.add(match[1])
-    return [key for key in SUMMARY_LIMITS if key in fields]
+        fields.add(body[1].split(".")[0])
+    return [key for key in REPAIRABLE_READER_FIELDS if key in fields]
 
 
 def reader_repair_schema(fields: list[str]) -> dict[str, Any]:
-    if not fields or len(set(fields)) != len(fields) or set(fields) - SUMMARY_LIMITS.keys():
+    if not fields or len(set(fields)) != len(fields) or set(fields) - set(REPAIRABLE_READER_FIELDS):
         raise WatchError("阅读层修补字段不合法")
+    from .research import research_schema
+    properties = research_schema()["properties"]["reader"]["properties"]
     patch = {"type": "object", "required": fields, "additionalProperties": False,
-             "properties": {key: {"type": "string", "minLength": 1, "maxLength": SUMMARY_LIMITS[key]} for key in fields}}
+             "properties": {key: properties[key] for key in fields}}
     return {"type": "object", "required": ["reader_patch"], "additionalProperties": False,
             "properties": {"reader_patch": patch}}
 
 
 def apply_reader_patch(previous: dict[str, Any], value: Any, fields: list[str]) -> dict[str, Any] | None:
-    if (not fields or set(fields) - SUMMARY_LIMITS.keys() or not isinstance(value, dict) or set(value) != {"reader_patch"}
+    if (not fields or set(fields) - set(REPAIRABLE_READER_FIELDS) or not isinstance(value, dict) or set(value) != {"reader_patch"}
             or not isinstance(value["reader_patch"], dict) or set(value["reader_patch"]) != set(fields)
-            or any(not isinstance(v, str) or not v.strip() or len(v) > SUMMARY_LIMITS[k] for k, v in value["reader_patch"].items())):
+            or any((not isinstance(v, str) or not v.strip() or len(v) > SUMMARY_LIMITS[k]) if k in SUMMARY_LIMITS
+                   else not isinstance(v, list) for k, v in value["reader_patch"].items())):
         return None
     result = deepcopy(previous)
     result["reader"].update(value["reader_patch"])
