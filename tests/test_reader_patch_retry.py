@@ -155,6 +155,8 @@ def test_body_term_repairs_patch_only_reader_lists_and_preserve_technical_findin
     client = RecordedClient([bad, patch, review(pack), review(pack), review(pack)])
     outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
     assert client.calls[1][2]['reader_repair_fields'] == ['impacts']
+    assert any('（命中：TIMELINE_HOME_HYDRATION）' in error for error in client.calls[1][2]['previous_validation_errors'])
+    assert '暂不能判断全部规则会怎样影响你' in client.calls[1][1]
     assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
     assert outputs[pack['item_id']]['analysis']['reader']['impacts'] == good
     assert len(client.calls) == 5 and outputs[pack['item_id']]['state'] == 'pending_confirmation'

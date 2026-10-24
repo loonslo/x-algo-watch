@@ -30,7 +30,7 @@ def reader_repair_fields(errors: list[str], previous: Any) -> list[str]:
         if match is not None:
             fields.add(match[1])
             continue
-        body = re.fullmatch(r"用户正文含代码标识或研究过程，改写为用户体验：(title|what_changed|who|when|action|impacts\.\d+\.[a-z_]+|terms\.\d+\.[a-z_]+)", error)
+        body = re.fullmatch(r"用户正文含代码标识或研究过程，改写为用户体验：(title|what_changed|who|when|action|impacts\.\d+\.[a-z_]+|terms\.\d+\.[a-z_]+)(?:（命中：[^）]+）)?", error)
         if body is None:
             return []
         fields.add(body[1].split(".")[0])
@@ -110,8 +110,11 @@ def validate_reader(reader: Any, evidence: dict[str, Any], *, user_impact: bool 
         errors.append("用户阅读层摘要引用无效")
     if user_impact:
         def check(text: Any, field: str) -> None:
-            if isinstance(text, str) and re.search(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|\b[A-Z]{3,}\b|Phoenix|VMRanker|水合|kill switch|\b(?:before|after|derived|truncated)\b|证据包|截断", text):
-                errors.append("用户正文含代码标识或研究过程，改写为用户体验：" + field)
+            if not isinstance(text, str):
+                return
+            match = re.search(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|(?:[A-Z][a-z0-9]+){2,}[A-Za-z0-9]*|\b[A-Z]{3,}\b|Phoenix|VMRanker|水合|kill switch|\b(?:before|after|derived|truncated)\b|证据包|截断", text)
+            if match:
+                errors.append("用户正文含代码标识或研究过程，改写为用户体验：" + field + "（命中：" + match[0][:120] + "）")
         for key in SUMMARY_LIMITS:
             if not any(error.endswith("：" + key) for error in errors):
                 check(reader.get(key), key)
