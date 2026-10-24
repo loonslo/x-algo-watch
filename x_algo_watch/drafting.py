@@ -322,7 +322,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                             event["normalizations"] = normalizations
                         errors = validate_research(value, pack, require_reader=True, user_impact=True)
                         safe_reader_errors = reader_repair_fields(errors, value)
-                        if not errors or (safe_reader_errors and all(isinstance(value["reader"][k], str) for k in safe_reader_errors)):
+                        if not errors or (safe_reader_errors and all("." in k or isinstance(value["reader"].get(k), str) for k in safe_reader_errors)):
                             failure_stage = "grounding_validation"
                             errors += validate_analysis(analysis_projection(value), pack, project_research=True)
                     else:
