@@ -243,7 +243,9 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     if not technical_only:
         text += "</details>\n\n"
     text += "<details><summary>研究附录：证据、复核与原始记录</summary>\n\n" + progress
-    text += "源码变化已检测；机制推断仍是模型解释；线上状态尚未核实。\n\n"
+    text += "源码变化已检测；模型推测，尚未人工确认；线上状态尚未核实。\n\n"
+    if disputed:
+        text += "复核存在分歧，用户正文待修订。\n\n"
     if "iteration" in event:
         records_base = context_base.removesuffix("project-context") + "records"
         text += "每版完整候选稿、审核裁决和问题清单保存在[追加研究记录](" + records_base + ")的 version_research.iteration 中；这些是审计材料，不能作为已发布结论。\n\n"
