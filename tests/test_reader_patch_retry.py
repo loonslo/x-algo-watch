@@ -149,13 +149,13 @@ def test_body_term_repairs_patch_only_reader_lists_and_preserve_technical_findin
     repo, result = prepare(sample_repo)
     pack = project_pack(repo, result.to_dict())
     bad = analysis(pack)
-    bad['reader']['impacts'][0]['after'] = 'TIMELINE_HOME_HYDRATION 发生变化'
+    bad['reader']['impacts'][0]['after'] = 'EnableExampleSource 发生变化'
     good = analysis(pack)['reader']['impacts']
     patch = {'reader_patch': {'impacts.0.after': good[0]['after']}}
     client = RecordedClient([bad, patch, review(pack), review(pack), review(pack)])
     outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
     assert client.calls[1][2]['reader_repair_fields'] == ['impacts.0.after']
-    assert any('（命中：TIMELINE_HOME_HYDRATION）' in error for error in client.calls[1][2]['previous_validation_errors'])
+    assert any('（命中：EnableExampleSource）' in error for error in client.calls[1][2]['previous_validation_errors'])
     assert '暂不能判断全部规则会怎样影响你' in client.calls[1][1]
     assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
     assert outputs[pack['item_id']]['analysis']['reader']['impacts'] == good
@@ -177,3 +177,15 @@ def test_sentence_patch_cannot_delete_other_impact_scenarios_or_change_evidence(
     assert previous['reader']['impacts'][1]['limits'] == '材料被截断'
     assert apply_reader_patch(previous, {'reader_patch':{'impacts':[]}}, ['impacts.1.limits']) is None
     assert apply_reader_patch(previous, {'reader_patch':{'impacts.1.evidence_refs':'E9'}}, ['impacts.1.evidence_refs']) is None
+
+
+def test_unknown_body_identifier_requires_full_grounded_correction(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    bad = analysis(pack)
+    bad['reader']['impacts'][0]['after'] = 'FabricatedUnknownModule 已改变'
+    client = RecordedClient([bad, analysis(pack), review(pack), review(pack), review(pack)])
+    outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
+    assert 'reader_repair_fields' not in client.calls[1][2]
+    assert '名字或路径不在证据包：FabricatedUnknownModule' in client.calls[1][2]['previous_validation_errors']
+    assert outputs[pack['item_id']]['state'] == 'pending_confirmation'
