@@ -122,3 +122,21 @@ def test_status_normalization_does_not_hide_other_identifiers_or_claims():
     assert edits
     wrong = {'reader': {'online_status': 'verified', 'when': 'online_status 为 unverified'}}
     assert normalize_reader_status(wrong) == (wrong, [])
+
+
+def test_explicit_recovery_carries_invalid_draft_instead_of_starting_over(sample_repo):
+    repo, result = prepare(sample_repo)
+    pack = project_pack(repo, result.to_dict())
+    bad = make_bad(pack)
+    _, prior = analyze_items([pack], [], RecordedClient([bad]), MODELS, NOW, PROMPTS,
+        daily_limit=1, project_research=True, extra_review_rounds=2,
+        iteration_context={'version':1, 'candidate':2, 'stage_epochs':{}})
+    client = RecordedClient([{'reader_patch':{'who':'可能涉及准备参与推荐的帖子作者。'}}, review(pack), review(pack), review(pack)])
+    outputs, calls = analyze_items([pack], prior, client, MODELS, NOW, PROMPTS,
+        project_research=True, extra_review_rounds=2,
+        iteration_context={'version':1, 'candidate':2, 'stage_epochs':{'analysis':1}})
+    assert client.calls[0][2]['previous_invalid_output'] == bad
+    assert client.calls[0][2]['reader_repair_fields'] == ['who']
+    assert len(client.calls) == 4
+    assert outputs[pack['item_id']]['state'] == 'pending_confirmation'
+    assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']

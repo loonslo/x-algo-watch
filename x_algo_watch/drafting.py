@@ -260,17 +260,24 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             invalid = [e for e in calls if e.get("outcome") == "invalid"]
             if len(invalid) >= 2:
                 state = "manual"; break
+            recovery_invalid = None
+            if iteration_context and iteration_context.get("stage_epochs", {}).get(stage, 0) > 0:
+                recovery_invalid = next((e for e in reversed(prior + events)
+                    if e.get("type") == "model_call" and e.get("item_id") == item_id
+                    and e.get("stage") == stage and e.get("outcome") == "invalid"
+                    and isinstance(e.get("output"), dict) and e.get("errors")), None)
             while len(invalid) < 2:
                 if used >= daily_limit or deferred_all or (call_deadline is not None and time.monotonic() >= call_deadline):
                     reason = "daily_budget" if used >= daily_limit else ("service" if deferred_all else "time_budget")
                     suspension = {"reason": reason, "stage": stage}
                     state = "pending"; break
-                errors = invalid[-1].get("errors", []) if invalid else []
+                previous_invalid = invalid[-1] if invalid else (recovery_invalid or {})
+                errors = previous_invalid.get("errors", [])
                 request_payload = {**payload, **({"previous_validation_errors": errors} if errors else {})}
-                if errors and isinstance(invalid[-1].get("output"), dict):
+                if errors and isinstance(previous_invalid.get("output"), dict):
                     # 已通过 public_text 扫描的上一稿只作为数据，换路由也能逐项纠错。
-                    request_payload["previous_invalid_output"] = invalid[-1]["output"]
-                patch_fields = reader_repair_fields(errors, invalid[-1].get("output")) if project_research and stage == "analysis" and errors else []
+                    request_payload["previous_invalid_output"] = previous_invalid["output"]
+                patch_fields = reader_repair_fields(errors, previous_invalid.get("output")) if project_research and stage == "analysis" and errors else []
                 request_prompt = prompt
                 if patch_fields:
                     request_payload["reader_repair_fields"] = patch_fields
@@ -293,7 +300,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                         value = None
                     failure_stage = "schema_validation"
                     if patch_fields:
-                        value = apply_reader_patch(invalid[-1]["output"], value, patch_fields)
+                        value = apply_reader_patch(previous_invalid["output"], value, patch_fields)
                     if project_research and stage == "analysis":
                         value, normalizations = normalize_reader_status(value)
                         if normalizations:
