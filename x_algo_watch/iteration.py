@@ -10,7 +10,7 @@ from .model_policy import MAX_DAILY_CALLS, review_stages
 from .models import WatchError
 
 PHASES = {
-    "ready": ("达到模型验收标准，待人工确认", "由所有者检查双页；正式速报仍须人工确认"),
+    "ready": ("达到模型验收标准，已通过复核", "正式速报由模型复核直接发布，不再要求所有者人工确认"),
     "waiting_service": ("接口暂未完成，等待续跑", "下次运行从失败阶段重试；不增加候选版本号"),
     "waiting_budget": ("当日调用预算不足", "UTC 次日预算恢复后，从缺少阶段继续"),
     "waiting_time": ("本次运行时间用完", "下次运行复用已完成阶段，继续当前候选"),
@@ -20,7 +20,7 @@ PHASES = {
 }
 PAUSED = {"waiting_manual", "paused_limit", "paused_stagnation"}
 REASONS = {"accepted": "全部模型审核同意", "service": "接口请求未完成", "service_retry_limit": "当前阶段累计三次接口失败", "invalid_output": "当前阶段两次输出校验失败", "daily_budget": "当日共享调用预算不足", "time_budget": "本次运行时间达到边界", "candidate_limit": "本批候选次数达到上限", "stagnation": "连续修订未解决可识别的重复问题"}
-NEXT_LABELS = {"analysis": "起草或修订", "review": "机制审核", "facts_review": "事实与遗漏审核", "reader_review": "普通读者理解审核", "confirmation": "所有者确认", "revision": "修订稿件", "manual": "人工处理"}
+NEXT_LABELS = {"analysis": "起草或修订", "review": "机制审核", "facts_review": "事实与遗漏审核", "reader_review": "普通读者理解审核", "confirmation": "模型复核直接发布", "revision": "修订稿件", "manual": "显式恢复处理"}
 RESULT_KEYS = {"state", "analysis", "review", "reviews", "extra_review_rounds", "resolved_models"}
 
 
@@ -40,7 +40,7 @@ def issue_ledger(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for candidate in history:
         result = candidate["result"]
         for row in ledger.values():
-            row["status"] = "not_repeated"  # 未再提出不等于人工确认或证实原意见正确。
+            row["status"] = "not_repeated"  # 未再提出不等于已完成复核或已确认原意见正确。
             row["checked_in"] = candidate["number"]
         for issue in result["review"]["issues"]:
             canonical = {"field": issue["field"], "reason": " ".join(issue["reason"].split()), "evidence_refs": sorted(set(issue["evidence_refs"]))}
@@ -181,7 +181,7 @@ def render_iteration(loop: dict[str, Any]) -> str:
         text += "| 候选版本 | 审核结果 | 问题数 |\n| --- | --- | --- |\n"
         for row in loop["history"]:
             result = row["result"]
-            text += f"| V{row['number']} | " + ("全部通过，尚未人工确认" if result["review"]["agree"] else "存在异议") + f" | {len(result['review']['issues'])} |\n"
+            text += f"| V{row['number']} | " + ("全部通过，已通过复核" if result["review"]["agree"] else "存在异议") + f" | {len(result['review']['issues'])} |\n"
         text += "\n"
     if open_issues:
         text += "<details><summary>未解决问题（供核对者处理）</summary>\n\n"

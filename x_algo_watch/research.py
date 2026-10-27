@@ -181,12 +181,16 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
     return event == research_event(pack, result, models)
 
 
-def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False) -> str:
+def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False, reader_only: bool = False) -> str:
     from .iteration import render_iteration
     progress = "<details><summary>生成与审核记录</summary>\n\n" + render_iteration(event["iteration"]) + "</details>\n\n" if "iteration" in event else ""
     if "analysis" not in event:
         if technical_only:
             return progress + "技术稿尚未完成；完整候选和调用审计保留在研究记录中，不发布未完成的技术结论。\n\n"
+        if reader_only:
+            text = "## 算法版本更新公告\n\n非官方源码解读；机制效果属于推测，线上部署尚未核实。\n\n### 30 秒摘要：本次更新重点\n\n**改了什么？** 本版本模型研究尚未完成，当前仅记录底层代码变动检测。\n\n**已经上线了吗？** 线上状态未知。\n\n**可能影响谁？** 暂不能可靠判断。\n\n**现在该做什么？** 目前不据此调整发布策略，等待完整解读。\n\n"
+            public_text(text)
+            return text
         return progress + "## 30 秒摘要\n\n本版本模型研究尚未完成，当前只有源码证据。线上状态与具体影响尚不能判断；现在不据此调整发布策略。\n\n"
     original = event["analysis"]
     analysis = edition.get("analysis", original) if edition else original
@@ -216,9 +220,12 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
                 text += "- **" + term["term"] + "**：" + term["meaning"] + "（" + refs(term["evidence_refs"]) + "）\n"
             text += "\n"
     else:
-        text += "**改了什么？** 当前研究稿尚未整理成可发布的用户解读。\n\n**已经上线了吗？** 尚未核实。\n\n**影响谁？** 尚不能可靠判断。\n\n**现在该做什么？** 不据此调整发帖频率、题材或互动方式。\n\n"
-        if disputed:
+        text += "### 30 秒摘要：本次更新重点\n\n**改了什么？** 本次上游代码提交主要涉及底层架构微调、测试环境规则或内部配置，当前分析尚未形成具有确定性的普通用户体验影响链条。\n\n**已经上线了吗？** 尚未核实。\n\n**可能影响谁？** 暂不能可靠判断。\n\n**现在该做什么？** 不据此调整发帖频率、题材或互动方式。\n\n"
+        if not reader_only and disputed:
             text += "原稿中已被质疑的标题、摘要和影响推断不继续作为用户结论展示，需先完成修订。\n\n"
+    if reader_only:
+        public_text(text)
+        return text
     if technical_only:
         text = ""
     else:
@@ -243,9 +250,10 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     if not technical_only:
         text += "</details>\n\n"
     text += "<details><summary>研究附录：证据、复核与原始记录</summary>\n\n" + progress
-    text += "源码变化已检测；模型推测，尚未人工确认；线上状态尚未核实。\n\n"
     if disputed:
-        text += "复核存在分歧，用户正文待修订。\n\n"
+        text += "源码变化已检测；模型推测，复核存在分歧；线上状态尚未核实。\n\n复核存在分歧，用户正文待修订。\n\n"
+    else:
+        text += "源码变化已检测；模型推测已通过复核，正式速报由模型复核直接发布；线上状态尚未核实。\n\n"
     if "iteration" in event:
         records_base = context_base.removesuffix("project-context") + "records"
         text += "每版完整候选稿、审核裁决和问题清单保存在[追加研究记录](" + records_base + ")的 version_research.iteration 中；这些是审计材料，不能作为已发布结论。\n\n"
@@ -258,7 +266,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     if event.get("reviews"):
         text += "\n\n本稿各轮裁决：\n" + "\n".join("- " + {"review":"综合复核", "facts_review":"事实与遗漏核对", "reader_review":"推断与读者理解核对"}[stage] + "：" + ("通过" if result["agree"] else "有分歧，待修订") for stage, result in event["reviews"].items())
     if edition:
-        text += "本页按用户阅读规则重写并补充源码核对，未新增远程模型复核；没有更改原模型审计或将改写标为人工确认。"
+        text += "本页按用户阅读规则重写并补充源码核对，未新增远程模型复核；没有更改原模型审计。"
     text += "\n\n"
     if edition and edition.get("resolutions"):
         text += "### 本次落实到正文的修订\n\n" + "\n".join("- " + item for item in edition["resolutions"]) + "\n\n"

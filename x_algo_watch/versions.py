@@ -162,9 +162,11 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     status = {"confirmed": "已人工确认", "rejected": "解读已驳回"}.get(decision.get("outcome"), "未人工确认")
     if not record["complete"]:
         status += "；检查未完成"
-    text = f"# {filename(record)[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
+    name = filename(record)
+    text = f"# {name[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
+    technical_link = f"technical/{name}"
     if research and ("analysis" in research or "iteration" in research):
-        technical_navigation = "技术读者可直接查看[本版本技术解读](technical/" + filename(record) + ")，包含前后实现、调用条件、机制推断、替代解释、验证办法及复核证据。\n\n"
+        technical_navigation = f"> 💡 **专业读者导航**：关于本版本的算法架构机制、代码行号与可验证假设，请查看 [本版本技术解读专页]({technical_link})。\n\n"
     else:
         technical_navigation = ""
     metadata = f"- 原速报解读状态：**{status}**\n- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
@@ -175,11 +177,21 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     month = datetime.fromisoformat(record["checked_at"]).astimezone(timezone.utc).strftime("%Y-%m")
     metadata += f" · [完整检查记录](../data/records/{month}.md)\n\n"
     if research and not (confirmed and decision.get("research_id") == research.get("id")):
-        text += render_research(research, edition=edition)
+        text += render_research(research, edition=edition, reader_only=True)
+        if confirmed:
+            text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
+        text += technical_navigation
+        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
+        return text
     elif research and confirmed:
         text += confirmed.strip() + "\n\n"
+        text += technical_navigation
+        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
+        return text
     elif not research and not record.get("base"):
         text += "## 30 秒摘要\n\n**这是起始基线，没有前一个版本可供比较，不属于待研究的算法迭代。**\n\n"
+        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
+        return text
     elif not research:
         text += "## 30 秒摘要\n\n- 改了什么：" + overview(record) + "\n- 已经上线了吗：尚未核实部署。\n- 影响谁：模型研究尚未完成，不能准确判断。\n- 创作者现在要做什么：目前不据此调整发布策略，等待完整解读。\n\n"
     text += technical_navigation
@@ -241,8 +253,6 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
             result = event["result"]
             text += f"- {inline(event['created_at'])}：登记重核级别 {inline(result['severity'])}，{'完整' if result['complete'] else '未完成'}；这是同一源码版本的依据核对，不是一次新的算法迭代。\n"
         text += "\n"
-    text += "<details><summary>技术证据：逐项旧值、新值与历史检查提示</summary>\n\n"
-    text += "历史检查提示只代表当时的登记状态；当前是否已登记请另查登记表。\n\n<pre>" + html.escape(json.dumps(record["findings"], ensure_ascii=False, indent=2)) + "</pre>\n</details>\n"
     text += "\n</details>\n"
     return text
 
@@ -266,7 +276,7 @@ def build_versions(root: Path) -> int:
     pages: dict[str, str] = {}
     index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [怎么读这些文档](../docs/how-to-read.md) · [已确认速报汇总](../digest.md)\n\n"
     index += "面向普通创作者与运营：先读每版的“30 秒摘要：本次更新重点”和“具体调整与影响解读”，了解改了什么、是否上线、可能影响谁、现在该做什么。技术分析、证据和历史记录折叠在页面末尾。每个上游提交一份独立文件，按提交时间从新到旧排列。\n\n"
-    index += "标为“待模型研究”的版本只有源码证据，不算已经完成解读。模型推测可以在人工确认前阅读，但不会被写成平台已部署的事实；正式速报仍由所有者确认。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
+    index += "标为“待模型研究”的版本只有源码证据，不算已经完成解读。模型推测可以在复核完成前阅读，但不会被写成平台已部署的事实；正式速报由模型复核直接发布，不再要求所有者人工确认。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
     index += "| 版本（UTC 日期） | 一句话变化 | 解读状态 | 核对级别 |\n| --- | --- | --- | --- |\n"
     for record in records:
         name = filename(record)
@@ -283,13 +293,14 @@ def build_versions(root: Path) -> int:
         if latest.get("id") != (research or {}).get("id") and "iteration" in latest:
             from .iteration import render_iteration
             progress = "以下是新版修订进度；正文保留上一份完整研究。\n\n" + render_iteration(latest["iteration"])
-            pages[name] = progress + pages[name]
+            user_notice = f"> 💡 **版本修订提示**：本版本有正在进行中的新一轮机制推断与复核，当前正文展示已通过复核的上一版解读。详细审核进度见 [技术专页](technical/{name})。\n\n"
+            pages[name] = user_notice + pages[name]
         if research and ("analysis" in research or "iteration" in research):
             technical = f"# {name[:10]} · {record['commit'][:7]} · 技术解读\n\n[返回通俗解读](../{name}) · [全部版本](../README.md) · [阅读说明](../../docs/how-to-read.md)\n\n"
             technical += "本页与通俗页来自同一份研究及复核记录；源码变化与条件性推断不等于线上部署。\n\n"
             technical += progress + render_research(research, context_base="../../data/project-context", edition=edition, technical_only=True)
             pages["technical/" + name] = technical
-        status = {"pending": "模型研究待续写", "manual": "模型研究需人工", "disputed": "模型复核有分歧", "pending_confirmation": "模型推测·未人工确认"}.get((research or {}).get("state"), "待模型研究")
+        status = {"pending": "模型研究待续写", "manual": "模型研究待续写", "disputed": "模型复核有分歧", "pending_confirmation": "模型推测已通过复核"}.get((research or {}).get("state"), "待模型研究")
         if research and latest_research.get(record["commit"], {}).get("id") != research.get("id"):
             status += "；新版待续写，当前页保留上一份研究及修订说明"
         if "iteration" in latest:

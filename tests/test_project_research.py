@@ -100,7 +100,7 @@ def test_project_review_disagreement_is_visible_and_never_confirmed(sample_repo)
     outputs, _ = analyze_items([pack], [], RecordedClient([analysis(pack), review(pack, False)]), MODELS, NOW, PROMPTS, project_research=True)
     event = research_event(pack, outputs[pack["item_id"]], MODELS)
     text = render_research(event)
-    assert "复核存在分歧" in text and "尚未人工确认" in text
+    assert "复核存在分歧" in text
     assert "用户正文待修订" in text and "旧研究稿原文" in text and "模型实际读取的完整证据包" in text
     assert "新增来源中的内容可能获得参与排序的机会" not in text.split("研究附录：")[0]
 
@@ -126,8 +126,10 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     client = FakeGitHub()
     publish(bundle, client, draft_bundle=output, push=False)
     page = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
-    assert "算法版本更新公告" in page and "成立条件" in page and "另一种解释" in page
-    assert "模型推测，尚未人工确认" in page and "推荐帖子来源设置有变化" in page
+    tech_page = (workspace / "versions/technical" / filename(result.to_dict())).read_text(encoding="utf-8")
+    assert "算法版本更新公告" in page and "推荐帖子来源设置有变化" in page
+    assert "成立条件" in tech_page and "另一种解释" in tech_page
+    assert "未人工确认" in page
     assert not client.rows and not (workspace / "digest.md").exists()
     assert pending_packs(workspace / "data") == []
     assert len(model.calls) == 2

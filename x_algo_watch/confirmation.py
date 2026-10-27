@@ -77,6 +77,8 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
         date = now.astimezone(SHANGHAI).date().isoformat()
         text = text.replace("未经确认的草稿", "仓库所有者已确认的速报")
         text = text.replace("模型推测，尚未人工确认", "模型解读，已获所有者人工确认")
+        text = text.replace("模型推测已通过复核，正式速报由模型复核直接发布", "模型解读，已获所有者人工确认")
+        text = text.replace("模型推测已通过复核", "模型解读，已获所有者人工确认")
         text = re.sub(rf"(?m)^(### [^\n]+ · {commit[:7]} · )源码变化待人工确认$", r"\g<1>源码变化已人工确认", text)
         text = text.replace("仍须仓库所有者人工确认。", "仓库所有者已人工确认。")
         text = text.replace("- 确认：待仓库所有者编辑核对并打标签。", "- 确认：" + date)

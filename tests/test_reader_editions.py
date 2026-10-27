@@ -207,10 +207,11 @@ def test_future_version_generates_reader_then_review_repairs_it_without_editoria
     publish(bundle,FakeGitHub(),draft_bundle=output,push=False)
     assert len(model.calls)==4 and not (workspace/'editorial').exists()
     page=next((workspace/'versions').glob('20*.md')).read_text(encoding='utf-8')
-    front=page.split('<details><summary>技术分析')[0]
+    tech_page=next((workspace/'versions/technical').glob('20*.md')).read_text(encoding='utf-8')
+    front=page.split('> 💡 **专业读者导航**')[0]
     assert fixed['reader']['who'] in front and bad['reader']['who'] not in front
     assert all(label in front for label in ('30 秒摘要','改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
-    assert '影响解读' in front and '研究附录：' in page
+    assert '影响解读' in front and '研究附录：' in tech_page
 
 
 def test_announcement_keeps_same_evidence_and_action_after_adjustments(sample_repo):
