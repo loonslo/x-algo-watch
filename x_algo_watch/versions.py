@@ -176,8 +176,16 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         metadata += f" · [对比前后代码]({UPSTREAM}/compare/{record['base']}...{sha})"
     month = datetime.fromisoformat(record["checked_at"]).astimezone(timezone.utc).strftime("%Y-%m")
     metadata += f" · [完整检查记录](../data/records/{month}.md)\n\n"
-    if research and not (confirmed and decision.get("research_id") == research.get("id")):
+    if research and "analysis" in research and not (confirmed and decision.get("research_id") == research.get("id")):
         text += render_research(research, edition=edition, reader_only=True)
+        if confirmed:
+            text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
+        text += technical_navigation
+        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
+        return text
+    elif research and "analysis" not in research and not (confirmed and decision.get("research_id") == research.get("id")):
+        text += render_research(research, edition=edition, reader_only=True)
+        text += f"### 本次检测代码变动概况（程序检测事实）\n\n- **代码变动摘要**：{overview(record)}\n- **复核优先级**：{inline(record['severity'])}（表示代码核对优先级，不代表实际流量影响）\n\n"
         if confirmed:
             text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
         text += technical_navigation
