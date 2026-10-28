@@ -48,6 +48,8 @@ Windows / Python 3.14.0：
 
 ## 授权前只读预检
 
+本次授权执行结果：修复提交 446543b 的远程 CI 40654664302 成功，Ubuntu / Python 3.14.8 为 423 passed in 287.32s；DRAFT_ENABLED 已恢复 true。指定 6258a15 的工作流 40655338957 的 detect、draft、publish 全部成功，自动记录提交 e600778 已回读。实际新增两次机制调用，均未通过结构/精确引用校验，状态 waiting_manual / invalid_output；用户页保持失败暂停，未产生新审核通过正文。下一步需处理真实输出的片段去向重复和源码引文不精确问题后显式恢复；本次未再次触发研究。
+
 2026-10-28 用户已授权 commit/push 及一轮 Actions。候选 5c0af9b 已推送 main；CI 40654152474 为 396 passed、27 failed，原因为模拟调用继承 Actions 宿主身份，触发生产预算防护。测试夹具现隔离宿主身份，预算专项仍显式注入 GitHub 身份测试防护；模拟 Actions 环境的相关 35 项通过。远程复验及一轮研究待执行。
 
 2026-10-28 07:46:59 UTC 对目标仓库只读核对：DRAFT_ENABLED 当前为 true；Actions 的 queued 与 in_progress 查询均为空；最新一次定时检查 run 40614893384 于 01:24:49 UTC 成功。该快照不构成操作授权，也不是远程状态锁；获得授权后，修改变量或推送前须再次读取 main、变量和活动工作流状态。
