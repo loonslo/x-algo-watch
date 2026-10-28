@@ -8,6 +8,13 @@ from x_algo_watch.git import Repository
 from x_algo_watch.parsers import REQUIRED_LEVELS
 
 
+@pytest.fixture(autouse=True)
+def isolated_github_identity(monkeypatch):
+    """模拟调用使用测试声明的身份，不继承承载 pytest 的 Actions 身份。"""
+    for name in ("GITHUB_ACTIONS", "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def pytest_addoption(parser):
     parser.addoption("--upstream-repo", default=os.environ.get("X_ALGO_UPSTREAM"), help="历史回放用的只读上游 Git 副本")
 

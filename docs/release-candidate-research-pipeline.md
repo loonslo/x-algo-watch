@@ -48,4 +48,6 @@ Windows / Python 3.14.0：
 
 ## 授权前只读预检
 
+2026-10-28 用户已授权 commit/push 及一轮 Actions。候选 5c0af9b 已推送 main；CI 40654152474 为 396 passed、27 failed，原因为模拟调用继承 Actions 宿主身份，触发生产预算防护。测试夹具现隔离宿主身份，预算专项仍显式注入 GitHub 身份测试防护；模拟 Actions 环境的相关 35 项通过。远程复验及一轮研究待执行。
+
 2026-10-28 07:46:59 UTC 对目标仓库只读核对：DRAFT_ENABLED 当前为 true；Actions 的 queued 与 in_progress 查询均为空；最新一次定时检查 run 40614893384 于 01:24:49 UTC 成功。该快照不构成操作授权，也不是远程状态锁；获得授权后，修改变量或推送前须再次读取 main、变量和活动工作流状态。

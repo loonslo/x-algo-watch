@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-28
-status: waiting
+status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 本地研究主链、共享预算和超大补证归并已实现；基于最新 main 的独立候选完成 Windows 421 项全量回归、末端边界 54 项检查，并在 WSL Ubuntu/Python 3.14.4 完成 423 项 Linux 全量回归。2026-10-28 07:46:59 UTC 只读预检见发布候选记录：DRAFT_ENABLED=true，Actions queued/in_progress 均为空，最近定时检查成功。原工作区修改保留，data/registry 未覆盖；尚未执行新模型、推送或远程 CI。
-next: 等待对 loonslo/x-algo-watch 的 main、DRAFT_ENABLED 变量及两个精确试点工作流的远程授权；获授权后，操作前重查远程状态，再执行 Linux CI、预算恢复验证、真实模型与读者验收，最后决定历史扩展。
+next: 用户已授权推送及一轮 Actions；候选已推送，首次远程 CI 暴露测试宿主身份污染，相关修复 35 项通过，继续远程复验后运行一轮 6258a15 研究，核对真实结果。
 evidence:
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md
