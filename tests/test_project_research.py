@@ -113,7 +113,7 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     shutil.copytree(PROMPTS, workspace / "prompts")
     config = workspace / "config/watch.yaml"
     config.parent.mkdir()
-    config.write_text(yaml.safe_dump({"models": MODELS, "daily_calls": 50, "project_research": True}), encoding="utf-8")
+    config.write_text(yaml.safe_dump({"models": MODELS, "daily_calls": 50, "project_research": True, "extra_review_rounds": 2}), encoding="utf-8")
     RecordStore(Path("data")).append(result, NOW, "uncommitted")
     bundle = workspace / "bundle"
     manifest = detect(bundle, source=repo.path, research_commit=result.commit)
@@ -121,7 +121,7 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     assert RecordStore(bundle / "data").last_success() == result.commit
     pack = context_packs(bundle / "data")[0]
     output = workspace / "draft.json"
-    model = RecordedClient([analysis(pack), review(pack)])
+    model = RecordedClient([analysis(pack), review(pack), review(pack), review(pack)])
     run(bundle, output, config, client=model)
     client = FakeGitHub()
     publish(bundle, client, draft_bundle=output, push=False)
@@ -132,7 +132,7 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     assert "未人工确认" in page
     assert not client.rows and not (workspace / "digest.md").exists()
     assert pending_packs(workspace / "data") == []
-    assert len(model.calls) == 2
+    assert len(model.calls) == 4
     assert RecordStore(Path("data")).last_success() == result.commit
     payload = json.loads(output.read_text(encoding="utf-8"))
     # 可以直接读未确认推测；正式速报仍须单独的所有者确认。

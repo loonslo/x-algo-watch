@@ -236,7 +236,17 @@ def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
                 ((e.get("state") == "pending_confirmation" and e.get("profile_hash") in {profile, *compatible}) or
                  (e.get("profile_hash") == profile and (e.get("iteration", {}).get("phase") in {"waiting_manual", "paused_limit", "paused_stagnation"} or
                   ("iteration" not in e and (e.get("state") == "manual" or (e.get("state") == "disputed" and e.get("repair_attempted")))))))}
-    return [p for p in context_packs(data) if p["item_id"] not in finished][:limit]
+    if any(e.get("pipeline_protocol") == "mechanisms-v1" for e in latest.values()):
+        from .mechanism_pipeline import pipeline_profile
+        current_profile = pipeline_profile(Path("prompts"))
+        finished.update(e.get("item_id") for e in latest.values() if e.get("pipeline_protocol") == "mechanisms-v1"
+                        and e.get("pipeline_profile") == current_profile
+                        and e.get("iteration", {}).get("phase") in {"waiting_manual", "paused_limit", "paused_stagnation"})
+    packs = context_packs(data)
+    if (settings or {}).get("mechanism_pilot_only") is True:
+        from .pipeline_context import pilot_enabled
+        packs = [p for p in packs if pilot_enabled(settings, p["commit"]) and p.get("research_pipeline") == "mechanisms-v1"]
+    return [p for p in packs if p["item_id"] not in finished][:limit]
 
 
 def research_profile() -> str:

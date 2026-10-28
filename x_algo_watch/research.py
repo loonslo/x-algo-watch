@@ -2,6 +2,7 @@
 
 import html
 import json
+from pathlib import Path
 from typing import Any
 
 from .evidence import digest
@@ -9,6 +10,7 @@ from .storage import public_text
 from .project_evidence import research_profile
 from .readers import SUMMARY_LIMITS, evidence_links, validate_reader
 from .model_policy import aggregate_reviews, free_model, review_mode, review_stages
+from .publication import publication_status, render_unpublished
 
 LEGACY_RESEARCH_FIELDS = {"item_id", "title", "summary", "changes", "hypotheses", "no_hypothesis_reason", "questions"}
 RESEARCH_FIELDS = LEGACY_RESEARCH_FIELDS | {"reader"}
@@ -181,16 +183,18 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
     return event == research_event(pack, result, models)
 
 
-def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False, reader_only: bool = False) -> str:
+def render_research(event: dict[str, Any], context_base: str = "../data/project-context", edition: dict[str, Any] | None = None, *, technical_only: bool = False, reader_only: bool = False, check_complete: bool = True, data_root: Path | None = None) -> str:
+    if event.get("pipeline_protocol") == "mechanisms-v1":
+        from .pipeline_views import render_pipeline
+        return render_pipeline(event, context_base, technical_only=technical_only, check_complete=check_complete, data_root=data_root)
     from .iteration import render_iteration
+    status = publication_status(event, complete=check_complete)
+    if reader_only and (not status["publishable"] or not (edition or event.get("analysis", {}).get("reader"))):
+        return render_unpublished(event, complete=check_complete)
     progress = "<details><summary>生成与审核记录</summary>\n\n" + render_iteration(event["iteration"]) + "</details>\n\n" if "iteration" in event else ""
     if "analysis" not in event:
         if technical_only:
-            return progress + "技术稿尚未完成；完整候选和调用审计保留在研究记录中，不发布未完成的技术结论。\n\n"
-        if reader_only:
-            text = "## 版本解读状态\n\n> ⏳ **通俗机制解读尚未就绪（模型排队或处理中）**\n>\n> 本版本上游代码变动已由系统捕获归档，针对创作者的通俗机制解读与多模型交叉复核正在排队处理中，尚未发布正式版本更新公告。\n\n### 创作者当前建议\n\n当前无需针对此版本调整发帖策略、发布频次或内容选题；如需了解最新已通过复核的机制变化，请查阅最近已发布的算法更新公告。\n\n"
-            public_text(text)
-            return text
+            return render_unpublished(event, complete=check_complete) + progress + "技术稿尚未完成；完整候选和调用审计保留在研究记录中，不发布未完成的技术结论。\n\n"
         return progress + "## 30 秒摘要\n\n本版本模型研究尚未完成，当前只有源码证据。线上状态与具体影响尚不能判断；现在不据此调整发布策略。\n\n"
     original = event["analysis"]
     analysis = edition.get("analysis", original) if edition else original
@@ -198,8 +202,9 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     sources = {**event["sources"], **(edition.get("supplementary_evidence", {}) if edition else {})}
     context_url = f"{context_base}/{event['commit']}-{event['item_id']}.json"
     refs = lambda values: evidence_links(values, sources, context_url)
-    reader = edition["reader"] if edition else (analysis.get("reader") if not disputed else None)
-    text = "## 算法版本更新公告\n\n非官方源码解读；机制效果属于推测，线上部署尚未核实。\n\n"
+    # 迁移稿只在技术审计中保留；其文案未参加原稿三角色复核。
+    reader = original.get("reader") if status["publishable"] else None
+    text = "## 算法版本更新公告\n\n非官方源码解读；机制推测尚未人工确认，正式 digest 仍需所有者确认；线上部署尚未核实。\n\n"
     if reader:
         text += "### " + reader["title"] + "\n\n### 30 秒摘要：本次更新重点\n\n"
         for field, label in (("what_changed", "改了什么？"), ("when", "已经上线了吗？何时可能生效？"), ("who", "可能影响谁？")):
@@ -220,14 +225,14 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
                 text += "- **" + term["term"] + "**：" + term["meaning"] + "（" + refs(term["evidence_refs"]) + "）\n"
             text += "\n"
     else:
-        text += "### 30 秒摘要：本次更新重点\n\n**改了什么？** 本次上游代码提交主要涉及底层架构微调、测试环境规则或内部配置，当前分析尚未形成具有确定性的普通用户体验影响链条。\n\n**已经上线了吗？** 尚未核实。\n\n**可能影响谁？** 暂不能可靠判断。\n\n**现在该做什么？** 不据此调整发帖频率、题材或互动方式。\n\n"
+        text = render_unpublished(event, complete=check_complete)
         if not reader_only and disputed:
             text += "原稿中已被质疑的标题、摘要和影响推断不继续作为用户结论展示，需先完成修订。\n\n"
     if reader_only:
         public_text(text)
         return text
     if technical_only:
-        text = ""
+        text = "" if status["publishable"] else render_unpublished(event, complete=check_complete) + "以下内容仅为历史候选及补充核对的审计，不作为当前已通过结论。\n\n"
     else:
         text += "<details><summary>技术分析（普通读者可跳过）</summary>\n\n"
     if not disputed or edition:
@@ -253,7 +258,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     if disputed:
         text += "源码变化已检测；模型推测，复核存在分歧；线上状态尚未核实。\n\n复核存在分歧，用户正文待修订。\n\n"
     else:
-        text += "源码变化已检测；模型推测已通过复核，正式速报由模型复核直接发布；线上状态尚未核实。\n\n"
+        text += "源码变化已检测；原模型裁决同意，具体审核范围见各轮记录；机制推测尚未人工确认，正式 digest 仍需所有者确认；线上状态尚未核实。\n\n"
     if "iteration" in event:
         records_base = context_base.removesuffix("project-context") + "records"
         text += "每版完整候选稿、审核裁决和问题清单保存在[追加研究记录](" + records_base + ")的 version_research.iteration 中；这些是审计材料，不能作为已发布结论。\n\n"

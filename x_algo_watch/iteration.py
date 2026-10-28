@@ -10,7 +10,11 @@ from .model_policy import MAX_DAILY_CALLS, review_stages
 from .models import WatchError
 
 PHASES = {
-    "ready": ("达到模型验收标准，已通过复核", "正式速报由模型复核直接发布，不再要求所有者人工确认"),
+    "researching": ("正在研究与复核", "已保存的调用从缺少阶段继续；未通过不得发布正文"),
+    "waiting_evidence": ("证据不足，等待 Git 补证", "检测阶段读取精确版本并保存新快照后恢复研究"),
+    "waiting_reader": ("机制复核已完成，等待读者稿阶段", "继续读者稿生成与三角色审核；当前不发布用户结论"),
+    "insufficient_scope": ("当前机制证据不足以形成用户结论", "补充有依据的机制判断后继续，不强行生成建议"),
+    "ready": ("达到模型验收标准，已通过复核", "机制推测可以展示；正式 digest 仍需所有者人工确认"),
     "waiting_service": ("接口暂未完成，等待续跑", "下次运行从失败阶段重试；不增加候选版本号"),
     "waiting_budget": ("当日调用预算不足", "UTC 次日预算恢复后，从缺少阶段继续"),
     "waiting_time": ("本次运行时间用完", "下次运行复用已完成阶段，继续当前候选"),
@@ -20,7 +24,11 @@ PHASES = {
 }
 PAUSED = {"waiting_manual", "paused_limit", "paused_stagnation"}
 REASONS = {"accepted": "全部模型审核同意", "service": "接口请求未完成", "service_retry_limit": "当前阶段累计三次接口失败", "invalid_output": "当前阶段两次输出校验失败", "daily_budget": "当日共享调用预算不足", "time_budget": "本次运行时间达到边界", "candidate_limit": "本批候选次数达到上限", "stagnation": "连续修订未解决可识别的重复问题"}
-NEXT_LABELS = {"analysis": "起草或修订", "review": "机制审核", "facts_review": "事实与遗漏审核", "reader_review": "普通读者理解审核", "confirmation": "模型复核直接发布", "revision": "修订稿件", "manual": "显式恢复处理"}
+REASONS.update(evidence_gap="审核要求补充具体源码证据", reader_stage_pending="尚缺读者稿及其复核")
+REASONS.update(no_supported_claims="已研究材料尚无足够支持的结论", synthesis_budget="综合所需上下文超出当前边界，需进一步拆分")
+REASONS.update(in_progress="正在执行当前研究阶段")
+REASONS.update(unprepared_file="仍有变化文件缺少可研究的必要任务")
+NEXT_LABELS = {"analysis": "起草或修订", "review": "机制审核", "facts_review": "事实与遗漏审核", "reader_review": "普通读者理解审核", "confirmation": "等待所有者确认正式速报", "revision": "修订稿件", "manual": "显式恢复处理"}
 RESULT_KEYS = {"state", "analysis", "review", "reviews", "extra_review_rounds", "resolved_models"}
 
 
@@ -78,7 +86,7 @@ def validate_iteration(value: Any, pack: dict[str, Any], models: dict[str, str],
     if not isinstance(history, list) or len(history) > 500 or not isinstance(value["phase"], str) or value["phase"] not in PHASES:
         return False
     expected = {"ready": {"accepted"}, "waiting_service": {"service"}, "waiting_budget": {"daily_budget"}, "waiting_time": {"time_budget"}, "waiting_manual": {"service_retry_limit", "invalid_output"}, "paused_limit": {"candidate_limit"}, "paused_stagnation": {"stagnation"}}
-    if not isinstance(value["reason"], str) or value["reason"] not in expected[value["phase"]]:
+    if value["phase"] not in expected or not isinstance(value["reason"], str) or value["reason"] not in expected[value["phase"]]:
         return False
     if any(type(value[key]) is not int for key in ("candidate", "resume_count", "batch_start")) or value["resume_count"] < 0 or not 1 <= value["batch_start"] <= len(history) + 1:
         return False

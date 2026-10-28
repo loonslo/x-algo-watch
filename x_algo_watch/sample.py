@@ -55,7 +55,7 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
     names={'review':'综合复核','facts_review':'事实与遗漏核对','reader_review':'推断与读者理解核对'}
     agreed=sum(r['agree'] for r in event['reviews'].values())
     status='三轮完成：'+str(agreed)+' 轮同意，'+str(3-agreed)+' 轮不同意'
-    notice='以下是实际模型原稿，已通过模型复核，正式速报由模型复核直接发布。' if agreed==3 else '本轮存在未解决分歧，暂不可作为可发布结论。以下保留实际模型原稿，供所有者检查；没有人工改写。'
+    notice='以下是实际模型原稿，已通过模型复核，机制推测尚未人工确认，正式 digest 仍需所有者确认。' if agreed==3 else '本轮存在未解决分歧，暂不可作为可发布结论。以下保留实际模型原稿，供所有者检查；没有人工改写。'
     css='body{margin:0;background:#f5f6f8;color:#20252b;font:17px/1.85 system-ui,"Microsoft YaHei",sans-serif}main{max-width:920px;margin:32px auto;padding:32px;background:white;border-radius:14px}h1{font-size:28px;line-height:1.5}h2{margin-top:32px;font-size:23px}h3{font-size:19px}a{color:#185dc3}nav{display:flex;gap:20px;flex-wrap:wrap}.notice{background:#fff0ec;border-left:5px solid #c64020;padding:18px;margin:24px 0}.meta{color:#555;font-size:14px}.card{border:1px solid #ddd;border-radius:8px;padding:18px;margin:16px 0}code{overflow-wrap:anywhere}details{margin:20px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #ddd;padding:12px;text-align:left}@media(max-width:650px){main{margin:0;padding:20px}body{font-size:16px}}'
     audit='<table><tr><th>核对角色</th><th>实际裁决</th><th>问题数</th></tr>'
     for stage,review in event['reviews'].items():
@@ -78,7 +78,7 @@ def write_owner_preview(event: dict, pack: dict, output: Path) -> None:
         user+='<details><summary>原稿的术语解释（可检查是否易懂）</summary>'
         for row in reader['terms']:user+='<p><strong>'+esc(row['term'])+'</strong>：'+esc(row['meaning'])+' '+refs(row['evidence_refs'])+'</p>'
         user+='</details>'
-    user+='<p class="meta">本地审阅稿已通过模型复核，正式速报由模型复核直接发布，不再要求所有者人工确认。三轮具体意见与源码证据见技术审阅页。</p>'
+    user+='<p class="meta">本地审阅稿已通过模型复核，机制推测尚未人工确认，正式 digest 仍需所有者确认。三轮具体意见与源码证据见技术审阅页。</p>'
     tech='<h1>技术审阅：'+esc(analysis['title'])+'</h1><h2>三轮原始裁决</h2>'
     for stage,review in event['reviews'].items():
         tech+='<section class="card"><h3>'+names[stage]+'：'+('同意' if review['agree'] else '不同意')+'</h3><p class="meta">实际型号：'+esc(event.get('resolved_models',{}).get(stage) or '接口未返回')+'</p>'

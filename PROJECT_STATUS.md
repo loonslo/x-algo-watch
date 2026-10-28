@@ -1,11 +1,20 @@
 ---
 project_id: x-algo-watch
-updated: 2026-10-27
-status: active
+updated: 2026-10-28
+status: waiting
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 已彻底拆分专业用户与非专业用户的可读区域；通俗主页面剥离底层机器 JSON 与静态模板堆叠，体积缩减 98%；技术深度归位专页，异常状态优雅降级。305 项本地测试全部通过。
-next: 执行 GitHub CI 回归与线上定时检查核验，验证新排版在线上部署环境的呈现效果。
+progress: 本地研究主链、共享预算和超大补证归并已实现；基于最新 main 的独立候选保留自动记录并完成 421 项全量回归，最后账本等边界在候选中 54 项通过。原工作区修改保留，data/registry 未覆盖；尚未执行新模型、推送或部署。
+next: 等待对 loonslo/x-algo-watch 的 main、DRAFT_ENABLED 变量及两个精确试点工作流的远程授权；获得后执行 Linux CI、预算恢复验证、真实模型与读者验收，再决定历史扩展。
 evidence:
+  - docs/release-candidate-research-pipeline.md
+  - docs/acceptance-context-consolidation.md
+  - docs/samples/2026-10-28-context-consolidation.json
+  - docs/acceptance-shared-call-budget.md
+  - docs/acceptance-integrated-research.md
+  - docs/samples/2026-10-28-integrated-research.json
+  - docs/acceptance-mechanism-pipeline.md
+  - docs/samples/2026-10-28-mechanism-evidence.json
+  - docs/acceptance-publication-boundary.md
   - docs/acceptance-reader-separation.md
   - docs/acceptance-user-impact.md
   - docs/acceptance-update-announcement.md
@@ -35,6 +44,21 @@ evidence:
   - tests/test_history.py
   - data/README.md
 ---
+
+2026-10-28 发布候选：已在独立本地工作树整合最新 main 218ebb2 的自动记录，源码补丁无冲突；421 项完整回归通过，最后账本等边界的候选相关检查 54 项通过。原工作区修改保留，候选生产 data/registry 未改变。远程授权按 AGENTS.md 要求确认；等待授权不代表功能、内容或部署已验收。详见 docs/release-candidate-research-pipeline.md。
+
+2026-10-28 超大补证续作：已实现完整行分块、紧凑事实及分层归并，每层三审后回到原机制，读者稿仍单独三审。两真实版本各 171,190 字符补证零截断，原快照与上游状态不变；跨快照候选号从 1 承接为 2，原 C 编号及本角色旧问题保持。阶段全量 417 passed，最后相关 49 passed/2 skipped；真实 Git 专项此前 7 passed。尚未执行新模型、远程 CI 或部署，仍须真实内容和读者验收。下段预算续作及更早“超大补证待完成”是历史阶段，已由本段更新。
+
+2026-10-28 共享预算续作：已将两个模型工作流的未合并、只读样例及发布失败产物纳入请求前核对；新旧调用都先原子写独立账本。未核实预算时保存暂停状态，核对恢复后清除；不导入旧结论或推进检查进度。阶段真实 Git 全量 408 passed，预算状态等后续相关 108 passed；现有 GitHub 旧产物只读核对识别当天 1 次调用，没有新模型请求。新增工作流权限、失败后上传及恢复尚未远程运行；超大补证拆分归并和真实内容质量验收仍待完成，目标 active。详见 docs/acceptance-shared-call-budget.md。下段为上一阶段集成验收，预算缺口说明已由本段更新。
+
+2026-10-28 主链集成：已将分任务证据接入 detect/draft/publish，机制及读者稿各自三角色审核，新增问题类别/稳定键/具体字段依赖、Git 补证回流、跨快照全批候选边界、来源版本检查、旧稿状态抑制、分文件审计和请求前预算占用。共享架构不能当作本次用户变化；只有所有机制任务及读者三关通过才显示正文，正式 digest 仍需所有者确认。阶段全量真实 Git 回归 388 passed，最后稳定键及试点解除等相关检查 35 passed。真实模型、读者质量、远程 CI 和部署尚未执行；超大补证及未合并产物的预算统一仍须完成，目标继续 active。详见 docs/acceptance-integrated-research.md。下方同日独立模块验收为历史阶段，不代表当前仍未接入主链。
+
+
+2026-10-28 继续研究流程改造：第二阶段独立证据层及第三阶段协议/执行器已实现，6258a15 的 56 个变化文件生成 76 个任务，07d159b 的 209 个变化文件生成 319 个任务；逐文件记录处理结果和缺口，所有文件仍标尚未模型研究。第四阶段已补逐字段修订审计，真实 V3→V4 有 39 项字段变化，mock 前提仍未消除，旧原文匹配不代表语义回退检测完成。真实 Git 全量回归 361 passed，检查记录、registry 和上游引用未改变。新模块尚未接入正式主链、三角色新审核或读者稿生成，未执行真实模型、远程发布或部署。详见 docs/acceptance-mechanism-pipeline.md。
+
+
+2026-10-28 发布边界：第一步已本地实现并回归。首页、目录与正文按最新研究统一计算状态；6258a15 明确显示失败暂停及输出校验阻塞，旧稿与迁移稿不能覆盖新失败。移除无依据的内部微调总结，统一 1,000 次预算及正式 digest 人工确认说明。只重建已有记录的展示，未推进检查进度、未改写原模型审计或人工事实。第二至第五步及真实模型质量验收仍未完成；详见 docs/acceptance-publication-boundary.md 与 docs/requirements-audit.md。下方 2026-10-27 及更早记录为历史来源，其“优雅降级”和排版通过不作为本轮内容质量验收。
+
 
 2026-10-27 专业与非专业受众区域彻底解耦：针对非专业用户看不懂、页面充斥底层源码与机器 JSON、流程异常直接输出报错诉状的问题，完成渲染层与呈现逻辑重构。主页面调用 reader_only 纯净模式，彻底剥离 1,400 行 JSON dump 与 38 项静态代码模板，单页体积由 360 KB 缩减至 7.8 KB（缩减 98%）；技术分析与硬核推论完全归位到 technical/ 专页；未解决分歧版本优雅降级，不再输出内部报错 issue 编号。Windows/Python 3.14 自动化测试 305 passed 100% 通过，全量重建 53 个版本档案。详见 docs/acceptance-reader-separation.md。
 

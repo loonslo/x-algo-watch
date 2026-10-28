@@ -77,6 +77,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
         date = now.astimezone(SHANGHAI).date().isoformat()
         text = text.replace("未经确认的草稿", "仓库所有者已确认的速报")
         text = text.replace("模型推测，尚未人工确认", "模型解读，已获所有者人工确认")
+        text = text.replace("机制推测尚未人工确认，正式 digest 仍需所有者确认", "模型解读，已获所有者人工确认")
         text = text.replace("模型推测已通过复核，正式速报由模型复核直接发布", "模型解读，已获所有者人工确认")
         text = text.replace("模型推测已通过复核", "模型解读，已获所有者人工确认")
         text = re.sub(rf"(?m)^(### [^\n]+ · {commit[:7]} · )源码变化待人工确认$", r"\g<1>源码变化已人工确认", text)
@@ -95,7 +96,7 @@ def confirm(event: dict[str, Any], client: GitHub, now: datetime, root: Path, *,
     store.status(now, code_version(root))
     build_versions(root)
     if push:
-        commit_paths(["digest.md", "data", "versions"], "docs: record reviewed upstream change", client.repository, client._token)
+        commit_paths(["digest.md", "data", "versions", *(["README.md"] if (root / "README.md").exists() else [])], "docs: record reviewed upstream change", client.repository, client._token)
     marker = "<!-- xaw-decision:" + commit + ":" + outcome + " -->"
     if not any(bot_owned(comment) and marker in comment.get("body", "") for comment in client.comments(number)):
         client.request("POST", f"/issues/{number}/comments", {"body": marker + "\n\n所有者已" + ("确认并归档到 digest.md。" if outcome == "confirmed" else "驳回；保留源码证据供追溯。")})

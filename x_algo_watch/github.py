@@ -50,6 +50,39 @@ class GitHub:
                 return result
         raise WatchError("GitHub 分页超过上限，未完成读取")
 
+    def artifact_zip(self, artifact_id: int, maximum: int) -> bytes:
+        """凭据只发送给 API；签名下载地址不记录，也不携带 Authorization。"""
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        if type(artifact_id) is not int or artifact_id <= 0:
+            raise WatchError("GitHub 产物编号无效")
+        opener = urllib.request.build_opener(NoRedirect())
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{self.repository}/actions/artifacts/{artifact_id}/zip",
+            headers={"Authorization": "Bearer " + self._token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+        try:
+            try:
+                response = opener.open(request, timeout=45)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 302:
+                    raise WatchError(f"GitHub 产物读取失败（HTTP {exc.code}）") from None
+                location = exc.headers.get("Location", "")
+                url = urllib.parse.urlsplit(location)
+                host = url.hostname or ""
+                if (url.scheme != "https" or url.username or url.password or url.port not in {None, 443}
+                        or not (host.endswith(".blob.core.windows.net") or host.endswith(".githubusercontent.com"))):
+                    raise WatchError("GitHub 产物下载目标无效")
+                response = opener.open(urllib.request.Request(location), timeout=45)
+            with response:
+                raw = response.read(maximum + 1)
+            if len(raw) > maximum:
+                raise WatchError("GitHub 产物超过读取上限")
+            return raw
+        except (OSError, ValueError):
+            raise WatchError("GitHub 产物下载失败，未输出下载地址或凭据") from None
+
     def issues(self) -> list[dict[str, Any]]:
         return [issue for issue in self.pages("/issues?state=all&labels=x-algo-watch") if "pull_request" not in issue]
 

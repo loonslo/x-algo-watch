@@ -45,7 +45,7 @@ def test_reader_first_technical_details_last_no_duplicate_summary(sample_repo):
     repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
     value = analysis(pack)
     value['summary'] = 'TECHNICAL_SUMMARY_SENTINEL'
-    event = research_event(pack, {'state':'pending_confirmation','analysis':value,'review':review(pack)}, MODELS)
+    event = research_event(pack, {'state':'pending_confirmation','analysis':value,'review':review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
     text = render_research(event)
     front, tail = text.split('<details><summary>技术分析', 1)
     assert all(q in front for q in ('改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
@@ -115,11 +115,9 @@ def test_real_latest_edition_corrects_user_issues_without_rewriting_model_audit(
     assert edition and len(edition['supplementary_evidence'])==2
     text=render_research(event,edition=edition)
     front=text.split('<details><summary>技术分析')[0]
-    assert '默认开关为关闭（false）' in front and '线上状态同样未知' in front
-    assert '不是 X 平台以外' in front and '不等于扶持小账号' in front
-    assert '保证保留' in front and '不能把跳过一次标签查询说成帖子一定保留' in front
-    assert 'Fair Share 同步打开' not in front and '新用户弱 NSFW 候选过滤成为主线' not in front
-    assert '[R1](' in front and '[E18](' in front
+    assert '复核分歧' in front and '算法版本更新公告' not in front
+    assert '默认开关为关闭（false）' not in front
+    assert '[R1](' in text  # 迁移证据仍留在技术审计中。
     assert (root/'data/records/2026-10.md').read_bytes()==before
 
 
@@ -143,8 +141,9 @@ def test_budget_deferred_new_profile_keeps_previous_reviewed_reading_page(sample
     store.append_event(pending,NOW+timedelta(seconds=1))
     build_versions(tmp_path)
     page=next((tmp_path/'versions').glob('20*.md')).read_text(encoding='utf-8')
-    assert '推荐帖子来源设置有变化' in page and '影响解读' in page
-    assert '新版待续写' in (tmp_path/'versions/README.md').read_text(encoding='utf-8')
+    assert '处理中' in page and '算法版本更新公告' not in page
+    assert '推荐帖子来源设置有变化' not in page
+    assert '处理中' in (tmp_path/'versions/README.md').read_text(encoding='utf-8')
 
 
 def test_technical_page_uses_same_research_with_working_relative_evidence_links(sample_repo, tmp_path):
@@ -195,17 +194,17 @@ def test_future_version_generates_reader_then_review_repairs_it_without_editoria
     workspace=tmp_path/'watch';workspace.mkdir();monkeypatch.chdir(workspace)
     shutil.copytree(PROMPTS,workspace/'prompts')
     config=workspace/'config/watch.yaml';config.parent.mkdir()
-    config.write_text(yaml.safe_dump({'models':MODELS,'project_research':True,'daily_calls':4}),encoding='utf-8')
+    config.write_text(yaml.safe_dump({'models':MODELS,'project_research':True,'daily_calls':8,'extra_review_rounds':2}),encoding='utf-8')
     RecordStore(workspace/'data').append(result,NOW,'uncommitted')
     bundle=workspace/'bundle';detect(bundle,source=repo.path,research_commit=result.commit)
     pack=project_pack(repo,result.to_dict())
     bad=analysis(pack);bad['reader']['who']='这是需要纠正的影响对象。'
     objection=review(pack,False);objection['issues'][0]['field']='reader'
     fixed=analysis(pack);fixed['reader']['who']='只有新来源覆盖的帖子作者可能受影响。'
-    model=RecordedClient([bad,objection,fixed,review(pack)])
+    model=RecordedClient([bad,objection,review(pack),review(pack),fixed,review(pack),review(pack),review(pack)])
     output=workspace/'draft.json';run(bundle,output,config,client=model)
     publish(bundle,FakeGitHub(),draft_bundle=output,push=False)
-    assert len(model.calls)==4 and not (workspace/'editorial').exists()
+    assert len(model.calls)==8 and not (workspace/'editorial').exists()
     page=next((workspace/'versions').glob('20*.md')).read_text(encoding='utf-8')
     tech_page=next((workspace/'versions/technical').glob('20*.md')).read_text(encoding='utf-8')
     front=page.split('> 💡 **专业读者导航**')[0]
@@ -218,7 +217,7 @@ def test_announcement_keeps_same_evidence_and_action_after_adjustments(sample_re
     repo, result = prepare(sample_repo)
     pack = project_pack(repo, result.to_dict())
     value = analysis(pack)
-    event = research_event(pack, {'state': 'pending_confirmation', 'analysis': value, 'review': review(pack)}, MODELS)
+    event = research_event(pack, {'state': 'pending_confirmation', 'analysis': value, 'review': review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
     page = render_research(event)
     front = page.split('<details><summary>技术分析')[0]
     assert '算法版本更新公告' in front and '非官方源码解读' in front
@@ -271,7 +270,7 @@ def test_before_after_numbers_are_grounded_and_process_follows_content(sample_re
     value = analysis(pack)
     value['reader']['impacts'][0]['before'] += ' 987654321'
     assert '数字不在证据包：987654321' in validate_analysis(analysis_projection(value), pack, project_research=True)
-    event = research_event(pack, {'state':'pending_confirmation', 'analysis':analysis(pack), 'review':review(pack)}, MODELS)
+    event = research_event(pack, {'state':'pending_confirmation', 'analysis':analysis(pack), 'review':review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
     page = render_research(event)
     assert '| 以前 | 现在的代码如何处理 |' in page
     assert page.index('对你的影响') < page.index('研究附录：')

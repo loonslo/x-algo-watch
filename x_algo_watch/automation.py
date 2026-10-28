@@ -26,7 +26,7 @@ from .versions import VERSION_PATH, build_versions, filename
 from .project_evidence import context_packs, pending_packs, project_pack, save_context, save_context_snapshot
 from .research import valid_research_event
 
-DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md|project-context/[0-9a-f]{40}(?:-[0-9a-f]{64})?\.json)\Z")
+DATA_PATH = re.compile(r"(?:status\.md|verification\.yaml|records/\d{4}-\d{2}\.md|project-context/[0-9a-f]{40}(?:-[0-9a-f]{64})?\.json|research-plans/[0-9a-f]{40}-[0-9a-f]{64}/(?:manifest\.json|tasks/T-[0-9a-f]{64}\.json)|research-runs/[0-9a-f]{40}/[0-9a-f]{64}\.json)\Z")
 BASELINE = "7f2ca2b914cadac591ea7fceec0c477e473d3dee"
 
 
@@ -115,6 +115,10 @@ def load_bundle(bundle: Path) -> tuple[dict[str, Any], dict[str, bytes], list[di
     known = {r["commit"] for r in RecordStore(bundle / "data").records() if r["complete"]}
     if not isinstance(research, list) or any(not isinstance(sha, str) or sha not in available or sha not in known for sha in research) or (manifest["test"] and research):
         raise WatchError("项目研究提交清单无效")
+    from .pipeline_context import load_pipeline_plan
+    for pack in context_packs(bundle / "data"):
+        if pack["commit"] in research and pack.get("research_pipeline") == "mechanisms-v1":
+            load_pipeline_plan(bundle / "data", pack)
     return manifest, files, notifications
 
 
@@ -163,18 +167,25 @@ def detect(bundle: Path, source: Path | None = None, test_from: str = "", test_t
         candidates = [r for r in RecordStore(working).records() if r["complete"] and r.get("base") and (research_all or r["commit"] == research_commit or r["commit"] not in old_commits or r["commit"] in requested)]
         if research_commit and not any(r["commit"] == research_commit for r in candidates):
             raise WatchError("项目研究只接受已有完整的迭代记录")
-        existing = {p["commit"] for p in context_packs(working)}
-        missing = [r for r in candidates if r["commit"] not in existing or r["commit"] == research_commit]
+        from .pipeline_context import pilot_enabled, prepare_pipeline_context
+        existing = {p["commit"]: p for p in context_packs(working)}
+        latest_research = {e["commit"]: e for e in RecordStore(working).events() if e["type"] == "version_research"}
+        def evidence_requests(commit):
+            event = latest_research.get(commit, {})
+            return event.get("pipeline_loop", {}).get("evidence_requests", []) if event.get("item_id") == existing.get(commit, {}).get("item_id") else []
+        missing = [r for r in candidates if r["commit"] not in existing or r["commit"] == research_commit
+                   or (pilot_enabled(settings, r["commit"]) and (existing[r["commit"]].get("research_pipeline") != "mechanisms-v1" or evidence_requests(r["commit"])))]
         for record in missing:
             RecordStore(working).append_event({"type": "research_context_requested", "id": "context-request:" + record["commit"], "commit": record["commit"]}, now)
 
         def deferred_context(record: dict[str, Any]) -> None:
-            RecordStore(working).append_event({"type": "research_context_deferred", "id": "context-deferred:" + record["commit"] + ":" + now.date().isoformat(), "commit": record["commit"], "reason": "项目上下文暂不可用；检测证据仍保留，后续重试"}, now)
+            RecordStore(working).append_event({"type": "research_context_deferred", "id": "context-deferred:" + record["commit"] + ":" + digest(now.isoformat()), "commit": record["commit"], "reason": "项目上下文暂不可用；检测证据仍保留，后续重试"}, now)
 
         def prepare_contexts(upstream: Repository) -> None:
             for record in missing:
                 try:
-                    save_context(working, project_pack(upstream, record))
+                    pack = prepare_pipeline_context(upstream, record, working, existing.get(record["commit"]), evidence_requests(record["commit"])) if pilot_enabled(settings, record["commit"]) else project_pack(upstream, record)
+                    save_context(working, pack)
                 except (WatchError, UnicodeError):
                     deferred_context(record)
 
@@ -273,7 +284,7 @@ def publish_issues(client: GitHub, records: list[dict[str, Any]], test: bool, dr
 
 
 def commit_paths(paths: list[str], message: str, repository: str, token: str) -> bool:
-    if any(path not in ("data", "digest.md", "versions") and not path.startswith("data/") and not VERSION_PATH.fullmatch(path) for path in paths):
+    if any(path not in ("data", "digest.md", "versions", "README.md") and not path.startswith("data/") and not VERSION_PATH.fullmatch(path) for path in paths):
         raise WatchError("发布超出检测数据、速报与版本档案写入边界")
     if Path("versions").is_symlink():
         raise WatchError("版本档案目录不能是符号链接")
@@ -283,8 +294,14 @@ def commit_paths(paths: list[str], message: str, repository: str, token: str) ->
     if not run_git(["diff", "--cached", "--name-only"], Path.cwd()).strip():
         return False
     staged = run_git(["diff", "--cached", "--name-only"], Path.cwd()).decode().splitlines()
-    if any(path != "digest.md" and not (path.startswith("data/") and DATA_PATH.fullmatch(path[5:])) and not VERSION_PATH.fullmatch(path) for path in staged):
+    if any(path not in ("digest.md", "README.md") and not (path.startswith("data/") and DATA_PATH.fullmatch(path[5:])) and not VERSION_PATH.fullmatch(path) for path in staged):
         raise WatchError("暂存区包含发布范围外文件")
+    if "README.md" in staged:
+        from .versions import validate_home_summary_change
+        validate_home_summary_change(
+            run_git(["show", "HEAD:README.md"], Path.cwd()).decode("utf-8"),
+            run_git(["show", ":README.md"], Path.cwd()).decode("utf-8"),
+        )
     for path in staged:
         if VERSION_PATH.fullmatch(path):
             target = Path(path)
@@ -322,14 +339,32 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
             if not isinstance(draft, dict) or set(draft) != {"body", "ready", "version"} or not isinstance(draft["body"], str) or len(draft["body"]) > 60_000 or type(draft["ready"]) is not bool or not re.fullmatch(r"[0-9a-f]{20}", str(draft["version"])):
                 raise WatchError("草稿结构或长度无效")
         for event in payload.get("events", []):
-            if not isinstance(event, dict) or event.get("type") not in ("model_call", "analysis_state", "version_research") or event.get("commit") not in allowed_commits:
+            if not isinstance(event, dict) or event.get("type") not in ("model_call", "analysis_state", "version_research", "research_budget_status") or event.get("commit") not in allowed_commits:
                 raise WatchError("草稿审计事件超出允许范围")
-            if event["type"] == "version_research":
+            if event["type"] == "research_budget_status":
+                from .call_budget import valid_budget_status
+                pack = next((p for p in context_packs(bundle / "data") if p["commit"] == event["commit"]), None)
+                if not valid_budget_status(event, pack):
+                    raise WatchError("共享预算状态事件与当前上下文不匹配")
+            elif event["type"] == "version_research":
                 pack = next((p for p in context_packs(bundle / "data") if p["commit"] == event["commit"]), None)
                 config = Path("config/watch.yaml")
                 settings = yaml.safe_load(config.read_text(encoding="utf-8")) if config.exists() else {}
-                if not pack or not valid_research_event(event, pack, required_extra_reviews=(settings or {}).get("extra_review_rounds", 0)):
+                if pack and pack.get("research_pipeline") == "mechanisms-v1":
+                    from .mechanism_pipeline import validate_pipeline_event
+                    valid = validate_pipeline_event(event, pack, bundle / "data", RecordStore(bundle / "data").events() + payload.get("events", []))
+                else:
+                    valid = bool(pack) and valid_research_event(event, pack, required_extra_reviews=(settings or {}).get("extra_review_rounds", 0))
+                if not valid:
                     raise WatchError("项目研究事件与当前上下文不匹配")
+            elif event.get("pipeline_protocol") == "mechanisms-v1":
+                from .pipeline_context import load_pipeline_plan
+                pack = next((p for p in context_packs(bundle / "data") if p["commit"] == event["commit"]), None)
+                plan = load_pipeline_plan(bundle / "data", pack) if pack else None
+                unit = event.get("item_id", "")
+                valid_unit = bool(plan) and (unit in {t["task_id"] for t in plan["tasks"]} or unit == pack["item_id"] or (isinstance(unit, str) and re.fullmatch(r"selection:[0-9a-f]{64}", unit)))
+                if not valid_unit or event.get("model") != "openrouter/free":
+                    raise WatchError("分任务调用审计不属于当前可信计划")
     if merge_research:
         selected = manifest.get('research', [])
         if manifest['test'] or len(selected) != 1 or draft_bundle is None or not draft_bundle.exists():
@@ -339,7 +374,12 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
         commit = selected[0]
         if commit not in current or incoming.get(commit) != current[commit]:
             raise WatchError('样例输入与当前可信上下文不一致')
-        if any(e.get('commit') != commit or e.get('item_id') != current[commit]['item_id'] for e in payload.get('events', [])):
+        identities = {current[commit]['item_id']}
+        if current[commit].get("research_pipeline") == "mechanisms-v1":
+            from .pipeline_context import load_pipeline_plan
+            identities.update(t["task_id"] for t in load_pipeline_plan(Path("data"), current[commit])["tasks"])
+            identities.update(e["item_id"] for e in payload.get("events", []) if e.get("type") == "model_call" and e.get("stage") == "reader_selection" and re.fullmatch(r"selection:[0-9a-f]{64}", str(e.get("item_id", ""))))
+        if any(e.get('commit') != commit or e.get('item_id') not in identities for e in payload.get('events', [])):
             raise WatchError('样例事件超出当前版本上下文')
     if not manifest["test"]:
         if not merge_research:
@@ -348,8 +388,14 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
             for name, content in files.items():
                 atomic_write(Path("data") / name, content.decode("utf-8"))
         if draft_bundle is not None and draft_bundle.exists():
+            baseline_roots = {e["commit"]: e for e in RecordStore(Path("data")).events() if e["type"] == "version_research"}
             for event in payload.get("events", []):
-                if merge_research and event['type']=='version_research' and event.get('state')=='pending':
+                if merge_research and event['type']=='version_research' and event.get('pipeline_protocol') == 'mechanisms-v1':
+                    baseline = baseline_roots.get(event['commit'], {})
+                    weight = lambda e: 2 if e.get('state') == 'pending_confirmation' else 0 if e.get('iteration', {}).get('phase') == 'researching' else 1
+                    if event.get('run_id', '') < baseline.get('run_id', '') or (event.get('run_id') == baseline.get('run_id') and weight(event) < weight(baseline)):
+                        continue  # 旧样例只补审计，不能将较新或同轮更完整的状态降级。
+                elif merge_research and event['type']=='version_research' and event.get('state')=='pending':
                     # 晚取回的旧样例只补调用审计，不把较新的完整研究覆盖为待续写。
                     continue
                 RecordStore(Path("data")).append_event(event, datetime.now(timezone.utc))
@@ -362,7 +408,7 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
         except WatchError as exc:
             page_error = exc
         if push and page_error is None:
-            commit_paths(["versions"], "docs: update version research pages", client.repository, client._token)
+            commit_paths(["versions", *(["README.md"] if Path("README.md").exists() else [])], "docs: update version research pages", client.repository, client._token)
     numbers = publish_issues(client, records, manifest["test"], drafts) if notify_issues else []
     if not manifest["test"] and page_error is not None:
         raise WatchError("检查证据、调用审计与通知已保留；版本页生成失败，需修复后重建") from page_error

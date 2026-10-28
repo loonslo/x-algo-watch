@@ -27,6 +27,30 @@ def public_text(text: str) -> None:
             raise UnsafePublicText(category)
 
 
+def public_json(value: Any, depth: int = 0) -> None:
+    """扫描解码后的字段，避免 JSON 的转义换行把装饰器误当邮箱。"""
+    if depth > 40:
+        raise WatchError("公开数据嵌套超过校验边界")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            public_json(str(key), depth + 1); public_json(child, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for child in value: public_json(child, depth + 1)
+    elif isinstance(value, str):
+        if value.lstrip().startswith(("{", "[", '"')):
+            try:
+                decoded = json.loads(value)
+            except ValueError:
+                decoded = None
+            if isinstance(decoded, (dict, list, str)):
+                public_json(decoded, depth + 1)
+                return
+        public_text(value)
+        if "\\u" in value:
+            decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda match: chr(int(match[1], 16)), value)
+            public_text(decoded)
+
+
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.with_suffix(path.suffix + ".new")
@@ -77,9 +101,41 @@ class RecordStore:
                 if not isinstance(event, dict) or not isinstance(event.get("id"), str) or not isinstance(event.get("type"), str):
                     raise WatchError("事件结构无效")
                 events.append(event)
-        return events
+        audit_root = self.root / "research-runs"
+        if audit_root.is_symlink():
+            raise WatchError("研究审计目录不能为符号链接")
+        for path in sorted(audit_root.glob("*/*.json")):
+            if path.is_symlink() or path.parent.is_symlink() or not SHA.fullmatch(path.parent.name):
+                raise WatchError("研究审计路径无效")
+            try:
+                event = json.loads(path.read_text(encoding="utf-8"))
+                expected = hashlib.sha256(event["id"].encode()).hexdigest() + ".json"
+                if path.name != expected or event["commit"] != path.parent.name or event.get("pipeline_protocol") != "mechanisms-v1" or event.get("type") not in {"model_call", "version_research"}:
+                    raise ValueError
+                public_json(event)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise WatchError("研究审计文件损坏") from exc
+            events.append(event)
+        return sorted(events, key=lambda e: e.get("created_at", ""))
 
     def append_event(self, event: dict[str, Any], now: datetime) -> bool:
+        if event.get("pipeline_protocol") == "mechanisms-v1" and event.get("type") in {"model_call", "version_research"}:
+            if not SHA.fullmatch(event.get("commit", "")) or not isinstance(event.get("id"), str):
+                raise WatchError("研究调用身份无效")
+            path = self.root / "research-runs" / event["commit"] / (hashlib.sha256(event["id"].encode()).hexdigest() + ".json")
+            if any(p.is_symlink() for p in (path, path.parent, path.parent.parent)):
+                raise WatchError("研究审计不能使用符号链接")
+            if path.exists():
+                old = json.loads(path.read_text(encoding="utf-8"))
+                if {k: v for k, v in old.items() if k != "created_at"} != {k: v for k, v in event.items() if k != "created_at"}:
+                    raise WatchError("拒绝覆盖不同内容的调用审计")
+                return False
+            payload = {**event, "created_at": now.isoformat()}
+            public_json(payload)
+            text = json.dumps(payload, ensure_ascii=False, indent=2).replace("@", "\\u0040")
+            public_text(text)
+            atomic_write(path, text + "\n")
+            return True
         if any(item["id"] == event["id"] for item in self.events()):
             return False
         payload = {**event, "created_at": now.isoformat()}

@@ -16,6 +16,7 @@ from .models import WatchError
 from .storage import RecordStore, atomic_write, public_text
 from .research import render_research
 from .readers import load_edition
+from .publication import publication_status, render_unpublished
 
 VERSION_PATH = re.compile(r"versions/(?:README\.md|(?:technical/)?\d{4}-\d{2}-\d{2}-[0-9a-f]{40}\.md)\Z")
 DIGEST_SECTION = re.compile(r"<!-- xaw-digest:([0-9a-f]{40}) -->\n(.*?)(?=\n<!-- xaw-digest:|\Z)", re.S)
@@ -35,6 +36,16 @@ LABELS = {
     "EnableVideoCarouselCandidatesLogging": "视频轮播候选内容的记录开关",
     "RetrievalValueModelWeights": "候选内容打分模型的权重设置",
 }
+
+
+def validate_home_summary_change(before: str, after: str) -> None:
+    """自动发布仅允许更新首页生成区，不能顺带发布人工说明改动。"""
+    pattern = r"<!-- versions-summary:begin -->.*?<!-- versions-summary:end -->"
+    if len(re.findall(pattern, before, re.S)) != 1 or len(re.findall(pattern, after, re.S)) != 1:
+        raise WatchError("首页生成区缺失或重复，拒绝自动发布")
+    if re.sub(pattern, "", before, flags=re.S) != re.sub(pattern, "", after, flags=re.S):
+        raise WatchError("首页含生成区以外改动，拒绝自动发布")
+    public_text(after)
 
 
 def inline(value: Any) -> str:
@@ -165,7 +176,7 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     name = filename(record)
     text = f"# {name[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
     technical_link = f"technical/{name}"
-    if research and ("analysis" in research or "iteration" in research):
+    if research:
         technical_navigation = f"> 💡 **专业读者导航**：关于本版本的算法架构机制、代码行号与可验证假设，请查看 [本版本技术解读专页]({technical_link})。\n\n"
     else:
         technical_navigation = ""
@@ -176,6 +187,16 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         metadata += f" · [对比前后代码]({UPSTREAM}/compare/{record['base']}...{sha})"
     month = datetime.fromisoformat(record["checked_at"]).astimezone(timezone.utc).strftime("%Y-%m")
     metadata += f" · [完整检查记录](../data/records/{month}.md)\n\n"
+    display = publication_status(research, complete=record["complete"])
+    if (research and not display["publishable"]) or not record["complete"]:
+        text += render_unpublished(research, complete=record["complete"])
+        text += "### 已核实的变化范围（程序检测）\n\n" + overview(record) + "\n\n"
+        text += "这只说明检测范围，不能据此判断机制、用户影响或影响大小。\n\n"
+        if confirmed:
+            text += "原速报曾获人工确认；这不代表当前研究已经确认，原文见[速报汇总](../digest.md)。\n\n"
+        text += technical_navigation
+        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
+        return text
     if research and "analysis" in research and not (confirmed and decision.get("research_id") == research.get("id")):
         text += render_research(research, edition=edition, reader_only=True)
         if confirmed:
@@ -201,7 +222,7 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
         return text
     elif not research:
-        text += "## 30 秒摘要\n\n- 改了什么：" + overview(record) + "\n- 已经上线了吗：尚未核实部署。\n- 影响谁：模型研究尚未完成，不能准确判断。\n- 创作者现在要做什么：目前不据此调整发布策略，等待完整解读。\n\n"
+        text += render_unpublished(None) + "已核实的变化范围（程序检测）：" + overview(record) + "\n\n"
     text += technical_navigation
     if decision.get("outcome") == "rejected":
         text += "**先前解读已被所有者驳回，不能作为运营建议。以下仅保留源码变化与待核对问题。**\n\n"
@@ -272,20 +293,30 @@ def build_versions(root: Path) -> int:
     events = sorted(store.events(), key=lambda e: e.get("created_at", ""))
     decisions = {e["commit"]: e for e in events if e["type"] == "decision"}
     latest_research = {e["commit"]: e for e in events if e["type"] == "version_research"}
-    research_by_commit: dict[str, Any] = {}
+    research_by_commit = dict(latest_research)
+    from .project_evidence import context_packs
+    contexts = {p["commit"]: p for p in context_packs(root / "data")}
     for event in events:
-        if event["type"] == "version_research":
-            previous = research_by_commit.get(event["commit"])
-            if "analysis" in event or not previous or "analysis" not in previous:
-                research_by_commit[event["commit"]] = event
+        if event["type"] == "research_context_deferred" and event.get("created_at", "") > latest_research.get(event["commit"], {}).get("created_at", ""):
+            research_by_commit[event["commit"]] = {"state": "manual", "preparation_failure": True, "id": event["id"], "commit": event["commit"]}
+    budget_states = {e["commit"]: e for e in sorted(events, key=lambda e: e.get("checked_at", ""))
+                     if e["type"] == "research_budget_status"}
+    for commit, event in budget_states.items():
+        if event["state"] == "blocked" and event.get("checked_at", "") > latest_research.get(commit, {}).get("created_at", ""):
+            research_by_commit[commit] = {"state": "manual", "budget_unverified": True, "id": event["id"], "commit": commit}
+    for commit, pack in contexts.items():
+        existing = research_by_commit.get(commit)
+        if existing and publication_status(existing)["publishable"] and existing.get("item_id") != pack["item_id"]:
+            research_by_commit[commit] = {"state": "pending", "source_context_pending": True, "id": "context:" + pack["item_id"], "commit": commit}
     path = root / "digest.md"
     digest = path.read_text(encoding="utf-8") if path.exists() else ""
     confirmed = dict(DIGEST_SECTION.findall(digest))
     pages: dict[str, str] = {}
     index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [怎么读这些文档](../docs/how-to-read.md) · [已确认速报汇总](../digest.md)\n\n"
     index += "面向普通创作者与运营：先读每版的“30 秒摘要：本次更新重点”和“具体调整与影响解读”，了解改了什么、是否上线、可能影响谁、现在该做什么。技术分析、证据和历史记录折叠在页面末尾。每个上游提交一份独立文件，按提交时间从新到旧排列。\n\n"
-    index += "标为“待模型研究”的版本只有源码证据，不算已经完成解读。模型推测可以在复核完成前阅读，但不会被写成平台已部署的事实；正式速报由模型复核直接发布，不再要求所有者人工确认。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
+    index += "未通过发布门槛的版本展示状态、检测范围与缺口；三个审核角色全部通过后才展示机制推测，仍标注尚未人工确认与线上未知。正式 digest 仍需所有者确认。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
     index += "| 版本（UTC 日期） | 一句话变化 | 解读状态 | 核对级别 |\n| --- | --- | --- | --- |\n"
+    home_rows = []
     for record in records:
         name = filename(record)
         decision = decisions.get(record["commit"], {})
@@ -296,24 +327,13 @@ def build_versions(root: Path) -> int:
         research = research_by_commit.get(record["commit"])
         edition = load_edition(root, research)
         pages[name] = render_page(record, decision, approved, rechecks, research, edition)
-        latest = latest_research.get(record["commit"], {})
-        progress = ""
-        if latest.get("id") != (research or {}).get("id") and "iteration" in latest:
-            from .iteration import render_iteration
-            progress = "以下是新版修订进度；正文保留上一份完整研究。\n\n" + render_iteration(latest["iteration"])
-            user_notice = f"> 💡 **版本修订提示**：本版本有正在进行中的新一轮机制推断与复核，当前正文展示已通过复核的上一版解读。详细审核进度见 [技术专页](technical/{name})。\n\n"
-            pages[name] = user_notice + pages[name]
-        if research and ("analysis" in research or "iteration" in research):
+        if research:
             technical = f"# {name[:10]} · {record['commit'][:7]} · 技术解读\n\n[返回通俗解读](../{name}) · [全部版本](../README.md) · [阅读说明](../../docs/how-to-read.md)\n\n"
             technical += "本页与通俗页来自同一份研究及复核记录；源码变化与条件性推断不等于线上部署。\n\n"
-            technical += progress + render_research(research, context_base="../../data/project-context", edition=edition, technical_only=True)
+            technical += render_research(research, context_base="../../data/project-context", edition=edition, technical_only=True, check_complete=record["complete"], data_root=root / "data")
             pages["technical/" + name] = technical
-        status = {"pending": "模型研究待续写", "manual": "模型研究待续写", "disputed": "模型复核有分歧", "pending_confirmation": "模型推测已通过复核"}.get((research or {}).get("state"), "待模型研究")
-        if research and latest_research.get(record["commit"], {}).get("id") != research.get("id"):
-            status += "；新版待续写，当前页保留上一份研究及修订说明"
-        if "iteration" in latest:
-            from .iteration import PHASES
-            status += f"；V{latest['iteration']['candidate']} " + PHASES[latest["iteration"]["phase"]][0]
+        display = publication_status(research, complete=record["complete"])
+        status = display["label"]
         if not record.get("base"):
             status = "起始基线·无前版对比"
         if approved:
@@ -322,10 +342,26 @@ def build_versions(root: Path) -> int:
             status += "；原速报解读已驳回"
         if not record["complete"]:
             status += "；检查未完成"
-        reader = edition["reader"] if edition else (research.get("analysis", {}).get("reader") if research and research.get("state") != "disputed" else None)
-        summary = reader["title"] if reader else "用户版待修订" if research and research.get("state") == "disputed" else research["analysis"]["title"] if research and "analysis" in research else "尚无模型项目研究" if record.get("base") else "起始基线快照"
+        reader = (research or {}).get("analysis", {}).get("reader") if display["publishable"] else None
+        summary = reader["title"] if reader else "用户正文尚未通过；" + overview(record) if record.get("base") else "起始基线快照"
         index += f"| [{name[:10]} · {record['commit'][:7]}]({name}) | {inline(summary)} | {status} | {inline(record['severity'])} |\n"
+        if len(home_rows) < 5:
+            home_rows.append(f"| {name[:10]} · `{record['commit'][:7]}` | {inline(summary)} | {status} | [版本档案](versions/{name}) |")
     pages["README.md"] = index + f"\n共 {len(records)} 个版本（含起始基线）。没有新上游提交的检查不会新增版本文件。\n\n目录和基础说明由程序重建；人工解读通过 Issue 审核后保存在速报中，不直接编辑这些生成文件。\n"
+    home_path = root / "README.md"
+    home_update = None
+    if home_path.is_symlink():
+        raise WatchError("首页不能是符号链接")
+    if home_path.exists():
+        home = home_path.read_text(encoding="utf-8")
+        start, end = "<!-- versions-summary:begin -->", "<!-- versions-summary:end -->"
+        if start in home and end in home:
+            before, rest = home.split(start, 1)
+            _, after = rest.split(end, 1)
+            updated = before + start + "\n\n| 更新日期与版本 | 检测范围或已通过的重点 | 当前状态 | 阅读入口 |\n| --- | --- | --- | --- |\n" + "\n".join(home_rows) + "\n\n" + end + after
+            public_text(updated)
+            if updated != home:
+                home_update = updated
     # 全量验证后才写入，避免扫描失败产生半套公开页面。
     directory = root / "versions"
     if directory.is_symlink():
@@ -338,6 +374,8 @@ def build_versions(root: Path) -> int:
         target = directory / name
         if not target.exists() or target.read_text(encoding="utf-8") != text:
             atomic_write(target, text)
+    if home_update is not None:
+        atomic_write(home_path, home_update)
     return len(records)
 
 

@@ -10,19 +10,25 @@ from x_algo_watch.models import Severity
 from x_algo_watch.storage import RecordStore
 
 
+def repository_state(repo):
+    bare = repo.git("rev-parse", "--is-bare-repository").strip() == "true"
+    return (repo.resolve("HEAD"), repo.git("show-ref"),
+            "bare:no-worktree" if bare else repo.git("status", "--porcelain=v1", "--untracked-files=all"))
+
+
 @pytest.fixture(scope="module")
 def replay(upstream, tmp_path_factory):
     root = tmp_path_factory.mktemp("historical-replay")
     registry = root / "facts.yaml"
     registry.write_text("[]\n", encoding="utf-8")
     output = root / "data"
-    before = (upstream.resolve("HEAD"), upstream.git("status", "--porcelain=v1", "--untracked-files=all"))
+    before = repository_state(upstream)
     args = ["replay", "--repo", str(upstream.path), "--from", "47c1bcd", "--to", "7f2ca2b", "--registry", str(registry), "--output", str(output), "--now", "2026-10-21T08:00:00+00:00"]
     assert main(args) == 0
     first_bytes = {p.name: p.read_bytes() for p in (output / "records").glob("*.md")}
     assert main(args) == 0
     assert first_bytes == {p.name: p.read_bytes() for p in (output / "records").glob("*.md")}
-    assert before == (upstream.resolve("HEAD"), upstream.git("status", "--porcelain=v1", "--untracked-files=all"))
+    assert before == repository_state(upstream)
     return {record["commit"][:7]: record for record in RecordStore(output).records()}
 
 
@@ -81,10 +87,10 @@ def test_unrecognized_historical_formats_are_red(upstream, monkeypatch):
 def test_oct23_expansion_snapshot_is_complete_and_read_only(upstream):
     from x_algo_watch.engine import snapshot
     target = upstream.resolve("07d159b69109f069c85f84d39dd38e38adc040f0")
-    before = upstream.git("status", "--porcelain=v1", "--untracked-files=all")
+    before = repository_state(upstream)
     result = compare(upstream, upstream.parent(target), target, [], date(2026, 10, 23))
     assert result.complete
     current = snapshot(upstream, target)
     assert current.level_format == "PostRules+Expansion"
     assert current.levels["TIMELINE_HOME_HYDRATION"][-1] == "PROTECTED_ORIGINAL_AUTHOR_DROP"
-    assert upstream.git("status", "--porcelain=v1", "--untracked-files=all") == before
+    assert repository_state(upstream) == before

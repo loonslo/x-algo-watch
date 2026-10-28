@@ -152,7 +152,18 @@ class OpenRouter:
             time.sleep(delay)
         self._last_call = time.monotonic()
         body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "max_tokens": 6000, "provider": {"allow_fallbacks": False}}
-        if payload.get("evidence_pack", {}).get("scope") == "project_version":
+        if payload.get("research_protocol") == "mechanisms-v1":
+            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "research_stage", "strict": True, "schema": payload["stage_schema"]}}
+            body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
+            body["max_tokens"] = 24000 if payload.get("stage_kind") == "review" else 12000
+            body["reasoning"] = {"effort": "low"} if payload.get("stage_kind") == "review" else {"max_tokens": 3000}
+        elif payload.get("evidence_pack", {}).get("scope") == "mechanism_task":
+            from .mechanisms import mechanism_schema
+            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "mechanism_research", "strict": True, "schema": mechanism_schema()}}
+            body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
+            body["max_tokens"] = 12000
+            body["reasoning"] = {"max_tokens": 3000}
+        elif payload.get("evidence_pack", {}).get("scope") == "project_version":
             patch_fields = payload.get("reader_repair_fields")
             schema = reader_repair_schema(patch_fields) if patch_fields else (review_schema() if "analysis" in payload else research_schema())
             schema_name = "version_reader_patch" if patch_fields else ("version_review" if "analysis" in payload else "version_research")
@@ -169,7 +180,7 @@ class OpenRouter:
             body["reasoning"] = {"effort": "low"}
         request = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + self._key, "Content-Type": "application/json"}, method="POST")
         try:
-            timeout = 90 if payload.get("evidence_pack", {}).get("scope") == "project_version" else 30
+            timeout = 90 if payload.get("research_protocol") == "mechanisms-v1" or payload.get("evidence_pack", {}).get("scope") in {"project_version", "mechanism_task"} else 30
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 self.last_response_received = True
                 status = getattr(response, "status", None)
@@ -203,6 +214,7 @@ class OpenRouter:
 
 
 def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], client: Any, models: dict[str, str], now: datetime, prompt_root: Path, daily_limit: int = MAX_DAILY_CALLS, *, allow_same_model: bool = False, project_research: bool = False, repair_feedback: dict[str, Any] | None = None, extra_review_rounds: int = 0, call_deadline: float | None = None, iteration_context: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prior = list({("id", event["id"]) if "id" in event else ("row", index): event for index, event in enumerate(prior)}.values())
     if type(daily_limit) is not int or not 1 <= daily_limit <= MAX_DAILY_CALLS:
         raise WatchError(f"免费模型本地每日调用上限须为 1 到 {MAX_DAILY_CALLS}")
     if type(allow_same_model) is not bool:
@@ -299,6 +311,8 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     )
                 event = {"type": "model_call", "id": key + ":" + str(len(calls)) + ":" + now.isoformat(), "analysis_key": key, "item_id": item_id, "commit": pack["commit"], "stage": stage, "model": model, "prompt_version": version, "input_hash": digest(request_payload), "day": now.date().isoformat(), "valid": False}
                 used += 1
+                if hasattr(client, "record_intent"):
+                    client.record_intent(event)
                 if patch_fields:
                     event["reader_repair_fields"] = patch_fields
                 failure_stage = "request"
@@ -436,20 +450,88 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
     return {"body": text, "ready": ready, "version": digest({"packs": packs, "outputs": outputs, "body": text})[:20]}
 
 
-def run(bundle: Path, output: Path, config: Path, client: Any | None = None, *, resume: bool = False) -> None:
+def run(bundle: Path, output: Path, config: Path, client: Any | None = None, *, resume: bool = False,
+        budget_receipt: Path | None = None, call_ledger: Path | None = None) -> None:
     manifest, _, records = load_bundle(bundle)
     if manifest["test"]:
         atomic_write(output, json.dumps({"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": {}, "events": []}))
         return
     settings = yaml.safe_load(config.read_text(encoding="utf-8"))
+    from .call_budget import BudgetClient, budget_status, load_receipt, merge_budget
+    if os.environ.get("GITHUB_ACTIONS") == "true" and budget_receipt is None:
+        raise WatchError("GitHub 模型任务必须先核对所有可信工作流的共享预算")
+    receipt = load_receipt(budget_receipt) if budget_receipt else None
+    def prepare_client(prior):
+        current = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
+        if receipt is not None:
+            current = BudgetClient(current, receipt, call_ledger or output.with_name("call-ledger.json"), prior, settings.get("daily_calls", MAX_DAILY_CALLS))
+            prior = merge_budget(prior, [*receipt["calls"], *current.calls])
+        return current, prior
     if settings.get("project_research") is True:
         selected = manifest.get("research", [])
         packs = [p for p in context_packs(bundle / "data") if p["commit"] in selected]
+        budget_statuses = [budget_status(p, "verified", receipt["run_id"], receipt["attempt"], receipt["checked_at"]) for p in packs] if receipt else []
+        from .pipeline_context import pilot_enabled
+        if any(pilot_enabled(settings, p["commit"]) and p.get("research_pipeline") != "mechanisms-v1" for p in packs):
+            raise WatchError("试点版本尚未准备分任务快照；先运行检测准备，不能沿用旧研究流程")
         prior = RecordStore(bundle / "data").events()
+        if any(p.get("research_pipeline") == "mechanisms-v1" for p in packs):
+            from .mechanism_pipeline import run_pipeline
+            accumulated = []
+            mixed_drafts = {}
+            if output.exists():
+                old_text = output.read_text(encoding="utf-8")
+                public_text(old_text)
+                old = json.loads(old_text)
+                if old.get("source_manifest_hash") == digest(manifest):
+                    accumulated = old.get("events", [])
+                    mixed_drafts = old.get("drafts", {})
+            accumulated.extend(e for e in budget_statuses if e["id"] not in {old["id"] for old in accumulated})
+            def flush(event=None):
+                if event is not None and event.get("type") == "version_research":
+                    mixed_drafts.pop(event["commit"], None)
+                if event is not None and event.get("type") == "version_research" and "review" in event:
+                    repository = os.environ.get("GITHUB_REPOSITORY", "")
+                    context_base = f"https://github.com/{repository}/blob/main/data/project-context" if repository else "data/project-context"
+                    body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base) + "- 确认：待仓库所有者编辑核对并打标签。\n"
+                    mixed_drafts[event["commit"]] = {"body": body, "ready": event["state"] == "pending_confirmation", "version": digest({"event": event, "body": body})[:20]}
+                if event is not None:
+                    index = next((i for i, old in enumerate(accumulated) if old["id"] == event["id"]), None)
+                    if index is None:
+                        accumulated.append(event)
+                    elif accumulated[index].get("outcome") == "started" and event.get("outcome") != "started":
+                        accumulated[index] = event
+                payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": mixed_drafts, "events": accumulated}
+                from .storage import public_json
+                public_json(payload)
+                text = json.dumps(payload, ensure_ascii=False, indent=2).replace("@", "\\u0040")
+                public_text(text)
+                atomic_write(output, text)
+            flush()
+            deadline = time.monotonic() + 20 * 60
+            try:
+                client, prior = prepare_client(prior)
+                from .iteration import iterate_items
+                for pack in packs:
+                    if pack.get("research_pipeline") == "mechanisms-v1":
+                        event, _ = run_pipeline(pack, bundle / "data", prior + accumulated, client, settings, Path("prompts"), resume=resume, deadline=deadline, persist=flush)
+                        flush(event)
+                        if event["pipeline_loop"]["reason"] in {"service", "service_retry_limit"}:
+                            break
+                    else:
+                        # 与新链共用累计调用记录；旧研究仍按原协议验收，不能冒充新研究。
+                        results, calls = iterate_items([pack], prior + accumulated, client, settings, Path("prompts"), call_deadline=deadline, resume=resume)
+                        for call in calls:
+                            flush(call)
+                        if pack["item_id"] in results:
+                            flush(research_event(pack, results[pack["item_id"]], settings["models"]))
+            except Deferred:
+                flush()
+            return
         # 多关核对最多主动运行 20 分钟，再留出一次请求和落盘时间；避免 35 分钟任务被强杀而丢失调用审计。
         call_deadline = time.monotonic() + 20 * 60
         try:
-            client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
+            client, prior = prepare_client(prior)
             from .iteration import iterate_items
             outputs, events = iterate_items(packs, prior, client, settings, Path("prompts"), call_deadline=call_deadline, resume=resume)
         except Deferred:
@@ -466,14 +548,14 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None, *, 
                 context_base = f"https://github.com/{repository}/blob/main/data/project-context" if repository else "data/project-context"
                 body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base) + "- 确认：待仓库所有者编辑核对并打标签。\n"
                 drafts[pack["commit"]] = {"body": body, "ready": result["state"] == "pending_confirmation", "version": digest({"event": event, "body": body})[:20]}
-        payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": drafts, "events": events}
+        payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": drafts, "events": [*events, *budget_statuses]}
         public_text(json.dumps(payload, ensure_ascii=False))
         atomic_write(output, json.dumps(payload, ensure_ascii=False, indent=2))
         return
     packs = [pack for record in records for pack in items_for_record(record)]
     prior = RecordStore(bundle / "data").events()
     try:
-        client = client or OpenRouter(os.environ.get("OPENROUTER_API_KEY", ""))
+        client, prior = prepare_client(prior)
         outputs, events = analyze_items(packs, prior, client, settings["models"], datetime.now(timezone.utc), Path("prompts"), settings.get("daily_calls", MAX_DAILY_CALLS), allow_same_model=settings.get("allow_same_model", False))
     except Deferred:
         outputs, events = {}, []
@@ -493,6 +575,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("config/watch.yaml"))
+    parser.add_argument("--budget-receipt", type=Path, help="当前工作流尝试的共享调用核对凭单")
+    parser.add_argument("--call-ledger", type=Path, help="每次请求发出前写入的独立调用账本")
     parser.add_argument("--resume", action="store_true", default=os.environ.get("RESUME_ITERATIONS", "false").lower() == "true", help="处理问题后，显式恢复指定版本暂停的修订批次")
     args = parser.parse_args(argv)
     try:
@@ -500,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest, _, _ = load_bundle(args.bundle)
             if len(manifest.get("research", [])) != 1:
                 raise WatchError("恢复须明确指定一个版本，不能恢复整个队列")
-        run(args.bundle, args.output, args.config, resume=args.resume)
+        run(args.bundle, args.output, args.config, resume=args.resume, budget_receipt=args.budget_receipt, call_ledger=args.call_ledger)
         return 0
     except WatchError as exc:
         print(str(exc)); return 2
