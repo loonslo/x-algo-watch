@@ -1,0 +1,1637 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/plan.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-1d8b597f88ba664e27847980ca88c693d6fe716fcbd0561c5cb263b4b9622cb7",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/plan.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 343,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::clients::socialgraph_client::{EdgeDirection, Graph};\nuse crate::hydration::hydrator::{Edge, Part, RequestRows};\nuse crate::hydration::inventory::Source;\nuse crate::hydration::relation::{Relation, Role};\nuse crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};\nuse crate::rules::SafetyLevel;\nuse std::fmt;\nuse std::time::Duration;\nuse strum::VariantArray;\nuse xai_core_entities::gizmoduck_client::QueryFields;\n\npub(crate) struct HydrationPlan {\n    level: SafetyLevel,\n    rows: RequestRows,\n    groups: Vec<Group>,\n    nodes: Hydrators,\n    logged_out_nodes: Hydrators,\n}\n\npub(super) struct Group {\n    pub(super) position: usize,\n    pub(super) source: Source,\n    pub(super) input: Option<Hydrator>,\n    pub(super) nodes: Hydrators,\n    clients: Vec<&'static str>,\n    methods: Vec<&'static str>,\n    edges: Vec<(Edge, Graph, EdgeDirection, Hydrators)>,\n    fields: Vec<QueryFields>,\n    readers: Vec<usize>,\n}\n\nimpl HydrationPlan {\n    pub(crate) fn new(level: SafetyLevel, hydrators: Hydrators) -> Self {\n        Self::with_rows(level, level.spec().rows, hydrators)\n    }\n\n    pub(crate) fn with_rows(level: SafetyLevel, rows: RequestRows, hydrators: Hydrators) -> Self {\n        let nodes = hydrators.closed(rows);\n        let mut groups: Vec<Group> = Vec::new();\n        for node in nodes.iter() {\n            let spec = node.spec();\n            let (client, method) = spec.label;\n            let input = node.input_at(rows);\n            match groups\n                .iter_mut()\n                .find(|group| group.source == spec.source && group.input == input)\n            {\n                Some(group) => {\n                    group.nodes = group.nodes.with(node);\n                    if !group.clients.contains(&client) {\n                        group.clients.push(client);\n                    }\n                    if !group.methods.contains(&method) {\n                        group.methods.push(method);\n                    }\n                }\n                None => groups.push(Group {\n                    position: groups.len(),\n                    source: spec.source,\n                    input,\n                    nodes: Hydrators::of(node),\n                    clients: vec![client],\n                    methods: vec![method],\n                    edges: Vec::new(),\n                    fields: Vec::new(),\n                    readers: Vec::new(),\n                }),\n            }\n        }\n        let reads: Vec<Hydrators> = groups\n            .iter()\n            .map(|group| {\n                group.nodes.iter().fold(Hydrators::empty(), |reads, node| {\n                    reads.union(node.reads_at(rows))\n                })\n            })\n            .collect();\n        let readers: Vec<Vec<usize>> = groups\n            .iter()\n            .map(|landed| {\n                reads\n                    .iter()\n                    .enumerate()\n                    .filter(|(_, reads)| !reads.intersection(landed.nodes).is_empty())\n                    .map(|(position, _)| position)\n                    .collect()\n            })\n            .collect();\n        for (group, readers) in groups.iter_mut().zip(readers) {\n            group.edges = edges(group.nodes);\n            group.fields = fields(group.source, group.nodes);\n            group.readers = readers;\n        }\n        Self {\n            level,\n            rows,\n            groups,\n            nodes,\n            logged_out_nodes: nodes\n                .iter()\n                .filter(|node| !node.needs_viewer())\n                .fold(Hydrators::empty(), Hydrators::with),\n        }\n    }\n\n    pub(crate) fn level(&self) -> SafetyLevel {\n        self.level\n    }\n\n    pub(crate) fn rows(&self) -> RequestRows {\n        self.rows\n    }\n\n    pub(crate) fn keys_only_user_rows_or_viewer(&self) -> bool {\n        self.nodes\n            .iter()\n            .all(|node| node.key_at(self.rows).keys_user_rows())\n    }\n\n    pub(super) fn reads_viewer_profile(&self) -> bool {\n        self.nodes.contains(Hydrator::ViewerProfile)\n    }\n\n    pub(super) fn reads_viewer_labels(&self) -> bool {\n        self.nodes.contains(Hydrator::ViewerLabels)\n    }\n\n    pub(super) fn callable(&self, viewer_id: Option<u64>) -> Hydrators {\n        match viewer_id {\n            Some(_) => self.nodes,\n            None => self.logged_out_nodes,\n        }\n    }\n\n    pub(super) fn groups(&self) -> impl Iterator<Item = &Group> {\n        self.groups.iter()\n    }\n\n    fn relations(&self) -> impl Iterator<Item = Relation> + '_ {\n        Relation::VARIANTS\n            .iter()\n            .copied()\n            .filter(|&relation| match relation.spec().role {\n                Role::Judged { rpc } => {\n                    self.level.is_carried_by(rpc)\n                        && !self\n                            .nodes\n                            .intersection(relation.spec().trigger.reads())\n                            .is_empty()\n                }\n                Role::Read => self\n                    .nodes\n                    .iter()\n                    .any(|node| node.spec().relation == Some(relation)),\n            })\n    }\n\n    pub(super) fn readers<'a>(&'a self, landed: &'a Group) -> impl Iterator<Item = &'a Group> {\n        landed\n            .readers\n            .iter()\n            .filter_map(|&position| self.groups.get(position))\n    }\n}\n\nimpl Group {\n    pub(super) fn ceiling(&self) -> Duration {\n        if self.nodes.has_must_have() {\n            HYDRATION_TIMEOUT\n        } else {\n            BEST_EFFORT_HYDRATION_TIMEOUT\n        }\n    }\n\n    pub(super) fn reads_relation(&self) -> bool {\n        self.nodes.iter().any(|node| node.spec().relation.is_some())\n    }\n\n    pub(super) fn label(&self) -> (String, String) {\n        (self.clients.join(\"+\"), self.methods.join(\"+\"))\n    }\n\n    pub(super) fn fields(&self) -> &[QueryFields] {\n        &self.fields\n    }\n\n    pub(super) fn edges(&self) -> &[(Edge, Graph, EdgeDirection, Hydrators)] {\n        &self.edges\n    }\n}\n\nfn fields(source: Source, nodes: Hydrators) -> Vec<QueryFields> {\n    let nodes = match source {\n        Source::GizmoduckAuthor => Hydrator::VARIANTS\n            .iter()\n            .copied()\n            .filter(|node| node.spec().source == source)\n            .fold(Hydrators::empty(), Hydrators::with),\n        Source::TesPureCoreData\n        | Source::TesTweet\n        | Source::TesConversationControl\n        | Source::TesQuotedTweet\n        | Source::SafetyLabels\n        | Source::GizmoduckViewer\n        | Source::Flock\n        | Source::FlockUserPair\n        | Source::ViewerCountry\n        | Source::Wingman\n        | Source::CommunityModeration\n        | Source::CommunityModerator\n        | Source::CommunityViewerRemoved\n        | Source::ArticleLifecycle\n        | Source::ArticleMediaEntities\n        | Source::ArticleCoverMedia\n        | Source::TrustedFriends\n        | Source::UserLocation => nodes,\n    };\n    let mut fields = Vec::new();\n    for node in nodes.iter() {\n        if let Part::Fields(node_fields) = node.spec().part {\n            for field in node_fields {\n                if !fields.contains(field) {\n                    fields.push(*field);\n                }\n            }\n        }\n    }\n    fields\n}\n\nfn edges(nodes: Hydrators) -> Vec<(Edge, Graph, EdgeDirection, Hydrators)> {\n    let mut edges: Vec<(Edge, Graph, EdgeDirection, Hydrators)> = Vec::new();\n    for node in nodes.iter() {\n        let Some(edge) = node.edge() else {\n            continue;\n        };\n        let Some((graph, direction)) = edge.flock() else {\n            continue;\n        };\n        match edges.iter_mut().find(|(queried, ..)| *queried == edge) {\n            Some((.., nodes)) => *nodes = nodes.with(node),\n            None => edges.push((edge, graph, direction, Hydrators::of(node))),\n        }\n    }\n    edges\n}\n\nimpl fmt::Display for HydrationPlan {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        writeln!(\n            f,\n            \"{}: {} calls\",\n            <&str>::from(self.level),\n            self.groups.len()\n        )?;\n        for group in &self.groups {\n            let (client, method) = group.label();\n            let after = group.input.map_or(\"-\", <&str>::from);\n            let nodes: Vec<&str> = group.nodes.iter().map(<&str>::from).collect();\n            write!(\n                f,\n                \"{client}/{method} after: {after} nodes: {}\",\n                nodes.join(\",\")\n            )?;\n            let fields = group.fields();\n            if !fields.is_empty() {\n                let fields: Vec<String> = fields.iter().map(|field| format!(\"{field:?}\")).collect();\n                write!(f, \" fields: {}\", fields.join(\"|\"))?;\n            }\n            for &(_, graph, direction, nodes) in group.edges() {\n                let direction = match direction {\n                    EdgeDirection::Forward => \"fwd\",\n                    EdgeDirection::Reverse => \"rev\",\n                };\n                let keys: Vec<String> = nodes\n                    .iter()\n                    .map(|node| node.key_at(self.rows).to_string())\n                    .collect();\n                write!(\n                    f,\n                    \" {}-{direction}[{}]\",\n                    <&str>::from(graph),\n                    keys.join(\",\")\n                )?;\n            }\n            for node in group.nodes.iter() {\n                if let Some(edge) = node.pair_edge() {\n                    let graph: &str = edge.graph().into();\n                    write!(f, \" {graph}-fwd[{}]\", node.key_at(self.rows))?;\n                }\n            }\n            if group.nodes.iter().all(Hydrator::needs_viewer) {\n                f.write_str(\" (skipped logged out)\")?;\n            }\n            if group.ceiling() != HYDRATION_TIMEOUT {\n                write!(f, \" timeout: {:?}\", group.ceiling())?;\n            }\n            writeln!(f)?;\n        }\n        for relation in self.relations() {\n            writeln!(f, \"{relation}\")?;\n        }\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{HydrationPlan, RequestRows};\n    use crate::hydration::{Hydrator, Hydrators};\n    use crate::rules::{RuleEngine, SafetyLevel};\n    use strum::VariantArray;\n\n    #[test]\n    fn each_level_plans_these_calls() {\n        let engine = RuleEngine::for_tests();\n        let plans: String = SafetyLevel::VARIANTS\n            .iter()\n            .map(|&level| engine.plan(level).to_string())\n            .collect();\n        crate::pinned::assert_pinned(\"tests/fixtures/plans.txt\", &plans);\n    }\n\n    #[test]\n    fn a_level_of_user_rows_plans_no_pure_core_and_keys_author_lookups_by_user() {\n        let nodes = Hydrators::of(Hydrator::ViewerProfile)\n            .with(Hydrator::AuthorSafety)\n            .with(Hydrator::Follows)\n            .with(Hydrator::Blocks);\n        let plan =\n            HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Users, nodes);\n        assert_eq!(\n            plan.to_string(),\n            \"\\\nquoted_tweet_rules: 3 calls\ngizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)\ngizmoduck/get_users after: - nodes: author_safety fields: SAFETY|LABELS\nsocialgraph/batch_check_relationships after: - nodes: follows,blocks follows-fwd[users] blocks-fwd[users] (skipped logged out)\n\"\n        );\n        assert!(plan.keys_only_user_rows_or_viewer());\n    }\n}\n",
+      "source_digest": "424d2a6c384b559c6059eb16d9b91e5f84026f1596a90735f571cd7c596d8b26",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/plan.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 332,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::clients::socialgraph_client::{EdgeDirection, Graph};\nuse crate::hydration::fetcher::{AskedFields, FetcherId};\nuse crate::hydration::hydrator::{Edge, Part, RequestRows};\nuse crate::hydration::relation::{Relation, Role};\nuse crate::hydration::{Hydrator, Hydrators, BEST_EFFORT_HYDRATION_TIMEOUT, HYDRATION_TIMEOUT};\nuse crate::rules::{Expansion, SafetyLevel};\nuse std::fmt;\nuse std::time::Duration;\nuse strum::VariantArray;\nuse xai_core_entities::gizmoduck_client::QueryFields;\n\npub(crate) struct HydrationPlan {\n    level: SafetyLevel,\n    rows: RequestRows,\n    groups: Vec<Group>,\n    nodes: Hydrators,\n    logged_out_nodes: Hydrators,\n}\n\npub(super) struct Group {\n    pub(super) position: usize,\n    pub(super) fetcher: FetcherId,\n    pub(super) input: Option<Hydrator>,\n    pub(super) nodes: Hydrators,\n    clients: Vec<&'static str>,\n    methods: Vec<&'static str>,\n    edges: Vec<(Edge, Graph, EdgeDirection, Hydrators)>,\n    fields: Vec<QueryFields>,\n    readers: Vec<usize>,\n}\n\nimpl HydrationPlan {\n    pub(crate) fn new(level: SafetyLevel, hydrators: Hydrators) -> Self {\n        Self::with_rows(level, level.spec().rows, hydrators)\n    }\n\n    pub(crate) fn with_rows(level: SafetyLevel, rows: RequestRows, hydrators: Hydrators) -> Self {\n        let nodes = hydrators.closed(rows);\n        let mut groups: Vec<Group> = Vec::new();\n        for node in nodes.iter() {\n            let spec = node.spec_at(rows);\n            let (client, method) = spec.label;\n            let input = node.input_at(rows);\n            match groups\n                .iter_mut()\n                .find(|group| group.fetcher == spec.fetcher() && group.input == input)\n            {\n                Some(group) => {\n                    group.nodes = group.nodes.with(node);\n                    if !group.clients.contains(&client) {\n                        group.clients.push(client);\n                    }\n                    if !group.methods.contains(&method) {\n                        group.methods.push(method);\n                    }\n                }\n                None => groups.push(Group {\n                    position: groups.len(),\n                    fetcher: spec.fetcher(),\n                    input,\n                    nodes: Hydrators::of(node),\n                    clients: vec![client],\n                    methods: vec![method],\n                    edges: Vec::new(),\n                    fields: Vec::new(),\n                    readers: Vec::new(),\n                }),\n            }\n        }\n        let reads: Vec<Hydrators> = groups\n            .iter()\n            .map(|group| {\n                group.nodes.iter().fold(Hydrators::empty(), |reads, node| {\n                    reads.union(node.reads_at(rows))\n                })\n            })\n            .collect();\n        let readers: Vec<Vec<usize>> = groups\n            .iter()\n            .map(|landed| {\n                reads\n                    .iter()\n                    .enumerate()\n                    .filter(|(_, reads)| !reads.intersection(landed.nodes).is_empty())\n                    .map(|(position, _)| position)\n                    .collect()\n            })\n            .collect();\n        for (group, readers) in groups.iter_mut().zip(readers) {\n            group.edges = edges(group.nodes);\n            group.fields = fields(group.fetcher, group.nodes, rows);\n            group.readers = readers;\n        }\n        Self {\n            level,\n            rows,\n            groups,\n            nodes,\n            logged_out_nodes: nodes\n                .iter()\n                .filter(|node| !node.needs_viewer())\n                .fold(Hydrators::empty(), Hydrators::with),\n        }\n    }\n\n    pub(crate) fn level(&self) -> SafetyLevel {\n        self.level\n    }\n\n    pub(crate) fn rows(&self) -> RequestRows {\n        self.rows\n    }\n\n    pub(crate) fn keys_only_user_rows_or_viewer(&self) -> bool {\n        self.nodes\n            .iter()\n            .all(|node| node.key_at(self.rows).keys_user_rows())\n    }\n\n    pub(crate) fn keys_a_node_only_user_rows_give(&self) -> bool {\n        self.nodes\n            .iter()\n            .any(|node| node.key_at(self.rows).keys_only_user_rows())\n    }\n\n    pub(super) fn reads_viewer_profile(&self) -> bool {\n        self.nodes.contains(Hydrator::ViewerProfile)\n    }\n\n    pub(super) fn reads_viewer_labels(&self) -> bool {\n        self.nodes.contains(Hydrator::ViewerLabels)\n    }\n\n    pub(super) fn callable(&self, viewer_id: Option<u64>) -> Hydrators {\n        match viewer_id {\n            Some(_) => self.nodes,\n            None => self.logged_out_nodes,\n        }\n    }\n\n    pub(super) fn groups(&self) -> impl Iterator<Item = &Group> {\n        self.groups.iter()\n    }\n\n    fn relations(&self) -> impl Iterator<Item = Relation> + '_ {\n        Relation::VARIANTS\n            .iter()\n            .copied()\n            .filter(|&relation| match relation.spec().role {\n                Role::Judged { rpc } => {\n                    self.level.is_carried_by(rpc)\n                        && !self\n                            .nodes\n                            .intersection(relation.spec().trigger.reads())\n                            .is_empty()\n                }\n                Role::Read => self\n                    .nodes\n                    .iter()\n                    .any(|node| node.spec().relation == Some(relation)),\n            })\n    }\n\n    pub(super) fn readers<'a>(&'a self, landed: &'a Group) -> impl Iterator<Item = &'a Group> {\n        landed\n            .readers\n            .iter()\n            .filter_map(|&position| self.groups.get(position))\n    }\n}\n\nimpl Group {\n    pub(super) fn ceiling(&self) -> Duration {\n        if self.nodes.has_must_have() {\n            return HYDRATION_TIMEOUT;\n        }\n        self.nodes\n            .iter()\n            .find_map(|node| Expansion::of(node.relation()?))\n            .map_or(BEST_EFFORT_HYDRATION_TIMEOUT, |expansion| {\n                expansion.spec().deadline\n            })\n    }\n\n    pub(super) fn label(&self) -> (String, String) {\n        (self.clients.join(\"+\"), self.methods.join(\"+\"))\n    }\n\n    pub(super) fn fields(&self) -> &[QueryFields] {\n        &self.fields\n    }\n\n    pub(super) fn edges(&self) -> &[(Edge, Graph, EdgeDirection, Hydrators)] {\n        &self.edges\n    }\n}\n\nfn fields(fetcher: FetcherId, nodes: Hydrators, rows: RequestRows) -> Vec<QueryFields> {\n    let nodes = match fetcher.spec().fields {\n        AskedFields::EveryLevel => Hydrator::VARIANTS\n            .iter()\n            .copied()\n            .filter(|node| node.spec_at(rows).fetcher() == fetcher)\n            .fold(Hydrators::empty(), Hydrators::with),\n        AskedFields::Planned => nodes,\n    };\n    let mut fields = Vec::new();\n    for node in nodes.iter() {\n        if let Part::Fields(node_fields) = node.spec().part {\n            for field in node_fields {\n                if !fields.contains(field) {\n                    fields.push(*field);\n                }\n            }\n        }\n    }\n    fields\n}\n\nfn edges(nodes: Hydrators) -> Vec<(Edge, Graph, EdgeDirection, Hydrators)> {\n    let mut edges: Vec<(Edge, Graph, EdgeDirection, Hydrators)> = Vec::new();\n    for node in nodes.iter() {\n        let Some(edge) = node.edge() else {\n            continue;\n        };\n        let Some((graph, direction)) = edge.flock() else {\n            continue;\n        };\n        match edges.iter_mut().find(|(queried, ..)| *queried == edge) {\n            Some((.., nodes)) => *nodes = nodes.with(node),\n            None => edges.push((edge, graph, direction, Hydrators::of(node))),\n        }\n    }\n    edges\n}\n\nimpl fmt::Display for HydrationPlan {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        writeln!(\n            f,\n            \"{}: {} calls\",\n            <&str>::from(self.level),\n            self.groups.len()\n        )?;\n        for group in &self.groups {\n            let (client, method) = group.label();\n            let after = group.input.map_or(\"-\", <&str>::from);\n            let nodes: Vec<&str> = group.nodes.iter().map(<&str>::from).collect();\n            write!(\n                f,\n                \"{client}/{method} after: {after} nodes: {}\",\n                nodes.join(\",\")\n            )?;\n            let fields = group.fields();\n            if !fields.is_empty() {\n                let fields: Vec<String> = fields.iter().map(|field| format!(\"{field:?}\")).collect();\n                write!(f, \" fields: {}\", fields.join(\"|\"))?;\n            }\n            for &(_, graph, direction, nodes) in group.edges() {\n                let direction = match direction {\n                    EdgeDirection::Forward => \"fwd\",\n                    EdgeDirection::Reverse => \"rev\",\n                };\n                let keys: Vec<String> = nodes\n                    .iter()\n                    .map(|node| node.key_at(self.rows).to_string())\n                    .collect();\n                write!(\n                    f,\n                    \" {}-{direction}[{}]\",\n                    <&str>::from(graph),\n                    keys.join(\",\")\n                )?;\n            }\n            for node in group.nodes.iter() {\n                if let Some(edge) = node.pair_edge() {\n                    let graph: &str = edge.graph().into();\n                    write!(f, \" {graph}-fwd[{}]\", node.key_at(self.rows))?;\n                }\n            }\n            if group.nodes.iter().all(Hydrator::needs_viewer) {\n                f.write_str(\" (skipped logged out)\")?;\n            }\n            if group.ceiling() != HYDRATION_TIMEOUT {\n                write!(f, \" timeout: {:?}\", group.ceiling())?;\n            }\n            writeln!(f)?;\n        }\n        for relation in self.relations() {\n            writeln!(f, \"{relation}\")?;\n        }\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{HydrationPlan, RequestRows};\n    use crate::hydration::{Hydrator, Hydrators};\n    use crate::rules::{RuleEngine, SafetyLevel};\n    use strum::VariantArray;\n\n    #[test]\n    fn each_level_plans_these_calls() {\n        let engine = RuleEngine::for_tests();\n        let plans: String = SafetyLevel::VARIANTS\n            .iter()\n            .map(|&level| engine.plan(level).to_string())\n            .collect();\n        crate::pinned::assert_pinned(\"tests/fixtures/plans.txt\", &plans);\n    }\n\n    #[test]\n    fn a_level_of_user_rows_plans_no_pure_core_and_asks_the_actor_source_by_user() {\n        let nodes = Hydrators::of(Hydrator::ViewerProfile)\n            .with(Hydrator::AuthorSafety)\n            .with(Hydrator::Follows)\n            .with(Hydrator::Blocks);\n        let plan =\n            HydrationPlan::with_rows(SafetyLevel::QuotedTweetRules, RequestRows::Users, nodes);\n        assert_eq!(\n            plan.to_string(),\n            \"\\\nquoted_tweet_rules: 3 calls\ngizmoduck/get_viewer_data after: - nodes: viewer_profile fields: ACCOUNT|EXTENDED_PROFILE|SAFETY (skipped logged out)\ngizmoduck_actor/get_users after: - nodes: author_safety fields: SAFETY|LABELS|PROFILE\nsocialgraph/batch_check_relationships after: - nodes: follows,blocks follows-fwd[users] blocks-fwd[users] (skipped logged out)\n\"\n        );\n        assert!(plan.keys_only_user_rows_or_viewer());\n    }\n}\n",
+      "source_digest": "06ca020907b414c4367418d38fe027ef92ef2fbfe54e3c1dd67d7cc2c167d443",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 15,
+      "end_line": 39,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ActionControlSeenRow, ActionControlView, AllowedActions, ConfidenceEvidence, ConfidenceLevel,\n    ConfidenceView, ControlEntity, ControlMode, CseLists, EvidenceOverride, LevelRow, Lifetime,\n    PageAction, PodActionControlView, RowSetting, RowView, RowsRequest, SafetyChecksByEntity,\n    UnreadableRecord,\n};\n\nmod levels;\npub use levels::level_lkey;\n\nuse crate::confidence::{ConfidenceConfig, RowOutcome};\nuse crate::decision::ActionSpec;\nuse crate::facts::EntityType;\nuse crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};\nuse crate::growthbook::DynamicConfig;\nuse crate::metrics;\nuse crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\n",
+      "source_digest": "ee184535e954ea33de1a052186b36fa3ab762f63c8b0809d912b99912cf3ca45",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 105,
+      "end_line": 129,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub fn seen_lkey(seen: &ActionControlSeen) -> String {\n    format!(\n        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n",
+      "source_digest": "2d4fcde274714515acd96ef3a52f495192fa7419baf6d3a0fdd1716f2789ebef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 106,
+      "end_line": 130,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\npub fn seen_lkey(seen: &ActionControlSeen) -> String {\n    format!(\n        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n",
+      "source_digest": "17a87d9edcba74f61d79377b3cb6ee7d69ce626d948ce34eb3a64d5073b5086f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 109,
+      "end_line": 133,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n",
+      "source_digest": "133a25ba477cdc92ca119affa5f3afd75de625b2232aa7cc3fc6bdff427bd3be",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 110,
+      "end_line": 134,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n    let rank = |a: &PageAction| match a {\n",
+      "source_digest": "326c485da8f3f9a3a832fcf3db96dbad49b751f0159ede29c3173d55ce3ff215",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 135,
+      "end_line": 159,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        PageAction::SpamHighRecall { .. }\n        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n",
+      "source_digest": "a275662129317966380e9e0f58dc0c03e5aa9ac6deb3c4694b7a563caba9cc8b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 139,
+      "end_line": 163,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n",
+      "source_digest": "11cc2f60f8be1dc5b875ec9ce1e6d07d2b384d2bb45680aa68f633962803e7e2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 143,
+      "end_line": 167,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n",
+      "source_digest": "b5e93ce3a56dd8c766817c044a1c195bd32402fef4f8e3d968f3fbb7430d916c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 155,
+      "end_line": 179,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n    match actions {\n        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),\n        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),\n        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n",
+      "source_digest": "0e20426e3e9367dac7729d9df23e51a0cf15ab43f5d563efbbf297709c6dde22",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 178,
+      "end_line": 202,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n",
+      "source_digest": "64c8f218d5d73366a01241e0cd0d62a2078216e26d4f2ef9e5ef946d6bc749ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 179,
+      "end_line": 203,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n",
+      "source_digest": "c0a8204a842e4117828c133cb5a8a3edf8ac48babcb3840db7a19a8659a553dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 181,
+      "end_line": 205,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n",
+      "source_digest": "46f3d0bc173e5498f9e8e6a82bb04c920758b71417d521d7fcc75c9d7b33c418",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 183,
+      "end_line": 207,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n",
+      "source_digest": "806861fdea3aa350378b6be3874871b3502c2d4bfafba0f01cd5f366819efd6d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 185,
+      "end_line": 209,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n            }\n            ActionSpec::SpamLivenessCheck => {\n",
+      "source_digest": "c0a3805f37654d53bded13a0bb256231388c2ac3b06da5c8ea0129536be2412b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 186,
+      "end_line": 210,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n            }\n            ActionSpec::SpamLivenessCheck => {\n                out.push(serde_json::json!({\"kind\": \"liveness_check\"}))\n",
+      "source_digest": "4510771f1b14293e66f751f9e604f3365a675160a33ffbb8625a48fb13d9842a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 508,
+      "end_line": 532,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            keys.push((FORCED_RECORDING_KEY.to_owned(), f.to_owned()));\n        }\n        if let Some(r) = &self.row {\n            keys.extend(r.info_keys(self.mode == ControlMode::Recording, self.forced));\n        }\n        keys\n    }\n}\n\npub struct ResolveInput<'a> {\n    pub head: &'a str,\n    pub classifier: &'a str,\n    pub labels: &'a [String],\n    pub entity: EntityType,\n    pub factory: bool,\n    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\n",
+      "source_digest": "720e6836968136c13e46b7dcb5d74f12276f8866afe259496069572ecaf59e13",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 711,
+      "end_line": 735,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n        PageAction::SpamHighRecall { lifetime }\n        | PageAction::PhoenixSkip { lifetime }\n        | PageAction::PostSpamHighRecall { lifetime } => {\n            Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))\n        }\n        _ => None,\n    }\n}\n\npub fn harsher_because(\n    before: Option<&ActionControlRecord>,\n",
+      "source_digest": "31bf1edaa2cdd21fd204dc843307384e261836cfb6c5bd78e3b9fadac5e6c181",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 757,
+      "end_line": 781,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n",
+      "source_digest": "a60553d49e133a635fdb73a0d93167561068731dade9cbc6b19fc8375a45f6c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 759,
+      "end_line": 783,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n",
+      "source_digest": "1d0e31535b9f27deb3b853ba55702298ee9ca8c2c8bf37dcfb23b40149c3d9a4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 762,
+      "end_line": 786,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n    let field = |o: &Value, k: &str| o.get(k).cloned().unwrap_or(Value::Null);\n    let permanent = |o: &Value| o.get(\"permanent\").and_then(Value::as_bool) == Some(true);\n    let days = |o: &Value| {\n",
+      "source_digest": "51a569eee353970f2bdcbe80fee30883bdb85844a982867eb4910fc1ae09d069",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 791,
+      "end_line": 815,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .and_then(Value::as_f64)\n                .unwrap_or(f64::INFINITY)\n        }\n    };\n    page.iter().any(|p| {\n        if field(rule, \"kind\") != field(p, \"kind\") {\n            return false;\n        }\n        match rule.get(\"kind\").and_then(Value::as_str) {\n            Some(\"suspend\") => {\n                field(rule, \"policy\") == field(p, \"policy\") && (!permanent(rule) || permanent(p))\n            }\n            Some(\"label\" | \"post_label\") => {\n                field(rule, \"label\") == field(p, \"label\") && days(rule) <= days(p)\n            }\n            Some(\"liveness_check\") => true,\n            _ => false,\n        }\n    })\n}\n\nimpl ActionControl {\n    pub fn new(store: Arc<dyn ControlStore>, env: String, pod: String) -> Self {\n        let (seen_tx, seen_rx) = mpsc::channel(SEEN_QUEUE);\n        Self {\n",
+      "source_digest": "b456c278e81c4cb598729e118fe6b5434ab0b920a12baef4ad858c4c436f1502",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 792,
+      "end_line": 816,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .unwrap_or(f64::INFINITY)\n        }\n    };\n    page.iter().any(|p| {\n        if field(rule, \"kind\") != field(p, \"kind\") {\n            return false;\n        }\n        match rule.get(\"kind\").and_then(Value::as_str) {\n            Some(\"suspend\") => {\n                field(rule, \"policy\") == field(p, \"policy\") && (!permanent(rule) || permanent(p))\n            }\n            Some(\"label\" | \"post_label\") => {\n                field(rule, \"label\") == field(p, \"label\") && days(rule) <= days(p)\n            }\n            Some(\"liveness_check\") => true,\n            _ => false,\n        }\n    })\n}\n\nimpl ActionControl {\n    pub fn new(store: Arc<dyn ControlStore>, env: String, pod: String) -> Self {\n        let (seen_tx, seen_rx) = mpsc::channel(SEEN_QUEUE);\n        Self {\n            store,\n",
+      "source_digest": "8aa99548db0cb5ec864d63b8f3e04c9b143268c4bacf988999627f95d4f76abe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 885,
+      "end_line": 909,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return out;\n        }\n        let snap = self.snapshot();\n        if snap.records.is_empty() && snap.unreadable.is_empty() {\n            return out;\n        }\n        let mut safety_ok = Some(safety_ok);\n        let mut safety_seen: Option<bool> = None;\n        let mut safety = |e: EntityType| {\n            *safety_seen.get_or_insert_with(|| safety_ok.take().is_none_or(|f| f(e)))\n        };\n        let mut bands: Vec<&str> = input\n            .labels\n            .iter()\n            .map(|l| strip_dry_run_prefix(l))\n            .filter(|l| valid_name(l))\n            .collect();\n        bands.sort_unstable();\n        bands.dedup();\n        let entity = entity_of(input.entity);\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let claim = input\n            .confidence\n            .clone()\n            .unwrap_or_else(|| crate::confidence::Claim {\n",
+      "source_digest": "84675a1e9bcc32860807c65385f44e93ae2c30561bcd1d3176bd6fa682a69817",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 964,
+      "end_line": 988,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.mode = mode;\n                out.page_actions = actions;\n                out.forced = forced;\n                out.matched = Some(Matched {\n                    lkey: lkey.to_owned(),\n                    record: record.clone(),\n                });\n            }\n        }\n        out.dedup_class = out.page_driven().then(|| page_class(&out.page_actions));\n        if let Some(m) = &out.matched {\n            metrics::ACTION_CONTROL_DECISIONS_TOTAL\n                .with_label_values(&[\n                    m.record.head.as_str(),\n                    out.mode.as_str(),\n                    out.forced.unwrap_or(\"\"),\n                ])\n                .inc();\n        }\n        out\n    }\n\n            pub fn resolve_run(\n        &self,\n        input: &ResolveInput<'_>,\n",
+      "source_digest": "b99b978a9622ebcb3332c740cc05db141bf6f697adde76f0419f24824d47a4a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 15,
+      "end_line": 39,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ActionControlSeenRow, ActionControlView, AllowedActions, ConfidenceEvidence, ConfidenceLevel,\n    ConfidenceView, ControlEntity, ControlMode, CseLists, EvidenceOverride, LevelRow, Lifetime,\n    PageAction, PodActionControlView, ROLLOUT_ALL_BP, ROWS_RECORD_VERSION, RowSetting, RowView,\n    RowsRequest, SafetyChecksByEntity, UnreadableRecord, in_rollout, rollout_bucket,\n};\n\nmod levels;\npub use levels::level_lkey;\n\nuse crate::confidence::{ConfidenceConfig, RowOutcome};\nuse crate::decision::ActionSpec;\nuse crate::facts::EntityType;\nuse crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};\nuse crate::growthbook::DynamicConfig;\nuse crate::metrics;\nuse crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\n",
+      "source_digest": "10be72f28aec304ac9f66cc6c8360af189b5bdbb4ba76cd4901ea1bb0d439a33",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 109,
+      "end_line": 133,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub fn seen_lkey(seen: &ActionControlSeen) -> String {\n    format!(\n        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n",
+      "source_digest": "2d4fcde274714515acd96ef3a52f495192fa7419baf6d3a0fdd1716f2789ebef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 110,
+      "end_line": 134,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\npub fn seen_lkey(seen: &ActionControlSeen) -> String {\n    format!(\n        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n",
+      "source_digest": "17a87d9edcba74f61d79377b3cb6ee7d69ce626d948ce34eb3a64d5073b5086f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 113,
+      "end_line": 137,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\nconst RISKY_HIGH_VIZ_REPLY: &str = \"RiskyHighVizReply\";\n",
+      "source_digest": "d074616a3d3fa8ea4d3c1dbe29e9b221a3961ca130bf0685a711385662640074",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 114,
+      "end_line": 138,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\nconst RISKY_HIGH_VIZ_REPLY: &str = \"RiskyHighVizReply\";\n\n",
+      "source_digest": "11a121910d2a316ef6bfea43410cc5e320df906b5e9a9c77d50572339c57d3c6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 142,
+      "end_line": 166,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. }\n        | PageAction::HideReply { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n",
+      "source_digest": "6e0984a921f2a50841f8ed2424d4cd0174c4cbaab2a57e22922208278379aa82",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 146,
+      "end_line": 170,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n",
+      "source_digest": "5a6f7d44889c1a7fb5e6e7936c08739bf7b402b8a6865b212274acce0652cc1c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 150,
+      "end_line": 174,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n",
+      "source_digest": "2610cd5b6b59c3eb07176ac6e3de7395aa5fc387c51e8706d88e6ecd59a4898a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 154,
+      "end_line": 178,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n",
+      "source_digest": "adadd7aa876c8ff3598f1157133d7bc56ad9320436f3561f2fb64ba622ee3d85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 166,
+      "end_line": 190,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n    match actions {\n        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),\n        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),\n        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n",
+      "source_digest": "a7b1ad520efee788a34ac787928e457c45756b08f7dc2ce346318c3d17f52fe4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 189,
+      "end_line": 213,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n",
+      "source_digest": "64c8f218d5d73366a01241e0cd0d62a2078216e26d4f2ef9e5ef946d6bc749ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 190,
+      "end_line": 214,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n",
+      "source_digest": "c0a8204a842e4117828c133cb5a8a3edf8ac48babcb3840db7a19a8659a553dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 192,
+      "end_line": 216,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n",
+      "source_digest": "46f3d0bc173e5498f9e8e6a82bb04c920758b71417d521d7fcc75c9d7b33c418",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 194,
+      "end_line": 218,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n",
+      "source_digest": "806861fdea3aa350378b6be3874871b3502c2d4bfafba0f01cd5f366819efd6d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 196,
+      "end_line": 220,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n            }\n            ActionSpec::SpamLivenessCheck => {\n",
+      "source_digest": "c0a3805f37654d53bded13a0bb256231388c2ac3b06da5c8ea0129536be2412b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 197,
+      "end_line": 221,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n            }\n            ActionSpec::SpamLivenessCheck => {\n                out.push(serde_json::json!({\"kind\": \"liveness_check\"}))\n",
+      "source_digest": "4510771f1b14293e66f751f9e604f3365a675160a33ffbb8625a48fb13d9842a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1d8b597f88ba664e27847980ca88c693d6fe716fcbd0561c5cb263b4b9622cb7",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "72d53cede7bad38f1d425de31bb77cb72445d7d4214fbc3eb540b71b37092ff5",
+      "context_complete": true,
+      "task_id": "T-13b293a541b6675592146bd46e8b514180170c6d37893f9d9f2e023a25f12e4b",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a8ced7c30b5eb5b0a742a023c84ba25661afbb17ad4ef05fae569041f16dc658",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-4c73b83296b9ee9ad84bb9ed67c7a0672fe4558a56f80eb5d6d7b924545f2ea5",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e5f1d4e26d641a8f6e41ecd13e5f7b865b06770392af8665bd03c0b954f92cfe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-a7dc1628177e8df4ca1f6f83b262974e53e8762fbbc6b6eca8c073a2f09d632b",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1d4a7ee59c7e180d5efec993729dd38f6acec25794aa6d146ed966f21fd7e90e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-c09befa348f26932a93c8851843941312c143c7f9c73164d46e5a14fdaf55bee",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-93e92e2e941b2cfd48bf520b216995ce07212fb52a81f0bf66aedca7bb07c436",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-6d933806346f799e425534d56cafce18ea9bc05dbdff447b02f24c8dbfb442e3",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a6878f487b6d768a4c948b402c2861c0976aeb061f079cb56fcdbd9d6c8c7f1e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-baf908c7bc0057a61ba4e905f765a8649e29514f1b05fd4d663d3e7860250419",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1e43f15cd487a4ece19118605de9c74a9a5e0d279118c5eca27a8db152befa6b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-1d3474f13292d1ffd66af4082601538467aa9bc79b0c9797b2a7bda3210c457f",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-860cbab3bdf9472a09cc764d0e8836d602c5bcbac56b1ee1c284e7769ac13152",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-65a95e4ca6db41f612e273e2fd3d87c7c1410a03a4dfe6268a6fba0e6b0dcad9",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-13d8e9538a110bec63a4ab5733e0ec1f9ce8baeb8eb97bd1a4600fdfc1a55f24",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-fd1e4f07edf8668cf1c2e2479d4bc3a101d7f09bbf6eecfa7a0ba2ce2b325200",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-14b6f32bcfc5a4620c48f199d5ada109a75112317225ca96e28e0adbbbaae7f6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-ac8f73ba050bddc98019150f9deb0c92751254f4be8d77e9b3d9878f5a4697b6",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-19bdcc10b26e944dbe27e1da499f1675635ccc3ff3887e6a40a374fe94d44524",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-a6ddcd8930f9c3798400a66073f573556e19f4202394b6789c7f33457bf25040",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-27bcb1fd71a3689ef8a931eec42ee5e608985a23fe5d8f27ba05ff76e1242012",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-ce5eb010449324769bf7c3f53f829861ec12e4f16293c6fc3d758eb13e531233",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-565b77f018861d8f975187ddb3509bb9956a90974114cd797c3d2d9f687178a7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-330673bb97e4604224e7aa3b1849e166840baebb08e86a51dd82f932a47da4c1",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-47106ed0b8b61c47f8af8b9bdb3f4b37d90d4ed0e5459f36ce94611e04838338",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-5feadfb16cd5083de3598325e63a9b4eed06bdddd555ebf2ee6f65cc975a95fe",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-722239e62bfdf90d72412ebf7ae90c108045036102fd85f1017b24db43f0835e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-ca30c07a3e89cc5a535052d67f03b27c2b7ad587d0d305d4882b48930bcfccbd",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4cd2751afbd21d9ff1376fbef79d0214f80a4848c452f1aed4e9fb4177b5e3f9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-617fbbea20241ee2b62803a7ed89a5dd3eb550c799ed83f67c240f7708497eaa",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2d31ce2c8cbc8100fd99d01f5bbe0674a8517ed658e032ac8594f8588f11ee1e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-598f5e0823855a1d5ac16c04ad3265c40e240c9db19b2f7a5df141a1a4d447eb",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9519b3dba47fa1a6d6710948964b45bae56500f03b7edcc6b9f7805379e7b132",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-a83c317b07cf123e24f298b1078feff69118d868c3e7c0b8ca6851c4c0e0aba3",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-322cca6095f7fd2f704d66df2ea05b5a6a9bd69011584e77dc0760e34e48e35f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-b676cf41d784a4c1818e4abd920ad9f1bf0060c97116cfcfea3a3bed8d5e3ed0",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d152b5d379056b0d49ff52d8b91dd345719bd1133198bbc0f0310171968b531d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-8e49b126855740fc222ba75d6b25bd1fd58b7236e260a6af76749353570aef51",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ce1e67a13a3f7c3aabbaac9e869b6068652680316e182e8343d80350771a6fc6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-2fdf96a41c393ee4453fea4af357fcaf6f5c6fce9c915fdd3dfab547303339a4",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6e903943a495f824a8778a2b041f55e78ec7344666c877ada9a4d7577b9c1011",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-f2da80754e76ff78ff3b84a6be547ece5474fec88d5fcdf83aba0f0ac99d070c",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c84970e00b24141877eaf362cb1ea294105273e36260d621b8649a1b7e74acb1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-a2463665d7e460ff5c867aceb194479976276b0673308261eac290e629af68fb",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1da3b5bc2cfe253f388c956ddada2091927d0362625f800512589d8b38959a45",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-e531adc2087a18441a1cf1b6c64b9947b3fd642e6a777db3c0a8648d6c794fac",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a3fb5e0718d244fba43dffbc63408591506e2a9e5cfd1a4a3ee838e4457bec37",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-79feb025773e9f0065923ac4f7e376666639f59db3909123892eea6dae0c279b",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab27649698668124147047d75c4f9c3aeb6973e62648b31d1cc55c6db9718e54",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-596dd998ca986fe98ec235ce4aae7f167e7cf3e1ea6fec9772b8a18c2352bceb",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fe57c3e696d50078bb16f5a0f87751684cb5c2e01f7cf7accd6994fa9a3c03ca",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-cdf443cf47b0819a468568c333dee85dc8b96a73000da8ea5c3cdfa7ffc50e37",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-69a554377315ed54376527be02694a22fc8af191afbc64ca6166f8e082b708b6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-955c9f4312491390669a6950d95868cd92e309052e3824e47313706a48d8d43a",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2f6e43e8b83161914f93764f6d61ded32b27b551b4b4a622a864f724e0226e37",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-06fe856e0f67309cae825c9f9f422371ba9fcb1a1fc1d34c39cb85192a72dfdb",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7abc33b8df1b2055910ddd93910d675b76183fd29d409a766f81f2d6d7c8bea5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-f06b546fd64f2d7caa3f5a371beea38b3f8cce98e89e02047340514532d9536c",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1fbf953f34bfbda57498f1bbc0ed13393937b31360b6252f7dfaee8c4fa114a0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-558d67b55e735bea60346b79e2d73932c197783135dd7ec0b03bb56ad9dfe508",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5149d242c57290cb232505e2f9a3165d5d05eea1c4e8c26b63173b8fe73d6d3d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-065bc39b984b9ab0c07e9a35ee87ea777eaa844fe4c29a2590f2d3f8551ee807",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-087f23ee19c13e24426762c97c80da5c2571d8b689418d5486607fd14c121861",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-1fc4d7f983b9a4a9352c6d1a87f48d9a85018643220d5d3c1997641342317655",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f260984ff63868c02eda1c9f925e622832970f71f57831df625f928243d649a2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-01656df428914ec2d16873d84c34173c424b434607daf20e14216d1f85e6696e",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ac35b0a58b5eb5c4aebb23bbcaec5799eb8e532bfbaf2f7e72fc687b01533064",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-e1df89337f2ba0847b7fd282b285ce1a7ce70b29bd9ba8f8343fe1740bc712bd",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7a8bccf2523e33a36c6c9f3cac072f454f8afe3ca058223943eb626f7256f0c0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-03500fc1e4d248d4ac5da38c6386e05c3b4843a6b81dc1f85e44a840fb29ae8a",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1a982aff57c572405d299a101fecec79c692a4503c42651aca204d006e49a59d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-e99d0cf645a30f1d2ff1e999a9e661f137e1789268d3932a6713f2ed7fbb3c3f",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b4fc7c7b454d2516936dc6e476cbebdd16817d06874d472bdee4a341f87e23cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-be12df7244c03c31f5268730dda00745b6fc08280af890fa8c4294534d8addf8",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-905d96a929fff4056b949826d1ded85cef64af4fa26cc3c122419c085bd543d7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-d7e06ce9ce7a81b9d019a221585ed7433e9d0ab43ea8adc887db99964f998b38",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a46d1f4059717a6625b2021a46cab80ac557e5cc811a3997a3f49f8c07daa306",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-0bf86851a8c0cf3473e8dba54f2d52da0da29c5c27b332fd139392b822914f2a",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/plan.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cacd1c444f88dbaf8bb1504ea48a8d65a43d59bd81954acf121353bbd417c268",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "HydrationPlan",
+        "Group",
+        "keys_a_node_only_user_rows_give",
+        "reads_viewer_profile",
+        "ceiling",
+        "reads_relation",
+        "label",
+        "fields"
+      ],
+      "context_complete": false,
+      "task_id": "T-33eb227d8fb8e446f37b49f2cc2007dc3f311614700aeae90e9757ffec78eb85",
+      "evidence_refs": [
+        "E42"
+      ]
+    }
+  ],
+  "task_id": "T-feebbda6c1a42597094b939bd3cf3e06837253c2d29ebbddae5c6badcd78f864"
+}

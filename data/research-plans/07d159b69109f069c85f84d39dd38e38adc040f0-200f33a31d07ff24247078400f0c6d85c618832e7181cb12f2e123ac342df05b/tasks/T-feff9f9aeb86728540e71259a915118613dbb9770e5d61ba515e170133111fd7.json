@@ -1,0 +1,1373 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/params/limited_actions_policy.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-6ab270ea7ea9664ad6ae47b636d8a64524dff54bafb41e4bc49f3e08cc7e3355",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/params",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 396,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::LimitedEngagementReason;\nuse crate::params::limited_actions_copy::{Prompt, PromptCopy};\nuse xai_feature_switches::FeatureSwitchResults;\nuse xai_stats_receiver::StatsReceiverExt;\n\npub(super) const REASON_FIELD: &str = \"LimitedEngagementReason\";\nconst LIMITED_ACTIONS_KEY: &str = \"limited_actions_policy_limited_actions\";\nconst COPY_NAMESPACE_KEY: &str = \"limited_actions_policy_copy_namespace\";\nconst PROMPT_TYPE_KEY: &str = \"limited_actions_policy_prompt_type\";\nconst LEARN_MORE_URL_KEY: &str = \"limited_actions_policy_prompt_learn_more_url\";\nconst MISSING_POLICY_COUNTER: &str = \"limited_actions_policy_missing\";\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]\n#[strum(serialize_all = \"snake_case\")]\npub enum LimitedActionType {\n    Reply,\n    Retweet,\n    QuoteTweet,\n    Like,\n    React,\n    SendViaDm,\n    AddToBookmarks,\n    AddToMoment,\n    PinToProfile,\n    ViewTweetActivity,\n    ShareTweetVia,\n    Follow,\n    ListsAddRemove,\n    MuteConversation,\n    Embed,\n    ViewHiddenReplies,\n    HideCommunityTweet,\n    CopyLink,\n    VoteOnPoll,\n    RemoveFromCommunity,\n    ShowRetweetActionMenu,\n    ReplyDownVote,\n    Autoplay,\n    EditTweet,\n    Highlight,\n    ViewPostEngagements,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\nenum Missing {\n    Actions,\n    Copy,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) struct LimitedAction {\n    pub(crate) action_type: LimitedActionType,\n    pub(crate) prompt: Option<Prompt>,\n}\n\n#[derive(Default)]\npub(crate) struct LimitedActionsPolicies {\n    policies: Vec<(LimitedEngagementReason, Vec<LimitedAction>)>,\n}\n\nimpl LimitedActionsPolicies {\n    pub(super) fn resolve(\n        reasons: impl IntoIterator<Item = LimitedEngagementReason>,\n        match_reason: impl Fn(LimitedEngagementReason) -> FeatureSwitchResults,\n        prompt: impl Fn(LimitedActionType, &PromptCopy) -> Option<Prompt>,\n        stats: Option<&dyn StatsReceiverExt>,\n    ) -> Self {\n        let mut matched: Vec<LimitedEngagementReason> = Vec::new();\n        let mut policies = Vec::new();\n        let count = |reason: LimitedEngagementReason, missing: Missing| {\n            if let Some(stats) = stats {\n                let labels = [(\"reason\", reason.into()), (\"missing\", missing.into())];\n                stats.incr(MISSING_POLICY_COUNTER, &labels, 1);\n            }\n        };\n        for reason in reasons {\n            if matched.contains(&reason) {\n                continue;\n            }\n            matched.push(reason);\n            let results = match_reason(reason);\n            let action_types: Vec<LimitedActionType> = results\n                .get_array_no_impression(LIMITED_ACTIONS_KEY)\n                .into_iter()\n                .flatten()\n                .filter_map(|name| name.as_str()?.parse().ok())\n                .collect();\n            if action_types.is_empty() {\n                count(reason, Missing::Actions);\n                continue;\n            }\n            let copy = PromptCopy::from_switches(\n                results.get_string_no_impression(COPY_NAMESPACE_KEY),\n                results.get_string_no_impression(PROMPT_TYPE_KEY),\n                results.get_string_no_impression(LEARN_MORE_URL_KEY),\n            );\n            let actions: Vec<LimitedAction> = action_types\n                .into_iter()\n                .map(|action_type| LimitedAction {\n                    action_type,\n                    prompt: copy.as_ref().and_then(|copy| prompt(action_type, copy)),\n                })\n                .collect();\n            if copy.is_some() && actions.iter().any(|action| action.prompt.is_none()) {\n                count(reason, Missing::Copy);\n            }\n            policies.push((reason, actions));\n        }\n        Self { policies }\n    }\n\n    pub(crate) fn actions(&self, reason: LimitedEngagementReason) -> &[LimitedAction] {\n        self.policies\n            .iter()\n            .find(|(held, _)| *held == reason)\n            .map_or(&[], |(_, actions)| actions)\n    }\n\n    #[cfg(test)]\n    pub(crate) fn for_tests(\n        policies: Vec<(LimitedEngagementReason, Vec<LimitedActionType>)>,\n    ) -> Self {\n        let unprompted = |action_type| LimitedAction {\n            action_type,\n            prompt: None,\n        };\n        Self {\n            policies: policies\n                .into_iter()\n                .map(|(reason, types)| (reason, types.into_iter().map(unprompted).collect()))\n                .collect(),\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::super::tests::Counted;\n    use super::*;\n    use crate::params::limited_actions_copy::LimitedActionsCopy;\n    use crate::params::ClientSwitches;\n    use arc_swap::ArcSwap;\n    use std::collections::BTreeMap;\n    use std::sync::Arc;\n    use xai_feature_switches::FeatureSwitches;\n    use LimitedEngagementReason::{\n        BlockedViewer, CommunityTweetCommunityDeleted, CommunityTweetCommunityNotFound,\n        CommunityTweetCommunitySuspended, CommunityTweetHidden, CommunityTweetMemberRemoved,\n        CommunityTweetViewerRemoved, ConversationControl, LocalTweet, ReadonlyViewer,\n        RootAuthorBlockedViewer, StaleTweet,\n    };\n\n    fn copy_naming_namespaces<'a>(\n        policies: impl IntoIterator<Item = (&'a str, &'a [LimitedActionType])>,\n    ) -> LimitedActionsCopy {\n        let mut keys = BTreeMap::new();\n        for (namespace, actions) in policies {\n            keys.insert(format!(\"{namespace}_GenericSubtext\"), namespace);\n            for action in actions {\n                keys.insert(format!(\"{namespace}_{action:?}_Headline\"), namespace);\n                keys.insert(format!(\"{namespace}_{action:?}_Subtext\"), namespace);\n            }\n        }\n        let entries: Vec<String> = keys\n            .iter()\n            .map(|(key, namespace)| {\n                format!(\n                    r#\"{{\"string_key\": \"{key}\", \"current_variant\": \"{namespace}\", \"instructions_v2\": []}}\"#\n                )\n            })\n            .collect();\n        LimitedActionsCopy::from_json(&format!(\"[{}]\", entries.join(\",\")))\n    }\n\n    #[test]\n    fn each_reason_resolves_its_policy_from_the_scala_file() {\n        use LimitedActionType as T;\n        let community_unavailable = vec![\n            T::AddToBookmarks,\n            T::AddToMoment,\n            T::Embed,\n            T::Follow,\n            T::HideCommunityTweet,\n            T::Like,\n            T::ListsAddRemove,\n            T::MuteConversation,\n            T::PinToProfile,\n            T::QuoteTweet,\n            T::React,\n            T::RemoveFromCommunity,\n            T::Reply,\n            T::Retweet,\n            T::SendViaDm,\n            T::ShareTweetVia,\n            T::ViewHiddenReplies,\n            T::ViewTweetActivity,\n            T::VoteOnPoll,\n        ];\n        let community_hidden = community_unavailable\n            .iter()\n            .copied()\n            .filter(|action| *action != T::RemoveFromCommunity)\n            .collect();\n        let expected = [\n            (ConversationControl, Some(\"LimitedReplies\"), vec![T::Reply]),\n            (\n                BlockedViewer,\n                Some(\"BlockedViewer\"),\n                vec![\n                    T::Reply,\n                    T::Retweet,\n                    T::QuoteTweet,\n                    T::Like,\n                    T::React,\n                    T::SendViaDm,\n                    T::AddToBookmarks,\n                    T::AddToMoment,\n                    T::PinToProfile,\n                    T::ShareTweetVia,\n                    T::Follow,\n                    T::ListsAddRemove,\n                    T::Embed,\n                    T::CopyLink,\n                    T::VoteOnPoll,\n                    T::ShowRetweetActionMenu,\n                    T::ReplyDownVote,\n                    T::EditTweet,\n                    T::Highlight,\n                ],\n            ),\n            (\n                RootAuthorBlockedViewer,\n                Some(\"BlockedViewer\"),\n                vec![T::Reply],\n            ),\n            (\n                ReadonlyViewer,\n                Some(\"ReadonlyViewer\"),\n                vec![\n                    T::AddToBookmarks,\n                    T::AddToMoment,\n                    T::Embed,\n                    T::HideCommunityTweet,\n                    T::Like,\n                    T::ListsAddRemove,\n                    T::PinToProfile,\n                    T::QuoteTweet,\n                    T::React,\n                    T::Reply,\n                    T::Retweet,\n                    T::VoteOnPoll,\n                    T::EditTweet,\n                    T::Highlight,\n                ],\n            ),\n            (\n                StaleTweet,\n                None,\n                vec![\n                    T::Reply,\n                    T::Retweet,\n                    T::QuoteTweet,\n                    T::Like,\n                    T::React,\n                    T::SendViaDm,\n                    T::AddToBookmarks,\n                    T::ShareTweetVia,\n                    T::AddToMoment,\n                    T::Embed,\n                    T::HideCommunityTweet,\n                    T::PinToProfile,\n                    T::ViewTweetActivity,\n                    T::VoteOnPoll,\n                    T::CopyLink,\n                ],\n            ),\n            (\n                CommunityTweetHidden,\n                Some(\"CommunityHidden\"),\n                community_hidden,\n            ),\n            (\n                CommunityTweetMemberRemoved,\n                Some(\"Default\"),\n                community_unavailable.clone(),\n            ),\n            (\n                CommunityTweetCommunityNotFound,\n                Some(\"Default\"),\n                community_unavailable.clone(),\n            ),\n            (\n                CommunityTweetCommunityDeleted,\n                Some(\"Default\"),\n                vec![T::HideCommunityTweet, T::RemoveFromCommunity],\n            ),\n            (\n                CommunityTweetCommunitySuspended,\n                Some(\"Default\"),\n                community_unavailable,\n            ),\n            (\n                CommunityTweetViewerRemoved,\n                Some(\"ViewerIsRemovedFromCommunity\"),\n                vec![T::Reply, T::PinToProfile],\n            ),\n            (LocalTweet, Some(\"LocalPost\"), vec![T::Retweet, T::Reply]),\n        ];\n        let copy = copy_naming_namespaces(\n            expected\n                .iter()\n                .filter_map(|(_, namespace, actions)| Some(((*namespace)?, actions.as_slice()))),\n        );\n        let stats = Counted::default();\n        let policies = ClientSwitches::for_tests().limited_actions_policies(\n            None,\n            None,\n            None,\n            expected.iter().map(|(reason, _, _)| *reason),\n            &copy,\n            Some(&stats),\n        );\n        for (reason, namespace, actions) in expected {\n            let resolved = policies.actions(reason);\n            let action_types: Vec<LimitedActionType> =\n                resolved.iter().map(|action| action.action_type).collect();\n            assert_eq!(action_types, actions, \"{reason:?}\");\n            for action in resolved {\n                assert_eq!(\n                    action\n                        .prompt\n                        .as_ref()\n                        .map(|prompt| prompt.headline.as_str()),\n                    namespace,\n                    \"{reason:?} {:?}\",\n                    action.action_type\n                );\n            }\n        }\n        let counted = stats.take();\n        assert!(counted.is_empty(), \"{counted:?}\");\n    }\n\n    #[test]\n    fn a_reason_without_a_known_action_has_no_policy_and_counts_once() {\n        const POLICY: &str = r#\"\nlimited_actions_policy:\n  parameters:\n    limited_actions_policy_limited_actions: {type: array, default: []}\n  rules:\n  - query: \"[$LimitedEngagementReason eq limited_replies]\"\n    values:\n      limited_actions_policy_limited_actions: [\"reply\"]\n  - query: \"[$LimitedEngagementReason eq blocked_viewer]\"\n    values:\n      limited_actions_policy_limited_actions: [\"no_such_action\"]\n\"#;\n        let switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(\n            FeatureSwitches::load_string(POLICY).unwrap(),\n        )));\n        let stats = Counted::default();\n        let policies = switches.limited_actions_policies(\n            None,\n            None,\n            None,\n            [StaleTweet, ConversationControl, BlockedViewer, StaleTweet],\n            &LimitedActionsCopy::from_json(\"[]\"),\n            Some(&stats),\n        );\n        assert_eq!(\n            policies.actions(ConversationControl),\n            [LimitedAction {\n                action_type: LimitedActionType::Reply,\n                prompt: None,\n            }]\n        );\n        assert!(policies.actions(StaleTweet).is_empty());\n        assert!(policies.actions(BlockedViewer).is_empty());\n        let missing = |reason: &str, missing: &str| {\n            (\n                MISSING_POLICY_COUNTER.to_string(),\n                format!(\"reason={reason},missing={missing}\"),\n                1,\n            )\n        };\n        assert_eq!(\n            stats.take(),\n            [\n                missing(\"stale_tweet\", \"actions\"),\n                missing(\"conversation_control\", \"copy\"),\n                missing(\"blocked_viewer\", \"actions\"),\n            ]\n        );\n    }\n}\n",
+      "source_digest": "c68c9e3214f2c4a4cccd5d9b4039965310434cde2157bce80c98cab1090821a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 428,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::LimitedEngagementReason;\nuse crate::params::limited_actions_copy::{Prompt, PromptCopy};\nuse xai_feature_switches::FeatureSwitchResults;\nuse xai_stats_receiver::StatsReceiverExt;\nuse xai_stringcenter::DEFAULT_LANGUAGE;\n\npub(super) const REASON_FIELD: &str = \"LimitedEngagementReason\";\nconst LIMITED_ACTIONS_KEY: &str = \"limited_actions_policy_limited_actions\";\nconst COPY_NAMESPACE_KEY: &str = \"limited_actions_policy_copy_namespace\";\nconst PROMPT_TYPE_KEY: &str = \"limited_actions_policy_prompt_type\";\nconst LEARN_MORE_URL_KEY: &str = \"limited_actions_policy_prompt_learn_more_url\";\nconst MISSING_POLICY_COUNTER: &str = \"limited_actions_policy_missing\";\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]\n#[strum(serialize_all = \"snake_case\")]\npub enum LimitedActionType {\n    Reply,\n    Retweet,\n    QuoteTweet,\n    Like,\n    React,\n    SendViaDm,\n    AddToBookmarks,\n    AddToMoment,\n    PinToProfile,\n    ViewTweetActivity,\n    ShareTweetVia,\n    Follow,\n    ListsAddRemove,\n    MuteConversation,\n    Embed,\n    ViewHiddenReplies,\n    HideCommunityTweet,\n    CopyLink,\n    VoteOnPoll,\n    RemoveFromCommunity,\n    ShowRetweetActionMenu,\n    ReplyDownVote,\n    Autoplay,\n    EditTweet,\n    Highlight,\n    ViewPostEngagements,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\nenum Missing {\n    Actions,\n    Copy,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) struct LimitedAction {\n    pub(crate) action_type: LimitedActionType,\n    pub(crate) prompt: Option<Prompt>,\n}\n\n#[derive(Default)]\npub(crate) struct LimitedActionsPolicies {\n    policies: Vec<(LimitedEngagementReason, Vec<LimitedAction>)>,\n    language: Option<String>,\n}\n\nimpl LimitedActionsPolicies {\n    pub(super) fn resolve(\n        reasons: impl IntoIterator<Item = LimitedEngagementReason>,\n        match_reason: impl Fn(LimitedEngagementReason) -> FeatureSwitchResults,\n        prompt: impl Fn(LimitedActionType, &PromptCopy) -> Option<Prompt>,\n        stats: Option<&dyn StatsReceiverExt>,\n    ) -> Self {\n        let mut matched: Vec<LimitedEngagementReason> = Vec::new();\n        let mut policies = Vec::new();\n        let count = |reason: LimitedEngagementReason, missing: Missing| {\n            if let Some(stats) = stats {\n                let labels = [(\"reason\", reason.into()), (\"missing\", missing.into())];\n                stats.incr(MISSING_POLICY_COUNTER, &labels, 1);\n            }\n        };\n        for reason in reasons {\n            if matched.contains(&reason) {\n                continue;\n            }\n            matched.push(reason);\n            let results = match_reason(reason);\n            let action_types: Vec<LimitedActionType> = results\n                .get_array_no_impression(LIMITED_ACTIONS_KEY)\n                .into_iter()\n                .flatten()\n                .filter_map(|name| name.as_str()?.parse().ok())\n                .collect();\n            if action_types.is_empty() {\n                count(reason, Missing::Actions);\n                continue;\n            }\n            let copy = PromptCopy::from_switches(\n                results.get_string_no_impression(COPY_NAMESPACE_KEY),\n                results.get_string_no_impression(PROMPT_TYPE_KEY),\n                results.get_string_no_impression(LEARN_MORE_URL_KEY),\n            );\n            let actions: Vec<LimitedAction> = action_types\n                .into_iter()\n                .map(|action_type| LimitedAction {\n                    action_type,\n                    prompt: copy.as_ref().and_then(|copy| prompt(action_type, copy)),\n                })\n                .collect();\n            if copy.is_some() && actions.iter().any(|action| action.prompt.is_none()) {\n                count(reason, Missing::Copy);\n            }\n            policies.push((reason, actions));\n        }\n        Self {\n            policies,\n            language: None,\n        }\n    }\n\n    pub(super) fn in_language(mut self, language: Option<&str>) -> Self {\n        self.language = language.map(str::to_owned);\n        self\n    }\n\n    pub(crate) fn language(&self) -> &str {\n        self.language.as_deref().unwrap_or(DEFAULT_LANGUAGE)\n    }\n\n    pub(crate) fn actions(&self, reason: LimitedEngagementReason) -> &[LimitedAction] {\n        self.policies\n            .iter()\n            .find(|(held, _)| *held == reason)\n            .map_or(&[], |(_, actions)| actions)\n    }\n\n    #[cfg(test)]\n    pub(crate) fn for_tests(\n        policies: Vec<(LimitedEngagementReason, Vec<LimitedActionType>)>,\n    ) -> Self {\n        let unprompted = |action_type| LimitedAction {\n            action_type,\n            prompt: None,\n        };\n        Self {\n            policies: policies\n                .into_iter()\n                .map(|(reason, types)| (reason, types.into_iter().map(unprompted).collect()))\n                .collect(),\n            language: None,\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::super::tests::Counted;\n    use super::*;\n    use crate::params::limited_actions_copy::LimitedActionsCopy;\n    use crate::params::ClientSwitches;\n    use arc_swap::ArcSwap;\n    use std::collections::BTreeMap;\n    use std::sync::Arc;\n    use xai_feature_switches::FeatureSwitches;\n    use LimitedEngagementReason::{\n        BlockedViewer, CommunityTweetCommunityDeleted, CommunityTweetCommunityNotFound,\n        CommunityTweetCommunitySuspended, CommunityTweetHidden, CommunityTweetMemberRemoved,\n        CommunityTweetViewerRemoved, ConversationControl, LocalTweet, NonCompliant, ReadonlyViewer,\n        RootAuthorBlockedViewer, StaleTweet,\n    };\n\n    fn copy_naming_namespaces<'a>(\n        policies: impl IntoIterator<Item = (&'a str, &'a [LimitedActionType])>,\n    ) -> LimitedActionsCopy {\n        let mut keys = BTreeMap::new();\n        for (namespace, actions) in policies {\n            keys.insert(format!(\"{namespace}_GenericSubtext\"), namespace);\n            for action in actions {\n                keys.insert(format!(\"{namespace}_{action:?}_Headline\"), namespace);\n                keys.insert(format!(\"{namespace}_{action:?}_Subtext\"), namespace);\n            }\n        }\n        let entries: Vec<String> = keys\n            .iter()\n            .map(|(key, namespace)| {\n                format!(\n                    r#\"{{\"string_key\": \"{key}\", \"current_variant\": \"{namespace}\", \"instructions_v2\": []}}\"#\n                )\n            })\n            .collect();\n        LimitedActionsCopy::from_json(&format!(\"[{}]\", entries.join(\",\")))\n    }\n\n    #[test]\n    fn each_reason_resolves_its_policy_from_the_scala_file() {\n        use LimitedActionType as T;\n        let community_unavailable = vec![\n            T::AddToBookmarks,\n            T::AddToMoment,\n            T::Embed,\n            T::Follow,\n            T::HideCommunityTweet,\n            T::Like,\n            T::ListsAddRemove,\n            T::MuteConversation,\n            T::PinToProfile,\n            T::QuoteTweet,\n            T::React,\n            T::RemoveFromCommunity,\n            T::Reply,\n            T::Retweet,\n            T::SendViaDm,\n            T::ShareTweetVia,\n            T::ViewHiddenReplies,\n            T::ViewTweetActivity,\n            T::VoteOnPoll,\n        ];\n        let community_hidden = community_unavailable\n            .iter()\n            .copied()\n            .filter(|action| *action != T::RemoveFromCommunity)\n            .collect();\n        let expected = [\n            (\n                NonCompliant,\n                Some(\"NonCompliant\"),\n                vec![\n                    T::Reply,\n                    T::Retweet,\n                    T::Like,\n                    T::React,\n                    T::SendViaDm,\n                    T::AddToBookmarks,\n                    T::AddToMoment,\n                    T::PinToProfile,\n                    T::ViewTweetActivity,\n                    T::ShareTweetVia,\n                    T::CopyLink,\n                ],\n            ),\n            (ConversationControl, Some(\"LimitedReplies\"), vec![T::Reply]),\n            (\n                BlockedViewer,\n                Some(\"BlockedViewer\"),\n                vec![\n                    T::Reply,\n                    T::Retweet,\n                    T::QuoteTweet,\n                    T::Like,\n                    T::React,\n                    T::SendViaDm,\n                    T::AddToBookmarks,\n                    T::AddToMoment,\n                    T::PinToProfile,\n                    T::ShareTweetVia,\n                    T::Follow,\n                    T::ListsAddRemove,\n                    T::Embed,\n                    T::CopyLink,\n                    T::VoteOnPoll,\n                    T::ShowRetweetActionMenu,\n                    T::ReplyDownVote,\n                    T::EditTweet,\n                    T::Highlight,\n                ],\n            ),\n            (\n                RootAuthorBlockedViewer,\n                Some(\"BlockedViewer\"),\n                vec![T::Reply],\n            ),\n            (\n                ReadonlyViewer,\n                Some(\"ReadonlyViewer\"),\n                vec![\n                    T::AddToBookmarks,\n                    T::AddToMoment,\n                    T::Embed,\n                    T::HideCommunityTweet,\n                    T::Like,\n                    T::ListsAddRemove,\n                    T::PinToProfile,\n                    T::QuoteTweet,\n                    T::React,\n                    T::Reply,\n                    T::Retweet,\n                    T::VoteOnPoll,\n                    T::EditTweet,\n                    T::Highlight,\n                ],\n            ),\n            (\n                StaleTweet,\n                None,\n                vec![\n                    T::Reply,\n                    T::Retweet,\n                    T::QuoteTweet,\n                    T::Like,\n                    T::React,\n                    T::SendViaDm,\n                    T::AddToBookmarks,\n                    T::ShareTweetVia,\n                    T::AddToMoment,\n                    T::Embed,\n                    T::HideCommunityTweet,\n                    T::PinToProfile,\n                    T::ViewTweetActivity,\n                    T::VoteOnPoll,\n                    T::CopyLink,\n                ],\n            ),\n            (\n                CommunityTweetHidden,\n                Some(\"CommunityHidden\"),\n                community_hidden,\n            ),\n            (\n                CommunityTweetMemberRemoved,\n                Some(\"Default\"),\n                community_unavailable.clone(),\n            ),\n            (\n                CommunityTweetCommunityNotFound,\n                Some(\"Default\"),\n                community_unavailable.clone(),\n            ),\n            (\n                CommunityTweetCommunityDeleted,\n                Some(\"Default\"),\n                vec![T::HideCommunityTweet, T::RemoveFromCommunity],\n            ),\n            (\n                CommunityTweetCommunitySuspended,\n                Some(\"Default\"),\n                community_unavailable,\n            ),\n            (\n                CommunityTweetViewerRemoved,\n                Some(\"ViewerIsRemovedFromCommunity\"),\n                vec![T::Reply, T::PinToProfile],\n            ),\n            (LocalTweet, Some(\"LocalPost\"), vec![T::Retweet, T::Reply]),\n        ];\n        let copy = copy_naming_namespaces(\n            expected\n                .iter()\n                .filter_map(|(_, namespace, actions)| Some(((*namespace)?, actions.as_slice()))),\n        );\n        let stats = Counted::default();\n        let policies = ClientSwitches::for_tests().limited_actions_policies(\n            None,\n            None,\n            None,\n            expected.iter().map(|(reason, _, _)| *reason),\n            &copy,\n            Some(&stats),\n        );\n        for (reason, namespace, actions) in expected {\n            let resolved = policies.actions(reason);\n            let action_types: Vec<LimitedActionType> =\n                resolved.iter().map(|action| action.action_type).collect();\n            assert_eq!(action_types, actions, \"{reason:?}\");\n            for action in resolved {\n                assert_eq!(\n                    action\n                        .prompt\n                        .as_ref()\n                        .map(|prompt| prompt.headline.as_str()),\n                    namespace,\n                    \"{reason:?} {:?}\",\n                    action.action_type\n                );\n            }\n        }\n        let counted = stats.take();\n        assert!(counted.is_empty(), \"{counted:?}\");\n    }\n\n    #[test]\n    fn a_reason_without_a_known_action_has_no_policy_and_counts_once() {\n        const POLICY: &str = r#\"\nlimited_actions_policy:\n  parameters:\n    limited_actions_policy_limited_actions: {type: array, default: []}\n  rules:\n  - query: \"[$LimitedEngagementReason eq limited_replies]\"\n    values:\n      limited_actions_policy_limited_actions: [\"reply\"]\n  - query: \"[$LimitedEngagementReason eq blocked_viewer]\"\n    values:\n      limited_actions_policy_limited_actions: [\"no_such_action\"]\n\"#;\n        let switches = ClientSwitches::new(Arc::new(ArcSwap::from_pointee(\n            FeatureSwitches::load_string(POLICY).unwrap(),\n        )));\n        let stats = Counted::default();\n        let policies = switches.limited_actions_policies(\n            None,\n            None,\n            None,\n            [StaleTweet, ConversationControl, BlockedViewer, StaleTweet],\n            &LimitedActionsCopy::from_json(\"[]\"),\n            Some(&stats),\n        );\n        assert_eq!(\n            policies.actions(ConversationControl),\n            [LimitedAction {\n                action_type: LimitedActionType::Reply,\n                prompt: None,\n            }]\n        );\n        assert!(policies.actions(StaleTweet).is_empty());\n        assert!(policies.actions(BlockedViewer).is_empty());\n        let missing = |reason: &str, missing: &str| {\n            (\n                MISSING_POLICY_COUNTER.to_string(),\n                format!(\"reason={reason},missing={missing}\"),\n                1,\n            )\n        };\n        assert_eq!(\n            stats.take(),\n            [\n                missing(\"stale_tweet\", \"actions\"),\n                missing(\"conversation_control\", \"copy\"),\n                missing(\"blocked_viewer\", \"actions\"),\n            ]\n        );\n    }\n}\n",
+      "source_digest": "424d69ce0899dce67b8969695a1b6d5e3cb1d725a39236d8cc09f64058a36482",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\npub const CONFIG_KEY: &str = \"action_control\";\npub const DRY_RUN_LABEL_PREFIX: &str = \"dry_run__\";\npub const FACTORY_LABEL: &str = \"abuse_platform_requested_actions\";\n\npub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);\npub const STALE_AFTER: Duration = Duration::from_secs(60);\nconst SCAN_TIMEOUT: Duration = Duration::from_secs(5);\nconst SCAN_LIMIT: u32 = 10_000;\nconst FIRST_LOAD_BACKOFF: Duration = Duration::from_secs(1);\nconst FIRST_LOAD_LOG_EVERY: u64 = 12;\nconst ENSURE_LOADED_RETRY: Duration = Duration::from_secs(1);\nconst REFRESH_ERROR_LOG_EVERY: u64 = 60;\npub const RECORD_TTL_SECS: u64 = 10 * 365 * 86_400;\npub const HISTORY_TTL_SECS: u64 = 10 * 365 * 86_400;\npub const SEEN_TTL_SECS: u64 = 30 * 86_400;\n",
+      "source_digest": "1edac72b5ebe2308887c649b9cd4f1f4b829e44aa04e1ade7127742e81f950e5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 53,
+      "end_line": 77,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub const HISTORY_TTL_SECS: u64 = 10 * 365 * 86_400;\npub const SEEN_TTL_SECS: u64 = 30 * 86_400;\npub const SEEN_WRITE_EVERY: Duration = Duration::from_secs(600);\nconst SEEN_QUEUE: usize = 256;\nconst SEEN_GUARD_MAX: usize = 10_000;\nconst LOCAL_WRITE_GRACE: Duration = Duration::from_secs(30);\nconst MAX_REASON_LEN: usize = 1_000;\nconst MAX_NAME_LEN: usize = 256;\npub const HISTORY_LIMIT_DEFAULT: usize = 50;\npub const HISTORY_LIMIT_MAX: usize = 500;\npub const CONFIRM_WORD: &str = \"ENFORCE\";\npub const PAGE_RULE_ID: &str = \"page\";\npub const STATUS_NO_ACTIONS: &str = \"no_actions\";\npub const FORCED_RECORDING_KEY: &str = \"action_control_forced_recording\";\n\npub fn lkey_for(\n    entity: ControlEntity,\n    head: &str,\n    classifier: Option<&str>,\n    band: Option<&str>,\n) -> String {\n    let e = entity.as_str();\n    match (classifier, band) {\n        (None, None) => format!(\"{e}/h/{head}\"),\n        (Some(c), None) => format!(\"{e}/c/{head}/{c}\"),\n",
+      "source_digest": "9305d668f0ff0af9fc31207186f5f756d49a84cca361e4563a2b61837984596a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 121,
+      "end_line": 145,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n    let rank = |a: &PageAction| match a {\n        PageAction::SpamHighRecall { .. }\n        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n",
+      "source_digest": "0ba5771639fc9876b439e1b029b1cbcb46b60077f63d3457f4f891490bae0e10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 129,
+      "end_line": 153,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n    let rank = |a: &PageAction| match a {\n        PageAction::SpamHighRecall { .. }\n        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n",
+      "source_digest": "a234453123b29c24ad880849b0df9a96320163e0e047e06e3012a086d7bfcb19",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 155,
+      "end_line": 179,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n    match actions {\n        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),\n        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),\n        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n",
+      "source_digest": "0e20426e3e9367dac7729d9df23e51a0cf15ab43f5d563efbbf297709c6dde22",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 156,
+      "end_line": 180,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n    match actions {\n        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),\n        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),\n        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n",
+      "source_digest": "84fe100ffc997c7f88320c2e7ac5414bed7fe9017ec47a9b599fd739b4b77354",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 211,
+      "end_line": 235,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            ActionSpec::Arkose => out.push(serde_json::json!({\"kind\": \"arkose\"})),\n            ActionSpec::Captcha => out.push(serde_json::json!({\"kind\": \"captcha\"})),\n        }\n    }\n    Value::Array(out)\n}\n\npub fn action_specs_json(specs: &[ActionSpec]) -> String {\n    action_specs_value(specs).to_string()\n}\n\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n",
+      "source_digest": "7528c3966be0b3ca0abde9604a3576c24b0717df46f60d9253c51baa4b2c19d8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 212,
+      "end_line": 236,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            ActionSpec::Arkose => out.push(serde_json::json!({\"kind\": \"arkose\"})),\n            ActionSpec::Captcha => out.push(serde_json::json!({\"kind\": \"captcha\"})),\n        }\n    }\n    Value::Array(out)\n}\n\npub fn action_specs_json(specs: &[ActionSpec]) -> String {\n    action_specs_value(specs).to_string()\n}\n\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n",
+      "source_digest": "8e26e87e03e105fe2144defef9ffeac0be1b3cb8d64b4a0d59cbed5da90d3591",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 417,
+      "end_line": 441,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Matched {\n    pub lkey: String,\n    pub record: ActionControlRecord,\n}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Resolved {\n    pub matched: Option<Matched>,\n        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n",
+      "source_digest": "f98ed2cae90b172cfac4c7ce0994c7a369ec8b9104a568fe492fc0cc4177af8f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 430,
+      "end_line": 454,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n",
+      "source_digest": "c7c734b954066febeddb84c77d5a8584db6cb3657e4778f388a6bb24d30ecc10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 442,
+      "end_line": 466,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n    }\n\n    pub fn recording(&self) -> bool {\n        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n",
+      "source_digest": "ad5799fdeb5f72be891d4e7746428a19929a79488d730c4864d05273abcea827",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 606,
+      "end_line": 630,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[allow(clippy::too_many_arguments)]\nfn effective(\n    record: &ActionControlRecord,\n    entity: EntityType,\n    factory: bool,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n",
+      "source_digest": "ee18dfa92f244ce81c449f23d59df6e04aacbf8d152dda994f7b41cb8581cdaa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 612,
+      "end_line": 636,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n",
+      "source_digest": "9a66248af069792b6cc1185bc898552b72a3f22af275ef29dfba4962f48ac214",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 621,
+      "end_line": 645,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n",
+      "source_digest": "aae4b95b36012901c98af52e195738f2c1dab915a07f309a783b0d5cd663ce6a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 625,
+      "end_line": 649,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n                None\n            };\n",
+      "source_digest": "3c820cce7e4219d15db32c14c82ab9463b38208cf3949a40aa24f61816e61c9a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 643,
+      "end_line": 667,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n                None\n            };\n            let mode = if forced.is_some() {\n                ControlMode::Recording\n            } else {\n                ControlMode::Live\n            };\n            (mode, record.actions.clone(), forced)\n        }\n    }\n}\n\n\n#[derive(Debug, PartialEq)]\npub enum SetError {\n        Invalid(&'static str, String),\n            Conflict(Option<ActionControlRecord>, Option<u64>),\n        LostRace(Option<ActionControlRecord>),\n        Ignored,\n        Store(String),\n",
+      "source_digest": "bf141c7ab61dcc4fa40c2acab0db787480a59d6708cc2e9f30d81d9f16edae86",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 728,
+      "end_line": 752,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))\n        }\n        _ => None,\n    }\n}\n\npub fn harsher_because(\n    before: Option<&ActionControlRecord>,\n    after: &ActionControlRecord,\n    rules_specs: Option<&[Value]>,\n) -> Vec<String> {\n    let before_mode = before.map_or(ControlMode::Rules, |b| b.mode);\n    let before_actions: &[PageAction] = before.map_or(&[], |b| &b.actions);\n    let mut why = Vec::new();\n    match (before_mode, after.mode) {\n        (ControlMode::Live, ControlMode::Live) => {}\n        (_, ControlMode::Live) => why.push(\"turns the scope live\".to_owned()),\n        (ControlMode::Recording, ControlMode::Rules) => {\n            why.push(\"hands the scope back to the GrowthBook rules, which act\".to_owned())\n        }\n        (ControlMode::Live, ControlMode::Rules) => {\n            let page = action_specs_value(&page_specs(before_actions));\n            let page = page.as_array().map(Vec::as_slice).unwrap_or_default();\n            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n",
+      "source_digest": "8eb0ae7f1e2d496db56a5911e992fcf94f76d001cc49e4bf4ebbf423259a3a27",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 737,
+      "end_line": 761,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    rules_specs: Option<&[Value]>,\n) -> Vec<String> {\n    let before_mode = before.map_or(ControlMode::Rules, |b| b.mode);\n    let before_actions: &[PageAction] = before.map_or(&[], |b| &b.actions);\n    let mut why = Vec::new();\n    match (before_mode, after.mode) {\n        (ControlMode::Live, ControlMode::Live) => {}\n        (_, ControlMode::Live) => why.push(\"turns the scope live\".to_owned()),\n        (ControlMode::Recording, ControlMode::Rules) => {\n            why.push(\"hands the scope back to the GrowthBook rules, which act\".to_owned())\n        }\n        (ControlMode::Live, ControlMode::Rules) => {\n            let page = action_specs_value(&page_specs(before_actions));\n            let page = page.as_array().map(Vec::as_slice).unwrap_or_default();\n            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n                _ => why.push(\n                    \"hands the scope back to the GrowthBook rules, whose actions may be harsher\"\n                        .to_owned(),\n                ),\n            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n",
+      "source_digest": "d4f1f0818cc78ab05d73e145713afade4db420824e7cacfa57320d0ef93a819e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 742,
+      "end_line": 766,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    match (before_mode, after.mode) {\n        (ControlMode::Live, ControlMode::Live) => {}\n        (_, ControlMode::Live) => why.push(\"turns the scope live\".to_owned()),\n        (ControlMode::Recording, ControlMode::Rules) => {\n            why.push(\"hands the scope back to the GrowthBook rules, which act\".to_owned())\n        }\n        (ControlMode::Live, ControlMode::Rules) => {\n            let page = action_specs_value(&page_specs(before_actions));\n            let page = page.as_array().map(Vec::as_slice).unwrap_or_default();\n            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n                _ => why.push(\n                    \"hands the scope back to the GrowthBook rules, whose actions may be harsher\"\n                        .to_owned(),\n                ),\n            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n",
+      "source_digest": "fe668b562c17a13c909c431c0d3f213cfddad3cbc3b3e752c519e60372dcd843",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 750,
+      "end_line": 774,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let page = page.as_array().map(Vec::as_slice).unwrap_or_default();\n            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n                _ => why.push(\n                    \"hands the scope back to the GrowthBook rules, whose actions may be harsher\"\n                        .to_owned(),\n                ),\n            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n",
+      "source_digest": "0285eed3de7a92788336274807fcf1c147ff5d25c3f72c66b1d8a3ff4601533f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 751,
+      "end_line": 775,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n                _ => why.push(\n                    \"hands the scope back to the GrowthBook rules, whose actions may be harsher\"\n                        .to_owned(),\n                ),\n            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n",
+      "source_digest": "c8271d82433a353d0bfe986f84e70278b0d0fa6a740326514fa8b5fcf76bbf06",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 944,
+      "end_line": 968,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        };\n        match hit {\n            None => {}\n            Some(Hit::Ambiguous) => {\n                out.mode = ControlMode::Recording;\n                out.forced = Some(\"band_ambiguous\");\n            }\n            Some(Hit::Unreadable) => {\n                out.mode = ControlMode::Recording;\n                out.forced = Some(\"unreadable\");\n            }\n            Some(Hit::Record(lkey, record)) => {\n                let (mode, actions, forced) = effective(\n                    record,\n                    input.entity,\n                    input.factory,\n                    cfg,\n                    stale,\n                    record.mode != ControlMode::Live || safety(input.entity),\n                );\n                out.mode = mode;\n                out.page_actions = actions;\n                out.forced = forced;\n                out.matched = Some(Matched {\n                    lkey: lkey.to_owned(),\n",
+      "source_digest": "6dc8f0393257e61e6895ecbdc7f790445c85c863e5ff416fa23af9b3ea915b15",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 953,
+      "end_line": 977,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.forced = Some(\"unreadable\");\n            }\n            Some(Hit::Record(lkey, record)) => {\n                let (mode, actions, forced) = effective(\n                    record,\n                    input.entity,\n                    input.factory,\n                    cfg,\n                    stale,\n                    record.mode != ControlMode::Live || safety(input.entity),\n                );\n                out.mode = mode;\n                out.page_actions = actions;\n                out.forced = forced;\n                out.matched = Some(Matched {\n                    lkey: lkey.to_owned(),\n                    record: record.clone(),\n                });\n            }\n        }\n        out.dedup_class = out.page_driven().then(|| page_class(&out.page_actions));\n        if let Some(m) = &out.matched {\n            metrics::ACTION_CONTROL_DECISIONS_TOTAL\n                .with_label_values(&[\n                    m.record.head.as_str(),\n",
+      "source_digest": "e56a70fd44808d15b90a4495436210af10dbb9ad841f2ef3da68cd2cd22b30c0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 961,
+      "end_line": 985,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    stale,\n                    record.mode != ControlMode::Live || safety(input.entity),\n                );\n                out.mode = mode;\n                out.page_actions = actions;\n                out.forced = forced;\n                out.matched = Some(Matched {\n                    lkey: lkey.to_owned(),\n                    record: record.clone(),\n                });\n            }\n        }\n        out.dedup_class = out.page_driven().then(|| page_class(&out.page_actions));\n        if let Some(m) = &out.matched {\n            metrics::ACTION_CONTROL_DECISIONS_TOTAL\n                .with_label_values(&[\n                    m.record.head.as_str(),\n                    out.mode.as_str(),\n                    out.forced.unwrap_or(\"\"),\n                ])\n                .inc();\n        }\n        out\n    }\n\n",
+      "source_digest": "498025e26e95b788224fc72ce9e7cdb4bb628b276bed29251f8baec95a7a5640",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 57,
+      "end_line": 81,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub const HISTORY_TTL_SECS: u64 = 10 * 365 * 86_400;\npub const SEEN_TTL_SECS: u64 = 30 * 86_400;\npub const SEEN_WRITE_EVERY: Duration = Duration::from_secs(600);\nconst SEEN_QUEUE: usize = 256;\nconst SEEN_GUARD_MAX: usize = 10_000;\nconst LOCAL_WRITE_GRACE: Duration = Duration::from_secs(30);\nconst MAX_REASON_LEN: usize = 1_000;\nconst MAX_NAME_LEN: usize = 256;\npub const HISTORY_LIMIT_DEFAULT: usize = 50;\npub const HISTORY_LIMIT_MAX: usize = 500;\npub const CONFIRM_WORD: &str = \"ENFORCE\";\npub const PAGE_RULE_ID: &str = \"page\";\npub const STATUS_NO_ACTIONS: &str = \"no_actions\";\npub const FORCED_RECORDING_KEY: &str = \"action_control_forced_recording\";\n\npub fn lkey_for(\n    entity: ControlEntity,\n    head: &str,\n    classifier: Option<&str>,\n    band: Option<&str>,\n) -> String {\n    let e = entity.as_str();\n    match (classifier, band) {\n        (None, None) => format!(\"{e}/h/{head}\"),\n        (Some(c), None) => format!(\"{e}/c/{head}/{c}\"),\n",
+      "source_digest": "9305d668f0ff0af9fc31207186f5f756d49a84cca361e4563a2b61837984596a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 127,
+      "end_line": 151,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\nconst RISKY_HIGH_VIZ_REPLY: &str = \"RiskyHighVizReply\";\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n    let rank = |a: &PageAction| match a {\n        PageAction::SpamHighRecall { .. }\n        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. }\n        | PageAction::HideReply { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n",
+      "source_digest": "5032e6aaf6365c6d4224d750f2c8d746bae44773d17207e18e48ee0092cd01e2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 136,
+      "end_line": 160,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nconst RISKY_HIGH_VIZ_REPLY: &str = \"RiskyHighVizReply\";\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n    let rank = |a: &PageAction| match a {\n        PageAction::SpamHighRecall { .. }\n        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. }\n        | PageAction::HideReply { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n",
+      "source_digest": "81fd5d0d106a8c0de4e3efa79df1d04a22059540f5458314c0d3ce4329d139f4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 166,
+      "end_line": 190,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n    match actions {\n        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),\n        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),\n        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n",
+      "source_digest": "a7b1ad520efee788a34ac787928e457c45756b08f7dc2ce346318c3d17f52fe4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 167,
+      "end_line": 191,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n    match actions {\n        [PageAction::SpamHighRecall { .. }] => Some(SPAM_HIGH_RECALL),\n        [PageAction::PhoenixSkip { .. }] => Some(CLIENT_EVENT_PHOENIX_SKIP),\n        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n",
+      "source_digest": "84fe100ffc997c7f88320c2e7ac5414bed7fe9017ec47a9b599fd739b4b77354",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 222,
+      "end_line": 246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            ActionSpec::Arkose => out.push(serde_json::json!({\"kind\": \"arkose\"})),\n            ActionSpec::Captcha => out.push(serde_json::json!({\"kind\": \"captcha\"})),\n        }\n    }\n    Value::Array(out)\n}\n\npub fn action_specs_json(specs: &[ActionSpec]) -> String {\n    action_specs_value(specs).to_string()\n}\n\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n",
+      "source_digest": "7528c3966be0b3ca0abde9604a3576c24b0717df46f60d9253c51baa4b2c19d8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 223,
+      "end_line": 247,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            ActionSpec::Arkose => out.push(serde_json::json!({\"kind\": \"arkose\"})),\n            ActionSpec::Captcha => out.push(serde_json::json!({\"kind\": \"captcha\"})),\n        }\n    }\n    Value::Array(out)\n}\n\npub fn action_specs_json(specs: &[ActionSpec]) -> String {\n    action_specs_value(specs).to_string()\n}\n\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n",
+      "source_digest": "8e26e87e03e105fe2144defef9ffeac0be1b3cb8d64b4a0d59cbed5da90d3591",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 428,
+      "end_line": 452,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Matched {\n    pub lkey: String,\n    pub record: ActionControlRecord,\n}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Resolved {\n    pub matched: Option<Matched>,\n        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n",
+      "source_digest": "53bd883b3835ab127a8946c821cd87ee1495e271062d876ab7c4770342043412",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 443,
+      "end_line": 467,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n",
+      "source_digest": "ed961668fa44b8e389692947127305fcd53b11f77ddffc393147cba89ef24dbd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 459,
+      "end_line": 483,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n            pub fn rules_unread(&self) -> bool {\n        self.factory || self.unlisted\n    }\n\n                        pub fn admit_unlisted(mut self) -> Option<Self> {\n        if self.factory || self.mode == ControlMode::Rules {\n            return None;\n        }\n        self.unlisted = true;\n        self.dedup_class = Some(page_class(&self.page_actions));\n",
+      "source_digest": "73cb49604319ac7283a8876364a41d93597de7f47794888ba1e00b59abad673d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 471,
+      "end_line": 495,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n            pub fn rules_unread(&self) -> bool {\n        self.factory || self.unlisted\n    }\n\n                        pub fn admit_unlisted(mut self) -> Option<Self> {\n        if self.factory || self.mode == ControlMode::Rules {\n            return None;\n        }\n        self.unlisted = true;\n        self.dedup_class = Some(page_class(&self.page_actions));\n        Some(self)\n    }\n\n    pub fn recording(&self) -> bool {\n        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n",
+      "source_digest": "20e9e2ca620194d1feffbb0184a6a60c7aa5d1614446ab8617d785cdf63245bb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 637,
+      "end_line": 661,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn effective(\n    record: &ActionControlRecord,\n    entity: EntityType,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n",
+      "source_digest": "761ccabd404c1dee498ff30106fa31005ec8a57f99b7f312eada275bf9cf41c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6ab270ea7ea9664ad6ae47b636d8a64524dff54bafb41e4bc49f3e08cc7e3355",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/params",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "775b25e268e9f3e24771acb0b334e4e9044288d6736e493b19154d67d2c23fef",
+      "context_complete": true,
+      "task_id": "T-44f7f6326babb7133dad88ba3276c3196ddf3ba5ebbc58816533f6f95584c778",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-63926e9c74389b95ea2391a9e8b6150b705b5c5bf2345773a493e1a3025da4c6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-f92d58882464c98b448888aa47f0feb73f923d319f50b01a4359e8f3fc57fd63",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b5dc4a3286066ec9a421a1330e0605fb3f0a19d4d93dfa562b83de0bdaf4fa4b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-b0e3d6b9f1071013b605a3542603390e4e4691aeccb4a3663ce44701d8cf2a3c",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b1c8a806d2cd9a4b55e8d6f3914a3b5aafad251bbf89d60da17c2ab12c736c2c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-f3773af47b0c5bdf82ab8fceb89ddbb1b5ce644ea88bcaf8d3eb68bd722fad6f",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0430a80264eb1f1aa170c33f4eb8a0a6889cebbc10c3e5fe7ff053810cda8ee4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-26d3131c12c2261f525385237b1ce14de69ef762c32167c92135f9ec2a67bba1",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6c77ae9b6f6a0181eec5f9d48e81265915447f640e091379f0325e5be5f364b6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-5feeef95975409bbe6693da707fd4e4ddc032cbe9bd021bcb1f9c08f99dadd7d",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d7d103d39d095473421940e890df93e2057b2f1d2aa9d781bd051c17e98ac506",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a59b8cc7a351b200bab47df39f9c1d709b17c5630e18d8d82074debada3d93f",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-012fbd26bcba0ada48491c6d24b8e92ff5cb06c769f2827c2b799bd237d7fc6e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-ed2414506d047eb6bc5e40536a4b0f657a10da6644fcacc7caec3a105883c375",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0abad85f1f786aef271f983c9cda1bd074c33abceaf14f6337bdd625d737b8dd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-4c985b2e1123036241f3349d8cbaff33021e451727e2929332937995d917d707",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1c461ad5a25fdee0da5aabca3b25891c153643446e48e0a38d0b9ab0d36e2da3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-eecc86a562a86f60912671373ca34ef31f39496128081cc1cd3dcdb629c9189f",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-40f5c51fbe4ae9d5b486ab4531a7bd2a84525757089b93b87076296a977acf74",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-cbffdb69f563ece4323501f43003af73d7ff0a253245f13fdb4e612164a74db3",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f5750c4000be1ab576c7f0ded9c0e27cb69ac36cdd4c6260a40a4f38f3cd0101",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-76ce198e9d72e4c45cfc3132acdbbb009ee0d6af394a0c14b6afa5153a96987d",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ebef22154d9183a28e3563a73217f9d7b73f92917270d481ca34290930686fb7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-7dce1731aaafffe469cba6bc91a948a7ec4c0cf07306e6891fcfabbd70d25726",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e3386eec942247f86b4a9f9f7fc989e4cd791d3fdca329ecf40b4ab852c277cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-43e6ec7b5445d77e43641e8bfd54793e892df9667461e7949b24fe17beff2025",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f2e4c2c13206bb087de70f3cb70b2192b111900b7342dd3409b293b9395159c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-22895aedfaa5d9f135b567bcd2985fd52cd64ad0b539b2ed98fcfc9f1432144c",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1b3b66c21e92cce52292432a9b688aa948bf5d31297397d56e93d891bc8998e9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec67d9707de8417eb6adf9188d2e286d61991571d2d0b6a99a0399bb47aef1ad",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-360e56ea7db1ebcc1b28878878e9bd7c5f35537528e94583231995a0b1f48b5d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-7a33d3b1d93307435b2114fb5fe104c5ec5407534ebfe78716f1ef50dc04930e",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1812126fbab8c949649fbab1ced5aca46a33a6f87a6b9522bbd9914378d32bc7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-4d9db9089d068018479915b4b83c5d125afa6260efacd1fedfe2c705f7fe6582",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-60d72b9e9ce33f6065b5f533d9babfcd34c92592d01fb50fc362c5bf51be2181",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-94f5ef420c0badcfb9e459857f6c6c4724d4558307f412841bf51a590dca8b6e",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2b9265f8d9862d627b73c5c94ac9aa54f2cab72217877f367c5cdd05ef988c15",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-cff7b1c2c3745ed7e858a58f27f5d9cf93cdeb5f4ffc17cb894f7acbaa674ad1",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cdf1dd701cacad274eec3b4777f95ee97617339a19ea44d082785e2982fc5717",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-407f4c69cf777ec8b33a2b4faf649b99fb2f400ff8916c399a708000bad94756",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e03dd3f4df6eda6a63bbf9ca99ce37675ce6203d8a3e249af2f849efbf10578c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec43635b590736385719ca16d4c38186e580a1657c903da41ac940ffe474aacf",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a910f55ee871975bfe02ce995fa4a98e7ed925ac97cd362fb26de65a0c982b89",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-fb8497328a17d4f405f9637196d8d2161d1e1619b3724711480a9cac00efa5ea",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-eaa24b7bfcb8c3ed38a90c546f5ac6120f8e966bb1687e6de098df397deae8e6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-a8dfad4e4551b599e7edc25e0775b1d6ea72c3b6a09b7d3a990b413b1d1d9c2a",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-495d7cad0e8207f6749b6c51ccec2afff0e556ef83013f997da2497f3bef434d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-f62c1361548d66739a7a879f8fdb03ca9efaecf023842836b78db6d7a03a1b9a",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-79390c6eaff69adc6a13440a6106485bff5e4889570b97df8fb95fdca3cbac96",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-8df6d83469793fda8339fbce814f33e1410b2286a82dac5d5dc0a91d11cc8f32",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-336824d7842bda416882d355452591e862cc351aa04b07308fd399108cefc55d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-1a70c0b2f146990499b36000fe881fc899b6ba16e0a53014ed8723c155249b6b",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-044ecae82c9abd2623cffbf6442cd8ca73e6fd51fe0a42984983968639b7909a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-c871f3adec7ab59747ee6eea483368880c1f62bc1a517c530785bb01cfb19da8",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2ff33ab44d1a0778dc42db42f0be05b25754afe312e982f53e4fa66205ca5549",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-8109387ea1071b381034b8d096d242d8c1fd302f8c8a1bcf0abe9508923f5b15",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-177b3581248c568ee867630d767efe00d198294fc4b60fb6f83b1688fb6a9b2f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-e42f889c178b2b9a3cf550147c1a46699edd2746b9f4ab3588c393fc0881f18c",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6500547496f7d581bbe87aca9eae1e042431d9ed9b99316543f08e4c7441abcc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-d51b1def31c78833aa1082c7d2a3df399cbb58cf643224488872efef2281d34a",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4567f1aa91bb08431e617b7d23c4a41956578bfe062644f29fa014dd81eb8f87",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-c45f39d98a8fcfb773569a26ddbd122fa9d9fb4f2329c0836f5ce4ed93244238",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-82df9df98d75029a5261608896deca695c4988f373db46d7927c7c6005ce0082",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-f0741be2c901ad6316e7135be999441a9c19d2789ff810bd6f11a9212b965fbe",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5e38cc0c294e82eb950f6eacfe9880d22a9eb674cd865c2281c26d4b80906f20",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-3e78651c4926433a4290449228678b6a3840977cb2722e13daf6f401383511a3",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0f5b886313e746db0e11bdd5c31884e0d485d6ba4d1e9b59897f420f56ab34c6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-dd51d4a937422561666177af94c47e81350ef49dc6e9ede8bfe6d739516eda6c",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-99762b422f1eab9deb40b2d2396c7ce528d88f7f34fbbdce096eeba10aa77c0d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-91effc652382b809b61379420f5b6325acf916a6ca640385c8e747b8d454a046",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/params/limited_actions_policy.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca27d87d9f4b2eb888e6a34ccd24fec0550665edd6fdecf7453fdadcec87d1c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/params",
+      "query_symbols": [
+        "LimitedAction",
+        "LimitedActionsPolicies",
+        "in_language",
+        "language",
+        "actions"
+      ],
+      "context_complete": false,
+      "task_id": "T-23de784c563e918d43de5d01f282a3cdb02851dbbb76a35a5b4b80d78707e896",
+      "evidence_refs": [
+        "E38"
+      ]
+    }
+  ],
+  "task_id": "T-feff9f9aeb86728540e71259a915118613dbb9770e5d61ba515e170133111fd7"
+}

@@ -1,0 +1,1513 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/rules/golden_corpus/article.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-5af363556462a36b0b04ca2c500f2df6dfb16be679c34f9ea9f5c45f2b3652a4",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/rules",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 278,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use super::builders::{on_client, tweet_candidate, viewer_with_age};\nuse super::{Role, Row};\nuse crate::hydration::Hydrator;\nuse crate::models::{\n    ArticleLifecycle, NsfwViewerDropReason, PostCandidate, SafetyLabelType, Verdict, Viewer,\n    ViewerAge,\n};\nuse crate::rules::fixtures::{\n    allow, author_viewer, blurred, candidate, dropped, nsfw_viewer_dropped,\n    sensitive_opt_in_viewer, AUTHOR_ID,\n};\nuse crate::rules::SafetyLevel::{\n    self, FilterAll, ImmersiveExpandedRecommendations, QuotedTweetRules, TimelineHome,\n    TimelineHomeHydration, TimelineHomeRecommendations,\n};\nuse std::num::NonZeroU64;\nuse xai_visibility_filtering::models::FilteredReason;\nuse xai_x_thrift::action::InterstitialReason;\n\nfn article_post(lifecycle: Option<ArticleLifecycle>) -> PostCandidate {\n    let mut candidate = tweet_candidate(|t| t.article_id = NonZeroU64::new(1));\n    candidate.post.article_lifecycle = lifecycle;\n    candidate\n}\n\nfn home_hydration_only(verdict: fn() -> Verdict) -> Vec<(SafetyLevel, Role, Verdict)> {\n    vec![\n        (TimelineHomeHydration, Role::NonFollower, verdict()),\n        (TimelineHomeHydration, Role::Follower, verdict()),\n        (TimelineHomeHydration, Role::LoggedOut, verdict()),\n        (TimelineHomeHydration, Role::Author, verdict()),\n    ]\n}\n\nfn unpublished() -> Verdict {\n    dropped(\n        FilteredReason::UnspecifiedReason,\n        \"article_tweet_content/drop/unspecified\",\n    )\n}\n\npub(super) fn rows() -> Vec<Row> {\n    let mut author_sensitive_opt_in = sensitive_opt_in_viewer();\n    if let Viewer::LoggedIn { id, .. } = &mut author_sensitive_opt_in.viewer {\n        *id = AUTHOR_ID;\n    }\n    let mut rows = vec![\n        Row {\n            name: \"article_draft\",\n            post: article_post(Some(ArticleLifecycle::Draft)),\n            expect: home_hydration_only(unpublished),\n        },\n        Row {\n            name: \"article_soft_deleted\",\n            post: article_post(Some(ArticleLifecycle::SoftDeleted)),\n            expect: home_hydration_only(unpublished),\n        },\n        Row {\n            name: \"article_without_lifecycle\",\n            post: article_post(None),\n            expect: home_hydration_only(unpublished),\n        },\n        Row {\n            name: \"article_published\",\n            post: article_post(Some(ArticleLifecycle::Published)),\n            expect: home_hydration_only(allow),\n        },\n        Row {\n            name: \"no_article\",\n            post: tweet_candidate(|_| {}),\n            expect: home_hydration_only(allow),\n        },\n    ];\n    for (name, body, cover, flagged, restricts) in [\n        (\"nsfw_article_cover\", false, true, true, true),\n        (\"nsfw_article_body\", true, false, true, true),\n        (\"nsfw_article_without_media\", false, false, true, false),\n        (\"unflagged_article_cover\", false, true, false, false),\n        (\"unflagged_article_body\", true, false, false, false),\n    ] {\n        let mut post = article_post(Some(ArticleLifecycle::Published));\n        post.author.is_nsfw_user = flagged;\n        post.post.tweet_features.nsfw.user = flagged;\n        post.post.article_has_media_entities = body;\n        post.post.article_has_cover_media = cover;\n        let levels = if restricts {\n            &[\n                TimelineHomeHydration,\n                TimelineHome,\n                TimelineHomeRecommendations,\n                ImmersiveExpandedRecommendations,\n            ][..]\n        } else {\n            &[TimelineHomeHydration][..]\n        };\n        let mut expect = Vec::new();\n        for &level in levels {\n            let restricted = |reason, by| match level {\n                TimelineHomeRecommendations => dropped(\n                    FilteredReason::ContainNsfwMedia,\n                    \"nsfw_user_author/drop/nsfw_media\",\n                ),\n                ImmersiveExpandedRecommendations => dropped(\n                    FilteredReason::ContainNsfwMedia,\n                    \"nsfw_sensitive_viewer_user/drop/nsfw_media\",\n                ),\n                FilterAll | TimelineHome | TimelineHomeHydration => nsfw_viewer_dropped(reason, by),\n                QuotedTweetRules => unreachable!(\"a user-only level judges no post\"),\n            };\n            expect.extend([\n                (\n                    level,\n                    Role::As(\"underage\", viewer_with_age(ViewerAge::Known(17))),\n                    if restricts {\n                        restricted(\n                            NsfwViewerDropReason::IsUnderage,\n                            \"sensitive_viewer_underage/drop\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    level,\n                    Role::As(\n                        \"no_stated_age\",\n                        on_client(\"web\", \"de\", viewer_with_age(ViewerAge::NotStated)),\n                    ),\n                    if restricts {\n                        restricted(\n                            NsfwViewerDropReason::HasNoStatedAge,\n                            \"sensitive_viewer_no_stated_age/drop\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    level,\n                    Role::LoggedOut,\n                    if restricts {\n                        restricted(\n                            NsfwViewerDropReason::LoggedOut,\n                            \"sensitive_viewer_logged_out/drop\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n            ]);\n        }\n        expect.push((\n            TimelineHomeHydration,\n            Role::As(\n                \"adult_sensitive_off\",\n                on_client(\"web\", \"us\", viewer_with_age(ViewerAge::Known(18))),\n            ),\n            if restricts {\n                blurred(\n                    InterstitialReason::SensitiveUser(true),\n                    \"nsfw_user/blur/sensitive_user\",\n                )\n            } else {\n                allow()\n            },\n        ));\n        if !body {\n            expect.extend([\n                (\n                    TimelineHome,\n                    Role::As(\"adult_sensitive_off\", viewer_with_age(ViewerAge::Known(18))),\n                    if restricts {\n                        blurred(\n                            InterstitialReason::SensitiveUser(true),\n                            \"nsfw_user/blur/sensitive_user\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    TimelineHome,\n                    Role::As(\"sensitive_opt_in\", sensitive_opt_in_viewer()),\n                    allow(),\n                ),\n                (TimelineHome, Role::Author, allow()),\n                (\n                    TimelineHomeHydration,\n                    Role::As(\n                        \"author_sensitive_opt_in\",\n                        on_client(\"web\", \"us\", author_sensitive_opt_in.clone()),\n                    ),\n                    allow(),\n                ),\n                (\n                    TimelineHomeHydration,\n                    Role::As(\n                        \"author_sensitive_off\",\n                        on_client(\"web\", \"us\", author_viewer()),\n                    ),\n                    if restricts {\n                        blurred(\n                            InterstitialReason::SensitiveUser(true),\n                            \"nsfw_user/blur/sensitive_user\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    TimelineHomeRecommendations,\n                    Role::NonFollower,\n                    if flagged {\n                        dropped(\n                            FilteredReason::ContainNsfwMedia,\n                            \"nsfw_user_author/drop/nsfw_media\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    ImmersiveExpandedRecommendations,\n                    Role::NonFollower,\n                    if flagged {\n                        dropped(\n                            FilteredReason::ContainNsfwMedia,\n                            \"nsfw_sensitive_viewer_user/drop/nsfw_media\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    ImmersiveExpandedRecommendations,\n                    Role::As(\"sensitive_opt_in\", sensitive_opt_in_viewer()),\n                    allow(),\n                ),\n                (ImmersiveExpandedRecommendations, Role::Author, allow()),\n            ]);\n        }\n        rows.push(Row { name, post, expect });\n    }\n    let mut creator = candidate()\n        .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)\n        .with_edge(Hydrator::SuperFollowsExclusive)\n        .build();\n    creator.post.tweet_features.article_id = NonZeroU64::new(1);\n    creator.post.tweet_features.exclusive_conversation_author_id = Some(42);\n    creator.post.article_lifecycle = Some(ArticleLifecycle::Published);\n    creator.post.article_has_media_entities = true;\n    rows.push(Row {\n        name: \"exclusive_nsfw_article_body_super_followed\",\n        post: creator,\n        expect: vec![\n            (\n                TimelineHomeHydration,\n                Role::As(\n                    \"sensitive_opt_in\",\n                    on_client(\"web\", \"us\", sensitive_opt_in_viewer()),\n                ),\n                dropped(\n                    FilteredReason::ContainNsfwMedia,\n                    \"creator_tweet_nsfw/drop/nsfw_media\",\n                ),\n            ),\n            (\n                TimelineHomeHydration,\n                Role::As(\n                    \"author_sensitive_opt_in\",\n                    on_client(\"web\", \"us\", author_sensitive_opt_in),\n                ),\n                allow(),\n            ),\n        ],\n    });\n    rows\n}\n",
+      "source_digest": "33279fb163e72634ca49d440b8e9295ff1d6e75a6db3d0621e31f7b6e823106e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mock_or_fixture",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 283,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use super::{Role, Row, Subject};\nuse crate::hydration::Hydrator;\nuse crate::models::{\n    ArticleLifecycle, NsfwViewerDropReason, PostCandidate, SafetyLabelType, Verdict, Viewer,\n    ViewerAge,\n};\nuse crate::rules::fixtures::{\n    allow, author_viewer, blurred, candidate, dropped, nsfw_viewer_dropped, on_client,\n    sensitive_opt_in_viewer, tweet_candidate, viewer_with_age, AUTHOR_ID,\n};\nuse crate::rules::SafetyLevel::{\n    self, FilterAll, ImmersiveExpandedRecommendations, NotificationsFollow, NotificationsWriterV2,\n    QuotedTweetRules, TimelineHome, TimelineHomeHydration, TimelineHomeRecommendations,\n};\nuse std::num::NonZeroU64;\nuse xai_visibility_filtering::models::FilteredReason;\nuse xai_x_thrift::action::InterstitialReason;\n\nfn article_post(lifecycle: Option<ArticleLifecycle>) -> PostCandidate {\n    let mut candidate = tweet_candidate(|t| t.article_id = NonZeroU64::new(1));\n    candidate.post.article_lifecycle = lifecycle;\n    candidate\n}\n\nfn home_hydration_only(verdict: fn() -> Verdict) -> Vec<(SafetyLevel, Role, Verdict)> {\n    vec![\n        (TimelineHomeHydration, Role::NonFollower, verdict()),\n        (TimelineHomeHydration, Role::Follower, verdict()),\n        (TimelineHomeHydration, Role::LoggedOut, verdict()),\n        (TimelineHomeHydration, Role::Author, verdict()),\n    ]\n}\n\nfn unpublished() -> Verdict {\n    dropped(\n        FilteredReason::UnspecifiedReason,\n        \"article_tweet_content/drop/unspecified\",\n    )\n}\n\npub(super) fn rows() -> Vec<Row> {\n    let mut author_sensitive_opt_in = sensitive_opt_in_viewer();\n    if let Viewer::LoggedIn { id, .. } = &mut author_sensitive_opt_in.viewer {\n        *id = AUTHOR_ID;\n    }\n    let mut rows = vec![\n        Row {\n            name: \"article_draft\",\n            subject: Subject::Post(article_post(Some(ArticleLifecycle::Draft))),\n            expect: home_hydration_only(unpublished),\n        },\n        Row {\n            name: \"article_soft_deleted\",\n            subject: Subject::Post(article_post(Some(ArticleLifecycle::SoftDeleted))),\n            expect: home_hydration_only(unpublished),\n        },\n        Row {\n            name: \"article_without_lifecycle\",\n            subject: Subject::Post(article_post(None)),\n            expect: home_hydration_only(unpublished),\n        },\n        Row {\n            name: \"article_published\",\n            subject: Subject::Post(article_post(Some(ArticleLifecycle::Published))),\n            expect: home_hydration_only(allow),\n        },\n        Row {\n            name: \"no_article\",\n            subject: Subject::Post(tweet_candidate(|_| {})),\n            expect: home_hydration_only(allow),\n        },\n    ];\n    for (name, body, cover, flagged, restricts) in [\n        (\"nsfw_article_cover\", false, true, true, true),\n        (\"nsfw_article_body\", true, false, true, true),\n        (\"nsfw_article_without_media\", false, false, true, false),\n        (\"unflagged_article_cover\", false, true, false, false),\n        (\"unflagged_article_body\", true, false, false, false),\n    ] {\n        let mut post = article_post(Some(ArticleLifecycle::Published));\n        post.author.features.is_nsfw_user = flagged;\n        post.post.tweet_features.nsfw.user = flagged;\n        post.post.article_has_media_entities = body;\n        post.post.article_has_cover_media = cover;\n        let levels = if restricts {\n            &[\n                TimelineHomeHydration,\n                TimelineHome,\n                TimelineHomeRecommendations,\n                ImmersiveExpandedRecommendations,\n            ][..]\n        } else {\n            &[TimelineHomeHydration][..]\n        };\n        let mut expect = Vec::new();\n        for &level in levels {\n            let restricted = |reason, by| match level {\n                TimelineHomeRecommendations => dropped(\n                    FilteredReason::ContainNsfwMedia,\n                    \"nsfw_user_author/drop/nsfw_media\",\n                ),\n                ImmersiveExpandedRecommendations => dropped(\n                    FilteredReason::ContainNsfwMedia,\n                    \"nsfw_sensitive_viewer_user/drop/nsfw_media\",\n                ),\n                FilterAll | TimelineHome | TimelineHomeHydration => nsfw_viewer_dropped(reason, by),\n                QuotedTweetRules | NotificationsFollow | NotificationsWriterV2 => {\n                    unreachable!(\"a user-only level judges no post\")\n                }\n            };\n            expect.extend([\n                (\n                    level,\n                    Role::As(\"underage\", viewer_with_age(ViewerAge::Known(17))),\n                    if restricts {\n                        restricted(\n                            NsfwViewerDropReason::IsUnderage,\n                            \"sensitive_viewer_underage/drop\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    level,\n                    Role::As(\n                        \"no_stated_age\",\n                        on_client(\"web\", \"de\", viewer_with_age(ViewerAge::NotStated)),\n                    ),\n                    if restricts {\n                        restricted(\n                            NsfwViewerDropReason::HasNoStatedAge,\n                            \"sensitive_viewer_no_stated_age/drop\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    level,\n                    Role::LoggedOut,\n                    if restricts {\n                        restricted(\n                            NsfwViewerDropReason::LoggedOut,\n                            \"sensitive_viewer_logged_out/drop\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n            ]);\n        }\n        expect.push((\n            TimelineHomeHydration,\n            Role::As(\n                \"adult_sensitive_off\",\n                on_client(\"web\", \"us\", viewer_with_age(ViewerAge::Known(18))),\n            ),\n            if restricts {\n                blurred(\n                    InterstitialReason::SensitiveUser(true),\n                    \"nsfw_user/blur/sensitive_user\",\n                )\n            } else {\n                allow()\n            },\n        ));\n        if !body {\n            expect.extend([\n                (\n                    TimelineHome,\n                    Role::As(\"adult_sensitive_off\", viewer_with_age(ViewerAge::Known(18))),\n                    if restricts {\n                        blurred(\n                            InterstitialReason::SensitiveUser(true),\n                            \"nsfw_user/blur/sensitive_user\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    TimelineHome,\n                    Role::As(\"sensitive_opt_in\", sensitive_opt_in_viewer()),\n                    allow(),\n                ),\n                (TimelineHome, Role::Author, allow()),\n                (\n                    TimelineHomeHydration,\n                    Role::As(\n                        \"author_sensitive_opt_in\",\n                        on_client(\"web\", \"us\", author_sensitive_opt_in.clone()),\n                    ),\n                    allow(),\n                ),\n                (\n                    TimelineHomeHydration,\n                    Role::As(\n                        \"author_sensitive_off\",\n                        on_client(\"web\", \"us\", author_viewer()),\n                    ),\n                    if restricts {\n                        blurred(\n                            InterstitialReason::SensitiveUser(true),\n                            \"nsfw_user/blur/sensitive_user\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    TimelineHomeRecommendations,\n                    Role::NonFollower,\n                    if flagged {\n                        dropped(\n                            FilteredReason::ContainNsfwMedia,\n                            \"nsfw_user_author/drop/nsfw_media\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    ImmersiveExpandedRecommendations,\n                    Role::NonFollower,\n                    if flagged {\n                        dropped(\n                            FilteredReason::ContainNsfwMedia,\n                            \"nsfw_sensitive_viewer_user/drop/nsfw_media\",\n                        )\n                    } else {\n                        allow()\n                    },\n                ),\n                (\n                    ImmersiveExpandedRecommendations,\n                    Role::As(\"sensitive_opt_in\", sensitive_opt_in_viewer()),\n                    allow(),\n                ),\n                (ImmersiveExpandedRecommendations, Role::Author, allow()),\n            ]);\n        }\n        rows.push(Row {\n            name,\n            subject: Subject::Post(post),\n            expect,\n        });\n    }\n    let mut creator = candidate()\n        .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)\n        .with_edge(Hydrator::SuperFollowsExclusive)\n        .build();\n    creator.post.tweet_features.article_id = NonZeroU64::new(1);\n    creator.post.tweet_features.exclusive_conversation_author_id = Some(42);\n    creator.post.article_lifecycle = Some(ArticleLifecycle::Published);\n    creator.post.article_has_media_entities = true;\n    rows.push(Row {\n        name: \"exclusive_nsfw_article_body_super_followed\",\n        subject: Subject::Post(creator),\n        expect: vec![\n            (\n                TimelineHomeHydration,\n                Role::As(\n                    \"sensitive_opt_in\",\n                    on_client(\"web\", \"us\", sensitive_opt_in_viewer()),\n                ),\n                dropped(\n                    FilteredReason::ContainNsfwMedia,\n                    \"creator_tweet_nsfw/drop/nsfw_media\",\n                ),\n            ),\n            (\n                TimelineHomeHydration,\n                Role::As(\n                    \"author_sensitive_opt_in\",\n                    on_client(\"web\", \"us\", author_sensitive_opt_in),\n                ),\n                allow(),\n            ),\n        ],\n    });\n    rows\n}\n",
+      "source_digest": "d6c9d06453b1ae987416524142e212d1b75486790255daebc98de2eb957ca7ae",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mock_or_fixture",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 32,
+      "end_line": 56,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n",
+      "source_digest": "23c04caab2ddd87fc69f2e758e906055e08c0b78a366610852852aa4c0e7b93f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 22,
+      "end_line": 46,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub use levels::level_lkey;\n\nuse crate::confidence::{ConfidenceConfig, RowOutcome};\nuse crate::decision::ActionSpec;\nuse crate::facts::EntityType;\nuse crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};\nuse crate::growthbook::DynamicConfig;\nuse crate::metrics;\nuse crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\npub const CONFIG_KEY: &str = \"action_control\";\npub const DRY_RUN_LABEL_PREFIX: &str = \"dry_run__\";\npub const FACTORY_LABEL: &str = \"abuse_platform_requested_actions\";\n\npub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);\npub const STALE_AFTER: Duration = Duration::from_secs(60);\nconst SCAN_TIMEOUT: Duration = Duration::from_secs(5);\n",
+      "source_digest": "4159c74495b445284827c98bfd246b254e6d067e96b3dbe5b78fdefb51e3ac04",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 350,
+      "end_line": 374,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                LkeySelector::Range {\n                    from: None,\n                    to: None,\n                },\n                SCAN_LIMIT,\n            )\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?;\n        if items.len() >= SCAN_LIMIT as usize {\n            warn!(\n                pkey,\n                limit = SCAN_LIMIT,\n                \"action-control scan hit its row limit; rows past it are not read\"\n            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n",
+      "source_digest": "a9bc6816a6bd3194326ad4a48d2e1327b74db369615e5296174af9d23448d123",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 577,
+      "end_line": 601,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                    fn plain_decider(\n        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &str) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| k != except) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n",
+      "source_digest": "2436a09938084e9b9a92da8796985ed79a79fac71a9666330d2ed9df1f7a0c56",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 579,
+      "end_line": 603,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &str) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| k != except) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        snap.records.remove(except);\n        snap\n",
+      "source_digest": "6b58d1c5db5e2ef7e1c082a28b830324284836723586b73f8633121ad57d68db",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 903,
+      "end_line": 927,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        bands.dedup();\n        let entity = entity_of(input.entity);\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let claim = input\n            .confidence\n            .clone()\n            .unwrap_or_else(|| crate::confidence::Claim {\n                row: LevelRow::Missing,\n                unknown: false,\n                evidence: None,\n                now_ms: crate::now_millis(),\n            });\n        let by_row = levels::resolve_rows(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n            },\n            &claim,\n            cfg,\n            &mut safety,\n",
+      "source_digest": "73262d9c720e504614b09c8d8fc48805a3ebb6794f9b10342abc60f6079ebedb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1028,
+      "end_line": 1052,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            actions,\n        )\n    }\n\n            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {\n        Ok(self\n            .store\n            .get(MH_PKEY, lkey)\n            .await?\n            .map(|b| raw_version(&b)))\n    }\n\n            pub fn weak_rows(\n        &self,\n        entity: EntityType,\n        head: &str,\n        classifier: Option<&str>,\n        rows: &[LevelRow],\n        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n",
+      "source_digest": "55c844fc1509199a088e27254b310f39883fd6a89da4c45d5b15f0341e53f1b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1033,
+      "end_line": 1057,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(self\n            .store\n            .get(MH_PKEY, lkey)\n            .await?\n            .map(|b| raw_version(&b)))\n    }\n\n            pub fn weak_rows(\n        &self,\n        entity: EntityType,\n        head: &str,\n        classifier: Option<&str>,\n        rows: &[LevelRow],\n        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n        levels::weak_rows(\n            &snap,\n            entity_of(entity),\n            &names,\n            classifier,\n",
+      "source_digest": "4b3327cb70e5920246557c3c1f7272449a6304158976f48d2c46b42af349408f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1041,
+      "end_line": 1065,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity: EntityType,\n        head: &str,\n        classifier: Option<&str>,\n        rows: &[LevelRow],\n        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n        levels::weak_rows(\n            &snap,\n            entity_of(entity),\n            &names,\n            classifier,\n            rows,\n            cfg,\n            now_ms,\n        )\n    }\n\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n",
+      "source_digest": "4e858e20e389c848b8136bb5ec9fdbf5f9aaa1d2d278f519fce848676d1ddb69",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1046,
+      "end_line": 1070,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n        levels::weak_rows(\n            &snap,\n            entity_of(entity),\n            &names,\n            classifier,\n            rows,\n            cfg,\n            now_ms,\n        )\n    }\n\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n",
+      "source_digest": "1e792bebadca0e6f647b5f7ed603275ccee4418d1f945ee8ee2871e0c21f4e34",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1062,
+      "end_line": 1086,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n",
+      "source_digest": "6b3aabac007324e4ae450c7272757c8bc55f68ec8bd1c178d4544afdc04bc74c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1063,
+      "end_line": 1087,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n",
+      "source_digest": "5f995655c441afb7833992499fa45fc9ab84652269ba9194746b8bbe70bbf696",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1065,
+      "end_line": 1089,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n",
+      "source_digest": "b528cf008630eac82c0c146572828001afa18643d6a4a727942f5c00b71f3f03",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1066,
+      "end_line": 1090,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n",
+      "source_digest": "d1d0ec0bd40c7cf6816efbb2746d8677ffbd63626155ae0c46c0d4455fa50bf9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1069,
+      "end_line": 1093,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n",
+      "source_digest": "1312d43058743a677eb741233f5976193e35fb40d792631b6f6b0719b85c8715",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1072,
+      "end_line": 1096,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n",
+      "source_digest": "e86bf61112fe434502128e54c6febb024ec1ee9a9ff596825cbc3fa6835a903b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1073,
+      "end_line": 1097,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n        let mut records = HashMap::with_capacity(n);\n",
+      "source_digest": "857c8a33dca623c4648610a03a6d06deffec397507d923d6e2bd31fc3103e835",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1083,
+      "end_line": 1107,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n        let mut records = HashMap::with_capacity(n);\n        let mut unreadable = HashMap::new();\n        for (lkey, value) in rows {\n            match parse_record(&value) {\n                Ok(rec) => {\n                    records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    metrics::ACTION_CONTROL_UNREADABLE_TOTAL.inc();\n                    warn!(lkey = %lkey, error = %err, \"action-control record does not parse; keeping the previous copy if any\");\n                    match prev.records.get(&lkey) {\n",
+      "source_digest": "be37ce790b5cf94e62117d6c26b7e380b1d5063edc7d1967a47b1de002351721",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1087,
+      "end_line": 1111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n        let mut records = HashMap::with_capacity(n);\n        let mut unreadable = HashMap::new();\n        for (lkey, value) in rows {\n            match parse_record(&value) {\n                Ok(rec) => {\n                    records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    metrics::ACTION_CONTROL_UNREADABLE_TOTAL.inc();\n                    warn!(lkey = %lkey, error = %err, \"action-control record does not parse; keeping the previous copy if any\");\n                    match prev.records.get(&lkey) {\n                        Some(old) => {\n                            records.insert(lkey, old.clone());\n                        }\n                        None => {\n",
+      "source_digest": "3070218744b1a48b51615765d2068eaf651e9b1120770f585f265324e433cca3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1402,
+      "end_line": 1426,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                            .inc();\n                        this.forget_seen(&key, None);\n                        if failures == 1 || failures.is_multiple_of(REFRESH_ERROR_LOG_EVERY) {\n                            warn!(error = %e, failures, key, \"action control: seen write failed; the next decision retries\");\n                        }\n                    }\n                }\n            }\n        }))\n    }\n\n    async fn scan_seen(&self) -> anyhow::Result<Vec<ActionControlSeen>> {\n        let rows = match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_PKEY)).await {\n            Ok(r) => r?,\n            Err(_) => anyhow::bail!(\"seen scan timed out\"),\n        };\n        let mut seen: Vec<ActionControlSeen> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, &a.band, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                &b.band,\n",
+      "source_digest": "fe64ddc02c3fa665c19a3bc3beccae4be82f1e74b85f6f3cb3db975df9c2e30f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1406,
+      "end_line": 1430,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        }\n                    }\n                }\n            }\n        }))\n    }\n\n    async fn scan_seen(&self) -> anyhow::Result<Vec<ActionControlSeen>> {\n        let rows = match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_PKEY)).await {\n            Ok(r) => r?,\n            Err(_) => anyhow::bail!(\"seen scan timed out\"),\n        };\n        let mut seen: Vec<ActionControlSeen> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, &a.band, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                &b.band,\n                b.entity_type.as_str(),\n            ))\n        });\n        Ok(seen)\n",
+      "source_digest": "eb0cbe095d160167bb4775f8c5ae6627245e333743eb18c3593f47d19d65e605",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1421,
+      "end_line": 1445,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, &a.band, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                &b.band,\n                b.entity_type.as_str(),\n            ))\n        });\n        Ok(seen)\n    }\n\n    async fn scan_seen_rows(&self) -> anyhow::Result<Vec<ActionControlSeenRow>> {\n        let rows =\n            match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_ROWS_PKEY)).await {\n                Ok(r) => r?,\n                Err(_) => anyhow::bail!(\"seen rows scan timed out\"),\n            };\n        let mut seen: Vec<ActionControlSeenRow> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, a.row, a.entity_type.as_str()).cmp(&(\n                &b.head,\n",
+      "source_digest": "096e8b62a4177fb6337b3d2c0243afa6cd180b39669380549fc12ddcab155585",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1422,
+      "end_line": 1446,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, &a.band, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                &b.band,\n                b.entity_type.as_str(),\n            ))\n        });\n        Ok(seen)\n    }\n\n    async fn scan_seen_rows(&self) -> anyhow::Result<Vec<ActionControlSeenRow>> {\n        let rows =\n            match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_ROWS_PKEY)).await {\n                Ok(r) => r?,\n                Err(_) => anyhow::bail!(\"seen rows scan timed out\"),\n            };\n        let mut seen: Vec<ActionControlSeenRow> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, a.row, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n",
+      "source_digest": "43983871c48e824fe98b5724208fb68cc44c264cbb83cbdc6cb085c7619baf7a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1425,
+      "end_line": 1449,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                &b.classifier,\n                &b.band,\n                b.entity_type.as_str(),\n            ))\n        });\n        Ok(seen)\n    }\n\n    async fn scan_seen_rows(&self) -> anyhow::Result<Vec<ActionControlSeenRow>> {\n        let rows =\n            match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_ROWS_PKEY)).await {\n                Ok(r) => r?,\n                Err(_) => anyhow::bail!(\"seen rows scan timed out\"),\n            };\n        let mut seen: Vec<ActionControlSeenRow> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, a.row, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                b.row,\n                b.entity_type.as_str(),\n            ))\n",
+      "source_digest": "6d6c4661fe817949d9cc212e0b9b9887cb514a40e03d9f7f8acb1d7003584e9a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 32,
+      "end_line": 56,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n",
+      "source_digest": "23c04caab2ddd87fc69f2e758e906055e08c0b78a366610852852aa4c0e7b93f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 22,
+      "end_line": 46,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub use levels::level_lkey;\n\nuse crate::confidence::{ConfidenceConfig, RowOutcome};\nuse crate::decision::ActionSpec;\nuse crate::facts::EntityType;\nuse crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};\nuse crate::growthbook::DynamicConfig;\nuse crate::metrics;\nuse crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\npub const CONFIG_KEY: &str = \"action_control\";\npub const DRY_RUN_LABEL_PREFIX: &str = \"dry_run__\";\n\npub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);\npub const STALE_AFTER: Duration = Duration::from_secs(60);\nconst SCAN_TIMEOUT: Duration = Duration::from_secs(5);\npub const ROLLOUT_WAIT_MS: i64 = 120_000;\n",
+      "source_digest": "59da42edbaf47fb2007c688c1a0002ce1f1b0d298f415c5ed40a4f54d1db5ac2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 361,
+      "end_line": 385,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                LkeySelector::Range {\n                    from: None,\n                    to: None,\n                },\n                SCAN_LIMIT,\n            )\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?;\n        if items.len() >= SCAN_LIMIT as usize {\n            warn!(\n                pkey,\n                limit = SCAN_LIMIT,\n                \"action-control scan hit its row limit; rows past it are not read\"\n            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n",
+      "source_digest": "a9bc6816a6bd3194326ad4a48d2e1327b74db369615e5296174af9d23448d123",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 608,
+      "end_line": 632,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                    fn plain_decider(\n        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| !except.contains(&k.as_str())) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n",
+      "source_digest": "8abecb805fab9a8ca59a0e2a49482193a7763503f991dbbcb36dea94b64e2f74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 610,
+      "end_line": 634,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| !except.contains(&k.as_str())) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        for k in except {\n            snap.records.remove(*k);\n",
+      "source_digest": "a8a5d71e3e1d52a37c50349bd2dcc24483a46fba0d200920160820818ce9b267",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 984,
+      "end_line": 1008,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            *safety_seen.get_or_insert_with(|| safety_ok.take().is_none_or(|f| f(e)))\n        };\n        let mut bands: Vec<&str> = input\n            .labels\n            .iter()\n            .map(|l| strip_dry_run_prefix(l))\n            .filter(|l| valid_name(l))\n            .collect();\n        bands.sort_unstable();\n        bands.dedup();\n        let entity = entity_of(input.entity);\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let by_row = levels::resolve_rows(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim(),\n            cfg,\n",
+      "source_digest": "f93aa0d1be326eedcfc1c9803841f8effc38a581ecd56400eba7998052fb68fd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1112,
+      "end_line": 1136,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            actions,\n        )\n    }\n\n            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {\n        Ok(self\n            .store\n            .get(MH_PKEY, lkey)\n            .await?\n            .map(|b| raw_version(&b)))\n    }\n\n            pub fn weak_rows(\n        &self,\n        entity: EntityType,\n        head: &str,\n        classifier: Option<&str>,\n        rows: &[LevelRow],\n        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n",
+      "source_digest": "55c844fc1509199a088e27254b310f39883fd6a89da4c45d5b15f0341e53f1b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1117,
+      "end_line": 1141,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(self\n            .store\n            .get(MH_PKEY, lkey)\n            .await?\n            .map(|b| raw_version(&b)))\n    }\n\n            pub fn weak_rows(\n        &self,\n        entity: EntityType,\n        head: &str,\n        classifier: Option<&str>,\n        rows: &[LevelRow],\n        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n        levels::weak_rows(\n            &snap,\n            entity_of(entity),\n            &names,\n            classifier,\n",
+      "source_digest": "4b3327cb70e5920246557c3c1f7272449a6304158976f48d2c46b42af349408f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1125,
+      "end_line": 1149,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity: EntityType,\n        head: &str,\n        classifier: Option<&str>,\n        rows: &[LevelRow],\n        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n        levels::weak_rows(\n            &snap,\n            entity_of(entity),\n            &names,\n            classifier,\n            rows,\n            cfg,\n            now_ms,\n        )\n    }\n\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n",
+      "source_digest": "4e858e20e389c848b8136bb5ec9fdbf5f9aaa1d2d278f519fce848676d1ddb69",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1130,
+      "end_line": 1154,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        cfg: &ControlConfig,\n        now_ms: i64,\n    ) -> Vec<LevelRow> {\n        let snap = self.snapshot();\n        let names: Vec<&str> = std::iter::once(head)\n            .chain(cfg.aliases.get(head).map(String::as_str))\n            .collect();\n        levels::weak_rows(\n            &snap,\n            entity_of(entity),\n            &names,\n            classifier,\n            rows,\n            cfg,\n            now_ms,\n        )\n    }\n\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n",
+      "source_digest": "1e792bebadca0e6f647b5f7ed603275ccee4418d1f945ee8ee2871e0c21f4e34",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1146,
+      "end_line": 1170,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n",
+      "source_digest": "6b3aabac007324e4ae450c7272757c8bc55f68ec8bd1c178d4544afdc04bc74c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1147,
+      "end_line": 1171,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n\n            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n",
+      "source_digest": "5f995655c441afb7833992499fa45fc9ab84652269ba9194746b8bbe70bbf696",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1149,
+      "end_line": 1173,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n",
+      "source_digest": "b528cf008630eac82c0c146572828001afa18643d6a4a727942f5c00b71f3f03",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1150,
+      "end_line": 1174,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n",
+      "source_digest": "d1d0ec0bd40c7cf6816efbb2746d8677ffbd63626155ae0c46c0d4455fa50bf9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1153,
+      "end_line": 1177,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n",
+      "source_digest": "1312d43058743a677eb741233f5976193e35fb40d792631b6f6b0719b85c8715",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1156,
+      "end_line": 1180,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n",
+      "source_digest": "e86bf61112fe434502128e54c6febb024ec1ee9a9ff596825cbc3fa6835a903b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1157,
+      "end_line": 1181,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n        let mut records = HashMap::with_capacity(n);\n",
+      "source_digest": "857c8a33dca623c4648610a03a6d06deffec397507d923d6e2bd31fc3103e835",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1167,
+      "end_line": 1191,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n        let mut records = HashMap::with_capacity(n);\n        let mut unreadable = HashMap::new();\n        for (lkey, value) in rows {\n            match parse_record(&value) {\n                Ok(rec) => {\n                    records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    metrics::ACTION_CONTROL_UNREADABLE_TOTAL.inc();\n                    warn!(lkey = %lkey, error = %err, \"action-control record does not parse; keeping the previous copy if any\");\n                    match prev.records.get(&lkey) {\n",
+      "source_digest": "be37ce790b5cf94e62117d6c26b7e380b1d5063edc7d1967a47b1de002351721",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1171,
+      "end_line": 1195,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n                    .inc();\n                self.publish_metrics();\n                return Err(e);\n            }\n        };\n        let n = rows.len();\n        let prev = self.snapshot();\n        let mut records = HashMap::with_capacity(n);\n        let mut unreadable = HashMap::new();\n        for (lkey, value) in rows {\n            match parse_record(&value) {\n                Ok(rec) => {\n                    records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    metrics::ACTION_CONTROL_UNREADABLE_TOTAL.inc();\n                    warn!(lkey = %lkey, error = %err, \"action-control record does not parse; keeping the previous copy if any\");\n                    match prev.records.get(&lkey) {\n                        Some(old) => {\n                            records.insert(lkey, old.clone());\n                        }\n                        None => {\n",
+      "source_digest": "3070218744b1a48b51615765d2068eaf651e9b1120770f585f265324e433cca3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1486,
+      "end_line": 1510,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                            .inc();\n                        this.forget_seen(&key, None);\n                        if failures == 1 || failures.is_multiple_of(REFRESH_ERROR_LOG_EVERY) {\n                            warn!(error = %e, failures, key, \"action control: seen write failed; the next decision retries\");\n                        }\n                    }\n                }\n            }\n        }))\n    }\n\n    pub(crate) async fn scan_seen(&self) -> anyhow::Result<Vec<ActionControlSeen>> {\n        let rows = match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_PKEY)).await {\n            Ok(r) => r?,\n            Err(_) => anyhow::bail!(\"seen scan timed out\"),\n        };\n        let mut seen: Vec<ActionControlSeen> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, &a.band, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                &b.band,\n",
+      "source_digest": "8c9e47a265b774ee275bd70d865dbc923d7ea21f2205d39df51cbeed55184b34",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1490,
+      "end_line": 1514,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        }\n                    }\n                }\n            }\n        }))\n    }\n\n    pub(crate) async fn scan_seen(&self) -> anyhow::Result<Vec<ActionControlSeen>> {\n        let rows = match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_PKEY)).await {\n            Ok(r) => r?,\n            Err(_) => anyhow::bail!(\"seen scan timed out\"),\n        };\n        let mut seen: Vec<ActionControlSeen> = rows\n            .iter()\n            .filter_map(|(_, v)| serde_json::from_slice(v).ok())\n            .collect();\n        seen.sort_by(|a, b| {\n            (&a.head, &a.classifier, &a.band, a.entity_type.as_str()).cmp(&(\n                &b.head,\n                &b.classifier,\n                &b.band,\n                b.entity_type.as_str(),\n            ))\n        });\n        Ok(seen)\n",
+      "source_digest": "7957440465c6ceaa3eb3d19100b359aece33caefda4a4ad8c040fe935b7a5deb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5af363556462a36b0b04ca2c500f2df6dfb16be679c34f9ea9f5c45f2b3652a4",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/rules",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "c2006cc9ed964d0674d8596409df0b66ea6d82dfec2e7efdb0e1e3e91acae798",
+      "context_complete": true,
+      "task_id": "T-cf9cb5f542ab186731322d7829b4a4718dd1c6a8e8f210ab8e25b7dfc639f54d",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d341a0e7e304c8f7fd62004b1cdfcc9f5067ddaa7bd89dfb8c0410ad6ac112cc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-8f3c0ab649c769936a0e6c06d430d884cb95fa127df8307c3adfdb04eb3aa861",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e39c455d8420c05dd61f4e52c8a702aa7b6930c839aa85a26459ba871206afa7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-0b92d73df9b3f9d6fb980e6051a622c5c30050fbbdce0790d69d25fd962069ad",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-88037694ed646a9a3dcad538e603b552df78086afce107af386305e35ed2b042",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-b635f3ed1b950c5544fab73ae7a1db4079e188dde82f3a8ba877ff63cda5e4ca",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-deed2456fd446e28d19f42d082d76e6bbcbb4259d1f385e432a3e244214e7b04",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-06d6106a5240e651e1c61052ded242caded038a779c97531e61e9f6ae75489d9",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a7359a8635a8d07dc66ea2c4cc30f9061a75b0a757565974eda1f1cdbf8a5fab",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-56af29b89ba21123ccf7a998f0f54c3af631330d0e820e0c3caba0fe72c558b9",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1ffb4bf5a8c42fd9778753b50a9c29bf2b651edacc9c9892de6fc674a8dc1784",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-fd1e1cbc304557e0815d59b4b72cedbdea174dfc5cab176b01e17cdb9bf4625c",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d36a424ff899c1abe715a0d96851cca7a4ea6efa4f021ae313a39f6f8ca9f7ed",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-61cf6a84996ba328180260b4754ab47c7e4e16017deebcdc3983b4bb6683d74a",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0cadf8d5b0e283585df3c358f46caf7effa8f6d21fe7f8761eb5f6408c595985",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-e700e8a7469567a137e9c13510016618fbe41d0f3db0460675986e81406e6154",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4de23672e2ff60226324f74d760dbc7223249cde0ab7c7836da5a9a6947928eb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-e686ed2befff855acb45c14976976b21dbd0853f5dd7f39d2fe8f1536177c9d4",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3efa103745b25a1b9f9f22fe16838a3287cd78fff29e32f240d2cb20ac040750",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-c07ae33bde58f2b97f74bcd12b17986456e29b186f36fda4c5f69a0c5bb9c153",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2d0722df296651b69a0c18931e532c7835fd88709bd0c87e7b1caee2becd4aa8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-621b90dbaf28aa64512295c20e41e06ac83e0de3eb467f55df12d45c5b48eaef",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-37f39540e77eece0b903024b051cd32aca1346c1c7a6e318b8173e5027550272",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-7e762bcf01e2f87d835e47ee28c126217bc26b532b5dde3a3d3b91b5e02b0f4b",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-627b9be2f27d714f9c31023d6563839a6797e66e2e3632d3f0071cf739c2c2fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-9e0f0cf729fa8cd694dbb3266e55ad4308e85ec2808a6a4cd8601cc2337a9e13",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-078d9c6a7e4093a45e4c78bfabdcf7ac5a05f177087a89439199e74897c028ed",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-56114623ad7dbbeaec2b4c85368d86f09ce72bb95da8a829a98fbe1cb2fbe39a",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-04f4f58d3565c821e3c217cc8c3aa5dc9ba505f037d92337f1f29a1189c1f677",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-5efb54a69a43bdaf40d2eee019a359e28b384a7858a850ee9c658452ed7b0744",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-75629065bfe4d64f5d6608f7d34207e9aaa721466df057ff7257af8bea12fa63",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-c2f67544785c8ff325d2623f90d51bb1be52b3856fc25e1a7702ccf51bc017c9",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1c11db9c210dfa15fd1c4e3916091d03cbbb24bcd91f091a424e93bbbf76e4c7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-39b4946785ebc8e060bb8fe2118e2e4d327457fee02444eda3b172cd8b8a0df1",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-83cbe6e70c9c22f064905e7bef42307e63fd7323d127125175931c88ada6d310",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4bfb20f6da3da0f46038efe5d1aba52a08deae557e7cf8c0c43311dc72f8b8c7",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2851417deba613197fed05404d6f8a8fe5c114922bdfb44565a45e6a8eaa0310",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-6bdc1bcb058773991ae5e019a9e0d1755c873dd6f4090ffe4d2202f37721f888",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bfb398a0acaa80739cc55d8c36f90a5705003bf027aa3982922f3e0cdcf95dd4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-36e1604c3e765f8ba80038e1d00514c726a17b1b03efc75b5d2e6f7f370345ae",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-14a97f5726d0684ef8e0ca8980f94fb5ea1e9ede393705e957e78d2f0a9bc9d8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4699defcbf722e30381d86ea488f815f2f165d6ef16c0137a87ffccf1e3baba3",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-081614addaaf497629be7b005248429511985d5ab709a0d379d5329ae81b630e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-09693f5faa8f0742b84aa674f2777f3a68c2e50346e50096a79415ea977c44ff",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-94dd617c70d0c8c0fb2ed52b4286decb7f17229450c385df5b84721fdde94804",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-aa85450663e1b874f88af3ec9cdfa2bc1c46ef043b0ca6c35aad02f819af0980",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-01100093628522b83fbc22822cd56629add5d7714a886df3541ad29704ac5188",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-2b1fce2e854b5b6106490c6c82f785bf9650ca43be93f07dff873fe76d4efb77",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c09defebb5df3fe73455bf0dc320b22c256d3ce884f2a60c1694cbb382038645",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-d4311b2a2582c8c326336e0aee231952116be308f6c931e09ca7dd154bde5822",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fa72ec027df773c5e6509a8ee1748f8a4bf3e9a7a0435ff1522819c65bc94c26",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-254adc5f1e2dee3438cd7bba885abd60ca9e6553c5b81f263587f8530f5049ad",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0ecee330ab71aab3f939890acc932dbed8a43f286d3147c5cfe888693598460b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-341304ebd2bf8224f0683922248ba4c537096328c10b2b2efa3ebc027a2748f6",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f7c8251dd63e7be94543d0c117969c9c7c73ce85c7664b1b7b41d6501a25824a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-352e57ec88d26e62ea274b07265b5745ccbed3049604333469d10ba324dae63e",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f131e94d5642391dfd977be50a71e86b46472dd0edf060b11d71c1bb846f4c23",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f93f5f1ce7303656f94b378e3bf1d88792b7ad93fe3b72ed408f8d3892393e1",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-609b68187ea788c9a4ac0cbd10d50ee45fe111beb5a634af954040c85c9d5e9c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-0e6f2333b83a43f79202cc6a487165034618b9bab326227c263ad9204a92be11",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d909252dfee727837fe92d55886f109c50c77a6faad4f3faaed13ec61675a551",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-f761b3673f92b3424f3f671e8d4a3d9624c4fff4caf887c240977e24bdbb34eb",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e3e0236f5d315f3af6045825e5f1e07004e2eb112542b698e2cf2d147db0983d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f214363ce22fa8413c38421fde1c49d9156c20b5beb275d0a062e509b0fd7f8",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5ecede79880f3a9ba4068c57392d7fd871bfb6c8d2cb789875b03a4adb434cab",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-0842ac3f776ae3aa7861315a96e12e706d2c3534b93e3f6a24069cec9fbccf94",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9c99d7b5f170557b516e0483d5e5e5e6f9d970c8adae9323e6ad494aaca9643f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-981d1f5fe9c5d40b62d853a418ae827145b039efee277bc155c4748e215c9c1b",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-61be8296820bf41d21fa5b908d864441f30058482e628ffdd253153f5fca96b5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-5b3b1893f6594912d4a59d15e3a2e20fd9057530ca0bbb9cc0025726fa6b48ca",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-70372186460fefc3bf40a97678bb5338de09b4446960687b1ce38a7a232b9bd7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-827e8d4da233605d565e0b1d2b0f3e4e5a4dacdf2e35df960f47c2d8b95cc48b",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-92bf0826e4b2018b318691f43e6698d1a4544334b7325088e174055a14e08472",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-3c8191d24da6b7ffec8867463174daf573d32c9845bcf56bc71543aef3d57a72",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8915d1b6d50516c5f2262fcffedfdf104729b1a4221173657159b873a5f4268c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-1b138e893ea31429534cf82c5886303f5950a182c89483a86ff0dc6ee24ab29f",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-43d7530e33d1f0bba2e7723c622924648e99ed14b15f3c7fd36397a73cec5079",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-444fb5cc7fca87dd418d33dac37e0a40fd753b2f8a886399e0800edec194d815",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d1f6f7677312315604b0024d86a8e93ad71a0c485a422b261ba32b6acd72570e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-153abdfdbbfbd665df2de59d9122745f5024227d098960da101bcab4b9bf66fa",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b984f0cf095e1473a942e44c1e99ad76c40ef77dfe34693cccee32fff56eba5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-68ab6e7f68872fcfefbc856723bf061ca5bf1409a28d029b6bcda33fcdac8a56",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5c3834b92398e64f873d0c18ccd1fe13a221bd79e3e18b43cfe57855ae4e77d3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-62d1b4e734069706d0091f795d697f9a0f45f2a987098fb96e2759ce80a54441",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-22cb5cc70ffe849d0ad12b50e6882b5c83566a8632f3ecd153defbada28eb0d8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-fd4b3571ac6962e0f6078cc26205449652273edf8ddd2485d2042730848aaa1b",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c316558203350b92f8dd74e9966c6efd13513d0b77ff96922443a97c21f3a779",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-e338b6334835b059a0f4b5d02f018b38a3dea7189b9ea6d9a65b196500b4f2b7",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/golden_corpus/article.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-02f5ea6969bbd0a3528f7b1dffe4237359e079197d0f009169979ffa2e800b93",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "rows"
+      ],
+      "context_complete": false,
+      "task_id": "T-6c4f90a4a103069a9529b52c6fc4d19308123f74942090e61a05518150372c07",
+      "evidence_refs": [
+        "E47"
+      ]
+    }
+  ],
+  "task_id": "T-258a0bd5480fc61f554a03bfe7908d8e17c9794174fc171e0dab52e82c011db6"
+}

@@ -1,0 +1,975 @@
+{
+  "schema_version": 1,
+  "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-d8c808c0e8bf60aff63672070c79896db08a44bab83235e92a04c7a2c8e5a879",
+  "change_scope": "changed_file",
+  "mechanism_group": "abuse-enforcement-service/service-lib",
+  "evidence": {
+    "E1": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 28,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};\nuse std::sync::{Arc, RwLock};\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\n\nuse async_trait::async_trait;\nuse tracing::{info, warn};\nuse xai_manhattan::{Key, LkeySelector, NativeManhattanClient, Tenant};\n\nuse crate::limiter::LimiterClient;\nuse crate::manhattan::ttl_nanos_from_secs;\nuse crate::metrics;\n\npub const USER_SNAP_PKEY: &str = \"global_rate_limit\";\npub const POST_SNAP_PKEY: &str = \"global_rate_limit:post\";\nconst WINDOW_SECS: u64 = 86_400;\nconst SNAPSHOT_INTERVAL_SECS: u64 = 60;\nconst SNAPSHOT_TTL_SECS: u64 = WINDOW_SECS + 3_600;\nconst SCAN_LIMIT: u32 = 200_000;\n\nfn now_secs() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_lkey(ts_secs: u64, interval: u64) -> String {\n    format!(\"{:020}\", (ts_secs / interval) * interval)\n",
+      "source_digest": "3b6b4176a0e489731ba295876f29fa2b4dde0bfa689bdd3535e959e0fb97f33d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 29,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};\nuse std::sync::{Arc, RwLock};\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\n\nuse async_trait::async_trait;\nuse tokio::task::JoinHandle;\nuse tracing::{info, warn};\nuse xai_manhattan::{Key, LkeySelector, NativeManhattanClient, Tenant};\n\nuse crate::limiter::LimiterClient;\nuse crate::manhattan::ttl_nanos_from_secs;\nuse crate::metrics;\n\npub const USER_SNAP_PKEY: &str = \"global_rate_limit\";\npub const POST_SNAP_PKEY: &str = \"global_rate_limit:post\";\nconst WINDOW_SECS: u64 = 86_400;\nconst SNAPSHOT_INTERVAL_SECS: u64 = 60;\nconst SCAN_LIMIT: u32 = 200_000;\n\n#[derive(Clone, Copy, Debug)]\npub struct WindowSpec {\n    pub windows_secs: &'static [u64],\n    pub snapshot_interval_secs: u64,\n}\n\nimpl WindowSpec {\n    fn longest_secs(&self) -> u64 {\n        self.windows_secs.iter().copied().max().unwrap_or(0)\n    }\n",
+      "source_digest": "498cd9d669872ba69e73316694d5057d91b80157c2bb2b8b1ebbe1cb3a5f2be5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 42,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};\nuse std::sync::{Arc, RwLock};\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\n\nuse async_trait::async_trait;\nuse tracing::{info, warn};\nuse xai_manhattan::{Key, LkeySelector, NativeManhattanClient, Tenant};\n\nuse crate::limiter::LimiterClient;\nuse crate::manhattan::ttl_nanos_from_secs;\nuse crate::metrics;\n\npub const USER_SNAP_PKEY: &str = \"global_rate_limit\";\npub const POST_SNAP_PKEY: &str = \"global_rate_limit:post\";\nconst WINDOW_SECS: u64 = 86_400;\nconst SNAPSHOT_INTERVAL_SECS: u64 = 60;\nconst SNAPSHOT_TTL_SECS: u64 = WINDOW_SECS + 3_600;\nconst SCAN_LIMIT: u32 = 200_000;\n\nfn now_secs() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_lkey(ts_secs: u64, interval: u64) -> String {\n    format!(\"{:020}\", (ts_secs / interval) * interval)\n}\n\nfn window_usage(counts: &[i64]) -> Option<(i64, i64)> {\n    let first = *counts.first()?;\n    let baseline = counts.iter().copied().max().unwrap_or(first);\n    Some((baseline - first, baseline))\n}\n\nfn remaining(cap: i64, used: i64) -> i64 {\n    (cap - used).max(0)\n}\n\n#[async_trait]\ntrait CounterSource: Send + Sync {\n",
+      "source_digest": "474a528cf05518da453f04d35f3b165c2397f04d92efdfa70dae8acb952697f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 63,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};\nuse std::sync::{Arc, RwLock};\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\n\nuse async_trait::async_trait;\nuse tokio::task::JoinHandle;\nuse tracing::{info, warn};\nuse xai_manhattan::{Key, LkeySelector, NativeManhattanClient, Tenant};\n\nuse crate::limiter::LimiterClient;\nuse crate::manhattan::ttl_nanos_from_secs;\nuse crate::metrics;\n\npub const USER_SNAP_PKEY: &str = \"global_rate_limit\";\npub const POST_SNAP_PKEY: &str = \"global_rate_limit:post\";\nconst WINDOW_SECS: u64 = 86_400;\nconst SNAPSHOT_INTERVAL_SECS: u64 = 60;\nconst SCAN_LIMIT: u32 = 200_000;\n\n#[derive(Clone, Copy, Debug)]\npub struct WindowSpec {\n    pub windows_secs: &'static [u64],\n    pub snapshot_interval_secs: u64,\n}\n\nimpl WindowSpec {\n    fn longest_secs(&self) -> u64 {\n        self.windows_secs.iter().copied().max().unwrap_or(0)\n    }\n\n    fn snapshot_ttl_secs(&self) -> u64 {\n        self.longest_secs() + 3_600\n    }\n}\n\npub const DAILY_CAP: WindowSpec = WindowSpec {\n    windows_secs: &[WINDOW_SECS],\n    snapshot_interval_secs: SNAPSHOT_INTERVAL_SECS,\n};\n\nfn now_secs() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_lkey(ts_secs: u64, interval: u64) -> String {\n    format!(\"{:020}\", (ts_secs / interval) * interval)\n}\n\nfn window_usage(counts: &[i64]) -> Option<(i64, i64)> {\n    let first = *counts.first()?;\n    let baseline = counts.iter().copied().max().unwrap_or(first);\n    Some((baseline - first, baseline))\n}\n\nfn remaining(cap: i64, used: i64) -> i64 {\n    (cap - used).max(0)\n}\n\nfn window_cache(\n    rows: &[(String, i64)],\n",
+      "source_digest": "6b3d8b7f5cbf8b681dede67744696b253b2c76f74074731be9834af1cff01bea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 18,
+      "end_line": 63,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "const SCAN_LIMIT: u32 = 200_000;\n\nfn now_secs() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_lkey(ts_secs: u64, interval: u64) -> String {\n    format!(\"{:020}\", (ts_secs / interval) * interval)\n}\n\nfn window_usage(counts: &[i64]) -> Option<(i64, i64)> {\n    let first = *counts.first()?;\n    let baseline = counts.iter().copied().max().unwrap_or(first);\n    Some((baseline - first, baseline))\n}\n\nfn remaining(cap: i64, used: i64) -> i64 {\n    (cap - used).max(0)\n}\n\n#[async_trait]\ntrait CounterSource: Send + Sync {\n    async fn increment(&self) -> Option<i64>;\n}\n\n#[async_trait]\nimpl CounterSource for LimiterClient {\n    async fn increment(&self) -> Option<i64> {\n        self.increment_count().await\n    }\n}\n\n#[async_trait]\ntrait SnapshotStore: Send + Sync {\n    async fn scan(\n        &self,\n        pkey: &str,\n        from: Option<&str>,\n        to: Option<&str>,\n        limit: u32,\n    ) -> anyhow::Result<Vec<(String, String)>>;\n    async fn put_with_ttl(\n        &self,\n",
+      "source_digest": "8d967be25f1f58f813ccb3cc6fe08f694a5974fe215e6ec7cc1615e6f12c8123",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 39,
+      "end_line": 111,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "};\n\nfn now_secs() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn snapshot_lkey(ts_secs: u64, interval: u64) -> String {\n    format!(\"{:020}\", (ts_secs / interval) * interval)\n}\n\nfn window_usage(counts: &[i64]) -> Option<(i64, i64)> {\n    let first = *counts.first()?;\n    let baseline = counts.iter().copied().max().unwrap_or(first);\n    Some((baseline - first, baseline))\n}\n\nfn remaining(cap: i64, used: i64) -> i64 {\n    (cap - used).max(0)\n}\n\nfn window_cache(\n    rows: &[(String, i64)],\n    now: u64,\n    window: u64,\n    floor: u64,\n    interval: u64,\n    last_count: i64,\n) -> Cached {\n    let start = snapshot_lkey(floor.max(now.saturating_sub(window)), interval);\n    let count = |(_, c): &(String, i64)| *c;\n    let mut counts: Vec<i64> = Vec::new();\n    counts.extend(rows.iter().rfind(|(l, _)| *l <= start).map(count));\n    counts.extend(rows.iter().filter(|(l, _)| *l > start).map(count));\n    match window_usage(&counts) {\n        Some((rolling_tail, baseline)) => Cached {\n            rolling_tail,\n            baseline,\n            present: true,\n        },\n        None => Cached {\n            rolling_tail: 0,\n            baseline: last_count,\n            present: false,\n        },\n    }\n}\n\n#[async_trait]\ntrait CounterSource: Send + Sync {\n    async fn increment(&self) -> Option<i64>;\n}\n\n#[async_trait]\nimpl CounterSource for LimiterClient {\n    async fn increment(&self) -> Option<i64> {\n        self.increment_count().await\n    }\n}\n\n#[async_trait]\ntrait SnapshotStore: Send + Sync {\n    async fn scan(\n        &self,\n        pkey: &str,\n        from: Option<&str>,\n        to: Option<&str>,\n        limit: u32,\n    ) -> anyhow::Result<Vec<(String, String)>>;\n    async fn put_with_ttl(\n        &self,\n",
+      "source_digest": "95e7735671848a265fb4d4a95135b96e6c994f7f1f1592df2a178e0d4ebb7301",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 112,
+      "end_line": 157,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        pkey: &str,\n        lkey: &str,\n        value: String,\n        ttl_nanos: i64,\n    ) -> anyhow::Result<()> {\n        self.mh\n            .put_with_ttl(self.tenant.clone(), [pkey], [lkey], value, ttl_nanos)\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n        self.mh\n            .delete(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n}\n\n#[derive(Clone, Copy, Default)]\nstruct Cached {\n    rolling_tail: i64,\n    baseline: i64,\n}\n\n#[derive(Clone)]\npub struct SlidingWindowLimiter {\n    counter: Arc<dyn CounterSource>,\n    store: Arc<dyn SnapshotStore>,\n    snap_pkey: String,\n    metric_label: &'static str,\n    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Cached>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    snapshots_present: Arc<AtomicBool>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n",
+      "source_digest": "759d6a12f233c5ab1c16983d9c0bb408c0ff217b916558256efdeae5d9415c73",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 160,
+      "end_line": 212,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        pkey: &str,\n        lkey: &str,\n        value: String,\n        ttl_nanos: i64,\n    ) -> anyhow::Result<()> {\n        self.mh\n            .put_with_ttl(self.tenant.clone(), [pkey], [lkey], value, ttl_nanos)\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n        self.mh\n            .delete(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n}\n\n#[derive(Clone, Copy, Default)]\nstruct Cached {\n    rolling_tail: i64,\n    baseline: i64,\n    present: bool,\n}\n\nimpl Cached {\n    fn rolling(&self, c_now: i64) -> i64 {\n        self.rolling_tail + (c_now - self.baseline).max(0)\n    }\n}\n\n#[derive(Clone)]\npub struct SlidingWindowLimiter {\n    counter: Arc<dyn CounterSource>,\n    store: Arc<dyn SnapshotStore>,\n    snap_pkey: String,\n    metric_label: &'static str,\n    spec: WindowSpec,\n    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Vec<Cached>>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    floor_ms: Arc<AtomicU64>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n",
+      "source_digest": "8a0ab80d4f2d823306ff616bfc5273fb3a51b033e06d9e727bb58b8a3c240650",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 120,
+      "end_line": 170,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n        self.mh\n            .delete(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n}\n\n#[derive(Clone, Copy, Default)]\nstruct Cached {\n    rolling_tail: i64,\n    baseline: i64,\n}\n\n#[derive(Clone)]\npub struct SlidingWindowLimiter {\n    counter: Arc<dyn CounterSource>,\n    store: Arc<dyn SnapshotStore>,\n    snap_pkey: String,\n    metric_label: &'static str,\n    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Cached>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    snapshots_present: Arc<AtomicBool>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n",
+      "source_digest": "3fa1e90080bbc0da8051473bdf57c0f8cb0bfe0dfac465e676645110260e1483",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 175,
+      "end_line": 226,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n}\n\n#[derive(Clone, Copy, Default)]\nstruct Cached {\n    rolling_tail: i64,\n    baseline: i64,\n    present: bool,\n}\n\nimpl Cached {\n    fn rolling(&self, c_now: i64) -> i64 {\n        self.rolling_tail + (c_now - self.baseline).max(0)\n    }\n}\n\n#[derive(Clone)]\npub struct SlidingWindowLimiter {\n    counter: Arc<dyn CounterSource>,\n    store: Arc<dyn SnapshotStore>,\n    snap_pkey: String,\n    metric_label: &'static str,\n    spec: WindowSpec,\n    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Vec<Cached>>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    floor_ms: Arc<AtomicU64>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n            spec,\n        )\n    }\n\n",
+      "source_digest": "b3328dfe476518e9b42bbc7e4c4f4dc1daa2358a86d6da4514ef8a2ab867c442",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 136,
+      "end_line": 181,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "\n#[derive(Clone)]\npub struct SlidingWindowLimiter {\n    counter: Arc<dyn CounterSource>,\n    store: Arc<dyn SnapshotStore>,\n    snap_pkey: String,\n    metric_label: &'static str,\n    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Cached>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    snapshots_present: Arc<AtomicBool>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            last_count: Arc::new(AtomicI64::new(0)),\n",
+      "source_digest": "d7dd4c5df75dc3ced922f89d2617748dfdcdb8a50cf6f7680f36a96230c40971",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 192,
+      "end_line": 238,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "#[derive(Clone)]\npub struct SlidingWindowLimiter {\n    counter: Arc<dyn CounterSource>,\n    store: Arc<dyn SnapshotStore>,\n    snap_pkey: String,\n    metric_label: &'static str,\n    spec: WindowSpec,\n    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Vec<Cached>>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    floor_ms: Arc<AtomicU64>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n            spec,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n",
+      "source_digest": "887432e0bb8d3b45bbb2fee982a1119a74a07e97678565012f2a334359f8015c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 143,
+      "end_line": 188,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    last_count: Arc<AtomicI64>,\n    cached: Arc<RwLock<Cached>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    snapshots_present: Arc<AtomicBool>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            last_count: Arc::new(AtomicI64::new(0)),\n            cached: Arc::new(RwLock::new(Cached::default())),\n            seeded: Arc::new(AtomicBool::new(false)),\n            dirty: Arc::new(AtomicBool::new(false)),\n            snapshots_present: Arc::new(AtomicBool::new(false)),\n            fail_open,\n        }\n    }\n",
+      "source_digest": "c035803978db37c424767c36e7a6f7b6cfcbbf47a60f5dde0b32fd98414f28fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 200,
+      "end_line": 246,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    cached: Arc<RwLock<Vec<Cached>>>,\n    seeded: Arc<AtomicBool>,\n    dirty: Arc<AtomicBool>,\n    floor_ms: Arc<AtomicU64>,\n    fail_open: bool,\n}\n\nimpl SlidingWindowLimiter {\n    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n            spec,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            spec,\n            last_count: Arc::new(AtomicI64::new(0)),\n            cached: Arc::new(RwLock::new(vec![\n                Cached::default();\n                spec.windows_secs.len()\n            ])),\n            seeded: Arc::new(AtomicBool::new(false)),\n",
+      "source_digest": "3071c4c808c136c11c2e1080ea43f4b620d53409ab7a2cafe6e10ea024a9bfe6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 152,
+      "end_line": 208,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    pub fn new(\n        limiter: LimiterClient,\n        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            last_count: Arc::new(AtomicI64::new(0)),\n            cached: Arc::new(RwLock::new(Cached::default())),\n            seeded: Arc::new(AtomicBool::new(false)),\n            dirty: Arc::new(AtomicBool::new(false)),\n            snapshots_present: Arc::new(AtomicBool::new(false)),\n            fail_open,\n        }\n    }\n\n    pub async fn try_record(&self, cap: i64) -> bool {\n        match self.increment_and_rolling().await {\n            Some(rolling) => {\n                metrics::RATE_LIMIT_REMAINING\n                    .with_label_values(&[self.metric_label])\n                    .set(remaining(cap, rolling));\n                if !self.seeded.load(Ordering::Relaxed) {\n                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n",
+      "source_digest": "2a9d297441e207577ceb3ff93250ab33c367a98d18ec8aa813d95baedadf6f4b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 210,
+      "end_line": 271,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        mh: Arc<NativeManhattanClient>,\n        tenant: Tenant,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self::from_parts(\n            Arc::new(limiter),\n            Arc::new(ManhattanSnapshotStore { mh, tenant }),\n            fail_open,\n            snap_pkey,\n            metric_label,\n            spec,\n        )\n    }\n\n    fn from_parts(\n        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            spec,\n            last_count: Arc::new(AtomicI64::new(0)),\n            cached: Arc::new(RwLock::new(vec![\n                Cached::default();\n                spec.windows_secs.len()\n            ])),\n            seeded: Arc::new(AtomicBool::new(false)),\n            dirty: Arc::new(AtomicBool::new(false)),\n            floor_ms: Arc::new(AtomicU64::new(0)),\n            fail_open,\n        }\n    }\n\n    pub async fn try_record(&self, cap: i64) -> bool {\n        match self.increment_and_rolling().await {\n            Some(rolling) => {\n                let rolling = rolling[0];\n                metrics::RATE_LIMIT_REMAINING\n                    .with_label_values(&[self.metric_label])\n                    .set(remaining(cap, rolling));\n                if !self.seeded.load(Ordering::Relaxed) {\n                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n",
+      "source_digest": "194af3e1303ee416e097fcc52ce2b32c87d59da787fdf9a77c5b8ce5a464e5d6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 170,
+      "end_line": 215,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        counter: Arc<dyn CounterSource>,\n        store: Arc<dyn SnapshotStore>,\n        fail_open: bool,\n        snap_pkey: impl Into<String>,\n        metric_label: &'static str,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            last_count: Arc::new(AtomicI64::new(0)),\n            cached: Arc::new(RwLock::new(Cached::default())),\n            seeded: Arc::new(AtomicBool::new(false)),\n            dirty: Arc::new(AtomicBool::new(false)),\n            snapshots_present: Arc::new(AtomicBool::new(false)),\n            fail_open,\n        }\n    }\n\n    pub async fn try_record(&self, cap: i64) -> bool {\n        match self.increment_and_rolling().await {\n            Some(rolling) => {\n                metrics::RATE_LIMIT_REMAINING\n                    .with_label_values(&[self.metric_label])\n                    .set(remaining(cap, rolling));\n                if !self.seeded.load(Ordering::Relaxed) {\n                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n\n    pub fn stats(&self, cap: i64) -> (u32, u32, u32) {\n        let used = self.rolling_cached();\n        (\n            used.max(0) as u32,\n            cap.max(0) as u32,\n            remaining(cap, used) as u32,\n",
+      "source_digest": "2dd8deb8159a6b2f3db08312fa23d9a752173fdba769a3dff44f9a47a03c56be",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 233,
+      "end_line": 279,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        spec: WindowSpec,\n    ) -> Self {\n        Self {\n            counter,\n            store,\n            snap_pkey: snap_pkey.into(),\n            metric_label,\n            spec,\n            last_count: Arc::new(AtomicI64::new(0)),\n            cached: Arc::new(RwLock::new(vec![\n                Cached::default();\n                spec.windows_secs.len()\n            ])),\n            seeded: Arc::new(AtomicBool::new(false)),\n            dirty: Arc::new(AtomicBool::new(false)),\n            floor_ms: Arc::new(AtomicU64::new(0)),\n            fail_open,\n        }\n    }\n\n    pub async fn try_record(&self, cap: i64) -> bool {\n        match self.increment_and_rolling().await {\n            Some(rolling) => {\n                let rolling = rolling[0];\n                metrics::RATE_LIMIT_REMAINING\n                    .with_label_values(&[self.metric_label])\n                    .set(remaining(cap, rolling));\n                if !self.seeded.load(Ordering::Relaxed) {\n                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n\n    pub fn stats(&self, cap: i64) -> (u32, u32, u32) {\n        let used = self.rolling_cached()[0];\n        (\n            used.max(0) as u32,\n            cap.max(0) as u32,\n            remaining(cap, used) as u32,\n",
+      "source_digest": "6b5c11adc0e7ddba4f40c3ee205ca3d2a56789b8af5066ba3694a33cfd2f3e4c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 188,
+      "end_line": 234,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    }\n\n    pub async fn try_record(&self, cap: i64) -> bool {\n        match self.increment_and_rolling().await {\n            Some(rolling) => {\n                metrics::RATE_LIMIT_REMAINING\n                    .with_label_values(&[self.metric_label])\n                    .set(remaining(cap, rolling));\n                if !self.seeded.load(Ordering::Relaxed) {\n                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n\n    pub fn stats(&self, cap: i64) -> (u32, u32, u32) {\n        let used = self.rolling_cached();\n        (\n            used.max(0) as u32,\n            cap.max(0) as u32,\n            remaining(cap, used) as u32,\n        )\n    }\n\n    pub async fn record_report(&self, cap: i64) -> Option<serde_json::Value> {\n        let rolling = self.increment_and_rolling().await?;\n        metrics::RATE_LIMIT_REMAINING\n            .with_label_values(&[self.metric_label])\n            .set(remaining(cap, rolling));\n        let allowed = !self.seeded.load(Ordering::Relaxed) || rolling < cap;\n        Some(serde_json::json!({\n            \"allowed\": allowed,\n            \"used\": rolling,\n            \"cap\": cap,\n            \"remaining\": remaining(cap, rolling),\n        }))\n    }\n\n    pub async fn reset(&self) -> Option<u64> {\n        let items = match self\n",
+      "source_digest": "52196525525ecd9ec719228a6550612d21e8cc8aee279a2d449b6416bbf95600",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 252,
+      "end_line": 298,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "\n    pub async fn try_record(&self, cap: i64) -> bool {\n        match self.increment_and_rolling().await {\n            Some(rolling) => {\n                let rolling = rolling[0];\n                metrics::RATE_LIMIT_REMAINING\n                    .with_label_values(&[self.metric_label])\n                    .set(remaining(cap, rolling));\n                if !self.seeded.load(Ordering::Relaxed) {\n                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n\n    pub fn stats(&self, cap: i64) -> (u32, u32, u32) {\n        let used = self.rolling_cached()[0];\n        (\n            used.max(0) as u32,\n            cap.max(0) as u32,\n            remaining(cap, used) as u32,\n        )\n    }\n\n    pub async fn record_report(&self, cap: i64) -> Option<serde_json::Value> {\n        let rolling = self.increment_and_rolling().await?[0];\n        metrics::RATE_LIMIT_REMAINING\n            .with_label_values(&[self.metric_label])\n            .set(remaining(cap, rolling));\n        let allowed = !self.seeded.load(Ordering::Relaxed) || rolling < cap;\n        Some(serde_json::json!({\n            \"allowed\": allowed,\n            \"used\": rolling,\n            \"cap\": cap,\n            \"remaining\": remaining(cap, rolling),\n        }))\n    }\n\n    pub async fn reset(&self) -> Option<u64> {\n        let items = match self\n",
+      "source_digest": "2dcdd95ea816a36f87fe53a8b2bacf28a3b185f3f75c26d0cc38bce3cf90a18d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 197,
+      "end_line": 243,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n\n    pub fn stats(&self, cap: i64) -> (u32, u32, u32) {\n        let used = self.rolling_cached();\n        (\n            used.max(0) as u32,\n            cap.max(0) as u32,\n            remaining(cap, used) as u32,\n        )\n    }\n\n    pub async fn record_report(&self, cap: i64) -> Option<serde_json::Value> {\n        let rolling = self.increment_and_rolling().await?;\n        metrics::RATE_LIMIT_REMAINING\n            .with_label_values(&[self.metric_label])\n            .set(remaining(cap, rolling));\n        let allowed = !self.seeded.load(Ordering::Relaxed) || rolling < cap;\n        Some(serde_json::json!({\n            \"allowed\": allowed,\n            \"used\": rolling,\n            \"cap\": cap,\n            \"remaining\": remaining(cap, rolling),\n        }))\n    }\n\n    pub async fn reset(&self) -> Option<u64> {\n        let items = match self\n            .store\n            .scan(self.snap_pkey.as_str(), None, None, SCAN_LIMIT)\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window reset scan failed: {e}\");\n                return None;\n",
+      "source_digest": "1be8996430d03bae4b7dc2797c3c589cfa199ea2c74083109fb6284530cd9c79",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 261,
+      "end_line": 307,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                    return true;\n                }\n                rolling < cap\n            }\n            None => self.fail_open,\n        }\n    }\n\n    #[cfg(test)]\n    pub(crate) fn seed_for_test(&self) {\n        self.seeded.store(true, Ordering::Relaxed);\n    }\n\n    pub fn stats(&self, cap: i64) -> (u32, u32, u32) {\n        let used = self.rolling_cached()[0];\n        (\n            used.max(0) as u32,\n            cap.max(0) as u32,\n            remaining(cap, used) as u32,\n        )\n    }\n\n    pub async fn record_report(&self, cap: i64) -> Option<serde_json::Value> {\n        let rolling = self.increment_and_rolling().await?[0];\n        metrics::RATE_LIMIT_REMAINING\n            .with_label_values(&[self.metric_label])\n            .set(remaining(cap, rolling));\n        let allowed = !self.seeded.load(Ordering::Relaxed) || rolling < cap;\n        Some(serde_json::json!({\n            \"allowed\": allowed,\n            \"used\": rolling,\n            \"cap\": cap,\n            \"remaining\": remaining(cap, rolling),\n        }))\n    }\n\n    pub async fn reset(&self) -> Option<u64> {\n        let items = match self\n            .store\n            .scan(self.snap_pkey.as_str(), None, None, SCAN_LIMIT)\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window reset scan failed: {e}\");\n                return None;\n",
+      "source_digest": "6deb6471ed771afcd2f7ae180b5c97f39891e5107d051480472d8a7f69038df8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 235,
+      "end_line": 303,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            .store\n            .scan(self.snap_pkey.as_str(), None, None, SCAN_LIMIT)\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window reset scan failed: {e}\");\n                return None;\n            }\n        };\n\n        let mut deleted = 0u64;\n        for (lkey, _) in &items {\n            if let Err(e) = self.store.delete(self.snap_pkey.as_str(), lkey).await {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window reset delete failed for lkey={lkey}: {e}\");\n            } else {\n                deleted += 1;\n            }\n        }\n\n        let baseline = self.last_count.load(Ordering::Relaxed);\n        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = Cached {\n            rolling_tail: 0,\n            baseline,\n        };\n        self.seeded.store(true, Ordering::Relaxed);\n        warn!(pkey = %self.snap_pkey, deleted, baseline, \"sliding-window reset\");\n        Some(deleted)\n    }\n\n    pub fn spawn_background(&self) {\n        let this = self.clone();\n        tokio::spawn(async move {\n            this.refresh().await;\n            let mut tick = tokio::time::interval(Duration::from_secs(SNAPSHOT_INTERVAL_SECS));\n            loop {\n                tick.tick().await;\n                this.write_snapshot().await;\n                this.refresh().await;\n            }\n        });\n    }\n\n    async fn increment_and_rolling(&self) -> Option<i64> {\n        let c_now = self.counter.increment().await?;\n        let prev = self.last_count.swap(c_now, Ordering::Relaxed);\n        self.dirty.store(true, Ordering::Relaxed);\n        if c_now < prev {\n            metrics::LIMITER_COUNTER_RESET_TOTAL\n                .with_label_values(&[self.metric_label])\n                .inc();\n        }\n        if !self.snapshots_present.load(Ordering::Relaxed) {\n            self.cached\n                .write()\n                .unwrap_or_else(|e| e.into_inner())\n                .baseline = c_now;\n        }\n        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());\n        let head = (c_now - cached.baseline).max(0);\n        Some(cached.rolling_tail + head)\n    }\n\n    fn rolling_cached(&self) -> i64 {\n        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());\n        let head = (self.last_count.load(Ordering::Relaxed) - cached.baseline).max(0);\n        cached.rolling_tail + head\n",
+      "source_digest": "db58505d68b9d68d1f967c1ea97d11d8aa116a3be05640b4eaa325cedc56feda",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 299,
+      "end_line": 397,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            .store\n            .scan(self.snap_pkey.as_str(), None, None, SCAN_LIMIT)\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window reset scan failed: {e}\");\n                return None;\n            }\n        };\n\n        let mut deleted = 0u64;\n        for (lkey, _) in &items {\n            if let Err(e) = self.store.delete(self.snap_pkey.as_str(), lkey).await {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window reset delete failed for lkey={lkey}: {e}\");\n            } else {\n                deleted += 1;\n            }\n        }\n\n        let baseline = self.last_count.load(Ordering::Relaxed);\n        for c in self\n            .cached\n            .write()\n            .unwrap_or_else(|e| e.into_inner())\n            .iter_mut()\n        {\n            c.rolling_tail = 0;\n            c.baseline = baseline;\n        }\n        self.seeded.store(true, Ordering::Relaxed);\n        warn!(pkey = %self.snap_pkey, deleted, baseline, \"sliding-window reset\");\n        Some(deleted)\n    }\n\n    pub fn spawn_background(&self) -> JoinHandle<()> {\n        let this = self.clone();\n        tokio::spawn(async move {\n            this.refresh().await;\n            let mut tick =\n                tokio::time::interval(Duration::from_secs(this.spec.snapshot_interval_secs));\n            loop {\n                tick.tick().await;\n                this.write_snapshot().await;\n                this.refresh().await;\n            }\n        })\n    }\n\n    pub fn set_floor(&self, floor_ms: u64) -> bool {\n        if self.floor_ms.fetch_max(floor_ms, Ordering::Relaxed) >= floor_ms {\n            return false;\n        }\n        let last = self.last_count.load(Ordering::Relaxed);\n        for c in self\n            .cached\n            .write()\n            .unwrap_or_else(|e| e.into_inner())\n            .iter_mut()\n        {\n            *c = Cached {\n                rolling_tail: 0,\n                baseline: last,\n                present: false,\n            };\n        }\n        true\n    }\n\n    pub fn floor_ms(&self) -> u64 {\n        self.floor_ms.load(Ordering::Relaxed)\n    }\n\n    pub async fn increment_and_rolling(&self) -> Option<Vec<i64>> {\n        let c_now = self.counter.increment().await?;\n        let prev = self.last_count.swap(c_now, Ordering::Relaxed);\n        self.dirty.store(true, Ordering::Relaxed);\n        if c_now < prev {\n            metrics::LIMITER_COUNTER_RESET_TOTAL\n                .with_label_values(&[self.metric_label])\n                .inc();\n        }\n        {\n            let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());\n            if cached.iter().all(|c| c.present) {\n                return Some(cached.iter().map(|c| c.rolling(c_now)).collect());\n            }\n        }\n        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());\n        for c in cached.iter_mut().filter(|c| !c.present) {\n            c.baseline = c_now;\n        }\n        Some(cached.iter().map(|c| c.rolling(c_now)).collect())\n    }\n\n    pub fn rolling_cached(&self) -> Vec<i64> {\n        let last = self.last_count.load(Ordering::Relaxed);\n",
+      "source_digest": "ecf1fc6a3d28fdd355e2195811fedd9745ae155ea06bfae12aa5a80e1c062e45",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 266,
+      "end_line": 335,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "\n    pub fn spawn_background(&self) {\n        let this = self.clone();\n        tokio::spawn(async move {\n            this.refresh().await;\n            let mut tick = tokio::time::interval(Duration::from_secs(SNAPSHOT_INTERVAL_SECS));\n            loop {\n                tick.tick().await;\n                this.write_snapshot().await;\n                this.refresh().await;\n            }\n        });\n    }\n\n    async fn increment_and_rolling(&self) -> Option<i64> {\n        let c_now = self.counter.increment().await?;\n        let prev = self.last_count.swap(c_now, Ordering::Relaxed);\n        self.dirty.store(true, Ordering::Relaxed);\n        if c_now < prev {\n            metrics::LIMITER_COUNTER_RESET_TOTAL\n                .with_label_values(&[self.metric_label])\n                .inc();\n        }\n        if !self.snapshots_present.load(Ordering::Relaxed) {\n            self.cached\n                .write()\n                .unwrap_or_else(|e| e.into_inner())\n                .baseline = c_now;\n        }\n        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());\n        let head = (c_now - cached.baseline).max(0);\n        Some(cached.rolling_tail + head)\n    }\n\n    fn rolling_cached(&self) -> i64 {\n        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());\n        let head = (self.last_count.load(Ordering::Relaxed) - cached.baseline).max(0);\n        cached.rolling_tail + head\n    }\n\n    async fn write_snapshot(&self) {\n        if !self.dirty.swap(false, Ordering::Relaxed) {\n            return;\n        }\n        let c = self.last_count.load(Ordering::Relaxed);\n        let lkey = snapshot_lkey(now_secs(), SNAPSHOT_INTERVAL_SECS);\n        let ttl = ttl_nanos_from_secs(SNAPSHOT_TTL_SECS);\n        if let Err(e) = self\n            .store\n            .put_with_ttl(self.snap_pkey.as_str(), lkey.as_str(), c.to_string(), ttl)\n            .await\n        {\n            metrics::MANHATTAN_ERRORS_TOTAL.inc();\n            warn!(pkey = %self.snap_pkey, \"sliding-window snapshot write failed: {e}\");\n            self.dirty.store(true, Ordering::Relaxed);\n        }\n    }\n\n    async fn refresh(&self) {\n        let now = now_secs();\n        let from = snapshot_lkey(now.saturating_sub(WINDOW_SECS), SNAPSHOT_INTERVAL_SECS);\n        let to = snapshot_lkey(now, SNAPSHOT_INTERVAL_SECS);\n        let items = match self\n            .store\n            .scan(\n                self.snap_pkey.as_str(),\n                Some(from.as_str()),\n                Some(to.as_str()),\n                SCAN_LIMIT,\n            )\n",
+      "source_digest": "fdadca0dad9ed6b8603d89f491de0382a2e086d3048f2091fd8234399bd749fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 360,
+      "end_line": 435,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        {\n            *c = Cached {\n                rolling_tail: 0,\n                baseline: last,\n                present: false,\n            };\n        }\n        true\n    }\n\n    pub fn floor_ms(&self) -> u64 {\n        self.floor_ms.load(Ordering::Relaxed)\n    }\n\n    pub async fn increment_and_rolling(&self) -> Option<Vec<i64>> {\n        let c_now = self.counter.increment().await?;\n        let prev = self.last_count.swap(c_now, Ordering::Relaxed);\n        self.dirty.store(true, Ordering::Relaxed);\n        if c_now < prev {\n            metrics::LIMITER_COUNTER_RESET_TOTAL\n                .with_label_values(&[self.metric_label])\n                .inc();\n        }\n        {\n            let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());\n            if cached.iter().all(|c| c.present) {\n                return Some(cached.iter().map(|c| c.rolling(c_now)).collect());\n            }\n        }\n        let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());\n        for c in cached.iter_mut().filter(|c| !c.present) {\n            c.baseline = c_now;\n        }\n        Some(cached.iter().map(|c| c.rolling(c_now)).collect())\n    }\n\n    pub fn rolling_cached(&self) -> Vec<i64> {\n        let last = self.last_count.load(Ordering::Relaxed);\n        self.cached\n            .read()\n            .unwrap_or_else(|e| e.into_inner())\n            .iter()\n            .map(|c| c.rolling(last))\n            .collect()\n    }\n\n    pub async fn write_snapshot(&self) {\n        if !self.dirty.load(Ordering::Relaxed) {\n            return;\n        }\n        let c = self.last_count.load(Ordering::Relaxed);\n        let lkey = snapshot_lkey(now_secs(), self.spec.snapshot_interval_secs);\n        let ttl = ttl_nanos_from_secs(self.spec.snapshot_ttl_secs());\n        if let Err(e) = self\n            .store\n            .put_with_ttl(self.snap_pkey.as_str(), lkey.as_str(), c.to_string(), ttl)\n            .await\n        {\n            metrics::MANHATTAN_ERRORS_TOTAL.inc();\n            warn!(pkey = %self.snap_pkey, \"sliding-window snapshot write failed: {e}\");\n            return;\n        }\n        self.dirty.store(false, Ordering::Relaxed);\n        if self.last_count.load(Ordering::Relaxed) != c {\n            self.dirty.store(true, Ordering::Relaxed);\n        }\n    }\n\n    pub async fn refresh(&self) {\n        let now = now_secs();\n        let interval = self.spec.snapshot_interval_secs;\n        let floor_ms = self.floor_ms.load(Ordering::Relaxed);\n        let from = snapshot_lkey(now.saturating_sub(self.spec.longest_secs()), interval);\n        let to = snapshot_lkey(now, interval);\n        let items = match self\n            .store\n",
+      "source_digest": "491da7be07fc0e2b396c989991c4780e178d17a8defc26591c727a45f293c282",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 297,
+      "end_line": 350,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        Some(cached.rolling_tail + head)\n    }\n\n    fn rolling_cached(&self) -> i64 {\n        let cached = *self.cached.read().unwrap_or_else(|e| e.into_inner());\n        let head = (self.last_count.load(Ordering::Relaxed) - cached.baseline).max(0);\n        cached.rolling_tail + head\n    }\n\n    async fn write_snapshot(&self) {\n        if !self.dirty.swap(false, Ordering::Relaxed) {\n            return;\n        }\n        let c = self.last_count.load(Ordering::Relaxed);\n        let lkey = snapshot_lkey(now_secs(), SNAPSHOT_INTERVAL_SECS);\n        let ttl = ttl_nanos_from_secs(SNAPSHOT_TTL_SECS);\n        if let Err(e) = self\n            .store\n            .put_with_ttl(self.snap_pkey.as_str(), lkey.as_str(), c.to_string(), ttl)\n            .await\n        {\n            metrics::MANHATTAN_ERRORS_TOTAL.inc();\n            warn!(pkey = %self.snap_pkey, \"sliding-window snapshot write failed: {e}\");\n            self.dirty.store(true, Ordering::Relaxed);\n        }\n    }\n\n    async fn refresh(&self) {\n        let now = now_secs();\n        let from = snapshot_lkey(now.saturating_sub(WINDOW_SECS), SNAPSHOT_INTERVAL_SECS);\n        let to = snapshot_lkey(now, SNAPSHOT_INTERVAL_SECS);\n        let items = match self\n            .store\n            .scan(\n                self.snap_pkey.as_str(),\n                Some(from.as_str()),\n                Some(to.as_str()),\n                SCAN_LIMIT,\n            )\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window scan failed: {e}\");\n                return;\n            }\n        };\n        let counts: Vec<i64> = items\n            .iter()\n            .filter_map(|(_, v)| v.trim().parse().ok())\n            .collect();\n        let (rolling_tail, baseline) = match window_usage(&counts) {\n            Some(usage) => usage,\n",
+      "source_digest": "dc6aa018d8c854474f6d3f86b16139a7803273277b3ea0231ae9e7c19724bf23",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 397,
+      "end_line": 456,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        let last = self.last_count.load(Ordering::Relaxed);\n        self.cached\n            .read()\n            .unwrap_or_else(|e| e.into_inner())\n            .iter()\n            .map(|c| c.rolling(last))\n            .collect()\n    }\n\n    pub async fn write_snapshot(&self) {\n        if !self.dirty.load(Ordering::Relaxed) {\n            return;\n        }\n        let c = self.last_count.load(Ordering::Relaxed);\n        let lkey = snapshot_lkey(now_secs(), self.spec.snapshot_interval_secs);\n        let ttl = ttl_nanos_from_secs(self.spec.snapshot_ttl_secs());\n        if let Err(e) = self\n            .store\n            .put_with_ttl(self.snap_pkey.as_str(), lkey.as_str(), c.to_string(), ttl)\n            .await\n        {\n            metrics::MANHATTAN_ERRORS_TOTAL.inc();\n            warn!(pkey = %self.snap_pkey, \"sliding-window snapshot write failed: {e}\");\n            return;\n        }\n        self.dirty.store(false, Ordering::Relaxed);\n        if self.last_count.load(Ordering::Relaxed) != c {\n            self.dirty.store(true, Ordering::Relaxed);\n        }\n    }\n\n    pub async fn refresh(&self) {\n        let now = now_secs();\n        let interval = self.spec.snapshot_interval_secs;\n        let floor_ms = self.floor_ms.load(Ordering::Relaxed);\n        let from = snapshot_lkey(now.saturating_sub(self.spec.longest_secs()), interval);\n        let to = snapshot_lkey(now, interval);\n        let items = match self\n            .store\n            .scan(\n                self.snap_pkey.as_str(),\n                Some(from.as_str()),\n                Some(to.as_str()),\n                SCAN_LIMIT,\n            )\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window scan failed: {e}\");\n                return;\n            }\n        };\n        let rows: Vec<(String, i64)> = items\n            .into_iter()\n            .filter_map(|(l, v)| Some((l, v.trim().parse().ok()?)))\n            .collect();\n        let last = self.last_count.load(Ordering::Relaxed);\n        let persisted = !self.dirty.load(Ordering::Relaxed);\n",
+      "source_digest": "df8a5d8b153f044d8dca66ae0fbc327c9843033b01315456ba802482a3b41a1d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 322,
+      "end_line": 398,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    }\n\n    async fn refresh(&self) {\n        let now = now_secs();\n        let from = snapshot_lkey(now.saturating_sub(WINDOW_SECS), SNAPSHOT_INTERVAL_SECS);\n        let to = snapshot_lkey(now, SNAPSHOT_INTERVAL_SECS);\n        let items = match self\n            .store\n            .scan(\n                self.snap_pkey.as_str(),\n                Some(from.as_str()),\n                Some(to.as_str()),\n                SCAN_LIMIT,\n            )\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window scan failed: {e}\");\n                return;\n            }\n        };\n        let counts: Vec<i64> = items\n            .iter()\n            .filter_map(|(_, v)| v.trim().parse().ok())\n            .collect();\n        let (rolling_tail, baseline) = match window_usage(&counts) {\n            Some(usage) => usage,\n            None => {\n                if !self.seeded.load(Ordering::Relaxed) {\n                    info!(\n                        pkey = %self.snap_pkey,\n                        \"sliding-window: cold start (no snapshots), baselining at C={}\",\n                        self.last_count.load(Ordering::Relaxed)\n                    );\n                }\n                (0, self.last_count.load(Ordering::Relaxed))\n            }\n        };\n        self.snapshots_present\n            .store(!counts.is_empty(), Ordering::Relaxed);\n        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = Cached {\n            rolling_tail,\n            baseline,\n        };\n        self.seeded.store(true, Ordering::Relaxed);\n        warn!(\n            pkey = %self.snap_pkey,\n            from = %from,\n            to = %to,\n            snapshots = counts.len(),\n            rolling_tail,\n            baseline,\n            \"sliding-window refresh\"\n        );\n    }\n}\n\n#[cfg(test)]\npub(crate) fn counting_limiter_for_test() -> (SlidingWindowLimiter, Arc<AtomicI64>) {\n    struct Counting(Arc<AtomicI64>);\n    #[async_trait]\n    impl CounterSource for Counting {\n        async fn increment(&self) -> Option<i64> {\n            Some(self.0.fetch_add(1, Ordering::Relaxed) + 1)\n        }\n    }\n    struct NoStore;\n    #[async_trait]\n    impl SnapshotStore for NoStore {\n        async fn scan(\n            &self,\n            _pkey: &str,\n            _from: Option<&str>,\n            _to: Option<&str>,\n            _limit: u32,\n",
+      "source_digest": "879c89db5c1d14c50f6d618158abda2d9582f0d2e7494584ccfdc9b860488796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 428,
+      "end_line": 513,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    pub async fn refresh(&self) {\n        let now = now_secs();\n        let interval = self.spec.snapshot_interval_secs;\n        let floor_ms = self.floor_ms.load(Ordering::Relaxed);\n        let from = snapshot_lkey(now.saturating_sub(self.spec.longest_secs()), interval);\n        let to = snapshot_lkey(now, interval);\n        let items = match self\n            .store\n            .scan(\n                self.snap_pkey.as_str(),\n                Some(from.as_str()),\n                Some(to.as_str()),\n                SCAN_LIMIT,\n            )\n            .await\n        {\n            Ok(items) => items,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                warn!(pkey = %self.snap_pkey, \"sliding-window scan failed: {e}\");\n                return;\n            }\n        };\n        let rows: Vec<(String, i64)> = items\n            .into_iter()\n            .filter_map(|(l, v)| Some((l, v.trim().parse().ok()?)))\n            .collect();\n        let last = self.last_count.load(Ordering::Relaxed);\n        let persisted = !self.dirty.load(Ordering::Relaxed);\n        if rows.is_empty() && !self.seeded.load(Ordering::Relaxed) {\n            info!(\n                pkey = %self.snap_pkey,\n                \"sliding-window: cold start (no snapshots), baselining at C={last}\"\n            );\n        }\n        let fresh: Vec<Cached> = self\n            .spec\n            .windows_secs\n            .iter()\n            .map(|&w| {\n                let mut c = window_cache(&rows, now, w, floor_ms / 1_000, interval, last);\n                if persisted {\n                    c.baseline = c.baseline.max(last);\n                }\n                c\n            })\n            .collect();\n        let first = fresh[0];\n        {\n            let mut cached = self.cached.write().unwrap_or_else(|e| e.into_inner());\n            if self.floor_ms.load(Ordering::Relaxed) != floor_ms {\n                return;\n            }\n            *cached = fresh;\n        }\n        self.seeded.store(true, Ordering::Relaxed);\n        warn!(\n            pkey = %self.snap_pkey,\n            from = %from,\n            to = %to,\n            snapshots = rows.len(),\n            rolling_tail = first.rolling_tail,\n            baseline = first.baseline,\n            \"sliding-window refresh\"\n        );\n    }\n}\n\n#[cfg(test)]\npub(crate) fn counting_limiter_for_test() -> (SlidingWindowLimiter, Arc<AtomicI64>) {\n    struct Counting(Arc<AtomicI64>);\n    #[async_trait]\n    impl CounterSource for Counting {\n        async fn increment(&self) -> Option<i64> {\n            Some(self.0.fetch_add(1, Ordering::Relaxed) + 1)\n        }\n    }\n    struct NoStore;\n    #[async_trait]\n    impl SnapshotStore for NoStore {\n        async fn scan(\n            &self,\n            _pkey: &str,\n            _from: Option<&str>,\n            _to: Option<&str>,\n            _limit: u32,\n",
+      "source_digest": "4fcd42223c3918f3c471752fe226e870d2fe4f8b308251b4db86a62e7313d5fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 399,
+      "end_line": 454,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        ) -> anyhow::Result<Vec<(String, String)>> {\n            Ok(Vec::new())\n        }\n        async fn put_with_ttl(\n            &self,\n            _pkey: &str,\n            _lkey: &str,\n            _value: String,\n            _ttl_nanos: i64,\n        ) -> anyhow::Result<()> {\n            Ok(())\n        }\n        async fn delete(&self, _pkey: &str, _lkey: &str) -> anyhow::Result<()> {\n            Ok(())\n        }\n    }\n    let tickets = Arc::new(AtomicI64::new(0));\n    let limiter = SlidingWindowLimiter::from_parts(\n        Arc::new(Counting(tickets.clone())),\n        Arc::new(NoStore),\n        true,\n        USER_SNAP_PKEY,\n        \"user\",\n    );\n    (limiter, tickets)\n}\n\n#[cfg(test)]\nmod tests {\n    use std::collections::BTreeMap;\n    use std::collections::VecDeque;\n    use std::sync::Mutex;\n\n    use super::*;\n\n    #[test]\n    fn window_usage_monotone_equals_last_minus_first() {\n        assert_eq!(window_usage(&[10, 13, 20, 100]), Some((90, 100)));\n    }\n\n    #[test]\n    fn window_usage_dip_and_recover_adds_no_phantom_usage() {\n        let incident = [4_650_000, 4_800_000, 5_000_000, 12, 5_000_000, 40];\n        assert_eq!(window_usage(&incident), Some((350_000, 5_000_000)));\n    }\n\n    #[test]\n    fn window_usage_true_reset_undercounts_never_overcounts() {\n        assert_eq!(window_usage(&[10, 100, 5, 30]), Some((90, 100)));\n    }\n\n    #[test]\n    fn window_usage_oscillation_bounded_by_range() {\n        assert_eq!(window_usage(&[50, 10, 60, 20, 55]), Some((10, 60)));\n    }\n\n",
+      "source_digest": "9d78e981f952d4713cd7f29c437c1cf14e887d4c4c935a37bccf3140549d7363",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 514,
+      "end_line": 680,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        ) -> anyhow::Result<Vec<(String, String)>> {\n            Ok(Vec::new())\n        }\n        async fn put_with_ttl(\n            &self,\n            _pkey: &str,\n            _lkey: &str,\n            _value: String,\n            _ttl_nanos: i64,\n        ) -> anyhow::Result<()> {\n            Ok(())\n        }\n        async fn delete(&self, _pkey: &str, _lkey: &str) -> anyhow::Result<()> {\n            Ok(())\n        }\n    }\n    let tickets = Arc::new(AtomicI64::new(0));\n    let limiter = SlidingWindowLimiter::from_parts(\n        Arc::new(Counting(tickets.clone())),\n        Arc::new(NoStore),\n        true,\n        USER_SNAP_PKEY,\n        \"user\",\n        DAILY_CAP,\n    );\n    (limiter, tickets)\n}\n\n#[cfg(test)]\npub(crate) mod test_support {\n    use std::collections::BTreeMap;\n    use std::sync::atomic::AtomicBool;\n    use std::sync::Mutex;\n\n    use super::*;\n\n    #[derive(Default)]\n    pub(crate) struct MemCounter {\n        pub count: AtomicI64,\n        pub fail: AtomicBool,\n    }\n\n    #[async_trait]\n    impl CounterSource for MemCounter {\n        async fn increment(&self) -> Option<i64> {\n            if self.fail.load(Ordering::Relaxed) {\n                return None;\n            }\n            Some(self.count.fetch_add(1, Ordering::SeqCst) + 1)\n        }\n    }\n\n    #[derive(Default)]\n    pub(crate) struct MemSnapshots {\n        pub rows: Mutex<BTreeMap<(String, String), String>>,\n        pub hang_scan: AtomicBool,\n        pub hang_put: AtomicBool,\n    }\n\n    impl MemSnapshots {\n        pub(crate) fn put_at(&self, pkey: &str, ts_secs: u64, value: i64) {\n            self.rows.lock().unwrap().insert(\n                (\n                    pkey.to_owned(),\n                    snapshot_lkey(ts_secs, SNAPSHOT_INTERVAL_SECS),\n                ),\n                value.to_string(),\n            );\n        }\n    }\n\n    #[async_trait]\n    impl SnapshotStore for MemSnapshots {\n        async fn scan(\n            &self,\n            pkey: &str,\n            from: Option<&str>,\n            to: Option<&str>,\n            _limit: u32,\n        ) -> anyhow::Result<Vec<(String, String)>> {\n            if self.hang_scan.load(Ordering::Relaxed) {\n                std::future::pending::<()>().await;\n            }\n            Ok(self\n                .rows\n                .lock()\n                .unwrap()\n                .iter()\n                .filter(|((p, l), _)| {\n                    p == pkey\n                        && from.is_none_or(|f| l.as_str() >= f)\n                        && to.is_none_or(|t| l.as_str() <= t)\n                })\n                .map(|((_, l), v)| (l.clone(), v.clone()))\n                .collect())\n        }\n\n        async fn put_with_ttl(\n            &self,\n            pkey: &str,\n            lkey: &str,\n            value: String,\n            _ttl_nanos: i64,\n        ) -> anyhow::Result<()> {\n            if self.hang_put.load(Ordering::Relaxed) {\n                std::future::pending::<()>().await;\n            }\n            self.rows\n                .lock()\n                .unwrap()\n                .insert((pkey.to_owned(), lkey.to_owned()), value);\n            Ok(())\n        }\n\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.rows\n                .lock()\n                .unwrap()\n                .remove(&(pkey.to_owned(), lkey.to_owned()));\n            Ok(())\n        }\n    }\n\n    pub(crate) fn limiter(\n        counter: Arc<MemCounter>,\n        store: Arc<MemSnapshots>,\n        snap_pkey: &str,\n        metric_label: &'static str,\n        spec: WindowSpec,\n    ) -> SlidingWindowLimiter {\n        SlidingWindowLimiter::from_parts(counter, store, true, snap_pkey, metric_label, spec)\n    }\n\n    pub(crate) fn now() -> u64 {\n        now_secs()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use std::collections::VecDeque;\n    use std::sync::Mutex;\n\n    use super::test_support::MemSnapshots as MemStore;\n    use super::*;\n\n    #[test]\n    fn window_usage_monotone_equals_last_minus_first() {\n        assert_eq!(window_usage(&[10, 13, 20, 100]), Some((90, 100)));\n    }\n\n    #[test]\n    fn window_usage_dip_and_recover_adds_no_phantom_usage() {\n        let incident = [4_650_000, 4_800_000, 5_000_000, 12, 5_000_000, 40];\n        assert_eq!(window_usage(&incident), Some((350_000, 5_000_000)));\n    }\n\n    #[test]\n    fn window_usage_true_reset_undercounts_never_overcounts() {\n        assert_eq!(window_usage(&[10, 100, 5, 30]), Some((90, 100)));\n    }\n\n    #[test]\n    fn window_usage_oscillation_bounded_by_range() {\n        assert_eq!(window_usage(&[50, 10, 60, 20, 55]), Some((10, 60)));\n    }\n\n",
+      "source_digest": "ece1c807cf0b33bcc8d2ad14b16454aa68dd357b9d2c4665080a1ba0b5a95e87",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d8c808c0e8bf60aff63672070c79896db08a44bab83235e92a04c7a2c8e5a879",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 1,
+      "part": 1,
+      "change_range": {
+        "before_start": 1,
+        "before_count": 8,
+        "after_start": 1,
+        "after_count": 9
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-46c4148e72eb52676fc39787d4e1bf98f135c06f871bf57a404981f114b0f88f",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-207fadb56d8f7c29298b5ed482902c174f9c32e421e2d654a0318525c7252474",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 2,
+      "part": 1,
+      "change_range": {
+        "before_start": 14,
+        "before_count": 9,
+        "after_start": 15,
+        "after_count": 29
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-ce243238cfa03f72ace3fc9e922a3b2770272fde30651291a19570d5a47a7baf",
+      "evidence_refs": [
+        "E3",
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dd5f89a917a1aee631a7480b516534ea1b3e8073b7c2723fbe3c51333b855ea4",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 3,
+      "part": 1,
+      "change_range": {
+        "before_start": 38,
+        "before_count": 6,
+        "after_start": 59,
+        "after_count": 33
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-49a9143f5925eb50d30bf90574d2da49156fee8266222c6f102981416ac9c1f9",
+      "evidence_refs": [
+        "E5",
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d1585dfb381abb355bdb02e57b80c681a04fa6ef26bc8ab7096c47eef2d31511",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 4,
+      "part": 1,
+      "change_range": {
+        "before_start": 132,
+        "before_count": 6,
+        "after_start": 180,
+        "after_count": 13
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-30685e13a0614ea4e51cb895ad017fab1634fe7697543fba6ede2ffe13a80b62",
+      "evidence_refs": [
+        "E7",
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bae8cb9f36bb0e95712ba1748f54e8cf34ab28fe35ceec2330b0d811351319d5",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 5,
+      "part": 1,
+      "change_range": {
+        "before_start": 140,
+        "before_count": 11,
+        "after_start": 195,
+        "after_count": 12
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-29cc5c5c1c518abf20d12cd39020b9005b078f864d3a318e3085628637254d23",
+      "evidence_refs": [
+        "E9",
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0ad31aed1fedf3735cbe4b2f193ccd91df5968412893a9c9990bb34b5629b4bc",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 6,
+      "part": 1,
+      "change_range": {
+        "before_start": 156,
+        "before_count": 6,
+        "after_start": 212,
+        "after_count": 7
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-f31ea7d46c5fadfb8e43b63147d06039c0e84e07da70dffaa9d4ecdd7de4d8e2",
+      "evidence_refs": [
+        "E11",
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ed92ee5832c5e7f0a8aa2dcd0ec0cf29d9c8c55c8319efef59f58d44850f3e0b",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 7,
+      "part": 1,
+      "change_range": {
+        "before_start": 163,
+        "before_count": 6,
+        "after_start": 220,
+        "after_count": 7
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-82176b3188db2ecc6c89f15499a0723a0436b43cf674f46058cfe839750c4d64",
+      "evidence_refs": [
+        "E13",
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6c05729bd4643c7e5ecfea6bcb99419d485fa58acaad01e157bba5b075a5d492",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 8,
+      "part": 1,
+      "change_range": {
+        "before_start": 172,
+        "before_count": 17,
+        "after_start": 230,
+        "after_count": 22
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-ad83c4cf6a941edd9870d51b06a49288cf02437e9b626df3949ec0494a06dfbd",
+      "evidence_refs": [
+        "E15",
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8afa5c18b0368f2afdd9c214a83729c9191cc16090cea8d9496a40b2f014b8c4",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 9,
+      "part": 1,
+      "change_range": {
+        "before_start": 190,
+        "before_count": 6,
+        "after_start": 253,
+        "after_count": 7
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-73d0a4651b6cea94a08290b12a59d532d5608845a554ed13a9ade584139cc3d5",
+      "evidence_refs": [
+        "E17",
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-58f7422f9907ba8b3b5744141ba1186dd95f6fdd518a233d844e1dae74f7e331",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 10,
+      "part": 1,
+      "change_range": {
+        "before_start": 208,
+        "before_count": 7,
+        "after_start": 272,
+        "after_count": 7
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-5cccf96a701a4d45384458fb41a386b63a15d2892fda196ec2f77271f0adfe8d",
+      "evidence_refs": [
+        "E19",
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-229f2541f18c50b3cf150e011cd8d5d493930ddc79c5e59db0c1a458b18d5a46",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 11,
+      "part": 1,
+      "change_range": {
+        "before_start": 217,
+        "before_count": 7,
+        "after_start": 281,
+        "after_count": 7
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-71b353a2499a719305d470d13113868e528e7f69faa5c7977b4d17a20872a38c",
+      "evidence_refs": [
+        "E21",
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fec0dc11280e33268e0eba6d1a9e91b3618ce68ffc67e5a360e72b6584e89c87",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 12,
+      "part": 1,
+      "change_range": {
+        "before_start": 255,
+        "before_count": 29,
+        "after_start": 319,
+        "after_count": 59
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-580e712d2f42d3fe70e034f0686ff5e6f50d0fcb767a768768ab3a44589238b2",
+      "evidence_refs": [
+        "E23",
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7a2518f135f3f0988876c97eb02d0f41de448c3220f7ded8cb8a783ee2795c83",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 13,
+      "part": 1,
+      "change_range": {
+        "before_start": 286,
+        "before_count": 30,
+        "after_start": 380,
+        "after_count": 36
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-eb3fc49ecdf43742d867c4aa365b92cbcab36477911086eba9b3876a74908c8d",
+      "evidence_refs": [
+        "E25",
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d3b5eff7fc06a947766b5dd0d3b6f0103e5ab0fbacb93aa7e4c7c019c5b7c55d",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 14,
+      "part": 1,
+      "change_range": {
+        "before_start": 317,
+        "before_count": 14,
+        "after_start": 417,
+        "after_count": 20
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-9d84e6ee39258294316d16b64459248142fc753a3b51529b924fcbd4ec1dea73",
+      "evidence_refs": [
+        "E27",
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ae874b25683cdd406a0c1d4c1ad11562338a198d45d2e1e9b99965b04b560f0e",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 15,
+      "part": 1,
+      "change_range": {
+        "before_start": 342,
+        "before_count": 37,
+        "after_start": 448,
+        "after_count": 46
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-bc13fe9f35c9ce11b333f3b2bacd7cf12059ff2129d64461a604a38e6318b4c3",
+      "evidence_refs": [
+        "E29",
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/sliding_window.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-af17e1680a0649cdbed71eb3bc5e2002944e8201cdf96e580a6abf1b5b391195",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 16,
+      "part": 1,
+      "change_range": {
+        "before_start": 419,
+        "before_count": 16,
+        "after_start": 534,
+        "after_count": 127
+      },
+      "diff_digest": "e72fda7421cdef1d6d2c8b748eaddb88258ecfea55d3060210447b64712e19d6",
+      "task_id": "T-6769f783e941ab10f2810b145c92a3461af6742567c6e358f9029153bf60d8c2",
+      "evidence_refs": [
+        "E31",
+        "E32"
+      ]
+    }
+  ],
+  "task_id": "T-6dfe1f55bac27cd4f41752e957a78a0d35cde2eefd911be2d9cdd0a64a33ed86"
+}

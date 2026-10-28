@@ -1,0 +1,1949 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/batch.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-ce0e5e3e103e68ec45c0ab3c2afe20f71dae755a3bb5f3c581de110f9943ada6",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/batch.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 180,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use rustc_hash::FxHashMap;\nuse std::collections::hash_map::Entry;\nuse std::collections::HashMap;\nuse std::hash::{BuildHasher, Hash};\nuse std::slice;\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) enum HydrationError {\n    Timeout,\n    Error,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) enum Hydrated<V> {\n    Found(V),\n    Partial(V),\n    NotFound,\n    Failed(HydrationError),\n}\n\nimpl<V> Hydrated<V> {\n    pub(crate) fn value(&self) -> Option<&V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed(_) => None,\n        }\n    }\n\n    pub(crate) fn into_value(self) -> Option<V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed(_) => None,\n        }\n    }\n\n    pub(crate) fn is_complete(&self) -> bool {\n        matches!(self, Hydrated::Found(_) | Hydrated::NotFound)\n    }\n}\n\nimpl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {\n    fn from(result: Result<Option<V>, E>) -> Self {\n        match result {\n            Ok(Some(value)) => Hydrated::Found(value),\n            Ok(None) => Hydrated::NotFound,\n            Err(_) => Hydrated::Failed(HydrationError::Error),\n        }\n    }\n}\n\n#[derive(Clone)]\npub(crate) struct HydrationBatch<K, V> {\n    results: FxHashMap<K, Hydrated<V>>,\n}\n\npub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;\n\nimpl<K: Eq + Hash, V> HydrationBatch<K, V> {\n    pub(crate) fn empty() -> Self {\n        Self {\n            results: FxHashMap::default(),\n        }\n    }\n\n    pub(crate) fn from_results<E, S: BuildHasher>(\n        expected: impl IntoIterator<Item = K>,\n        mut results: HashMap<K, Result<Option<V>, E>, S>,\n    ) -> Self {\n        Self::from_expected(expected, |key| {\n            results\n                .remove(key)\n                .map(Hydrated::from)\n                .unwrap_or(Hydrated::Failed(HydrationError::Error))\n        })\n    }\n\n    pub(crate) fn from_hydrated(results: FxHashMap<K, Hydrated<V>>) -> Self {\n        Self { results }\n    }\n\n    fn from_expected(\n        expected: impl IntoIterator<Item = K>,\n        mut resolve: impl FnMut(&K) -> Hydrated<V>,\n    ) -> Self {\n        let mut results = FxHashMap::default();\n        for key in expected {\n            if let Entry::Vacant(entry) = results.entry(key) {\n                let hydrated = resolve(entry.key());\n                entry.insert(hydrated);\n            }\n        }\n        Self { results }\n    }\n\n    pub(crate) fn timed_out(expected: impl IntoIterator<Item = K>) -> Self {\n        Self {\n            results: expected\n                .into_iter()\n                .map(|key| (key, Hydrated::Failed(HydrationError::Timeout)))\n                .collect(),\n        }\n    }\n\n    pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {\n        self.results.get(key)\n    }\n\n    pub(crate) fn into_hydrated(self) -> FxHashMap<K, Hydrated<V>> {\n        self.results\n    }\n\n    #[cfg(test)]\n    pub(crate) fn get(&self, key: &K) -> Option<&V> {\n        self.results.get(key).and_then(Hydrated::value)\n    }\n\n    pub(crate) fn map<V2>(self, mut f: impl FnMut(V) -> V2) -> HydrationBatch<K, V2> {\n        HydrationBatch {\n            results: self\n                .results\n                .into_iter()\n                .map(|(key, hydrated)| {\n                    let hydrated = match hydrated {\n                        Hydrated::Found(value) => Hydrated::Found(f(value)),\n                        Hydrated::Partial(value) => Hydrated::Partial(f(value)),\n                        Hydrated::NotFound => Hydrated::NotFound,\n                        Hydrated::Failed(e) => Hydrated::Failed(e),\n                    };\n                    (key, hydrated)\n                })\n                .collect(),\n        }\n    }\n}\n\nimpl<K, V> AsRef<[HydrationBatch<K, V>]> for HydrationBatch<K, V> {\n    fn as_ref(&self) -> &[Self] {\n        slice::from_ref(self)\n    }\n}\n\nimpl<K: Eq + Hash, V> Default for HydrationBatch<K, V> {\n    fn default() -> Self {\n        Self::empty()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn batch(results: HashMap<u64, Result<Option<u32>, &str>>) -> HydrationBatch<u64, u32> {\n        HydrationBatch::from_results(results.keys().copied().collect::<Vec<_>>(), results)\n    }\n\n    #[test]\n    fn absent_expected_keys_become_missing() {\n        let batch: HydrationBatch<u64, u32> =\n            HydrationBatch::from_results([1, 2], HashMap::from([(1, Ok::<_, &str>(Some(7)))]));\n\n        assert_eq!(\n            batch.hydrated(&2),\n            Some(&Hydrated::Failed(HydrationError::Error))\n        );\n    }\n\n    #[test]\n    fn map_preserves_tri_state() {\n        let mapped = batch(HashMap::from([\n            (1, Ok(Some(7))),\n            (2, Ok(None)),\n            (3, Err(\"boom\")),\n        ]))\n        .map(|v| v * 10);\n\n        assert_eq!(mapped.get(&1), Some(&70));\n        assert_eq!(mapped.hydrated(&2), Some(&Hydrated::NotFound));\n        assert!(matches!(mapped.hydrated(&3), Some(&Hydrated::Failed(_))));\n    }\n}\n",
+      "source_digest": "a0ff436393751fdcddd91ea724a23b586d6f1858ab537e6da5e549d705e3aa43",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/batch.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 168,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use rustc_hash::FxHashMap;\nuse std::collections::hash_map::Entry;\nuse std::collections::HashMap;\nuse std::hash::{BuildHasher, Hash};\nuse std::slice;\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) enum Hydrated<V> {\n    Found(V),\n    Partial(V),\n    NotFound,\n    Failed,\n    Unanswered,\n}\n\nimpl<V> Hydrated<V> {\n    pub(crate) fn value(&self) -> Option<&V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed | Hydrated::Unanswered => None,\n        }\n    }\n\n    pub(crate) fn into_value(self) -> Option<V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed | Hydrated::Unanswered => None,\n        }\n    }\n\n    pub(crate) fn is_complete(&self) -> bool {\n        matches!(self, Hydrated::Found(_) | Hydrated::NotFound)\n    }\n}\n\nimpl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {\n    fn from(result: Result<Option<V>, E>) -> Self {\n        match result {\n            Ok(Some(value)) => Hydrated::Found(value),\n            Ok(None) => Hydrated::NotFound,\n            Err(_) => Hydrated::Failed,\n        }\n    }\n}\n\n#[derive(Clone)]\npub(crate) struct HydrationBatch<K, V> {\n    results: FxHashMap<K, Hydrated<V>>,\n}\n\npub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;\n\nimpl<K: Eq + Hash, V> HydrationBatch<K, V> {\n    pub(crate) fn from_results<E, S: BuildHasher>(\n        expected: impl IntoIterator<Item = K>,\n        mut results: HashMap<K, Result<Option<V>, E>, S>,\n    ) -> Self {\n        Self::from_expected(expected, |key| {\n            results\n                .remove(key)\n                .map_or(Hydrated::Unanswered, Hydrated::from)\n        })\n    }\n\n    pub(crate) fn from_hydrated(results: FxHashMap<K, Hydrated<V>>) -> Self {\n        Self { results }\n    }\n\n    fn from_expected(\n        expected: impl IntoIterator<Item = K>,\n        mut resolve: impl FnMut(&K) -> Hydrated<V>,\n    ) -> Self {\n        let mut results = FxHashMap::default();\n        for key in expected {\n            if let Entry::Vacant(entry) = results.entry(key) {\n                let hydrated = resolve(entry.key());\n                entry.insert(hydrated);\n            }\n        }\n        Self { results }\n    }\n\n    pub(crate) fn failed(expected: impl IntoIterator<Item = K>) -> Self {\n        Self {\n            results: expected\n                .into_iter()\n                .map(|key| (key, Hydrated::Failed))\n                .collect(),\n        }\n    }\n\n    pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {\n        self.results.get(key)\n    }\n\n    pub(crate) fn into_hydrated(self) -> FxHashMap<K, Hydrated<V>> {\n        self.results\n    }\n\n    #[cfg(test)]\n    pub(crate) fn get(&self, key: &K) -> Option<&V> {\n        self.results.get(key).and_then(Hydrated::value)\n    }\n\n    pub(crate) fn map<V2>(self, mut f: impl FnMut(V) -> V2) -> HydrationBatch<K, V2> {\n        HydrationBatch {\n            results: self\n                .results\n                .into_iter()\n                .map(|(key, hydrated)| {\n                    let hydrated = match hydrated {\n                        Hydrated::Found(value) => Hydrated::Found(f(value)),\n                        Hydrated::Partial(value) => Hydrated::Partial(f(value)),\n                        Hydrated::NotFound => Hydrated::NotFound,\n                        Hydrated::Failed => Hydrated::Failed,\n                        Hydrated::Unanswered => Hydrated::Unanswered,\n                    };\n                    (key, hydrated)\n                })\n                .collect(),\n        }\n    }\n}\n\nimpl<K, V> AsRef<[HydrationBatch<K, V>]> for HydrationBatch<K, V> {\n    fn as_ref(&self) -> &[Self] {\n        slice::from_ref(self)\n    }\n}\n\nimpl<K: Eq + Hash, V> Default for HydrationBatch<K, V> {\n    fn default() -> Self {\n        Self {\n            results: FxHashMap::default(),\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn batch(results: HashMap<u64, Result<Option<u32>, &str>>) -> HydrationBatch<u64, u32> {\n        HydrationBatch::from_results(results.keys().copied().collect::<Vec<_>>(), results)\n    }\n\n    #[test]\n    fn an_expected_key_the_results_leave_out_is_unanswered() {\n        let batch: HydrationBatch<u64, u32> =\n            HydrationBatch::from_results([1, 2], HashMap::from([(1, Ok::<_, &str>(Some(7)))]));\n\n        assert_eq!(batch.hydrated(&2), Some(&Hydrated::Unanswered));\n    }\n\n    #[test]\n    fn map_preserves_tri_state() {\n        let mapped = batch(HashMap::from([\n            (1, Ok(Some(7))),\n            (2, Ok(None)),\n            (3, Err(\"boom\")),\n        ]))\n        .map(|v| v * 10);\n\n        assert_eq!(mapped.get(&1), Some(&70));\n        assert_eq!(mapped.hydrated(&2), Some(&Hydrated::NotFound));\n        assert!(matches!(mapped.hydrated(&3), Some(&Hydrated::Failed)));\n    }\n}\n",
+      "source_digest": "8fc8f4dbed963ea1c883aa68e5f20adc423cf24f24323729d0009ac67f17be11",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 28,
+      "end_line": 52,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n",
+      "source_digest": "19dde438afe9c1df51aa496e0db15e20e4489967f807d68371d212901e3d0af5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n",
+      "source_digest": "df30bf2dd889213d65a7e27f92fb5ec8e1ffc41a640121076e77ff79c32e66ca",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 171,
+      "end_line": 195,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n",
+      "source_digest": "031b23cc15f786bdf9adf86d54f9ec6cb6e1a7214e693c8337390b1bd2cc6405",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 208,
+      "end_line": 232,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            ActionSpec::SpamLivenessCheck => {\n                out.push(serde_json::json!({\"kind\": \"liveness_check\"}))\n            }\n            ActionSpec::Arkose => out.push(serde_json::json!({\"kind\": \"arkose\"})),\n            ActionSpec::Captcha => out.push(serde_json::json!({\"kind\": \"captcha\"})),\n        }\n    }\n    Value::Array(out)\n}\n\npub fn action_specs_json(specs: &[ActionSpec]) -> String {\n    action_specs_value(specs).to_string()\n}\n\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\n",
+      "source_digest": "56bb83dab11ac62f780a928d012fef389a2b01c7215106eb0acf96e7fcb8323b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 232,
+      "end_line": 256,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n",
+      "source_digest": "0299950b693ed62d4c2a0d08e91f24fa3bfad2e0dde6234ab62f4db8563c5461",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 239,
+      "end_line": 263,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n",
+      "source_digest": "3b66c2eb9d34025ee21d73c23734bfa58ae0c5351ce0724f7fded35be761ac2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 268,
+      "end_line": 292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n",
+      "source_digest": "9bfdfb24f3e13fdc7debc08e7f08b099d27affa880ffa65559ca78f706223406",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 276,
+      "end_line": 300,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n",
+      "source_digest": "afbc638ada9fdd35ee17ac9ba0d523c2a3714f720330800564732b236ffcae49",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 283,
+      "end_line": 307,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n        }\n        out\n    }\n",
+      "source_digest": "36b5cfebd022638e979f355cb37fb696058c291b4601cab312e447a36dd7db84",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 288,
+      "end_line": 312,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n        }\n        out\n    }\n\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n",
+      "source_digest": "898eb13c1f71374fd49487cc0acbd5e5a0ef3ef7449de9ee9946a17b12eb0deb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 313,
+      "end_line": 337,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n",
+      "source_digest": "64f03e02975005b3c2470a8db311c4e68994fa9a0235f6e30700a6f77960bc09",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 358,
+      "end_line": 382,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if items.len() >= SCAN_LIMIT as usize {\n            warn!(\n                pkey,\n                limit = SCAN_LIMIT,\n                \"action-control scan hit its row limit; rows past it are not read\"\n            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n",
+      "source_digest": "8ce942b775762b25f6bc38c532cacb96310c847a636f8858aca07b2b54ed26bb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 369,
+      "end_line": 393,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n        self.client\n            .put_with_ttl(\n                self.tenant.clone(),\n",
+      "source_digest": "2583157786c94826fa5550bda1fcf7046cf6c27b8438ee39fbfd6b3ff51b55e3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 376,
+      "end_line": 400,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n        self.client\n            .put_with_ttl(\n                self.tenant.clone(),\n                [pkey],\n                [lkey],\n                value,\n                crate::manhattan::ttl_nanos_from_secs(ttl_secs),\n            )\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n",
+      "source_digest": "d6acc0dff7ed1b1dcf620cdf7ef17fc9491b52b1dd93b8dd232c43100b5ccec5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 384,
+      "end_line": 408,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n        self.client\n            .put_with_ttl(\n                self.tenant.clone(),\n                [pkey],\n                [lkey],\n                value,\n                crate::manhattan::ttl_nanos_from_secs(ttl_secs),\n            )\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n        self.client\n            .delete(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n",
+      "source_digest": "1ef7168b7d6828b0ebc0949fe507703223a24e21d9295f27103dc943ef57f8d0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 426,
+      "end_line": 450,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub struct Resolved {\n    pub matched: Option<Matched>,\n        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n",
+      "source_digest": "f656e6f9393f197993ef2aecd2375cb360b5359d28edeb173ef8f66d295e5c0e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 442,
+      "end_line": 466,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n    }\n\n    pub fn recording(&self) -> bool {\n        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n",
+      "source_digest": "ad5799fdeb5f72be891d4e7746428a19929a79488d730c4864d05273abcea827",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 523,
+      "end_line": 547,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n        if let Some((k, r)) = self.records.get_key_value(lkey) {\n            return Some(Hit::Record(k, r));\n        }\n        self.unreadable.get(lkey).map(|_| Hit::Unreadable)\n    }\n\n                    fn levels(\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Vec<Vec<Vec<String>>> {\n",
+      "source_digest": "569e4f07a7e8e039b637827ee0b877caa1ccdf25b7b9e9b391b35d561052a928",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 540,
+      "end_line": 564,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                    fn levels(\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Vec<Vec<Vec<String>>> {\n        let names: Vec<&str> = std::iter::once(head).chain(alias).collect();\n        let slot = |c: Option<&str>, b: Option<&str>| -> Vec<String> {\n            names.iter().map(|n| lkey_for(entity, n, c, b)).collect()\n        };\n        let c = (!classifier.is_empty() && valid_name(classifier)).then_some(classifier);\n        let mut levels = Vec::with_capacity(4);\n        if let Some(c) = c {\n            levels.push(bands.iter().map(|b| slot(Some(c), Some(b))).collect());\n            levels.push(vec![slot(Some(c), None)]);\n        }\n        levels.push(bands.iter().map(|b| slot(None, Some(b))).collect());\n        levels.push(vec![slot(None, None)]);\n        levels\n    }\n\n    fn find(&self, levels: &[Vec<Vec<String>>]) -> Option<Hit<'_>> {\n        for level in levels {\n",
+      "source_digest": "41e498e5212edcddff386e446391d443aa22e729d53253e9f54ce3e747db1dd1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 578,
+      "end_line": 602,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    fn plain_decider(\n        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &str) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| k != except) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        snap.records.remove(except);\n",
+      "source_digest": "3c2b949bb9ba0aba57d7c3bb180eb74c999c2bb728fd3d481037ab64303bc40a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 579,
+      "end_line": 603,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &str) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| k != except) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        snap.records.remove(except);\n        snap\n",
+      "source_digest": "6b58d1c5db5e2ef7e1c082a28b830324284836723586b73f8633121ad57d68db",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 580,
+      "end_line": 604,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &str) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| k != except) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        snap.records.remove(except);\n        snap\n    }\n",
+      "source_digest": "242e5768713b1b6c18676008fedefc676b7635a4fbf4a4c19df8d17003b4b2c4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 586,
+      "end_line": 610,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &str) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| k != except) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        snap.records.remove(except);\n        snap\n    }\n}\n\n#[allow(clippy::too_many_arguments)]\nfn effective(\n    record: &ActionControlRecord,\n    entity: EntityType,\n",
+      "source_digest": "0ef4c491a76560ad8383e97463ddbecbd3a2e5d9c4bf58c43a94c8493cf7253f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 612,
+      "end_line": 636,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n",
+      "source_digest": "9a66248af069792b6cc1185bc898552b72a3f22af275ef29dfba4962f48ac214",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 28,
+      "end_line": 52,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n",
+      "source_digest": "19dde438afe9c1df51aa496e0db15e20e4489967f807d68371d212901e3d0af5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n",
+      "source_digest": "df30bf2dd889213d65a7e27f92fb5ec8e1ffc41a640121076e77ff79c32e66ca",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 182,
+      "end_line": 206,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        _ => None,\n    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n",
+      "source_digest": "031b23cc15f786bdf9adf86d54f9ec6cb6e1a7214e693c8337390b1bd2cc6405",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 219,
+      "end_line": 243,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            ActionSpec::SpamLivenessCheck => {\n                out.push(serde_json::json!({\"kind\": \"liveness_check\"}))\n            }\n            ActionSpec::Arkose => out.push(serde_json::json!({\"kind\": \"arkose\"})),\n            ActionSpec::Captcha => out.push(serde_json::json!({\"kind\": \"captcha\"})),\n        }\n    }\n    Value::Array(out)\n}\n\npub fn action_specs_json(specs: &[ActionSpec]) -> String {\n    action_specs_value(specs).to_string()\n}\n\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\n",
+      "source_digest": "56bb83dab11ac62f780a928d012fef389a2b01c7215106eb0acf96e7fcb8323b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 243,
+      "end_line": 267,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n",
+      "source_digest": "0299950b693ed62d4c2a0d08e91f24fa3bfad2e0dde6234ab62f4db8563c5461",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 250,
+      "end_line": 274,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n",
+      "source_digest": "3b66c2eb9d34025ee21d73c23734bfa58ae0c5351ce0724f7fded35be761ac2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 279,
+      "end_line": 303,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n",
+      "source_digest": "9bfdfb24f3e13fdc7debc08e7f08b099d27affa880ffa65559ca78f706223406",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 287,
+      "end_line": 311,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n",
+      "source_digest": "afbc638ada9fdd35ee17ac9ba0d523c2a3714f720330800564732b236ffcae49",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 294,
+      "end_line": 318,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n        }\n        out\n    }\n",
+      "source_digest": "36b5cfebd022638e979f355cb37fb696058c291b4601cab312e447a36dd7db84",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 299,
+      "end_line": 323,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n        }\n        out\n    }\n\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n",
+      "source_digest": "898eb13c1f71374fd49487cc0acbd5e5a0ef3ef7449de9ee9946a17b12eb0deb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 324,
+      "end_line": 348,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n",
+      "source_digest": "64f03e02975005b3c2470a8db311c4e68994fa9a0235f6e30700a6f77960bc09",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 369,
+      "end_line": 393,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if items.len() >= SCAN_LIMIT as usize {\n            warn!(\n                pkey,\n                limit = SCAN_LIMIT,\n                \"action-control scan hit its row limit; rows past it are not read\"\n            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n",
+      "source_digest": "8ce942b775762b25f6bc38c532cacb96310c847a636f8858aca07b2b54ed26bb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 380,
+      "end_line": 404,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n        self.client\n            .put_with_ttl(\n                self.tenant.clone(),\n",
+      "source_digest": "2583157786c94826fa5550bda1fcf7046cf6c27b8438ee39fbfd6b3ff51b55e3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 387,
+      "end_line": 411,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n        self.client\n            .put_with_ttl(\n                self.tenant.clone(),\n                [pkey],\n                [lkey],\n                value,\n                crate::manhattan::ttl_nanos_from_secs(ttl_secs),\n            )\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n",
+      "source_digest": "d6acc0dff7ed1b1dcf620cdf7ef17fc9491b52b1dd93b8dd232c43100b5ccec5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 395,
+      "end_line": 419,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n        self.client\n            .put_with_ttl(\n                self.tenant.clone(),\n                [pkey],\n                [lkey],\n                value,\n                crate::manhattan::ttl_nanos_from_secs(ttl_secs),\n            )\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n        self.client\n            .delete(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))\n    }\n",
+      "source_digest": "1ef7168b7d6828b0ebc0949fe507703223a24e21d9295f27103dc943ef57f8d0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 439,
+      "end_line": 463,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n",
+      "source_digest": "4c540893587f79eb5e4d1ed6b4f1a422decc117b92a78acb2e0f5e8058c638e8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 459,
+      "end_line": 483,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n            pub fn rules_unread(&self) -> bool {\n        self.factory || self.unlisted\n    }\n\n                        pub fn admit_unlisted(mut self) -> Option<Self> {\n        if self.factory || self.mode == ControlMode::Rules {\n            return None;\n        }\n        self.unlisted = true;\n        self.dedup_class = Some(page_class(&self.page_actions));\n",
+      "source_digest": "73cb49604319ac7283a8876364a41d93597de7f47794888ba1e00b59abad673d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 554,
+      "end_line": 578,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub confidence: Option<crate::confidence::Claim>,\n        pub author_id: i64,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n        if let Some((k, r)) = self.records.get_key_value(lkey) {\n            return Some(Hit::Record(k, r));\n        }\n        self.unreadable.get(lkey).map(|_| Hit::Unreadable)\n    }\n\n                    fn levels(\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Vec<Vec<Vec<String>>> {\n",
+      "source_digest": "887ffebeb77ca3fdf64aa78f1e76ed87bb5769ed29e9af6d48872be6667aa2bd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 571,
+      "end_line": 595,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                    fn levels(\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Vec<Vec<Vec<String>>> {\n        let names: Vec<&str> = std::iter::once(head).chain(alias).collect();\n        let slot = |c: Option<&str>, b: Option<&str>| -> Vec<String> {\n            names.iter().map(|n| lkey_for(entity, n, c, b)).collect()\n        };\n        let c = (!classifier.is_empty() && valid_name(classifier)).then_some(classifier);\n        let mut levels = Vec::with_capacity(4);\n        if let Some(c) = c {\n            levels.push(bands.iter().map(|b| slot(Some(c), Some(b))).collect());\n            levels.push(vec![slot(Some(c), None)]);\n        }\n        levels.push(bands.iter().map(|b| slot(None, Some(b))).collect());\n        levels.push(vec![slot(None, None)]);\n        levels\n    }\n\n    fn find(&self, levels: &[Vec<Vec<String>>]) -> Option<Hit<'_>> {\n        for level in levels {\n",
+      "source_digest": "41e498e5212edcddff386e446391d443aa22e729d53253e9f54ce3e747db1dd1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 609,
+      "end_line": 633,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    fn plain_decider(\n        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| !except.contains(&k.as_str())) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        for k in except {\n",
+      "source_digest": "f32047f531ebe748d27be3941919ca2ea3f0048af045c1ea70da49c22476b802",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 610,
+      "end_line": 634,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| !except.contains(&k.as_str())) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        for k in except {\n            snap.records.remove(*k);\n",
+      "source_digest": "a8a5d71e3e1d52a37c50349bd2dcc24483a46fba0d200920160820818ce9b267",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 611,
+      "end_line": 635,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Option<Hit<'_>> {\n        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| !except.contains(&k.as_str())) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        for k in except {\n            snap.records.remove(*k);\n        }\n",
+      "source_digest": "87493d126bbc77eb5d917ebf9df21e67c0eab5ef4fe83f5ae04acdc0e5c595bc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 617,
+      "end_line": 641,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.find(&Self::levels(entity, head, alias, classifier, bands))\n    }\n\n            fn of_rows(rows: &[(String, Vec<u8>)], except: &[&str]) -> Snapshot {\n        let mut snap = Snapshot::default();\n        for (lkey, value) in rows.iter().filter(|(k, _)| !except.contains(&k.as_str())) {\n            match parse_record(value) {\n                Ok(rec) => {\n                    snap.records.insert(record_lkey(&rec), rec);\n                }\n                Err(err) => {\n                    snap.unreadable\n                        .insert(lkey.clone(), (err, raw_version(value)));\n                }\n            }\n        }\n        for k in except {\n            snap.records.remove(*k);\n        }\n        snap\n    }\n}\n\nfn effective(\n    record: &ActionControlRecord,\n",
+      "source_digest": "7c6093974f0f37ca01c9a1efd5a7d756c486a362f9e172896be37c09d0f59e3f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E50": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 643,
+      "end_line": 667,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n",
+      "source_digest": "71104d91a558896bc0e8076682fca5594a41b040bf07870b94b6d6fa55316df2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ce0e5e3e103e68ec45c0ab3c2afe20f71dae755a3bb5f3c581de110f9943ada6",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "13da18cdd44793cbfb8c2dc772f0732f0f287f1d8e0ca71483d59ad248ad11d2",
+      "context_complete": true,
+      "task_id": "T-bc061e5bab38ed5bff403a588151e5d9a31fb1cf6d311d38f7be33eff44320bb",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cbfdc0e490143947fe6a7e699969d838b7f4ffd429514796ca30d0360f81906a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-1f04e9096e9f09dd7c1cca2a4eeb14ecd3b81418634edcc7b465424c68f80d1d",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7d7b6b4bc868ad2d0b6b98a5293ecd578614808bd7e309b6ef0243c2ecb6d282",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-50f1b5e580f8aff316b666591d1a9da120e6c6dc14738545e4e47e8c4cbe0c4a",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-87d69d9d5566bf4166a114b657d81f3be8420c0e6a322d598298f51c5fbf426f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-7798ca3d88f574ac9826a2b968173aee4b900fb4adb3e5c4f650c7b70bdeda8c",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bac2c8cce2dbd72dd2048a5c30edbc1e93ede48afe13f692cd810025eb9cb7ee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-bab9e67538dd929eb170435e213df059307cb8f15db27ba94921119574655c9e",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f412ee5d962bed048698121f076d71b0f7084ad26380fd2dcd89eac4469b2e7e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-6b1ab0ada1255357dc32c91a7c4ac9d7c4ba6da8994149ce9aa7d8e9edac7380",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7395a1bb50df624e408b64b916138830a145bd2800f8313ff2caf5c780c2befb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-92f4d2993322cbf85a7a8d6ee796ae875c14e37d98d3b3df5c18afff02ebbfac",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-50963c72273e31468c134e62d96168f7732a6e9cc332d3a4782abb1ea9d37843",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-9e2a912ec8df13af08e341b4eb5a49f837e640ffe74f214eed4eed5ced6892e5",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-438597e6de2916cf02bbf26885746bd005c7c0bb38c91ad59d80b64df3320e7d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-960434febe55d6d49dbdcb4dc3eb8977c1d23789a74ef4ae9a9e3dc373203c61",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b9456acd22a07e6e1deec14f88f09b958e7b1ff8bdcf08156280148004daa58c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-67ae72bcd7698c4bf28828fd3f7cfedf7fccc4602d69942246693680dea78106",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca714fef4787f61665634f17fa78f342a1ffd9dc101904412ae9cebab66805de",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-26a647b759d777d2657b3da0ded4afa7e55d8337040968892acb60fe92928deb",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cce1ddc93a001f12e0bfb59963a5e864c7bfa89ca291f1f81ffc2890febbfa88",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-f854e5f9a4ae2d65da2161a6c040bb25cd74f0e21b4dd93f3abf0ae1a4ecbe55",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-43278139e64c5f919ed64db696caee3a035adb0ad9a62b19a9dfe892415f4cd8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-1ed476fa66260fdabcaffed42ce69733520e0f576d1304d49b735971f59dc32d",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d17248ee5608d8b72dcbbeff7ab9a08b14dd53d1f6ca92e0a4ba638682e38ced",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-da406137f7070a78a08f434ab921fac0481ea9109e1b3a2879f2c4b0cbd1fcb7",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2b5b2d842ea1a69122a5db2d8eb864bdf47614ee60ee5087eddb82ebcbe916ba",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-b9f4b83a149a4dad9a86f9aa2ff48340e000d3e20d2b934ff50f3877d12598c2",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9e82e2e9b5b7ba41d1bb7a3a837b188a02eec5ae73ca392e76f103795059bd0a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-6d121179b451ea450ebd7aa1b8edfac2403d9d33ce4ab0be09ae403cdfa4b7a1",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-14f421cb43fa97f06e65eb58dea157ae7ee769a51e47d258233308726f4b8d56",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-c50cb93db737deae8f75007b7706a1780008bbc8be4726be5eff3e49adbc9f93",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c3a4b85fc680462b542fa88ca9f75268ba0770827e18f358ca39d129ad044738",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-5d34e6a95bbbb272f479fba47b62bee2b2c509ed0b6bae6a8a5fde1809a4a9e6",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e5a098aa3dbdafbed69cba1f885e3e75d8d57f8379ee47382c03a62e91f2d764",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-e81670860d7a9ec47f3d1905f825a48b1dec6a01b2cf10e6ad9c186384847f5e",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-58bc8af39b596a3cf94ef36fc21b927aaef06d87b5af6bc158ebc5ab0b67b9c9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-80af32d3f4bb1590c51a8c0206d9efc71de31d2589456bd89bc93f050e39beff",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ef873fdad6907fdd8b5276a3ec54ea48b98afa7429f690d34490707e2573ceac",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-24e2db2b619719e156040c32324d97c58b0f6de28a4347c2ba71b2f8268425f3",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a9322bc3625c64ae496333ade1ea2a1eeeb36a98336921a8b1f7b2264a082b2c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-c0e4c17441fd120c5afa716a80d20e91091fd019053b550b1fbe7383ddf52efe",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c6114fbd8d9f39e3a3b59ec4e3cd5ca8527b32f85bff38d7230a78b40aa9241f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-3ad5081db52fc61f0d181f92b8f58b1824105df83de7dcffe07ce276d7123ee1",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-18ffc6d1bcb954940ca104954d441c9b45a079799ad737dd07d61ec4b06785d1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-c3538a64275c8d3aef3315da60e8ffbb5b0945323a223dfe836c1da2de3ba547",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6685ee52187435371ae29bceab30b0a18684549eba98090b2bdf989aff611bcc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-6c86f1023240e50825b4284ae97adfd93452b2a296e84c3073c7bf1c1d90d9e8",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4848dd099a6b1a471a31b5b68563a1cc042c4f7d15c0ad723818bab74c82bbc5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-6c330d0c8dbd5a508ca0807e1b53b2147073de40b8285419ba7a29c315b4cf88",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8234ad9d3f2de937cfb9b4cc932de0f3fa76f92f41c09a1d20827c26e0e6dde0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-e57e5acddc4a97deae8978b77c8b4c4b3220819598c2f95165cbf2d3e2f92e39",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9344ab9841adc93e56a8951e9635f069d19dd91c2d439bbc5ef22ccb69c2cae4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-dc04f561b3e574f4ed58027e17260dc642cbf21144bb88de6889d70d7ddbcf36",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1eb4693dc988bf118abed9148f2f8466d6a69ce363aab95bcb7773bcc3ae1321",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-35b8b5e51acfc5d2835e9c39b9232618a309e14dbdeb3aa55416d2ebb74a7dd8",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b0beae47e2ec7d7adc60b459fdc9ec6348667a4a3878aa0ecf83550a2853e0b8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-5cc48efd76ff1f7bdfeb483068bc1d0c9375e399379636d1d13ab35be1dd79db",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-292b6f2f81359e936f22ccac8923f7e3dc7c27643da8d8444986280ab2239f50",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-5f839ea828792270841f066ee26e00b797611b95524d99fcf5d3009e8d2c4f1d",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f0c3439d66a45cd6c07c959ea3165b0a398ea04e843654b8f9509b0a22ecbd60",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-e2535c84a6037883f75c2a6dfbaa718428a8ff4c1dcd4bf9c5bd8d2202f6a39d",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-af0050d981b5ee49c766bb44ecd09130ecdf1b166a75633615bf3375cf56c892",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-85d3667560900cf9a52808d90730e6a478b9ba012e4109e6b74a61c183502a32",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8e524de59d26e4d221f257bdd23f7fa6ad62ab873efa8c35d1d198cfc739f5b6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-12ccfb9ce0b683a4a8df00bd0916186be550a7eacc68b51852f4969063292415",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-33fc10865449412b1f4d9beeb33d94f1debe649ea5be2a6d5ac0c78d3081ab05",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-2bb0dae32b2d71641548b0c2764d7d2e10cbb02d45b5715e7823f25216523728",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39a46398deeb196260d17098fe8f533eb704f30d20a5f40ef21ffb87b74066e3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-c8c49fb933fa501fe8b78bef4701cc8aecf7f2d6f3e4750bde3b453010925df2",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-81361cf5cbec325eafe63d4eef9fd4bc843b23e44137f3c0531972f72d32ffd9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-cb6c83be9c6daed2e3e327abd38d4f63d18f384ac62ea9bb0bf2a055293f0e88",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ac848992b1cddbafb246f5798234a6a88abf6adfba22552b32d4a14caf373504",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-7b27e94bb08e684ba299353938e054158b5cf707299bcf2460113caaf9ad4685",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7d7ac863d8155ff4d8ff056ca7d83397d6a1da8dd89c0eef12000dccb65007ce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-ee57697da295301ded6184940fbe61fba5e81c8a5956e48bbd7612a6fbcfb083",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f39132398cbc78a7f66800cc770dd4067afd94656cd68bcf24eed9a54995acac",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-ada1122cedd8bdeb7496c06f2ad34a325ba479aeece39f89b90d72aa90b2869f",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-65e63913fdc0f022ecf4f334223b5422c6f56e29b1373539296d2c527718749a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-90ad081ee12ca6c2e6af0046b5360639787e47eb0aead23282da234c2360a510",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7a8befcaa92504660d968a6efbd3451333dae2edc3750e61a151a9c74baaf23a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-f19f8d8c2a1bf77d8922f5491dc42a3da8c00eee4581cd4f888691209be30f04",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7ded98f6b9b7058b9c087e368413b512ce6f3d8914c3d50677f46716d2acf0cf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-03ac9cf7b515e5a8942dedda7540bfb71c68d925f12f75a6df9e7d5d06979ab1",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8e04041919e08d47a41864d54e6fae1e65f9ed80d40e7c9b8007261661d5ab37",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-77fb5d12b61696ddce9ad3cb940382bf8be5162f4d1c06ad810d41ffb07a0907",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a48c3c04721adb5eb87e952e2810f363f60cb21a43aa4dfc6a9d86514e19a806",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-c79dd2809186dd36e4582b6a41f8d3b98307bdd4b3b30ae49ff4e42f387bfa5c",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-432b8c82e325f872cd886523f3235c6042512af9d638d04559fc3b4bbdfc1356",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-6148e560260e958ee3feaf8eabb55b37400d147850c992bbe44d4530c23a30ee",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-980159ad3a7468bd7f6816f8861bcde32d380ccaeca88fd50c46f6700bed6567",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-7bfeaeda6d209b9ccf8113d2af43bb54f3ad28baee34b9367785b1811be55a34",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-27bbe4c5c41088ab74c8f9209419197f92b8b06a9753567a5309639ca8031211",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-a58097d36e744615ee1bff1fe70cdeb17964b0020b556917919a8209e4a22b97",
+      "evidence_refs": [
+        "E49"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2c544ef443b43f21f948c11c64d5d28f5e62a73fb0f80590afe31b653dc0c139",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "value",
+        "into_value",
+        "HydrationBatch",
+        "empty",
+        "from_results",
+        "timed_out",
+        "failed",
+        "default"
+      ],
+      "context_complete": false,
+      "task_id": "T-def884d945c553a911d11eff7774004913da6525eaf8081ca94b3880d399364e",
+      "evidence_refs": [
+        "E50"
+      ]
+    }
+  ],
+  "task_id": "T-0e4963f3ea349360b229adc35d93a15348a3fa7b1d9c97e88db5e1be371c9440"
+}

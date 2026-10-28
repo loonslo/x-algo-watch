@@ -1,0 +1,457 @@
+{
+  "schema_version": 1,
+  "path": "grox/libs/grok_sampler/eapi_sampler.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-fec16ac107241a97c956583b5e57bb13903ae10036a6cbba6538f175566dd42f",
+  "change_scope": "changed_file",
+  "mechanism_group": "grox/libs",
+  "evidence": {
+    "E1": {
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 221,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "import logging\nimport os\nimport time\nimport traceback\nfrom dataclasses import dataclass, field\nfrom asyncio import get_running_loop\n\nimport grpc.aio\nfrom monitor.metrics import Metrics\n\nfrom xai_sdk import AsyncClient\nfrom xai_sdk.proto import chat_pb2\nfrom xai_sdk.tools import web_search\n\nfrom grok_sampler.config import EapiModelConfig\n\nlogger = logging.getLogger(__name__)\n\nMAX_SEARCH_DOMAINS = 5\n\n\ndef get_loop_id() -> int:\n    return id(get_running_loop())\n\n\ndef _rpc_request_id(error: Exception) -> str | None:\n    if not isinstance(error, grpc.aio.AioRpcError):\n        return None\n    for metadata in (error.initial_metadata(), error.trailing_metadata()):\n        if not metadata:\n            continue\n        for key, value in metadata:\n            if key == \"x-request-id\":\n                return value\n    return None\n\n\n\u0040dataclass\nclass WebSearchDetails:\n    used: bool = False\n    citations: list[str] = field(default_factory=list)\n    tool_calls: list[dict] = field(default_factory=list)\n    tool_outputs: list[str] = field(default_factory=list)\n    server_side_tool_usage: dict | None = None\n\n\n\u0040dataclass\nclass SampleDetails:\n    trace: str | None = None\n    web_search: WebSearchDetails = field(default_factory=WebSearchDetails)\n\n\nclass EapiSampler:\n    _cached_clients: dict[tuple[int, str, str], AsyncClient] = {}\n\n    def __init__(self, eapi_config: EapiModelConfig):\n        self.model: str = eapi_config.model\n        self.temperature: float = eapi_config.temperature\n        self.timeout: int = eapi_config.timeout\n        self.max_tokens = eapi_config.max_resp_len\n        self.api_key = eapi_config.api_key\n        self.api_host = eapi_config.api_host\n        self.log_reasoning_trace: bool = eapi_config.log_reasoning_trace\n        self.enable_search: bool = eapi_config.enable_search\n        self.open_search: bool = eapi_config.open_search\n        self.reasoning_effort: str | None = eapi_config.reasoning_effort\n\n        api_key = self.api_key or os.getenv(\"XAI_API_KEY\")\n\n        if not api_key:\n            raise ValueError(\n                \"API key is required: set EapiModelConfig.api_key or the XAI_API_KEY environment variable.\"\n            )\n\n        self.client_kwargs = {\n            \"api_key\": api_key,\n            \"timeout\": self.timeout,\n            \"channel_options\": [(\"grpc.enable_retries\", 0)],\n        }\n\n        if self.api_host:\n            self.client_kwargs[\"api_host\"] = self.api_host\n\n    def _get_client(self) -> AsyncClient:\n        loop_id = get_loop_id()\n        key = (loop_id, self.model, self.api_host)\n        if key in self._cached_clients:\n            client = self._cached_clients[key]\n            return client\n        logger.info(\n            f\"Creating new AsyncClient for {self.model} and {self.api_host} (loop_id={loop_id})\"\n        )\n        client = AsyncClient(**self.client_kwargs)\n        self._cached_clients[key] = client\n        return client\n\n    def _prompt_len(self, prompt: list[chat_pb2.Message]) -> int:\n        def _len(content: chat_pb2.Content) -> int:\n            if content.text:\n                return len(content.text)\n            if content.image_url and content.image_url.image_url:\n                return len(content.image_url.image_url)\n            return 0\n\n        return sum(_len(content) for message in prompt for content in message.content)\n\n    def _log_request(self, prompt: list[chat_pb2.Message]):\n        def _to_log_string(content: chat_pb2.Content) -> str:\n            if content.text:\n                return content.text\n            if content.image_url and content.image_url.image_url:\n                return f\"[[[[image_bytes({len(content.image_url.image_url)})]]]]\"\n            return \"\"\n\n        msg = \"\\n\".join(\n            [\n                _to_log_string(content)\n                for message in prompt\n                for content in message.content\n            ]\n        )\n        logger.info(f\"inputs: {msg}\")\n\n    async def _sample_raw(self, prompt: list[chat_pb2.Message], **kwargs):\n        conversation_id = kwargs.get(\"conversation_id\", None)\n        search_allowed_domains = kwargs.get(\"search_allowed_domains\", None)\n        attributes = {\"model_name\": self.model}\n        Metrics.counter(\"llm.sample.count\").add(1, attributes=attributes)\n        if kwargs.get(\"log_prompt\", False):\n            self._log_request(prompt)\n\n        start = time.perf_counter()\n\n        client = self._get_client()\n        try:\n            create_kwargs: dict = dict(\n                model=self.model,\n                conversation_id=conversation_id,\n                messages=prompt,\n                temperature=self.temperature,\n                top_p=0.95,\n                max_tokens=self.max_tokens,\n            )\n            if self.reasoning_effort is not None:\n                create_kwargs[\"reasoning_effort\"] = self.reasoning_effort\n            if self.enable_search and search_allowed_domains:\n                create_kwargs[\"tools\"] = [\n                    web_search(\n                        allowed_domains=search_allowed_domains[:MAX_SEARCH_DOMAINS]\n                    )\n                ]\n            elif self.enable_search and self.open_search:\n                create_kwargs[\"tools\"] = [web_search()]\n            chat = client.chat.create(**create_kwargs)\n            response = await chat.sample()\n            Metrics.counter(\"llm.sample.success.count\").add(1, attributes=attributes)\n            if (\n                self.log_reasoning_trace\n                and hasattr(response, \"reasoning_content\")\n                and response.reasoning_content\n            ):\n                logger.info(f\"thinking trace: {response.reasoning_content}\")\n            return response\n        except Exception as e:\n            logger.error(\n                f\"Error in sampling EAPI request to model {self.model} and api host {self.api_host}, conversation_id={conversation_id}, x_request_id={_rpc_request_id(e)}, with prompt_len {self._prompt_len(prompt)} with elapsed time {time.perf_counter() - start}: {traceback.format_exc()}\"\n            )\n            Metrics.counter(\"llm.sample.error.count\").add(1, attributes=attributes)\n            raise\n        finally:\n            Metrics.histogram(\"llm.sample.duration\").record(\n                time.perf_counter() - start, attributes=attributes\n            )\n\n    async def sample(self, prompt: list[chat_pb2.Message], **kwargs) -> str:\n        response = await self._sample_raw(prompt, **kwargs)\n        return response.content\n\n    def _extract_details(self, response) -> SampleDetails:\n        trace = getattr(response, \"reasoning_content\", None) or None\n        ws = WebSearchDetails()\n\n        if hasattr(response, \"tool_calls\") and response.tool_calls:\n            ws.used = True\n            for tc in response.tool_calls:\n                ws.tool_calls.append(\n                    {\n                        \"id\": tc.id,\n                        \"name\": tc.function.name,\n                        \"arguments\": tc.function.arguments,\n                    }\n                )\n\n        if hasattr(response, \"tool_outputs\") and response.tool_outputs:\n            ws.used = True\n            for to in response.tool_outputs:\n                content = (\n                    to.message.content\n                    if hasattr(to.message, \"content\")\n                    else str(to.message)\n                )\n                ws.tool_outputs.append(content)\n\n        if hasattr(response, \"citations\") and response.citations:\n            ws.used = True\n            ws.citations = list(response.citations)\n\n        if (\n            hasattr(response, \"server_side_tool_usage\")\n            and response.server_side_tool_usage\n        ):\n            ws.used = True\n            ws.server_side_tool_usage = dict(response.server_side_tool_usage)\n\n        return SampleDetails(trace=trace, web_search=ws)\n\n    async def sample_with_details(\n        self, prompt: list[chat_pb2.Message], **kwargs\n    ) -> tuple[str, SampleDetails]:\n        response = await self._sample_raw(prompt, **kwargs)\n        return response.content, self._extract_details(response)\n",
+      "source_digest": "8a1e2ce7b755ef1186e022f7c5a118cd762174b90d89ca0f6e3b48c6dace6ea4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 224,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "import logging\nimport os\nimport time\nimport traceback\nfrom dataclasses import dataclass, field\nfrom asyncio import get_running_loop\n\nimport grpc.aio\nfrom monitor.metrics import Metrics\n\nfrom xai_sdk import AsyncClient\nfrom xai_sdk.proto import chat_pb2\nfrom xai_sdk.tools import web_search, x_search\n\nfrom grok_sampler.config import EapiModelConfig\n\nlogger = logging.getLogger(__name__)\n\nMAX_SEARCH_DOMAINS = 5\n\n\ndef get_loop_id() -> int:\n    return id(get_running_loop())\n\n\ndef _rpc_request_id(error: Exception) -> str | None:\n    if not isinstance(error, grpc.aio.AioRpcError):\n        return None\n    for metadata in (error.initial_metadata(), error.trailing_metadata()):\n        if not metadata:\n            continue\n        for key, value in metadata:\n            if key == \"x-request-id\":\n                return value\n    return None\n\n\n\u0040dataclass\nclass WebSearchDetails:\n    used: bool = False\n    citations: list[str] = field(default_factory=list)\n    tool_calls: list[dict] = field(default_factory=list)\n    tool_outputs: list[str] = field(default_factory=list)\n    server_side_tool_usage: dict | None = None\n\n\n\u0040dataclass\nclass SampleDetails:\n    trace: str | None = None\n    web_search: WebSearchDetails = field(default_factory=WebSearchDetails)\n\n\nclass EapiSampler:\n    _cached_clients: dict[tuple[int, str, str], AsyncClient] = {}\n\n    def __init__(self, eapi_config: EapiModelConfig):\n        self.model: str = eapi_config.model\n        self.temperature: float = eapi_config.temperature\n        self.timeout: int = eapi_config.timeout\n        self.max_tokens = eapi_config.max_resp_len\n        self.api_key = eapi_config.api_key\n        self.api_host = eapi_config.api_host\n        self.log_reasoning_trace: bool = eapi_config.log_reasoning_trace\n        self.enable_search: bool = eapi_config.enable_search\n        self.open_search: bool = eapi_config.open_search\n        self.x_search: bool = eapi_config.x_search\n        self.reasoning_effort: str | None = eapi_config.reasoning_effort\n\n        api_key = self.api_key or os.getenv(\"XAI_API_KEY\")\n\n        if not api_key:\n            raise ValueError(\n                \"API key is required: set EapiModelConfig.api_key or the XAI_API_KEY environment variable.\"\n            )\n\n        self.client_kwargs = {\n            \"api_key\": api_key,\n            \"timeout\": self.timeout,\n            \"channel_options\": [(\"grpc.enable_retries\", 0)],\n        }\n\n        if self.api_host:\n            self.client_kwargs[\"api_host\"] = self.api_host\n\n    def _get_client(self) -> AsyncClient:\n        loop_id = get_loop_id()\n        key = (loop_id, self.model, self.api_host)\n        if key in self._cached_clients:\n            client = self._cached_clients[key]\n            return client\n        logger.info(\n            f\"Creating new AsyncClient for {self.model} and {self.api_host} (loop_id={loop_id})\"\n        )\n        client = AsyncClient(**self.client_kwargs)\n        self._cached_clients[key] = client\n        return client\n\n    def _prompt_len(self, prompt: list[chat_pb2.Message]) -> int:\n        def _len(content: chat_pb2.Content) -> int:\n            if content.text:\n                return len(content.text)\n            if content.image_url and content.image_url.image_url:\n                return len(content.image_url.image_url)\n            return 0\n\n        return sum(_len(content) for message in prompt for content in message.content)\n\n    def _log_request(self, prompt: list[chat_pb2.Message]):\n        def _to_log_string(content: chat_pb2.Content) -> str:\n            if content.text:\n                return content.text\n            if content.image_url and content.image_url.image_url:\n                return f\"[[[[image_bytes({len(content.image_url.image_url)})]]]]\"\n            return \"\"\n\n        msg = \"\\n\".join(\n            [\n                _to_log_string(content)\n                for message in prompt\n                for content in message.content\n            ]\n        )\n        logger.info(f\"inputs: {msg}\")\n\n    async def _sample_raw(self, prompt: list[chat_pb2.Message], **kwargs):\n        conversation_id = kwargs.get(\"conversation_id\", None)\n        search_allowed_domains = kwargs.get(\"search_allowed_domains\", None)\n        attributes = {\"model_name\": self.model}\n        Metrics.counter(\"llm.sample.count\").add(1, attributes=attributes)\n        if kwargs.get(\"log_prompt\", False):\n            self._log_request(prompt)\n\n        start = time.perf_counter()\n\n        client = self._get_client()\n        try:\n            create_kwargs: dict = dict(\n                model=self.model,\n                conversation_id=conversation_id,\n                messages=prompt,\n                temperature=self.temperature,\n                top_p=0.95,\n                max_tokens=self.max_tokens,\n            )\n            if self.reasoning_effort is not None:\n                create_kwargs[\"reasoning_effort\"] = self.reasoning_effort\n            if self.enable_search and search_allowed_domains:\n                create_kwargs[\"tools\"] = [\n                    web_search(\n                        allowed_domains=search_allowed_domains[:MAX_SEARCH_DOMAINS]\n                    )\n                ]\n            elif self.enable_search and self.open_search:\n                create_kwargs[\"tools\"] = (\n                    [web_search(), x_search()] if self.x_search else [web_search()]\n                )\n            chat = client.chat.create(**create_kwargs)\n            response = await chat.sample()\n            Metrics.counter(\"llm.sample.success.count\").add(1, attributes=attributes)\n            if (\n                self.log_reasoning_trace\n                and hasattr(response, \"reasoning_content\")\n                and response.reasoning_content\n            ):\n                logger.info(f\"thinking trace: {response.reasoning_content}\")\n            return response\n        except Exception as e:\n            logger.error(\n                f\"Error in sampling EAPI request to model {self.model} and api host {self.api_host}, conversation_id={conversation_id}, x_request_id={_rpc_request_id(e)}, with prompt_len {self._prompt_len(prompt)} with elapsed time {time.perf_counter() - start}: {traceback.format_exc()}\"\n            )\n            Metrics.counter(\"llm.sample.error.count\").add(1, attributes=attributes)\n            raise\n        finally:\n            Metrics.histogram(\"llm.sample.duration\").record(\n                time.perf_counter() - start, attributes=attributes\n            )\n\n    async def sample(self, prompt: list[chat_pb2.Message], **kwargs) -> str:\n        response = await self._sample_raw(prompt, **kwargs)\n        return response.content\n\n    def _extract_details(self, response) -> SampleDetails:\n        trace = getattr(response, \"reasoning_content\", None) or None\n        ws = WebSearchDetails()\n\n        if hasattr(response, \"tool_calls\") and response.tool_calls:\n            ws.used = True\n            for tc in response.tool_calls:\n                ws.tool_calls.append(\n                    {\n                        \"id\": tc.id,\n                        \"name\": tc.function.name,\n                        \"arguments\": tc.function.arguments,\n                    }\n                )\n\n        if hasattr(response, \"tool_outputs\") and response.tool_outputs:\n            ws.used = True\n            for to in response.tool_outputs:\n                content = (\n                    to.message.content\n                    if hasattr(to.message, \"content\")\n                    else str(to.message)\n                )\n                ws.tool_outputs.append(content)\n\n        if hasattr(response, \"citations\") and response.citations:\n            ws.used = True\n            ws.citations = list(response.citations)\n\n        if (\n            hasattr(response, \"server_side_tool_usage\")\n            and response.server_side_tool_usage\n        ):\n            ws.used = True\n            ws.server_side_tool_usage = dict(response.server_side_tool_usage)\n\n        return SampleDetails(trace=trace, web_search=ws)\n\n    async def sample_with_details(\n        self, prompt: list[chat_pb2.Message], **kwargs\n    ) -> tuple[str, SampleDetails]:\n        response = await self._sample_raw(prompt, **kwargs)\n        return response.content, self._extract_details(response)\n",
+      "source_digest": "aca853983b81184a3f9253e98491f1083b108000e940dae7b5819a17ca4ccf1c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    adult_content_policy_prompt,\n    age_gating_harmful_text_policy_prompt,\n    child_safety_policy_prompt,\n    hate_or_abuse_policy_prompt,\n    illegal_and_regulated_behaviors_policy_prompt,\n    safety_ptos_prompt,\n    spam_policy_prompt,\n    suicide_or_self_harm_policy_prompt,\n    violent_media_policy_prompt,\n    violent_speech_policy_prompt,\n)\nfrom grok_sampler.vision_sampler import VisionSampler\nfrom grok_sampler.eapi_sampler import EapiSampler\nfrom grok_sampler.oai_sampler import OaiSampler\nfrom circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpen\nfrom monitor.metrics import Metrics\nfrom grox.core.data_loaders.data_types import Post\nfrom grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD\nfrom grox.flows.ptos.state import (\n    SafetyPolicy,\n    SafetyPolicyCategory,\n    SafetyPolicyType,\n    SafetyPostAnnotations,\n    SafetyPtosViolatedPolicy,\n)\n",
+      "source_digest": "91126efdcfa2269013e23b8c05bf9790378349c609a96add7c4594d01160cb58",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 191,
+      "end_line": 215,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    policy_type: SafetyPolicyType, source: SafetyPolicy, reason: str\n) -> SafetyPolicy:\n    return SafetyPolicy(\n        policyType=policy_type, confidenceScore=source.confidenceScore, reason=reason\n    )\n\n\nclass SafetyPtosPolicyCrossValidator:\n    result_pattern = re.compile(r\"(.*)<json>(.*)</json>\", re.DOTALL)\n\n    def __init__(self):\n        eapi_4_5 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)\n        self.eapi_4_5_x_algo = EapiSampler(EapiModelConfig(**eapi_4_5.model_dump()))\n        eapi_4_1 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_1_FAST_X_ALGO)\n        self.eapi_4_1_x_algo = EapiSampler(EapiModelConfig(**eapi_4_1.model_dump()))\n\n    def _parse_policy(self, raw: str) -> SafetyPolicy | None:\n        match = self.result_pattern.search(raw)\n        if not match:\n            return None\n        try:\n            return SafetyPolicy.model_validate_json(match.group(2).strip())\n        except Exception:\n            return None\n\n",
+      "source_digest": "b5c284e6de3c05fe01e756be396cb4d961b88b52838ceb81f78e04313b0da578",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 193,
+      "end_line": 217,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    return SafetyPolicy(\n        policyType=policy_type, confidenceScore=source.confidenceScore, reason=reason\n    )\n\n\nclass SafetyPtosPolicyCrossValidator:\n    result_pattern = re.compile(r\"(.*)<json>(.*)</json>\", re.DOTALL)\n\n    def __init__(self):\n        eapi_4_5 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)\n        self.eapi_4_5_x_algo = EapiSampler(EapiModelConfig(**eapi_4_5.model_dump()))\n        eapi_4_1 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_1_FAST_X_ALGO)\n        self.eapi_4_1_x_algo = EapiSampler(EapiModelConfig(**eapi_4_1.model_dump()))\n\n    def _parse_policy(self, raw: str) -> SafetyPolicy | None:\n        match = self.result_pattern.search(raw)\n        if not match:\n            return None\n        try:\n            return SafetyPolicy.model_validate_json(match.group(2).strip())\n        except Exception:\n            return None\n\n    def _build_policy_convo(\n        self, post: Post, category: SafetyPolicyCategory, system_prompt: str\n",
+      "source_digest": "d2fbe956f2e8a258a756c4da5069ab67a3aace5502f951250c26bb316f3e7c36",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 485,
+      "end_line": 509,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.use_gemma = use_gemma\n\n        vlm_config = grox_config.get_model(model_name)\n        self.llm = VisionSampler(GrokModelConfig(**vlm_config.model_dump()))\n\n        oai_config = grox_config.get_oai_model(gemma_model_name)\n        self.oai_gemma4 = OaiSampler(oai_config)\n\n        if self.deluxe:\n            eapi_config_4_3_x_algo = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_3_X_ALGO\n            )\n            self.eapi_4_3_x_algo = EapiSampler(\n                EapiModelConfig(**eapi_config_4_3_x_algo.model_dump())\n            )\n\n            eapi_config_4_6_internal = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_6_INTERNAL\n            )\n            self.eapi_4_6_internal = EapiSampler(\n                EapiModelConfig(**eapi_config_4_6_internal.model_dump())\n            )\n\n    \u0040staticmethod\n    def _get_policy_prompt(violation: SafetyPtosViolatedPolicy, post: Post) -> str:\n",
+      "source_digest": "56a816f78f8c446b8a24e4554f73f5be511089865572d55bdbc32d5c94dec394",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 492,
+      "end_line": 516,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        if self.deluxe:\n            eapi_config_4_3_x_algo = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_3_X_ALGO\n            )\n            self.eapi_4_3_x_algo = EapiSampler(\n                EapiModelConfig(**eapi_config_4_3_x_algo.model_dump())\n            )\n\n            eapi_config_4_6_internal = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_6_INTERNAL\n            )\n            self.eapi_4_6_internal = EapiSampler(\n                EapiModelConfig(**eapi_config_4_6_internal.model_dump())\n            )\n\n    \u0040staticmethod\n    def _get_policy_prompt(violation: SafetyPtosViolatedPolicy, post: Post) -> str:\n        if violation.category == SafetyPolicyCategory.ViolentMedia:\n            return violent_media_policy_prompt()\n        elif violation.category == SafetyPolicyCategory.AdultContent:\n            return adult_content_policy_prompt()\n        elif violation.category == SafetyPolicyCategory.Spam:\n            return spam_policy_prompt()\n        elif violation.category == SafetyPolicyCategory.IllegalAndRegulatedBehaviors:\n",
+      "source_digest": "90e0592dfb706930ec9161b1eab9eacf836a8a651daaeaf784400f8d59170a94",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 724,
+      "end_line": 748,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    f\"OaiSampler (gemma4) failed for policy, falling back to grok: {traceback.format_exc()}\"\n                )\n        return await self.llm.sample(\n            convo.interleave(), conversation_id=convo.conversation_id\n        )\n\n\nclass SafetyPtosAdultContentCrossValidationJudge:\n    result_pattern = re.compile(r\"(.*)<json>(.*)</json>\", re.DOTALL)\n\n    def __init__(self):\n        eapi_cfg = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)\n        self.llm = EapiSampler(EapiModelConfig(**eapi_cfg.model_dump()))\n\n    def build_convo(self, post: Post) -> Conversation:\n        convo = Conversation(conversation_id=uuid.uuid4().hex)\n        convo.messages.append(\n            Message(\n                role=Role.SYSTEM,\n                content=[_strip_thinking_restrictions(adult_content_policy_prompt())],\n            )\n        )\n\n        user_msg = Message(role=Role.USER, content=[])\n        user_msg.content.extend(UserRenderer.render(post.user))\n",
+      "source_digest": "e540580ea571647bf79ed74e4c0f33b05d425277f023a96384f32f4aa772bcb5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    adult_content_policy_prompt,\n    age_gating_harmful_text_policy_prompt,\n    child_safety_policy_prompt,\n    hate_or_abuse_policy_prompt,\n    illegal_and_regulated_behaviors_policy_prompt,\n    safety_ptos_prompt,\n    spam_policy_prompt,\n    suicide_or_self_harm_policy_prompt,\n    violent_media_policy_prompt,\n    violent_speech_policy_prompt,\n)\nfrom grok_sampler.vision_sampler import VisionSampler\nfrom grok_sampler.eapi_sampler import EapiSampler\nfrom grok_sampler.oai_sampler import OaiSampler\nfrom circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpen\nfrom monitor.metrics import Metrics\nfrom grox.core.data_loaders.data_types import Post\nfrom grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD\nfrom grox.flows.ptos.state import (\n    SafetyPolicy,\n    SafetyPolicyCategory,\n    SafetyPolicyType,\n    SafetyPostAnnotations,\n    SafetyPtosViolatedPolicy,\n)\n",
+      "source_digest": "91126efdcfa2269013e23b8c05bf9790378349c609a96add7c4594d01160cb58",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 191,
+      "end_line": 215,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    policy_type: SafetyPolicyType, source: SafetyPolicy, reason: str\n) -> SafetyPolicy:\n    return SafetyPolicy(\n        policyType=policy_type, confidenceScore=source.confidenceScore, reason=reason\n    )\n\n\nclass SafetyPtosPolicyCrossValidator:\n    result_pattern = re.compile(r\"(.*)<json>(.*)</json>\", re.DOTALL)\n\n    def __init__(self):\n        eapi_4_5 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)\n        self.eapi_4_5_x_algo = EapiSampler(EapiModelConfig(**eapi_4_5.model_dump()))\n        eapi_4_1 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_1_FAST_X_ALGO)\n        self.eapi_4_1_x_algo = EapiSampler(EapiModelConfig(**eapi_4_1.model_dump()))\n\n    def _parse_policy(self, raw: str) -> SafetyPolicy | None:\n        match = self.result_pattern.search(raw)\n        if not match:\n            return None\n        try:\n            return SafetyPolicy.model_validate_json(match.group(2).strip())\n        except Exception:\n            return None\n\n",
+      "source_digest": "b5c284e6de3c05fe01e756be396cb4d961b88b52838ceb81f78e04313b0da578",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 193,
+      "end_line": 217,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    return SafetyPolicy(\n        policyType=policy_type, confidenceScore=source.confidenceScore, reason=reason\n    )\n\n\nclass SafetyPtosPolicyCrossValidator:\n    result_pattern = re.compile(r\"(.*)<json>(.*)</json>\", re.DOTALL)\n\n    def __init__(self):\n        eapi_4_5 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)\n        self.eapi_4_5_x_algo = EapiSampler(EapiModelConfig(**eapi_4_5.model_dump()))\n        eapi_4_1 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_1_FAST_X_ALGO)\n        self.eapi_4_1_x_algo = EapiSampler(EapiModelConfig(**eapi_4_1.model_dump()))\n\n    def _parse_policy(self, raw: str) -> SafetyPolicy | None:\n        match = self.result_pattern.search(raw)\n        if not match:\n            return None\n        try:\n            return SafetyPolicy.model_validate_json(match.group(2).strip())\n        except Exception:\n            return None\n\n    def _build_policy_convo(\n        self, post: Post, category: SafetyPolicyCategory, system_prompt: str\n",
+      "source_digest": "d2fbe956f2e8a258a756c4da5069ab67a3aace5502f951250c26bb316f3e7c36",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 485,
+      "end_line": 509,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.use_gemma = use_gemma\n\n        vlm_config = grox_config.get_model(model_name)\n        self.llm = VisionSampler(GrokModelConfig(**vlm_config.model_dump()))\n\n        oai_config = grox_config.get_oai_model(gemma_model_name)\n        self.oai_gemma4 = OaiSampler(oai_config)\n\n        if self.deluxe:\n            eapi_config_4_3_x_algo = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_3_X_ALGO\n            )\n            self.eapi_4_3_x_algo = EapiSampler(\n                EapiModelConfig(**eapi_config_4_3_x_algo.model_dump())\n            )\n\n            eapi_config_4_6_internal = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_6_INTERNAL\n            )\n            self.eapi_4_6_internal = EapiSampler(\n                EapiModelConfig(**eapi_config_4_6_internal.model_dump())\n            )\n\n    \u0040staticmethod\n    def _get_policy_prompt(violation: SafetyPtosViolatedPolicy, post: Post) -> str:\n",
+      "source_digest": "56a816f78f8c446b8a24e4554f73f5be511089865572d55bdbc32d5c94dec394",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 492,
+      "end_line": 516,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        if self.deluxe:\n            eapi_config_4_3_x_algo = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_3_X_ALGO\n            )\n            self.eapi_4_3_x_algo = EapiSampler(\n                EapiModelConfig(**eapi_config_4_3_x_algo.model_dump())\n            )\n\n            eapi_config_4_6_internal = grox_config.get_eapi_model(\n                ModelName.EAPI_GROK_4_6_INTERNAL\n            )\n            self.eapi_4_6_internal = EapiSampler(\n                EapiModelConfig(**eapi_config_4_6_internal.model_dump())\n            )\n\n    \u0040staticmethod\n    def _get_policy_prompt(violation: SafetyPtosViolatedPolicy, post: Post) -> str:\n        if violation.category == SafetyPolicyCategory.ViolentMedia:\n            return violent_media_policy_prompt()\n        elif violation.category == SafetyPolicyCategory.AdultContent:\n            return adult_content_policy_prompt()\n        elif violation.category == SafetyPolicyCategory.Spam:\n            return spam_policy_prompt()\n        elif violation.category == SafetyPolicyCategory.IllegalAndRegulatedBehaviors:\n",
+      "source_digest": "90e0592dfb706930ec9161b1eab9eacf836a8a651daaeaf784400f8d59170a94",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "grox/flows/ptos/classifier.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 724,
+      "end_line": 748,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    f\"OaiSampler (gemma4) failed for policy, falling back to grok: {traceback.format_exc()}\"\n                )\n        return await self.llm.sample(\n            convo.interleave(), conversation_id=convo.conversation_id\n        )\n\n\nclass SafetyPtosAdultContentCrossValidationJudge:\n    result_pattern = re.compile(r\"(.*)<json>(.*)</json>\", re.DOTALL)\n\n    def __init__(self):\n        eapi_cfg = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)\n        self.llm = EapiSampler(EapiModelConfig(**eapi_cfg.model_dump()))\n\n    def build_convo(self, post: Post) -> Conversation:\n        convo = Conversation(conversation_id=uuid.uuid4().hex)\n        convo.messages.append(\n            Message(\n                role=Role.SYSTEM,\n                content=[_strip_thinking_restrictions(adult_content_policy_prompt())],\n            )\n        )\n\n        user_msg = Message(role=Role.USER, content=[])\n        user_msg.content.extend(UserRenderer.render(post.user))\n",
+      "source_digest": "e540580ea571647bf79ed74e4c0f33b05d425277f023a96384f32f4aa772bcb5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fec16ac107241a97c956583b5e57bb13903ae10036a6cbba6538f175566dd42f",
+      "change_scope": "changed_file",
+      "mechanism_group": "grox/libs",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "a19bb90212263291803e01173eff3d5516925722e0ae077a9619f40411a77905",
+      "context_complete": true,
+      "task_id": "T-abd24ca71381dc3fd8e0b71a6e0fc985b1c8bc7dd3555797bfcd712ca202e448",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2ad8aef196fcb08e80a7e893953a6f22467b10b866200ee468424dacc7b08096",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-838df7bc014b358f2698f8147c5f6e2e2fef8f174ef0785140f877e1343fad20",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-81d84d487494e6bf17d0e94cbe91c980ed92ef7dc2e8627d1d00bab717c6e80f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-77a5a03034c4cf35f8e759fa78e30ab7a9f56151648fc7cf6c1f6f5d8961333b",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7bd7ceb58b3b51f135ee757ead9e708f8868f34c91e75a381ddecede49a930fa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-50324600eab994546eb879e44f1e6790bb0b44a5b878c937d54caf16d7bce399",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a30620097b6c0bc9360e06bde387c6ece5fcb3a0b1e18327fb7a7ed5609a2c0b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-4c75d7b63810d12af3390ffccf3b3193a2282cf6dd9d392c79c55aadf6ac7f29",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cd249ca46536105bc731046bdfd2d2b99a1b0385049203d33a38cb336a354e00",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-f0c2abcc7f179e137ac32aa81e5f14e05a1cfbbcf804157e83bdb1b2c983a775",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-23f32eb39888efde481e072dbcee10977de2eea996c26780a21e43a9f23684ee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-d389c012743c987f6fb8c774e71c39bcc9a74664ec290957cc3efe01a360165b",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f69ea5dd509ad3146e17942b5f7c2bc52bf7e18404c7a54275e7b27aeeffe29c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-d3e0a9748ab769b1121aac9292558ebc000105ec38435e30d672296ceb934dd3",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7618f5369410d7bb6f39c4e736fae105726c1db26ce76bad249a8fce2f3b1262",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-bc607afbb27eaf8844d9dce8b525476d94a688ddac5867f02979f70dd86d18dd",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-be0785ab10cdcd77f8322392226c2c42550f00e94b6fe095bcdecc6984adfd7d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-b7d59dfca0bf87d023b963a27ca6d01260accdd165271ac66fffb1bb6c9873de",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a33db5e3e6dded14eb74206e46978b29bffdb10842320a80a908f9f165c473f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-1d34098fd2f8652f8d924c841b36be1cf91345164a83fb084d0163ad7ba88734",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0ae52f70bc962078cf814285d03582d23d562e004027996a478d6071dd036e0a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-70b33e8cad0353f152876e4842712b293c9d975f21f6eef08a9541db9b6d8b83",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "grox/libs/grok_sampler/eapi_sampler.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8dbd19c204ab35409489816693919486c766e1b39c61615e0f93bb8ea4fda85f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "grox/libs",
+      "query_symbols": [
+        "EapiSampler"
+      ],
+      "context_complete": false,
+      "task_id": "T-ce342aaf1bca62b222c61601f5303a7550c9079d587cc2824b91ae27359a5750",
+      "evidence_refs": [
+        "E14"
+      ]
+    }
+  ],
+  "task_id": "T-504ecd1fe6dd2d5d234fef2adc0864e193c4319255c1a6be9e8736e9a7bbef42"
+}

@@ -1,0 +1,1773 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-15ffb38e9491a1fe592dd971027ef4987d28a6719a1ac3791e8e848405326cba",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 261,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport functools\nimport operator\n\nimport jax\nimport jax.numpy as jnp\nfrom jax.typing import DTypeLike\n\nfrom xrex.utils import gpu\n\n_VEC_WIDTH = 8\n_CTAS_PER_SM = 3\n_MAX_THREADS_PER_CTA = 1024\n_WARP_SIZE = 32\n_NUM_ROW_SUMS = 4\n\n\ndef qk_norm_rope_backward_supported(\n    num_tokens: int,\n    num_q_heads: int,\n    num_kv_heads: int,\n    head_dim: int,\n    dtype: DTypeLike,\n    device: jax.Device,\n) -> bool:\n    return (\n        gpu.cuda_compute_capability(device) == (9, 0)\n        and dtype == jnp.bfloat16\n        and _shape_fits_kernel(num_tokens, num_q_heads, num_kv_heads, head_dim)\n    )\n\n\ndef _shape_fits_kernel(num_tokens: int, num_q_heads: int, num_kv_heads: int, head_dim: int) -> bool:\n    return (\n        num_q_heads % num_kv_heads == 0\n        and head_dim % (2 * _VEC_WIDTH) == 0\n        and _num_threads(num_q_heads, num_kv_heads, head_dim) <= _MAX_THREADS_PER_CTA\n        and num_tokens * (num_q_heads + 2 * num_kv_heads) * head_dim < 2**31\n    )\n\n\ndef _num_threads(num_q_heads: int, num_kv_heads: int, head_dim: int) -> int:\n    num_lane_groups = (num_q_heads + num_kv_heads) * (head_dim // (2 * _VEC_WIDTH))\n    return -(-num_lane_groups // _WARP_SIZE) * _WARP_SIZE\n\n\ndef qk_norm_rope_backward(\n    dq: jax.Array,\n    q: jax.Array,\n    dk: jax.Array,\n    k: jax.Array,\n    dv: jax.Array,\n    cos: jax.Array,\n    sin: jax.Array,\n    q_gain: jax.Array,\n    k_gain: jax.Array,\n    *,\n    eps: float,\n) -> tuple[jax.Array, jax.Array, jax.Array]:\n    assert jax.default_backend() == \"gpu\", \"qk_norm_rope_backward needs a GPU (CUDA kernel)\"\n    num_tokens, num_q_heads, head_dim = q.shape\n    num_kv_heads = k.shape[1]\n    assert _shape_fits_kernel(num_tokens, num_q_heads, num_kv_heads, head_dim), (q.shape, k.shape)\n    kv_shape = (num_tokens, num_kv_heads, head_dim)\n    assert dq.shape == q.shape and dk.shape == k.shape == dv.shape == kv_shape\n    assert {x.dtype for x in (dq, q, dk, k, dv)} == {jnp.dtype(jnp.bfloat16)}\n    assert cos.shape == sin.shape == (num_tokens, head_dim // 2), f\"cos and sin {cos.shape}\"\n    assert q_gain.shape == (num_q_heads * head_dim,), f\"q_gain {q_gain.shape}\"\n    assert k_gain.shape == (num_kv_heads * head_dim,), f\"k_gain {k_gain.shape}\"\n    assert {x.dtype for x in (cos, sin, q_gain, k_gain)} == {jnp.dtype(jnp.float32)}\n    num_q_per_kv = num_q_heads // num_kv_heads\n    call = _compiled_kernel(num_tokens, num_kv_heads, num_q_per_kv, head_dim, float(eps))\n    dqkv, dq_gain, dk_gain = call(\n        *(x.reshape(num_tokens, -1) for x in (dq, q, dk, k, dv)), cos, sin, q_gain, k_gain\n    )\n    dqkv = dqkv.reshape(num_tokens, num_kv_heads, num_q_per_kv + 2, head_dim)\n    return dqkv, dq_gain.sum(axis=0), dk_gain.sum(axis=0)\n\n\n\u0040functools.cache\ndef _compiled_kernel(\n    num_tokens: int, num_kv_heads: int, num_q_per_kv: int, head_dim: int, eps: float\n):\n    import cuda.bindings.driver as cuda_driver\n    import cutlass\n    import cutlass.cute as cute\n    from cutlass import Float32, const_expr\n    from cutlass.jax import cutlass_call\n\n    from xrex.cutedsl.ranker_fa4.utils import warp_reduce\n\n    num_q_heads = num_kv_heads * num_q_per_kv\n    half_dim = head_dim // 2\n    vecs_per_half_head = half_dim // _VEC_WIDTH\n    q_threads = num_q_heads * vecs_per_half_head\n    k_threads = num_kv_heads * vecs_per_half_head\n    v_threads = num_kv_heads * head_dim // _VEC_WIDTH\n    num_threads = _num_threads(num_q_heads, num_kv_heads, head_dim)\n    num_warps = num_threads // _WARP_SIZE\n    num_ctas = min(\n        num_tokens, cutlass.utils.HardwareInfo().get_device_multiprocessor_count() * _CTAS_PER_SM\n    )\n    slots_per_kv_head = num_q_per_kv + 2\n    q_width, k_width = float(num_q_heads * head_dim), float(num_kv_heads * head_dim)\n\n    def tile(tensor, row, col):\n        return cute.local_tile(tensor, (1, _VEC_WIDTH), (row, col // _VEC_WIDTH))\n\n    def make_fragment(dtype=Float32):\n        return cute.make_rmem_tensor((1, _VEC_WIDTH), dtype)\n\n    def load_tile(tensor, row, col, dst):\n        if const_expr(dst.element_type == tensor.element_type):\n            cute.autovec_copy(tile(tensor, row, col), dst)\n        else:\n            src = make_fragment(tensor.element_type)\n            cute.autovec_copy(tile(tensor, row, col), src)\n            dst.store(src.load().to(dst.element_type))\n\n    def store_tile(value, tensor, row, col):\n        src = make_fragment(tensor.element_type)\n        src.store(value.to(tensor.element_type))\n        cute.autovec_copy(src, tile(tensor, row, col))\n\n    def load_f32(fragment):\n        return fragment.load().to(Float32)\n\n    def reduce_sum(values):\n        return values.reduce(cute.ReductionOp.ADD, 0.0, reduction_profile=0)\n\n    def load_rope_pair(dy, x, row, col, d_lo, d_hi, x_lo, x_hi):\n        load_tile(dy, row, col, d_lo)\n        load_tile(dy, row, col + half_dim, d_hi)\n        load_tile(x, row, col, x_lo)\n        load_tile(x, row, col + half_dim, x_hi)\n\n    def rope_transpose(cos, sin, d_lo, d_hi):\n        dy_lo, dy_hi = load_f32(d_lo), load_f32(d_hi)\n        d_lo.store((dy_hi * sin.load() + dy_lo * cos.load()).to(d_lo.element_type))\n        d_hi.store((dy_hi * cos.load() - dy_lo * sin.load()).to(d_hi.element_type))\n\n    def partial_row_sums(d_lo, d_hi, x_lo, x_hi, g_lo, g_hi):\n        x_lo_f32, x_hi_f32 = load_f32(x_lo), load_f32(x_hi)\n        dot = reduce_sum(x_lo_f32 * (g_lo.load() * load_f32(d_lo)))\n        dot += reduce_sum(x_hi_f32 * (g_hi.load() * load_f32(d_hi)))\n        return dot, reduce_sum(x_lo_f32 * x_lo_f32) + reduce_sum(x_hi_f32 * x_hi_f32)\n\n    def norm_transpose(rope_dy, x, gain, dot, sq_sum, width, out, row, col, dgain):\n        mean_sq = sq_sum / width + eps\n        inv_rms = cute.math.rsqrt(mean_sq)\n        d_mean_sq = dot * (-0.5 * (inv_rms / mean_sq))\n        d32, x32 = load_f32(rope_dy), load_f32(x)\n        store_tile((gain.load() * d32) * inv_rms + x32 * ((d_mean_sq / width) * 2.0), out, row, col)\n        dgain.store(dgain.load() + d32 * (x32 * inv_rms))\n\n    \u0040cute.kernel\n    def kernel(mdQ, mQ, mdK, mK, mdV, mCos, mSin, mQG, mKG, mdQKV, mdQG, mdKG):\n        tidx, _, _ = cute.arch.thread_idx()\n        bidx, _, _ = cute.arch.block_idx()\n        warp, lane = tidx // _WARP_SIZE, tidx % _WARP_SIZE\n        smem = cutlass.utils.SmemAllocator()\n        warp_sums = smem.allocate_tensor(\n            Float32, cute.make_layout((_NUM_ROW_SUMS, num_warps, 2)), byte_alignment=16\n        )\n\n        is_q = tidx < q_threads\n        is_k = (tidx >= q_threads) & (tidx < q_threads + k_threads)\n        is_v = tidx < v_threads\n        lane_group = tidx if tidx < q_threads else tidx - q_threads\n        head = lane_group // vecs_per_half_head\n        col = (lane_group % vecs_per_half_head) * _VEC_WIDTH\n        in_col = head * head_dim + col\n        q_out = ((head // num_q_per_kv) * slots_per_kv_head + head % num_q_per_kv) * head_dim + col\n        k_out = (head * slots_per_kv_head + num_q_per_kv) * head_dim + col\n        v_head = tidx // (head_dim // _VEC_WIDTH)\n        v_col = (tidx % (head_dim // _VEC_WIDTH)) * _VEC_WIDTH\n        v_out = (v_head * slots_per_kv_head + num_q_per_kv + 1) * head_dim + v_col\n\n        g_lo, g_hi, dg_lo, dg_hi, cos, sin = (make_fragment() for _ in range(6))\n        for fragment in (g_lo, g_hi, dg_lo, dg_hi):\n            fragment.fill(0.0)\n        if is_q:\n            load_tile(mQG, 0, in_col, g_lo)\n            load_tile(mQG, 0, in_col + half_dim, g_hi)\n        if is_k:\n            load_tile(mKG, 0, in_col, g_lo)\n            load_tile(mKG, 0, in_col + half_dim, g_hi)\n        d_lo, d_hi, x_lo, x_hi, v = (make_fragment(cutlass.BFloat16) for _ in range(5))\n\n        parity = cutlass.Int32(0)\n        for row in cutlass.range(bidx, mdQ.shape[0], num_ctas, unroll=1):\n            load_tile(mCos, row, col, cos)\n            load_tile(mSin, row, col, sin)\n            dot_q, sq_q, dot_k, sq_k = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)\n            if is_q:\n                load_rope_pair(mdQ, mQ, row, in_col, d_lo, d_hi, x_lo, x_hi)\n                rope_transpose(cos, sin, d_lo, d_hi)\n                dot_q, sq_q = partial_row_sums(d_lo, d_hi, x_lo, x_hi, g_lo, g_hi)\n            if is_k:\n                load_rope_pair(mdK, mK, row, in_col, d_lo, d_hi, x_lo, x_hi)\n                rope_transpose(cos, sin, d_lo, d_hi)\n                dot_k, sq_k = partial_row_sums(d_lo, d_hi, x_lo, x_hi, g_lo, g_hi)\n            if is_v:\n                load_tile(mdV, row, v_head * head_dim + v_col, v)\n                cute.autovec_copy(v, tile(mdQKV, row, v_out))\n            sums = [warp_reduce(x, operator.add) for x in (dot_q, sq_q, dot_k, sq_k)]\n            if lane == 0:\n                for i in cutlass.range_constexpr(_NUM_ROW_SUMS):\n                    warp_sums[i, warp, parity] = sums[i]\n            cute.arch.barrier()\n            sums = [warp_sums[i, 0, parity] for i in range(_NUM_ROW_SUMS)]\n            for other_warp in cutlass.range_constexpr(1, num_warps):\n                for i in cutlass.range_constexpr(_NUM_ROW_SUMS):\n                    sums[i] += warp_sums[i, other_warp, parity]\n            dot_q, sq_q, dot_k, sq_k = sums\n            if is_q:\n                norm_transpose(d_lo, x_lo, g_lo, dot_q, sq_q, q_width, mdQKV, row, q_out, dg_lo)\n                norm_transpose(\n                    d_hi, x_hi, g_hi, dot_q, sq_q, q_width, mdQKV, row, q_out + half_dim, dg_hi\n                )\n            if is_k:\n                norm_transpose(d_lo, x_lo, g_lo, dot_k, sq_k, k_width, mdQKV, row, k_out, dg_lo)\n                norm_transpose(\n                    d_hi, x_hi, g_hi, dot_k, sq_k, k_width, mdQKV, row, k_out + half_dim, dg_hi\n                )\n            parity ^= 1\n\n        if is_q:\n            store_tile(dg_lo.load(), mdQG, bidx, in_col)\n            store_tile(dg_hi.load(), mdQG, bidx, in_col + half_dim)\n        if is_k:\n            store_tile(dg_lo.load(), mdKG, bidx, in_col)\n            store_tile(dg_hi.load(), mdKG, bidx, in_col + half_dim)\n\n    \u0040cute.jit\n    def launch(\n        stream: cuda_driver.CUstream, mdQ, mQ, mdK, mK, mdV, mCos, mSin, mQG, mKG, mdQKV, mdQG, mdKG\n    ):\n        mQG, mKG = (\n            cute.make_tensor(gain.iterator, cute.make_layout((1, gain.shape[0])))\n            for gain in (mQG, mKG)\n        )\n        kernel(mdQ, mQ, mdK, mK, mdV, mCos, mSin, mQG, mKG, mdQKV, mdQG, mdKG).launch(\n            grid=[num_ctas, 1, 1],\n            block=[num_threads, 1, 1],\n            min_blocks_per_mp=_CTAS_PER_SM,\n            stream=stream,\n        )\n\n    return cutlass_call(\n        launch,\n        output_shape_dtype=[\n            jax.ShapeDtypeStruct(\n                (num_tokens, num_kv_heads * slots_per_kv_head * head_dim), jnp.bfloat16\n            ),\n            jax.ShapeDtypeStruct((num_ctas, num_q_heads * head_dim), jnp.float32),\n            jax.ShapeDtypeStruct((num_ctas, num_kv_heads * head_dim), jnp.float32),\n        ],\n        use_static_tensors=True,\n    )\n",
+      "source_digest": "462f51b1a89d8dd127cd4d38ff0d42fbf830b1e2b77b4e82a0a53ac8865f5ea0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "package com.twitter.hub.agatha.predict\n\nimport com.twitter.hub.agatha.thriftscala._\nimport com.twitter.hub.pmi.PMISetExtractors\nimport com.twitter.hub.pmi.math.aggregators.Moments\nimport com.twitter.hub.pmi.math.aggregators.Percentiles\nimport com.twitter.scalding.thrift.macros.Macros._\nimport com.twitter.scalding._\n\nobject Aggregators {\n\n  def getMoments(\n    features: TypedPipe[(Long, Feature)],\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    numMoments: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Int, Double])] = {\n    val augmentedFeatures = features.map {\n      case (uId, feature) => ((uId, feature.identifier.featureClass), feature.value)\n",
+      "source_digest": "6f143754849a873c0675ea155df3677baba44bf1a253eb1951365e16f97f8ace",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 29,
+      "end_line": 53,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n  def getPresentMoments(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)]\n  ): TypedPipe[(Long, FeatureClass, String, Map[Int, Double])] = {\n    Moments\n      .getPresentMoments(pmiSet)\n      .map {\n        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n",
+      "source_digest": "8e8cb0d776fc153f1f685bc3c49b1e83dfb0b19a73a22799025aa1fc5f0ff44e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 31,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)]\n  ): TypedPipe[(Long, FeatureClass, String, Map[Int, Double])] = {\n    Moments\n      .getPresentMoments(pmiSet)\n      .map {\n        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "8c784dca988ab449390c15bd7344a0283a74bf739fa19f2ac8bd2556fcb693a2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 35,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      .map {\n        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "909799bd9842054b148eeab1ea90499babcfce81e4e360256b74fe66b4ef7601",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 36,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "5c93109d6959e2a15c4239ba5695d190fb4e08703f5214c52709076c8382e8c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 38,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "58ec687a5e981335b926e615f106f6e47d597c33e727f2492669cb6e4b361798",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 39,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "e30562d307f6c7ca6a59d1cfa46b7a2325ae89b203d9a357d7014266679100d7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "package com.twitter.hub.pmi.math.aggregators\n\nimport com.twitter.scalding.TypedPipe\nimport com.twitter.algebird.QTree\nimport com.twitter.algebird.QTreeSemigroup\nimport com.twitter.algebird.Semigroup\n\nobject Percentiles {\n\n  def getPresentPercentiles[T](\n    pmiSet: TypedPipe[(T, Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n",
+      "source_digest": "c569e22d0c7fe18cdc2db553fff60bce1bdcace023462c608d6ddf5eea1df567",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 12,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n      .map(pmiSet => (pmiSet._1, QTree(pmiSet._2 + offset)))\n      .sumByKey\n      .mapValues(qTree =>\n        percentiles.map { percentile =>\n          val bounds = qTree.quantileBounds(percentile)\n          val mean = (bounds._1 + bounds._2) / 2.0 - offset\n          (percentile, mean)\n        }.toMap)\n  }\n}\n",
+      "source_digest": "419f67750cd638b033f6200e97734cd5862f3bfdbb37c522c37650715e2452d9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 13,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    offset: Int,\n    k: Int\n  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n      .map(pmiSet => (pmiSet._1, QTree(pmiSet._2 + offset)))\n      .sumByKey\n      .mapValues(qTree =>\n        percentiles.map { percentile =>\n          val bounds = qTree.quantileBounds(percentile)\n          val mean = (bounds._1 + bounds._2) / 2.0 - offset\n          (percentile, mean)\n        }.toMap)\n  }\n}\n",
+      "source_digest": "c5d33e2a50fd85ac6784e9a6300e2673ca7c6d3587072e4435be426a5cf4dd83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 15,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n      .map(pmiSet => (pmiSet._1, QTree(pmiSet._2 + offset)))\n      .sumByKey\n      .mapValues(qTree =>\n        percentiles.map { percentile =>\n          val bounds = qTree.quantileBounds(percentile)\n          val mean = (bounds._1 + bounds._2) / 2.0 - offset\n          (percentile, mean)\n        }.toMap)\n  }\n}\n",
+      "source_digest": "dc5b625e50b42b1f7680869d7258b7b39f395f0aaf97fa31b9da8e3543b479f2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "agatha/scalding/AgathaFeaturesPredictJob.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.scalding_internal.dalv2.remote_access.ProcAtla\n\nobject AgathaFeaturesJobConfig extends PredictJobConfig {\n  override val historyDuration: Duration = Days(14)\n  override val labelManager: LabelManager = AgathaLabelManager\n  override val labelNames: Set[String] = Set(\n    ReportsPerFav,\n    AllSpamReportsPerFav,\n    SpamReportsPerFav,\n    SpamSuspendedLabel,\n    NSFWLabel,\n  ).map(_.labelName)\n  val quantiles: Seq[Double] = Seq(.1, .25, .5, .75, .9)\n\n  override def readUserFeatures(dateRange: DateRange): TypedPipe[UserFeature] = {\n    DAL\n      .readMostRecentSnapshot(ActiveUserFeaturesScalaDataset, dateRange)\n      .withRemoteReadPolicy(ExplicitLocation(ProcAtla))\n      .toTypedPipe\n  }\n\n  override def readModelledFeatures(\n    dateRange: DateRange\n  )(\n    implicit mode: Mode\n",
+      "source_digest": "27390e5d94dd40cdba45da71cb711bfe8f91804da8145560769650ed68963633",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.agatha.scalding.AgathaFeaturesScalaDataset\nimport com.twitter.agatha.scalding.data.ActiveUserFeaturesConfig\nimport com.twitter.agatha.scalding.labels.AgathaLabelManager\nimport com.twitter.agatha.scalding.labels.nsfw.NSFWLabel\nimport com.twitter.agatha.scalding.labels.reports_per_fav.ReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.AllSpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.SpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_suspended.SpamSuspendedLabel\nimport com.twitter.agatha.scalding.util.GetActiveUsers\nimport com.twitter.agatha.thriftscala.FlattenedBlinkScore\nimport com.twitter.agatha.thriftscala.UserPrediction\nimport com.twitter.dal.client.dataset.KeyValDALDataset\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrationApplicator\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrator\nimport com.twitter.hub.agatha.labels.LabelManager\nimport com.twitter.hub.agatha.thriftscala.FeatureClass\nimport com.twitter.hub.agatha.thriftscala.FeatureSource\nimport com.twitter.mediascience.scalding.extensions.MediaScienceBatch\nimport com.twitter.scalding._\nimport com.twitter.scalding_internal.dalv2.DAL\nimport com.twitter.scalding_internal.dalv2.DALWrite.D\nimport com.twitter.scalding_internal.dalv2.DALWrite._\nimport com.twitter.scalding_internal.dalv2.remote_access.ExplicitLocation\nimport com.twitter.scalding_internal.dalv2.remote_access.ProcAtla\nimport com.twitter.scalding_internal.job.TwitterExecutionApp\n",
+      "source_digest": "91afec8f6fe52e282bde3dc01e581d0c7ddb932f8405b3d26d00cfa1bc992d91",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5,
+      "end_line": 29,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.agatha.scalding.data.ActiveUserFeaturesConfig\nimport com.twitter.agatha.scalding.labels.AgathaLabelManager\nimport com.twitter.agatha.scalding.labels.nsfw.NSFWLabel\nimport com.twitter.agatha.scalding.labels.reports_per_fav.ReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.AllSpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.SpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_suspended.SpamSuspendedLabel\nimport com.twitter.agatha.scalding.util.GetActiveUsers\nimport com.twitter.agatha.thriftscala.FlattenedBlinkScore\nimport com.twitter.agatha.thriftscala.UserPrediction\nimport com.twitter.dal.client.dataset.KeyValDALDataset\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrationApplicator\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrator\nimport com.twitter.hub.agatha.labels.LabelManager\nimport com.twitter.hub.agatha.thriftscala.FeatureClass\nimport com.twitter.hub.agatha.thriftscala.FeatureSource\nimport com.twitter.mediascience.scalding.extensions.MediaScienceBatch\nimport com.twitter.scalding._\nimport com.twitter.scalding_internal.dalv2.DAL\nimport com.twitter.scalding_internal.dalv2.DALWrite.D\nimport com.twitter.scalding_internal.dalv2.DALWrite._\nimport com.twitter.scalding_internal.dalv2.remote_access.ExplicitLocation\nimport com.twitter.scalding_internal.dalv2.remote_access.ProcAtla\nimport com.twitter.scalding_internal.job.TwitterExecutionApp\nimport com.twitter.scalding_internal.job.analytics_batch.AnalyticsBatchExecution\n",
+      "source_digest": "ca2e8b1af06798ecc12da26daead285ce9ac999ea68b5e6d1619af09f54c04d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 95,
+      "end_line": 119,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    val activeUserAverages = toUserAverages(userScores)\n      .groupBy { case (userId, _, _) => userId }\n      .join(GetActiveUsers(DateRange(dateRange.start, RichDate.now)).asKeys)\n      .mapValues(_._1)\n      .values\n\n    Execution\n      .zip(\n        userScores.forceToDiskExecution,\n        activeUserAverages.forceToDiskExecution,\n      ).flatMap {\n        case (userScores, activeUserAverages) =>\n          percentileCalibrateUserAverages(\n            toUserAverages(userScores),\n            activeUserAverages,\n            config.labelNames)\n            .flatMap { calibratedUserAverages =>\n              Execution\n                .zip(\n                  config.writeUserBlinkScoreRecords(userScores, dateRange),\n                  config.writeCalibratedUserBlinkScores(calibratedUserAverages, dateRange)\n                ).unit\n            }\n      }\n  }\n",
+      "source_digest": "d5162f8d2ff1345f9023a8047eed267f4bb69497855311e5ec07412e4c3bbee6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      }\n      .group\n      .sum\n      .groupBy { case ((_, label), _) => label }\n      .hashJoin(labelPriors)\n      .mapValues {\n        case (((userId, label), sums), prior) =>\n          toFlattenedBlinkScore(userId, label, sums, prior)\n      }\n      .values\n  }\n\n  def percentileCalibrateUserAverages(\n    userAverages: TypedPipe[(Long, String, Double)],\n    userAveragesForCalibration: TypedPipe[(Long, String, Double)],\n    labelNames: Set[String],\n  )(\n    implicit uniqueId: UniqueID\n  ): Execution[TypedPipe[(Long, String, Double)]] = {\n    val perLabelCalibratedUserAveragesExecs: Seq[Execution[TypedPipe[(Long, String, Double)]]] =\n      labelNames.toSeq\n        .map { labelName =>\n          def filterToLabel(\n            pipe: TypedPipe[(Long, String, Double)],\n            statName: String\n",
+      "source_digest": "be4ad9906d3ddfbbf1c2517f3c717ce1370ef15c079a8b566ca63415d2134cfd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 198,
+      "end_line": 222,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            val stat = Stat(StatKey(statName, f\"Label${labelName}\"))(uniqueId)\n            pipe.collect {\n              case (userId, label, rawScore) if label == labelName => {\n                stat.inc()\n                (userId, rawScore)\n              }\n            }\n          }\n\n          val rawScores = filterToLabel(userAverages, \"Total\")\n          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n",
+      "source_digest": "c64df8e89f7535b8a1f565c12c7c3d2efadc0410eee6fce79af5c22f8cad4c5a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 199,
+      "end_line": 223,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pipe.collect {\n              case (userId, label, rawScore) if label == labelName => {\n                stat.inc()\n                (userId, rawScore)\n              }\n            }\n          }\n\n          val rawScores = filterToLabel(userAverages, \"Total\")\n          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n",
+      "source_digest": "d220c88999dfe92c1ecf92965bf278259327022ac145ece606dedaadb18f2b63",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 201,
+      "end_line": 225,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                stat.inc()\n                (userId, rawScore)\n              }\n            }\n          }\n\n          val rawScores = filterToLabel(userAverages, \"Total\")\n          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n",
+      "source_digest": "0b72603fc23e867b1f07944f8146944f1bfcdf6f30ee340fe21b00a47ecbeba7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 208,
+      "end_line": 232,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n            .fromPercentileCalibratedScorePipe(calibrationMapping)\n            .toOptionExecution\n            .map(_.get)\n            .map { percentileCalibrationApplicator =>\n              rawScores\n                .map {\n                  case (userId, rawScore) =>\n",
+      "source_digest": "35d0e133fb624a2248a46d5b5451be12e6675e25ed855c5c655ca13d5161778c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 209,
+      "end_line": 233,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n            .fromPercentileCalibratedScorePipe(calibrationMapping)\n            .toOptionExecution\n            .map(_.get)\n            .map { percentileCalibrationApplicator =>\n              rawScores\n                .map {\n                  case (userId, rawScore) =>\n                    val pctScore =\n",
+      "source_digest": "9990a8cc053cfe341f675fecfa07e1271795afb349ee501c84d6d07c97c3042d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 210,
+      "end_line": 234,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n            .fromPercentileCalibratedScorePipe(calibrationMapping)\n            .toOptionExecution\n            .map(_.get)\n            .map { percentileCalibrationApplicator =>\n              rawScores\n                .map {\n                  case (userId, rawScore) =>\n                    val pctScore =\n                      percentileCalibrationApplicator.applyCalibration(rawScore)\n",
+      "source_digest": "b967012780497535f51be5364ee4f69d6534b074a0dc38ba7aea477588b4626f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "package com.twitter.hub.agatha.predict\n\nimport com.twitter.hub.agatha.thriftscala._\nimport com.twitter.hub.pmi.PMISetExtractors\nimport com.twitter.hub.pmi.math.aggregators.Moments\nimport com.twitter.hub.pmi.math.aggregators.Percentiles\nimport com.twitter.scalding.thrift.macros.Macros._\nimport com.twitter.scalding._\n\nobject Aggregators {\n\n  def getMoments(\n    features: TypedPipe[(Long, Feature)],\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    numMoments: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Int, Double])] = {\n    val augmentedFeatures = features.map {\n      case (uId, feature) => ((uId, feature.identifier.featureClass), feature.value)\n",
+      "source_digest": "6f143754849a873c0675ea155df3677baba44bf1a253eb1951365e16f97f8ace",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 29,
+      "end_line": 53,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n  def getPresentMoments(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)]\n  ): TypedPipe[(Long, FeatureClass, String, Map[Int, Double])] = {\n    Moments\n      .getPresentMoments(pmiSet)\n      .map {\n        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n",
+      "source_digest": "8e8cb0d776fc153f1f685bc3c49b1e83dfb0b19a73a22799025aa1fc5f0ff44e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 31,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)]\n  ): TypedPipe[(Long, FeatureClass, String, Map[Int, Double])] = {\n    Moments\n      .getPresentMoments(pmiSet)\n      .map {\n        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "8c784dca988ab449390c15bd7344a0283a74bf739fa19f2ac8bd2556fcb693a2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 35,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      .map {\n        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "909799bd9842054b148eeab1ea90499babcfce81e4e360256b74fe66b4ef7601",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 36,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        case (((userId, featureClass), label), centralMoments) =>\n          (userId, featureClass, label, centralMoments.standardize.toSparseMap)\n      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "5c93109d6959e2a15c4239ba5695d190fb4e08703f5214c52709076c8382e8c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 38,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      }\n  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "58ec687a5e981335b926e615f106f6e47d597c33e727f2492669cb6e4b361798",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "agatha/hub/agatha/predict/Aggregators.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 39,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "  }\n\n  def getPresentPercentiles(\n    pmiSet: TypedPipe[((UserGraphGrouping, String), Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  ): TypedPipe[(Long, FeatureClass, String, Map[Double, Double])] = {\n    Percentiles\n      .getPresentPercentiles(pmiSet, percentiles, offset, k)\n      .map {\n        case (((userId, featureClass), label), percentileMap) =>\n          (userId, featureClass, label, percentileMap)\n      }\n  }\n}\n",
+      "source_digest": "e30562d307f6c7ca6a59d1cfa46b7a2325ae89b203d9a357d7014266679100d7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "package com.twitter.hub.pmi.math.aggregators\n\nimport com.twitter.scalding.TypedPipe\nimport com.twitter.algebird.QTree\nimport com.twitter.algebird.QTreeSemigroup\nimport com.twitter.algebird.Semigroup\n\nobject Percentiles {\n\n  def getPresentPercentiles[T](\n    pmiSet: TypedPipe[(T, Double)],\n    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n",
+      "source_digest": "c569e22d0c7fe18cdc2db553fff60bce1bdcace023462c608d6ddf5eea1df567",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 12,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    percentiles: Seq[Double],\n    offset: Int,\n    k: Int\n  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n      .map(pmiSet => (pmiSet._1, QTree(pmiSet._2 + offset)))\n      .sumByKey\n      .mapValues(qTree =>\n        percentiles.map { percentile =>\n          val bounds = qTree.quantileBounds(percentile)\n          val mean = (bounds._1 + bounds._2) / 2.0 - offset\n          (percentile, mean)\n        }.toMap)\n  }\n}\n",
+      "source_digest": "419f67750cd638b033f6200e97734cd5862f3bfdbb37c522c37650715e2452d9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 13,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    offset: Int,\n    k: Int\n  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n      .map(pmiSet => (pmiSet._1, QTree(pmiSet._2 + offset)))\n      .sumByKey\n      .mapValues(qTree =>\n        percentiles.map { percentile =>\n          val bounds = qTree.quantileBounds(percentile)\n          val mean = (bounds._1 + bounds._2) / 2.0 - offset\n          (percentile, mean)\n        }.toMap)\n  }\n}\n",
+      "source_digest": "c5d33e2a50fd85ac6784e9a6300e2673ca7c6d3587072e4435be426a5cf4dd83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "agatha/hub/pmi/math/aggregators/Percentiles.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 15,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "  )(\n    implicit ordering: Ordering[T]\n  ): TypedPipe[(T, Map[Double, Double])] = {\n    implicit val qtSemigroup: Semigroup[QTree[Double]] = new QTreeSemigroup[Double](k)\n\n    pmiSet\n      .map(pmiSet => (pmiSet._1, QTree(pmiSet._2 + offset)))\n      .sumByKey\n      .mapValues(qTree =>\n        percentiles.map { percentile =>\n          val bounds = qTree.quantileBounds(percentile)\n          val mean = (bounds._1 + bounds._2) / 2.0 - offset\n          (percentile, mean)\n        }.toMap)\n  }\n}\n",
+      "source_digest": "dc5b625e50b42b1f7680869d7258b7b39f395f0aaf97fa31b9da8e3543b479f2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "agatha/scalding/AgathaFeaturesPredictJob.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.scalding_internal.dalv2.remote_access.ProcAtla\n\nobject AgathaFeaturesJobConfig extends PredictJobConfig {\n  override val historyDuration: Duration = Days(14)\n  override val labelManager: LabelManager = AgathaLabelManager\n  override val labelNames: Set[String] = Set(\n    ReportsPerFav,\n    AllSpamReportsPerFav,\n    SpamReportsPerFav,\n    SpamSuspendedLabel,\n    NSFWLabel,\n  ).map(_.labelName)\n  val quantiles: Seq[Double] = Seq(.1, .25, .5, .75, .9)\n\n  override def readUserFeatures(dateRange: DateRange): TypedPipe[UserFeature] = {\n    DAL\n      .readMostRecentSnapshot(ActiveUserFeaturesScalaDataset, dateRange)\n      .withRemoteReadPolicy(ExplicitLocation(ProcAtla))\n      .toTypedPipe\n  }\n\n  override def readModelledFeatures(\n    dateRange: DateRange\n  )(\n    implicit mode: Mode\n",
+      "source_digest": "27390e5d94dd40cdba45da71cb711bfe8f91804da8145560769650ed68963633",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.agatha.scalding.AgathaFeaturesScalaDataset\nimport com.twitter.agatha.scalding.data.ActiveUserFeaturesConfig\nimport com.twitter.agatha.scalding.labels.AgathaLabelManager\nimport com.twitter.agatha.scalding.labels.nsfw.NSFWLabel\nimport com.twitter.agatha.scalding.labels.reports_per_fav.ReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.AllSpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.SpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_suspended.SpamSuspendedLabel\nimport com.twitter.agatha.scalding.util.GetActiveUsers\nimport com.twitter.agatha.thriftscala.FlattenedBlinkScore\nimport com.twitter.agatha.thriftscala.UserPrediction\nimport com.twitter.dal.client.dataset.KeyValDALDataset\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrationApplicator\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrator\nimport com.twitter.hub.agatha.labels.LabelManager\nimport com.twitter.hub.agatha.thriftscala.FeatureClass\nimport com.twitter.hub.agatha.thriftscala.FeatureSource\nimport com.twitter.mediascience.scalding.extensions.MediaScienceBatch\nimport com.twitter.scalding._\nimport com.twitter.scalding_internal.dalv2.DAL\nimport com.twitter.scalding_internal.dalv2.DALWrite.D\nimport com.twitter.scalding_internal.dalv2.DALWrite._\nimport com.twitter.scalding_internal.dalv2.remote_access.ExplicitLocation\nimport com.twitter.scalding_internal.dalv2.remote_access.ProcAtla\nimport com.twitter.scalding_internal.job.TwitterExecutionApp\n",
+      "source_digest": "91afec8f6fe52e282bde3dc01e581d0c7ddb932f8405b3d26d00cfa1bc992d91",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 5,
+      "end_line": 29,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.agatha.scalding.data.ActiveUserFeaturesConfig\nimport com.twitter.agatha.scalding.labels.AgathaLabelManager\nimport com.twitter.agatha.scalding.labels.nsfw.NSFWLabel\nimport com.twitter.agatha.scalding.labels.reports_per_fav.ReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.AllSpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_reports_per_fav.SpamReportsPerFav\nimport com.twitter.agatha.scalding.labels.spam_suspended.SpamSuspendedLabel\nimport com.twitter.agatha.scalding.util.GetActiveUsers\nimport com.twitter.agatha.thriftscala.FlattenedBlinkScore\nimport com.twitter.agatha.thriftscala.UserPrediction\nimport com.twitter.dal.client.dataset.KeyValDALDataset\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrationApplicator\nimport com.twitter.health.platform_manipulation.calibration.PercentileCalibrator\nimport com.twitter.hub.agatha.labels.LabelManager\nimport com.twitter.hub.agatha.thriftscala.FeatureClass\nimport com.twitter.hub.agatha.thriftscala.FeatureSource\nimport com.twitter.mediascience.scalding.extensions.MediaScienceBatch\nimport com.twitter.scalding._\nimport com.twitter.scalding_internal.dalv2.DAL\nimport com.twitter.scalding_internal.dalv2.DALWrite.D\nimport com.twitter.scalding_internal.dalv2.DALWrite._\nimport com.twitter.scalding_internal.dalv2.remote_access.ExplicitLocation\nimport com.twitter.scalding_internal.dalv2.remote_access.ProcAtla\nimport com.twitter.scalding_internal.job.TwitterExecutionApp\nimport com.twitter.scalding_internal.job.analytics_batch.AnalyticsBatchExecution\n",
+      "source_digest": "ca2e8b1af06798ecc12da26daead285ce9ac999ea68b5e6d1619af09f54c04d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 95,
+      "end_line": 119,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    val activeUserAverages = toUserAverages(userScores)\n      .groupBy { case (userId, _, _) => userId }\n      .join(GetActiveUsers(DateRange(dateRange.start, RichDate.now)).asKeys)\n      .mapValues(_._1)\n      .values\n\n    Execution\n      .zip(\n        userScores.forceToDiskExecution,\n        activeUserAverages.forceToDiskExecution,\n      ).flatMap {\n        case (userScores, activeUserAverages) =>\n          percentileCalibrateUserAverages(\n            toUserAverages(userScores),\n            activeUserAverages,\n            config.labelNames)\n            .flatMap { calibratedUserAverages =>\n              Execution\n                .zip(\n                  config.writeUserBlinkScoreRecords(userScores, dateRange),\n                  config.writeCalibratedUserBlinkScores(calibratedUserAverages, dateRange)\n                ).unit\n            }\n      }\n  }\n",
+      "source_digest": "d5162f8d2ff1345f9023a8047eed267f4bb69497855311e5ec07412e4c3bbee6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      }\n      .group\n      .sum\n      .groupBy { case ((_, label), _) => label }\n      .hashJoin(labelPriors)\n      .mapValues {\n        case (((userId, label), sums), prior) =>\n          toFlattenedBlinkScore(userId, label, sums, prior)\n      }\n      .values\n  }\n\n  def percentileCalibrateUserAverages(\n    userAverages: TypedPipe[(Long, String, Double)],\n    userAveragesForCalibration: TypedPipe[(Long, String, Double)],\n    labelNames: Set[String],\n  )(\n    implicit uniqueId: UniqueID\n  ): Execution[TypedPipe[(Long, String, Double)]] = {\n    val perLabelCalibratedUserAveragesExecs: Seq[Execution[TypedPipe[(Long, String, Double)]]] =\n      labelNames.toSeq\n        .map { labelName =>\n          def filterToLabel(\n            pipe: TypedPipe[(Long, String, Double)],\n            statName: String\n",
+      "source_digest": "be4ad9906d3ddfbbf1c2517f3c717ce1370ef15c079a8b566ca63415d2134cfd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 198,
+      "end_line": 222,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            val stat = Stat(StatKey(statName, f\"Label${labelName}\"))(uniqueId)\n            pipe.collect {\n              case (userId, label, rawScore) if label == labelName => {\n                stat.inc()\n                (userId, rawScore)\n              }\n            }\n          }\n\n          val rawScores = filterToLabel(userAverages, \"Total\")\n          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n",
+      "source_digest": "c64df8e89f7535b8a1f565c12c7c3d2efadc0410eee6fce79af5c22f8cad4c5a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 199,
+      "end_line": 223,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pipe.collect {\n              case (userId, label, rawScore) if label == labelName => {\n                stat.inc()\n                (userId, rawScore)\n              }\n            }\n          }\n\n          val rawScores = filterToLabel(userAverages, \"Total\")\n          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n",
+      "source_digest": "d220c88999dfe92c1ecf92965bf278259327022ac145ece606dedaadb18f2b63",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 201,
+      "end_line": 225,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                stat.inc()\n                (userId, rawScore)\n              }\n            }\n          }\n\n          val rawScores = filterToLabel(userAverages, \"Total\")\n          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n",
+      "source_digest": "0b72603fc23e867b1f07944f8146944f1bfcdf6f30ee340fe21b00a47ecbeba7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 208,
+      "end_line": 232,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "          val rawScoresForCalibration = filterToLabel(userAveragesForCalibration, \"ForCalibration\")\n\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n            .fromPercentileCalibratedScorePipe(calibrationMapping)\n            .toOptionExecution\n            .map(_.get)\n            .map { percentileCalibrationApplicator =>\n              rawScores\n                .map {\n                  case (userId, rawScore) =>\n",
+      "source_digest": "35d0e133fb624a2248a46d5b5451be12e6675e25ed855c5c655ca13d5161778c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 209,
+      "end_line": 233,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n            .fromPercentileCalibratedScorePipe(calibrationMapping)\n            .toOptionExecution\n            .map(_.get)\n            .map { percentileCalibrationApplicator =>\n              rawScores\n                .map {\n                  case (userId, rawScore) =>\n                    val pctScore =\n",
+      "source_digest": "9990a8cc053cfe341f675fecfa07e1271795afb349ee501c84d6d07c97c3042d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "agatha/scalding/blink/BlinkScoreJobTemplate.scala",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 210,
+      "end_line": 234,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "          val distinctPercentileCalibratedScoreStat =\n            Stat(StatKey(\"DistinctPercentileCalibratedScore\", \"Calibration\"))(uniqueId)\n          val calibrationMapping =\n            PercentileCalibrator\n              .calibrateDistinct(\n                rawScores = rawScoresForCalibration.map { case (_, rawScore) => rawScore },\n                numPartitions = 1000,\n                k = 12,\n                partitionedScoresReducersOpt = Some(500)\n              )\n              .map { percentileCalibratedScore =>\n                distinctPercentileCalibratedScoreStat.inc()\n                percentileCalibratedScore\n              }\n\n          PercentileCalibrationApplicator\n            .fromPercentileCalibratedScorePipe(calibrationMapping)\n            .toOptionExecution\n            .map(_.get)\n            .map { percentileCalibrationApplicator =>\n              rawScores\n                .map {\n                  case (userId, rawScore) =>\n                    val pctScore =\n                      percentileCalibrationApplicator.applyCalibration(rawScore)\n",
+      "source_digest": "b967012780497535f51be5364ee4f69d6534b074a0dc38ba7aea477588b4626f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-15ffb38e9491a1fe592dd971027ef4987d28a6719a1ac3791e8e848405326cba",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "74c87e40128191a4ce658c259030fd04360961e8d21f04e41c7818d8fb1b1763",
+      "context_complete": true,
+      "task_id": "T-f56292bfc4369b8b7cdbcd8240495a893b4dcb02123bb393b045f73f3154a0a3",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9d0dbfe1b31430a7e0f45d7255d0d1655838295cfc22546fb1a6242ac3567dd5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-27eabd4f1354d19ebcc8981477551ab91d4b1f8b01d56c1f1825c8a18d012f57",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8b693657a77b118a321c08c0830a6f736d0b45717460ce9b4d13d12750b99b53",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-5d3928d5dc2d25cf30203cdedc4df4b77fc55752fa888266821793cd5d6d034f",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c4b5daf2538a318680e2728684d47712d68ca9cdd0da2078767c20d55ab901f0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f5e75744339d80ce71772a4f871dfcf3400393e015d40c4a5b1a236465b0bfc",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d06416002fdbb35048c36d8415236400f4518bc708b672a03758a28cdcf1a4ae",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-21ce043207b8129f6a188d3a9966e044a4e935826d69e1ed8324d6730f87875e",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-dacc9ced28938b5f46b1d32f5c9f85c8ad74997f2cde96ae4a3db77da01afb2c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-caebb8e0844bf2dfa3549687947e4bd94eac80d1555096a23929cbf7a27023ea",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b695474434e7d6b6ecabea77a1a8c1fd624deb054b060d8bc148739d7f933c93",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-0a7e08fd959dfc25586a8ad5f24f6a10f32997824778bae392f8e7c68789fe44",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-42dcc4180deda05d2581add4bb7cf10b07861a25c83b4c34b2f0e8a7a352be2b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-9294e0e97c619aa9d065be5b9c9ac5a02ac17e8da23749b93457c1df9a0d4324",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ef4e822eaff4bcab5db5e6b10715d3ecde31bc0781b66d4f3a91ad4431cc4e94",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-f29b2e53a799c9d1940842d198e71a79c3eb31d804c6cee06564661c2d328128",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f71d5d4ce8b51c12dc7bea1794b37191c4a6ae635c726029ccdddad4f6f20a32",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-35928ba79ee4d653d71623389c58db79d2f85fa8d7b73d3e91b5b84f42479eee",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b9b1803e742f5c23b6fd3da2dbf94bb9714ea587ef8eb669ab99c997dd57fed7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-76fd86db959ecc730b048ae8c261cd5f8930775c3c90fe68a32640637fa1ad5e",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-945aa89aa913182afa2b0fce5c282363577cb1a3cbde34e1aeed9f965c823448",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-e5e98fb29fd83c4a93759e8048fd20375a4823b81f5bf84fcc7f3226643e0728",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-189a086a472e2fa2b12c20bdcf6b9fb4715f4af326fea438005297f72a0d2df6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-1aecc4d5d2ef876b109f2cd12aed05a1775bece2d57866b856a8dbec9d613fbe",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7a96bc85aa0318f089fae54e87dda7c78d4a1896659ccd4b72cb2807ad559827",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-4b7b2bd264138ebd51743de7bb440db1c5f4997983a9b516e689231ab9014413",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a44d6defaa5f47d54f2d11865d65030399fa8de225a8e5df6404033255a9e95f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-bea8388aecd8818fc5e6b34bf933db9a1c9566fb6a0197c89e8f2af22ffc1d46",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-fec72ed4d9a8f7ac891f33137d8eb63050ad93ed710535de328afe3a72260b2e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-11b7241935b1963a77b237856a5241027d9d205b109c8f29dad73753c8b5d55e",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-297869dda7696ff2f499946deaaa1193f4ced990e87789ebd1bb6549d351673d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-a3a6366e3c721769fe9f50506e046da21701e0ae924c33cca8cc15dbcdb682b6",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4b48b307ed79cb6e5dc61923bbc83629c692aa437c5dac2da0529a3374b0db09",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-b64e342cfcb9467e8679d17e52f3390b003f139ffe3b2b17c10ae8443bd9520d",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c98ea3c02e068e1b506df78283f10e30a5229410222e8e6fedbdd8e8cecb7500",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-37e90ec42a47112dd36f8999dbf8541f9aa212bd45d919455e4ae5dc6492131f",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9140f1be45d42459a8eca57d0ab4b8d26255c7f0932d11ada00f62305a4a397b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-db212510a7401e1d07658527fd51da529071a0e192a329efba6c10125b2eefd1",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e37f27e49e2d2424a183d33e9d00f94546139e3a8f666e8b4d39a8b7912e3608",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-ca6c8fd875d09a320bcbc1711172c324c14d709fa7b8296a7e8c66c104549021",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-0ffece20c6ca800cd7c6e382a554ba70faec6e2e80ec773fd934423bafdb0211",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f6e25ec7918fe4421f03cb92a18cb2330d9ab67be71fc170b641c1a985653f6",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-0747a9cc8d1fafe544864246ac922d1d6b39c8cf2c1aed714f62a647b889cd98",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-02452218866e861c5b7ae22795cdad32196078064535aab79d5a1982ed867cdc",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-fe1249c8194130f13aff642837de5948397c9d578ff3a99e4c9e31ff6abc6fcb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-8c19d2745c1716084a744a7aa71ad8e1d8cbb93ee6ea1b1307a9320b56d66e47",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-01178d5e7a66d452b8089872a1653bb0d43f2347c9b906aa8771a114de68c2e0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-ef8412282fc09ff7dd05c605c227e0f8f9c210a0c35ec51c478aeb967fa9e5ab",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ae6f8a9c40901be4e36b1920a78560e13d6a3cc8405af68a4aed592d9648a6bc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-a7ca0964e6288252e038b8b87d3245fa8e85f94f9bcc2321ceed1b6cd0ddf2b8",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c2822080cd1a909e21adf7f4293744ac6ddc9206a2704917063f649c2e0cb483",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-be69fccb5135aefee6a2762401de4c9cdad34db39a6a684b606d539f712d7a6f",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ed13ab405a96110d069952980f59d671ac0b02470a4376d2f120a2c04d55afee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-8fc084fb28a39e7c193dfe3ffa68de664a5ccb386e0135efca08ae23ef5e7209",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b118a0c74d1d5788706d30d59de5149bed9e16b8ab5bc3bbc5ec2760c16c83fa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-b399a7bc25a13e21503cbb906916f4618ea72b667567ccae55fcb2c81e77f53d",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-bb687c26aab0229d2fd3502dead11304af2c5c99afe3ed9ee974a39217d41548",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-584215c41570de9482eb874c15e0f3003a108c0ee4e1fad3196c460ae797c5f1",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-274b46bb07fd9072303b3b63383468f5646eaa3456520aa07159a72db91e39a3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-938ae62a9dd3f0288470fb3f473c2545151860cd409457ea24f1f6983b2c4539",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7aa4d32803a3113c09ffb1e5fe5352063ab62114051176c20d1dfa1633c45fd8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-a36f9dc315f5a849aa52f98db65a27c67310546f3ba65f1f113ead32274f6649",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ff0a45cc5c5c267391575dc6af66051ebac6123c51a842a9df628a83df1ab5e1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-3ecfc777508abf4972e3c0995b141d5e4901b52c9fa8326b45819dc9c146c3dd",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-39fa71b2376b12affbae6cab6ffd8b55c5476052066f34d8436f6687b5a3973e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-0fcb683a10b7bf5670735d987885e439a46fbf815b25c4722678a2066da4e728",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f07f188d446b141680e8eeb8cd74c46ecb3cfb3f3515754e215059e5afe74902",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-854026ece7e9a6e1af163e9be18890f3da0c846c822d7fca8449ae1dda66541e",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a17626145cc86a499d4f5c8dfb888bcfa31134b83f06daa048a7edd39ff1e50d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-c492f72cdd13d5f0d616ae765acb9f9ed5f003e77944eadc0553a7cccd8dddd1",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-34738995868ca33734055a89ce7a3425b2b07e28e1e759782e2dfddb6e04d96c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-e81f2765e84c83dcee813177750593aec79cead78de91f138a36dc58aab192fd",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e8a3942d15a396819aaccb6b5d255dcb3486ca29ede2c4945d80b197a55255ed",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-eb41528c27835370e4de88b3f34a502d7ecbbfa7c7920ee6cda30bce4159eba9",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-1d3c63229712554af322b08983b39e371fc469e73efab55498d5de3f501d834a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-8f3c657bf5011ba10acd90f9d169d0a3d9cc6edbba596a1f52a925fb49916597",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-236287ee018b0ce9aaf671cc0710c7485a9cc11dda4d1e7dec2f73249e7d559a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-318aa2d9dc798a922ea91c46ddee21b4b7f7fb755d4fa684ccfaa2997eb3f60f",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b6e60a3a6f892b8b424d4dea1510c776228096eddf3eb8f02baa3d95e73a303c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-aab3e9f2396c657f56c43f6ecb4e1bce953bee88fe859ca2fcadc99887d67961",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-db5aad7a2360f2309086353722131b1a0d3c9da970ef05b993cefb3f109a82e7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-d198695da19aa9aa07f1c1f95d802fbc980ee8bd63789c416cbde430f5851078",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-dad863354c0f7fefc81fe25dc207bb10a8ff7664f71e644234dacb4479c46dcd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-b5a3ecdad927a4c1ef6357956c79eab08de80d616eca1690f9e2886cf74ab31f",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e98ada3d36666d35c885488b77658834b997c620c3e08f62f16892a914b9e803",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-2ad21d19a732b681606a80dbc8fa32d8f2346ae411dd6fd8cc29c7793e1eda55",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ae83a2fa449ce3e1dbf9a7dfe5489bc82388fd49bc784c4642ac6a2026870190",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "qk_norm_rope_backward_supported",
+        "_shape_fits_kernel",
+        "_num_threads",
+        "qk_norm_rope_backward",
+        "_compiled_kernel",
+        "tile",
+        "make_fragment",
+        "load_tile"
+      ],
+      "context_complete": false,
+      "task_id": "T-8cda75ce2d906a05a542d40cc4e8e8d3dda8340a63adf15a3e5185bda7f269a1",
+      "evidence_refs": [
+        "E45"
+      ]
+    }
+  ],
+  "task_id": "T-43293ade0a0c8ccc7656b2aa209746145f3628884a76556a516da35233536b25"
+}

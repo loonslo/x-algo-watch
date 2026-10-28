@@ -1,0 +1,1563 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/server.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-2642ceb032b58f5490939194aeb1b8b8f1705ef04a1d7b323dbbc1cc7ef9c8f2",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/server.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 397,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::dark_traffic_setup;\nuse crate::evaluate_tweets::EvaluateTweetsEndpoint;\nuse crate::filter_tweets::FilterTweetsEndpoint;\nuse crate::get_safety_labels::{GetSafetyLabelsCodec, GetSafetyLabelsEndpoint};\nuse crate::server_deps::{self, Comparators};\nuse std::convert::Infallible;\nuse std::sync::Arc;\nuse std::task::{Context, Poll};\nuse tonic::body::Body;\nuse tonic::codec::CompressionEncoding;\nuse tonic::codegen::{http, BoxFuture, Service};\nuse tonic::server::{Grpc, NamedService};\nuse tonic::{Request, Response, Status};\nuse xai_dark_traffic::RejectDarkTrafficLayer;\nuse xai_grpc_compression::GrpcZstdLayer;\nuse xai_visibility_filtering_proto as vf_pb;\nuse xai_x_rpc::grpc_client::TlsMode;\nuse xai_x_service_builder::{XService, XServiceBuilder};\n\n#[derive(clap::Args, Debug)]\npub struct ServeArgs {\n    #[arg(long, default_value_t = 50051u16)]\n    grpc_port: u16,\n    #[arg(long, default_value_t = 9090u16)]\n    metrics_port: u16,\n    #[arg(long, default_value = \"atla\")]\n    datacenter: String,\n    #[arg(long, default_value = \"\")]\n    otel_endpoint: String,\n}\n\npub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::Result<()> {\n    XServiceBuilder::new(\"visibility-filtering-service\")\n        .grpc_port(args.grpc_port)\n        .metrics_port(args.metrics_port)\n        .datacenter(args.datacenter)\n        .otel_endpoint(args.otel_endpoint)\n        .with_tls(TlsMode::server_mtls_from_env()?)\n        .with_reflection(vf_pb::FILE_DESCRIPTOR_SET)\n        .with_layer(dark_traffic_setup::resolve_layer())\n        .with_layer(RejectDarkTrafficLayer::from_env())\n        .with_layer(GrpcZstdLayer)\n        .http_routes(xai_profiling::profiling_router())\n        .run::<S>(config)\n        .await\n}\n\npub struct VFServer {\n    evaluate_tweets: EvaluateTweetsEndpoint,\n    filter_tweets: FilterTweetsEndpoint,\n    get_safety_labels: GetSafetyLabelsEndpoint,\n}\n\n#[tonic::async_trait]\nimpl XService for VFServer {\n    type Config = ();\n\n    async fn build(ctx: xai_x_service_builder::ServiceContext<()>) -> Self {\n        VFServer::new(&ctx.datacenter).await\n    }\n\n    fn register(self: Arc<Self>, routes: &mut tonic::service::RoutesBuilder) {\n        routes.add_service(VFRouter {\n            generated_server: ACCEPTED_ENCODINGS.into_iter().fold(\n                vf_pb::VisibilityFilteringServiceServer::from_arc(Arc::clone(&self)),\n                |server, encoding| server.accept_compressed(encoding),\n            ),\n            vf_server: self,\n        });\n    }\n}\n\nconst ACCEPTED_ENCODINGS: [CompressionEncoding; 2] =\n    [CompressionEncoding::Zstd, CompressionEncoding::Gzip];\n\nconst GET_SAFETY_LABELS_PATH: &str =\n    \"/xai.visibility_filtering.v1.VisibilityFilteringService/GetSafetyLabels\";\n\n#[derive(Clone)]\nstruct VFRouter {\n    generated_server: vf_pb::VisibilityFilteringServiceServer<VFServer>,\n    vf_server: Arc<VFServer>,\n}\n\nimpl NamedService for VFRouter {\n    const NAME: &'static str = vf_pb::visibility_filtering_service_server::SERVICE_NAME;\n}\n\nimpl Service<http::Request<Body>> for VFRouter {\n    type Response = http::Response<Body>;\n    type Error = Infallible;\n    type Future = BoxFuture<Self::Response, Self::Error>;\n\n    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {\n        Poll::Ready(Ok(()))\n    }\n\n    fn call(&mut self, request: http::Request<Body>) -> Self::Future {\n        if request.uri().path() != GET_SAFETY_LABELS_PATH {\n            return self.generated_server.call(request);\n        }\n        let vf_server = Arc::clone(&self.vf_server);\n        Box::pin(async move {\n            let method = tower::service_fn(move |request| {\n                let vf_server = Arc::clone(&vf_server);\n                async move { vf_server.get_safety_labels.handle(request).await }\n            });\n            let mut grpc = ACCEPTED_ENCODINGS\n                .into_iter()\n                .fold(Grpc::new(GetSafetyLabelsCodec), |grpc, encoding| {\n                    grpc.accept_compressed(encoding)\n                });\n            Ok(grpc.unary(method, request).await)\n        })\n    }\n}\n\nimpl VFServer {\n    pub(crate) async fn new(datacenter: &str) -> Self {\n        crate::config::refuse_reference();\n        server_deps::build(datacenter, None)\n            .await\n            .into_server(Comparators::default())\n    }\n\n    pub(crate) fn from_endpoints(\n        evaluate_tweets: EvaluateTweetsEndpoint,\n        filter_tweets: FilterTweetsEndpoint,\n        get_safety_labels: GetSafetyLabelsEndpoint,\n    ) -> Self {\n        Self {\n            evaluate_tweets,\n            filter_tweets,\n            get_safety_labels,\n        }\n    }\n}\n\n#[tonic::async_trait]\nimpl vf_pb::VisibilityFilteringService for VFServer {\n    async fn evaluate_tweets(\n        &self,\n        request: Request<vf_pb::EvaluateTweetsRequest>,\n    ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {\n        self.evaluate_tweets.handle(request).await\n    }\n\n    async fn filter_tweets(\n        &self,\n        request: Request<vf_pb::VisibilityFilterRequest>,\n    ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {\n        self.filter_tweets.handle(request).await\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::hydration::sources::InMemorySources;\n    use crate::params::limited_actions_copy::LimitedActionsCopy;\n    use crate::params::ClientSwitches;\n    use crate::post_evaluator::PostEvaluator;\n    use crate::rules::RuleEngine;\n    use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};\n    use crate::safety_label_source::types::FailureKind;\n    use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};\n    use crate::safety_label_source::LookupError;\n    use crate::safety_label_source::SafetyLabelSource;\n    use rustc_hash::FxHashMap;\n    use std::collections::HashMap;\n    use xai_visibility_filtering::vf_client::XaiVfClient;\n    use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;\n    use xai_x_thrift::safety_result::FilteredReason;\n    use xai_x_thrift::tweet_service::{\n        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,\n        TweetFieldsResultState,\n    };\n\n    struct NoLabels;\n\n    #[tonic::async_trait]\n    impl TwemcacheLookup for NoLabels {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {\n            ids.iter().map(|&id| (id, TwemcacheOutcome::Miss)).collect()\n        }\n    }\n\n    #[tonic::async_trait]\n    impl ManhattanLookup for NoLabels {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {\n            ids.iter()\n                .map(|&id| (id, ManhattanOutcome::Resolved(Default::default())))\n                .collect()\n        }\n    }\n\n    struct LabelsForPostOne;\n\n    #[tonic::async_trait]\n    impl ManhattanLookup for LabelsForPostOne {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {\n            ids.iter()\n                .map(|&id| {\n                    let outcome = if id == 1 {\n                        ManhattanOutcome::Resolved(post_one_labels())\n                    } else {\n                        ManhattanOutcome::Failure(LookupError::new(\n                            FailureKind::ManhattanFetch,\n                            \"down\",\n                        ))\n                    };\n                    (id, outcome)\n                })\n                .collect()\n        }\n    }\n\n    fn post_one_labels() -> vf_pb::SafetyLabelMap {\n        vf_pb::SafetyLabelMap {\n            labels: HashMap::from([(\n                3,\n                vf_pb::SafetyLabel {\n                    score: Some(0.5),\n                    source: Some(\"botmaker\".to_owned()),\n                    ..Default::default()\n                },\n            )]),\n        }\n    }\n\n    fn server(sources: InMemorySources) -> VFServer {\n        let post_evaluator = Arc::new(PostEvaluator::new(\n            Arc::new(sources),\n            RuleEngine::for_tests(),\n            Arc::default(),\n        ));\n        let labels = Arc::new(NoLabels);\n        VFServer::from_endpoints(\n            EvaluateTweetsEndpoint::new(\n                Arc::clone(&post_evaluator),\n                ClientSwitches::for_tests(),\n                LimitedActionsCopy::from_json(\"[]\"),\n                None,\n            ),\n            FilterTweetsEndpoint::new(post_evaluator, ClientSwitches::for_tests(), None),\n            GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(\n                Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),\n                Some(1024),\n            ))),\n        )\n    }\n\n    async fn serve(server: VFServer) -> (tonic::transport::Channel, tokio::task::JoinHandle<()>) {\n        let mut routes = tonic::service::RoutesBuilder::default();\n        Arc::new(server).register(&mut routes);\n        let listener = tokio::net::TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let address = listener.local_addr().unwrap();\n        let handle = tokio::spawn(async move {\n            tonic::transport::Server::builder()\n                .add_routes(routes.routes())\n                .serve_with_incoming(futures::stream::unfold(listener, |listener| async {\n                    Some((listener.accept().await.map(|(socket, _)| socket), listener))\n                }))\n                .await\n                .unwrap();\n        });\n        let channel = tonic::transport::Endpoint::from_shared(format!(\"http://{address}\"))\n            .unwrap()\n            .connect()\n            .await\n            .unwrap();\n        (channel, handle)\n    }\n\n    #[tokio::test]\n    async fn evaluate_tweets_loopback_overrides_only_a_tweetypie_found() {\n        let (channel, handle) = serve(server(\n            InMemorySources::default().tweet(1, 100).authors(&[100]),\n        ))\n        .await;\n        let client = XaiVfClient::from_channel(channel);\n        let tweet = |tweet_id, outer_tweet_id: Option<u64>| vf_pb::TweetData {\n            tweet_id,\n            quote_context: outer_tweet_id\n                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),\n        };\n        let found = || TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));\n        let protected = || {\n            TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(\n                FilteredReason::AuthorIsProtected(true),\n            ))\n        };\n        let deleted =\n            || TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));\n        let cases = [\n            (tweet(1, None), found(), Some(found())),\n            (tweet(1, None), protected(), Some(protected())),\n            (tweet(1, Some(2)), found(), None),\n            (tweet(2, None), found(), None),\n            (tweet(2, None), deleted(), Some(deleted())),\n        ];\n        let home = client\n            .evaluate_tweets(\n                vf_pb::EvaluateTweetsRequest {\n                    safety_level: 8,\n                    tweets: cases.iter().map(|(tweet, ..)| *tweet).collect(),\n                    ..Default::default()\n                },\n                &Default::default(),\n            )\n            .await;\n        handle.abort();\n        assert!(handle.await.unwrap_err().is_cancelled());\n\n        let served: Vec<_> = home\n            .unwrap()\n            .into_iter()\n            .zip(&cases)\n            .map(|(vf, (_, fetched, _))| vf.into_result_state(fetched.clone()))\n            .collect();\n        let expected: Vec<_> = cases.into_iter().map(|(.., expected)| expected).collect();\n        assert_eq!(served, expected);\n    }\n\n    #[tokio::test]\n    async fn get_safety_labels_loopback() {\n        let (channel, handle) = serve(VFServer {\n            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(\n                Arc::new(RemoteSource::new(\n                    Arc::new(NoLabels),\n                    Arc::new(LabelsForPostOne),\n                )),\n                Some(1024),\n            ))),\n            ..server(InMemorySources::default())\n        })\n        .await;\n        let mut client = VisibilityFilteringServiceClient::new(channel)\n            .send_compressed(CompressionEncoding::Zstd);\n        let response = client\n            .get_safety_labels(vf_pb::GetSafetyLabelsRequest {\n                tweet_ids: vec![1, 2, 1],\n            })\n            .await;\n        handle.abort();\n        assert!(handle.await.unwrap_err().is_cancelled());\n\n        let response = response.unwrap().into_inner();\n        assert_eq!(response.results, HashMap::from([(1, post_one_labels())]));\n        assert_eq!(response.failed_ids, vec![2]);\n    }\n\n    #[tokio::test]\n    async fn filter_tweets_loopback() {\n        let (channel, handle) = serve(server(\n            InMemorySources::default().tweet(2, 20).authors(&[20]),\n        ))\n        .await;\n        let mut client = VisibilityFilteringServiceClient::new(channel)\n            .send_compressed(CompressionEncoding::Gzip)\n            .accept_compressed(CompressionEncoding::Gzip);\n        let tweet = |tweet_id, author_id| vf_pb::TweetInput {\n            tweet_id,\n            author_id,\n        };\n        let response = client\n            .filter_tweets(vf_pb::VisibilityFilterRequest {\n                safety_level: vf_pb::SafetyLevel::TimelineHome.into(),\n                tweets: vec![tweet(2, Some(20)), tweet(1, None), tweet(2, Some(20))],\n                viewer_id: None,\n                country_code: None,\n            })\n            .await;\n        handle.abort();\n        assert!(handle.await.unwrap_err().is_cancelled());\n\n        let results = response.unwrap().into_inner().results;\n        let wire = |result: &vf_pb::TweetVisibilityResult| {\n            (\n                result.tweet_id,\n                result.action.and_then(|a| a.kind),\n                result.filtered_reason.clone().and_then(|r| r.reason),\n            )\n        };\n        let allow = vf_pb::action::Kind::Allow(true);\n        let drop = vf_pb::action::Kind::Drop(vf_pb::DropReason {});\n        let unspecified = vf_pb::filtered_reason::Reason::UnspecifiedReason(true);\n        assert_eq!(\n            results.iter().map(wire).collect::<Vec<_>>(),\n            vec![\n                (2, Some(allow), None),\n                (1, Some(drop), Some(unspecified)),\n                (2, Some(allow), None),\n            ]\n        );\n    }\n}\n",
+      "source_digest": "8b527439f639c75a0d4059ccf240852eaf1ad1ceaec8cafb90c1ddbd45debee1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/server.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 381,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::dark_traffic_setup;\nuse crate::evaluate_tweets::EvaluateTweetsEndpoint;\nuse crate::filter_notifications::FilterNotificationsEndpoint;\nuse crate::filter_tweets::FilterTweetsEndpoint;\nuse crate::get_safety_labels::{GetSafetyLabelsCodec, GetSafetyLabelsEndpoint};\nuse crate::server_deps::{self, Comparators};\nuse std::convert::Infallible;\nuse std::sync::Arc;\nuse std::task::{Context, Poll};\nuse tonic::body::Body;\nuse tonic::codec::CompressionEncoding;\nuse tonic::codegen::{http, BoxFuture, Service};\nuse tonic::server::{Grpc, NamedService};\nuse tonic::{Request, Response, Status};\nuse xai_dark_traffic::RejectDarkTrafficLayer;\nuse xai_grpc_compression::GrpcZstdLayer;\nuse xai_visibility_filtering_proto as vf_pb;\nuse xai_x_rpc::grpc_client::TlsMode;\nuse xai_x_service_builder::{XService, XServiceBuilder};\n\n#[derive(clap::Args, Debug)]\npub struct ServeArgs {\n    #[arg(long, default_value_t = 50051u16)]\n    grpc_port: u16,\n    #[arg(long, default_value_t = 9090u16)]\n    metrics_port: u16,\n    #[arg(long, default_value = \"atla\")]\n    datacenter: String,\n    #[arg(long, default_value = \"\")]\n    otel_endpoint: String,\n}\n\npub async fn serve<S: XService>(args: ServeArgs, config: S::Config) -> anyhow::Result<()> {\n    XServiceBuilder::new(\"visibility-filtering-service\")\n        .grpc_port(args.grpc_port)\n        .metrics_port(args.metrics_port)\n        .datacenter(args.datacenter)\n        .otel_endpoint(args.otel_endpoint)\n        .with_tls(TlsMode::server_mtls_from_env()?)\n        .with_reflection(vf_pb::FILE_DESCRIPTOR_SET)\n        .with_layer(dark_traffic_setup::resolve_layer())\n        .with_layer(RejectDarkTrafficLayer::from_env())\n        .with_layer(GrpcZstdLayer)\n        .http_routes(xai_profiling::profiling_router())\n        .run::<S>(config)\n        .await\n}\n\npub struct VFServer {\n    pub(crate) evaluate_tweets: EvaluateTweetsEndpoint,\n    pub(crate) filter_notifications: FilterNotificationsEndpoint,\n    pub(crate) filter_tweets: FilterTweetsEndpoint,\n    pub(crate) get_safety_labels: GetSafetyLabelsEndpoint,\n}\n\n#[tonic::async_trait]\nimpl XService for VFServer {\n    type Config = ();\n\n    async fn build(ctx: xai_x_service_builder::ServiceContext<()>) -> Self {\n        VFServer::new(&ctx.datacenter).await\n    }\n\n    fn register(self: Arc<Self>, routes: &mut tonic::service::RoutesBuilder) {\n        routes.add_service(VFRouter {\n            generated_server: ACCEPTED_ENCODINGS.into_iter().fold(\n                vf_pb::VisibilityFilteringServiceServer::from_arc(Arc::clone(&self)),\n                |server, encoding| server.accept_compressed(encoding),\n            ),\n            vf_server: self,\n        });\n    }\n}\n\nconst ACCEPTED_ENCODINGS: [CompressionEncoding; 2] =\n    [CompressionEncoding::Zstd, CompressionEncoding::Gzip];\n\nconst GET_SAFETY_LABELS_PATH: &str =\n    \"/xai.visibility_filtering.v1.VisibilityFilteringService/GetSafetyLabels\";\n\n#[derive(Clone)]\nstruct VFRouter {\n    generated_server: vf_pb::VisibilityFilteringServiceServer<VFServer>,\n    vf_server: Arc<VFServer>,\n}\n\nimpl NamedService for VFRouter {\n    const NAME: &'static str = vf_pb::visibility_filtering_service_server::SERVICE_NAME;\n}\n\nimpl Service<http::Request<Body>> for VFRouter {\n    type Response = http::Response<Body>;\n    type Error = Infallible;\n    type Future = BoxFuture<Self::Response, Self::Error>;\n\n    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {\n        Poll::Ready(Ok(()))\n    }\n\n    fn call(&mut self, request: http::Request<Body>) -> Self::Future {\n        if request.uri().path() != GET_SAFETY_LABELS_PATH {\n            return self.generated_server.call(request);\n        }\n        let vf_server = Arc::clone(&self.vf_server);\n        Box::pin(async move {\n            let method = tower::service_fn(move |request| {\n                let vf_server = Arc::clone(&vf_server);\n                async move { vf_server.get_safety_labels.handle(request).await }\n            });\n            let mut grpc = ACCEPTED_ENCODINGS\n                .into_iter()\n                .fold(Grpc::new(GetSafetyLabelsCodec), |grpc, encoding| {\n                    grpc.accept_compressed(encoding)\n                });\n            Ok(grpc.unary(method, request).await)\n        })\n    }\n}\n\nimpl VFServer {\n    pub(crate) async fn new(datacenter: &str) -> Self {\n        crate::config::refuse_reference();\n        server_deps::build(datacenter, None)\n            .await\n            .into_server(Comparators::default())\n    }\n}\n\n#[tonic::async_trait]\nimpl vf_pb::VisibilityFilteringService for VFServer {\n    async fn evaluate_tweets(\n        &self,\n        request: Request<vf_pb::EvaluateTweetsRequest>,\n    ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {\n        self.evaluate_tweets.handle(request).await\n    }\n\n    async fn filter_notifications(\n        &self,\n        request: Request<vf_pb::FilterNotificationsRequest>,\n    ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {\n        self.filter_notifications.handle(request).await\n    }\n\n    async fn filter_tweets(\n        &self,\n        request: Request<vf_pb::VisibilityFilterRequest>,\n    ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {\n        self.filter_tweets.handle(request).await\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::hydration::sources::InMemorySources;\n    use crate::params::ClientSwitches;\n    use crate::safety_label_source::lookup::{\n        LookupResults, ManhattanLookup, RemoteSource, TwemcacheLookup,\n    };\n    use crate::safety_label_source::types::FailureKind;\n    use crate::safety_label_source::types::TwemcacheOutcome;\n    use crate::safety_label_source::LookupError;\n    use crate::safety_label_source::SafetyLabelSource;\n    use crate::scenario::{tweet_data, Wire};\n    use rustc_hash::FxHashMap;\n    use std::collections::HashMap;\n    use xai_visibility_filtering::vf_client::XaiVfClient;\n    use xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;\n    use xai_x_thrift::safety_result::FilteredReason;\n    use xai_x_thrift::tweet_service::{\n        TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultNotFound,\n        TweetFieldsResultState,\n    };\n\n    struct NoLabels;\n\n    #[tonic::async_trait]\n    impl TwemcacheLookup for NoLabels {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {\n            ids.iter().map(|&id| (id, TwemcacheOutcome::Miss)).collect()\n        }\n    }\n\n    #[tonic::async_trait]\n    impl ManhattanLookup for NoLabels {\n        async fn get(&self, ids: &[u64]) -> LookupResults {\n            ids.iter().map(|&id| (id, Ok(Default::default()))).collect()\n        }\n    }\n\n    struct LabelsForPostOne;\n\n    #[tonic::async_trait]\n    impl ManhattanLookup for LabelsForPostOne {\n        async fn get(&self, ids: &[u64]) -> LookupResults {\n            ids.iter()\n                .map(|&id| {\n                    let result = if id == 1 {\n                        Ok(post_one_labels())\n                    } else {\n                        Err(LookupError::new(FailureKind::ManhattanFetch, \"down\"))\n                    };\n                    (id, result)\n                })\n                .collect()\n        }\n    }\n\n    fn post_one_labels() -> vf_pb::SafetyLabelMap {\n        vf_pb::SafetyLabelMap {\n            labels: HashMap::from([(\n                3,\n                vf_pb::SafetyLabel {\n                    score: Some(0.5),\n                    source: Some(\"botmaker\".to_owned()),\n                    ..Default::default()\n                },\n            )]),\n        }\n    }\n\n    fn server(sources: InMemorySources) -> VFServer {\n        let wire = Wire::new(Arc::new(sources));\n        let post_evaluator = Arc::clone(wire.post_evaluator());\n        let labels = Arc::new(NoLabels);\n        VFServer {\n            evaluate_tweets: wire.into_endpoint(),\n            filter_notifications: FilterNotificationsEndpoint::new(Arc::clone(&post_evaluator)),\n            filter_tweets: FilterTweetsEndpoint::new(\n                post_evaluator,\n                ClientSwitches::for_tests(),\n                None,\n            ),\n            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(\n                Arc::new(RemoteSource::new(Arc::clone(&labels), labels)),\n                Some(1024),\n            ))),\n        }\n    }\n\n    async fn serve(server: VFServer) -> (tonic::transport::Channel, tokio::task::JoinHandle<()>) {\n        let mut routes = tonic::service::RoutesBuilder::default();\n        Arc::new(server).register(&mut routes);\n        let listener = tokio::net::TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let address = listener.local_addr().unwrap();\n        let handle = tokio::spawn(async move {\n            tonic::transport::Server::builder()\n                .add_routes(routes.routes())\n                .serve_with_incoming(futures::stream::unfold(listener, |listener| async {\n                    Some((listener.accept().await.map(|(socket, _)| socket), listener))\n                }))\n                .await\n                .unwrap();\n        });\n        let channel = tonic::transport::Endpoint::from_shared(format!(\"http://{address}\"))\n            .unwrap()\n            .connect()\n            .await\n            .unwrap();\n        (channel, handle)\n    }\n\n    #[tokio::test]\n    async fn evaluate_tweets_loopback_overrides_only_a_tweetypie_found() {\n        let (channel, handle) = serve(server(\n            InMemorySources::default().tweet(1, 100).authors(&[100]),\n        ))\n        .await;\n        let client = XaiVfClient::from_channel(channel);\n        let found = || TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));\n        let protected = || {\n            TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(\n                FilteredReason::AuthorIsProtected(true),\n            ))\n        };\n        let deleted =\n            || TweetFieldsResultState::NotFound(TweetFieldsResultNotFound::new(true, true, None));\n        let cases = [\n            (tweet_data(1, None), found(), Some(found())),\n            (tweet_data(1, None), protected(), Some(protected())),\n            (tweet_data(1, Some(2)), found(), None),\n            (tweet_data(2, None), found(), None),\n            (tweet_data(2, None), deleted(), Some(deleted())),\n        ];\n        let home = client\n            .evaluate_tweets(\n                vf_pb::EvaluateTweetsRequest {\n                    safety_level: 8,\n                    tweets: cases.iter().map(|(tweet, ..)| *tweet).collect(),\n                    ..Default::default()\n                },\n                &Default::default(),\n            )\n            .await;\n        handle.abort();\n        assert!(handle.await.unwrap_err().is_cancelled());\n\n        let served: Vec<_> = home\n            .unwrap()\n            .into_iter()\n            .zip(&cases)\n            .map(|(vf, (_, fetched, _))| vf.into_result_state(fetched.clone()))\n            .collect();\n        let expected: Vec<_> = cases.into_iter().map(|(.., expected)| expected).collect();\n        assert_eq!(served, expected);\n    }\n\n    #[tokio::test]\n    async fn get_safety_labels_loopback() {\n        let (channel, handle) = serve(VFServer {\n            get_safety_labels: GetSafetyLabelsEndpoint::new(Arc::new(SafetyLabelSource::new(\n                Arc::new(RemoteSource::new(\n                    Arc::new(NoLabels),\n                    Arc::new(LabelsForPostOne),\n                )),\n                Some(1024),\n            ))),\n            ..server(InMemorySources::default())\n        })\n        .await;\n        let mut client = VisibilityFilteringServiceClient::new(channel)\n            .send_compressed(CompressionEncoding::Zstd);\n        let response = client\n            .get_safety_labels(vf_pb::GetSafetyLabelsRequest {\n                tweet_ids: vec![1, 2, 1],\n            })\n            .await;\n        handle.abort();\n        assert!(handle.await.unwrap_err().is_cancelled());\n\n        let response = response.unwrap().into_inner();\n        assert_eq!(response.results, HashMap::from([(1, post_one_labels())]));\n        assert_eq!(response.failed_ids, vec![2]);\n    }\n\n    #[tokio::test]\n    async fn filter_tweets_loopback() {\n        let (channel, handle) = serve(server(\n            InMemorySources::default().tweet(2, 20).authors(&[20]),\n        ))\n        .await;\n        let mut client = VisibilityFilteringServiceClient::new(channel)\n            .send_compressed(CompressionEncoding::Gzip)\n            .accept_compressed(CompressionEncoding::Gzip);\n        let tweet = |tweet_id, author_id| vf_pb::TweetInput {\n            tweet_id,\n            author_id,\n        };\n        let response = client\n            .filter_tweets(vf_pb::VisibilityFilterRequest {\n                safety_level: vf_pb::SafetyLevel::TimelineHome.into(),\n                tweets: vec![tweet(2, Some(20)), tweet(1, None), tweet(2, Some(20))],\n                viewer_id: None,\n                country_code: None,\n            })\n            .await;\n        handle.abort();\n        assert!(handle.await.unwrap_err().is_cancelled());\n\n        let results = response.unwrap().into_inner().results;\n        let wire = |result: &vf_pb::TweetVisibilityResult| {\n            (\n                result.tweet_id,\n                result.action.and_then(|a| a.kind),\n                result.filtered_reason.clone().and_then(|r| r.reason),\n            )\n        };\n        let allow = vf_pb::action::Kind::Allow(true);\n        let drop = vf_pb::action::Kind::Drop(vf_pb::DropReason {});\n        let unspecified = vf_pb::filtered_reason::Reason::UnspecifiedReason(true);\n        assert_eq!(\n            results.iter().map(wire).collect::<Vec<_>>(),\n            vec![\n                (2, Some(allow), None),\n                (1, Some(drop), Some(unspecified)),\n                (2, Some(allow), None),\n            ]\n        );\n    }\n}\n",
+      "source_digest": "73768689cd9c2c28d33529c93de49e736bb5f382af2d246c6435078bed86965d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[global_allocator]\nstatic GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;\n\nuse std::{path::PathBuf, time::Duration};\n\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n",
+      "source_digest": "6ed1d822fc9a316683d817d362ebe05e1b3427ef2c4c83d87fb063ece2d6be18",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 61,
+      "end_line": 85,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n",
+      "source_digest": "acde26443fa3453ea8fda52d2defcf2aa4b350f988f5d32bd00a3deb37cef732",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 81,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "6d9bfc55034970054b53bbd9e3f28b458fe77b84a5fdfd213e49faec070b7e10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 83,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "080e0ab2ed2ac8899ae5ac3976b27d41512bbe0f1720cc37e076dfb60108ce83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 84,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "338f9def77d3112eacf00d1068db842fec4b853591924ffcce5163f2ead8dcd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 87,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "0a52c90688b3f6e6e5a604f8e6f75ff4ef83061307008bec21e4d66253e7fbf9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 234,
+      "end_line": 258,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n",
+      "source_digest": "0c8b8e899736f78334eca4c1bbc2cefb83e8dba5560a6401e0b9174db9b2f9ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 239,
+      "end_line": 263,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n",
+      "source_digest": "3b66c2eb9d34025ee21d73c23734bfa58ae0c5351ce0724f7fded35be761ac2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 241,
+      "end_line": 265,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n",
+      "source_digest": "3b459aead22e76de83f09adc1f40d8923c400fbb73e20f139c3ebaed896c7c74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 249,
+      "end_line": 273,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n",
+      "source_digest": "76e68c7dd92cb925c03bff5084565e8c3996c0632a0efefd992d15aca69ad512",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 254,
+      "end_line": 278,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n",
+      "source_digest": "2ef43c2b2422d591adc1a5a26208dd2c4fd94f64917dc5fc488c0784ead24cdb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 260,
+      "end_line": 284,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n",
+      "source_digest": "45fa552996f5fb3a28052b8383ec9d4651425ec81f83214072c321e5a06d8942",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 308,
+      "end_line": 332,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n",
+      "source_digest": "028df223a225c87816005e22b8068f867d315e188915e5b7e3455e92da278c16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 363,
+      "end_line": 387,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n",
+      "source_digest": "da98d3da877c54d27d3233597981864602a1ab0f9a4a2c9d508c5583453b09ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 366,
+      "end_line": 390,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n",
+      "source_digest": "097d415899e9d2ab709782b1e8c6b09b4ec2264e0491bf31349b7b6685b0fdfe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 523,
+      "end_line": 547,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n        if let Some((k, r)) = self.records.get_key_value(lkey) {\n            return Some(Hit::Record(k, r));\n        }\n        self.unreadable.get(lkey).map(|_| Hit::Unreadable)\n    }\n\n                    fn levels(\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Vec<Vec<Vec<String>>> {\n",
+      "source_digest": "569e4f07a7e8e039b637827ee0b877caa1ccdf25b7b9e9b391b35d561052a928",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 526,
+      "end_line": 550,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n        if let Some((k, r)) = self.records.get_key_value(lkey) {\n            return Some(Hit::Record(k, r));\n        }\n        self.unreadable.get(lkey).map(|_| Hit::Unreadable)\n    }\n\n                    fn levels(\n        entity: ControlEntity,\n        head: &str,\n        alias: Option<&str>,\n        classifier: &str,\n        bands: &[&str],\n    ) -> Vec<Vec<Vec<String>>> {\n        let names: Vec<&str> = std::iter::once(head).chain(alias).collect();\n        let slot = |c: Option<&str>, b: Option<&str>| -> Vec<String> {\n            names.iter().map(|n| lkey_for(entity, n, c, b)).collect()\n",
+      "source_digest": "3b7f5e11ba24d618724095f5736c25223298a4317d244119574da67ba8366927",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 680,
+      "end_line": 704,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    Queued,\n    Recent,\n    Dropped,\n    Invalid,\n}\n\npub struct ActionControl {\n    store: Arc<dyn ControlStore>,\n    snapshot: RwLock<Arc<Snapshot>>,\n    local_writes: Mutex<HashMap<String, (ActionControlRecord, Instant)>>,\n    created_at: Instant,\n    scan_timeout: Duration,\n    save_budget: Duration,\n    pub env: String,\n    pub pod: String,\n    seen_guard: Mutex<HashMap<String, Instant>>,\n    seen_tx: mpsc::Sender<SeenWrite>,\n    seen_rx: Mutex<Option<mpsc::Receiver<SeenWrite>>>,\n        #[cfg(test)]\n    age_offset: Mutex<Duration>,\n}\n\ntype SeenWrite = (&'static str, String, Vec<u8>);\n\nfn seen_guard_key(pkey: &str, lkey: &str) -> String {\n",
+      "source_digest": "51029ac829fd63202fcd809fcc465f37efa57034d28f5f23a7959d02b6db1f8a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 772,
+      "end_line": 796,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n    let field = |o: &Value, k: &str| o.get(k).cloned().unwrap_or(Value::Null);\n    let permanent = |o: &Value| o.get(\"permanent\").and_then(Value::as_bool) == Some(true);\n    let days = |o: &Value| {\n        if permanent(o) {\n            f64::INFINITY\n        } else {\n            o.get(\"ttl_days\")\n                .and_then(Value::as_f64)\n                .unwrap_or(f64::INFINITY)\n        }\n    };\n    page.iter().any(|p| {\n        if field(rule, \"kind\") != field(p, \"kind\") {\n",
+      "source_digest": "fef3a71fddc6109df2260d1f469f3c492f1a02a79d656eeec920d4035fc05971",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 773,
+      "end_line": 797,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n    let field = |o: &Value, k: &str| o.get(k).cloned().unwrap_or(Value::Null);\n    let permanent = |o: &Value| o.get(\"permanent\").and_then(Value::as_bool) == Some(true);\n    let days = |o: &Value| {\n        if permanent(o) {\n            f64::INFINITY\n        } else {\n            o.get(\"ttl_days\")\n                .and_then(Value::as_f64)\n                .unwrap_or(f64::INFINITY)\n        }\n    };\n    page.iter().any(|p| {\n        if field(rule, \"kind\") != field(p, \"kind\") {\n            return false;\n",
+      "source_digest": "493554fd9b6db1559767e7bf7f546983ee9f4f801f666f17c062060f109451b5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 778,
+      "end_line": 802,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n    let field = |o: &Value, k: &str| o.get(k).cloned().unwrap_or(Value::Null);\n    let permanent = |o: &Value| o.get(\"permanent\").and_then(Value::as_bool) == Some(true);\n    let days = |o: &Value| {\n        if permanent(o) {\n            f64::INFINITY\n        } else {\n            o.get(\"ttl_days\")\n                .and_then(Value::as_f64)\n                .unwrap_or(f64::INFINITY)\n        }\n    };\n    page.iter().any(|p| {\n        if field(rule, \"kind\") != field(p, \"kind\") {\n            return false;\n        }\n        match rule.get(\"kind\").and_then(Value::as_str) {\n            Some(\"suspend\") => {\n                field(rule, \"policy\") == field(p, \"policy\") && (!permanent(rule) || permanent(p))\n            }\n",
+      "source_digest": "52860c736910519675c3561a988b9e455ac3ebf87971fa984896a926e525e438",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 787,
+      "end_line": 811,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if permanent(o) {\n            f64::INFINITY\n        } else {\n            o.get(\"ttl_days\")\n                .and_then(Value::as_f64)\n                .unwrap_or(f64::INFINITY)\n        }\n    };\n    page.iter().any(|p| {\n        if field(rule, \"kind\") != field(p, \"kind\") {\n            return false;\n        }\n        match rule.get(\"kind\").and_then(Value::as_str) {\n            Some(\"suspend\") => {\n                field(rule, \"policy\") == field(p, \"policy\") && (!permanent(rule) || permanent(p))\n            }\n            Some(\"label\" | \"post_label\") => {\n                field(rule, \"label\") == field(p, \"label\") && days(rule) <= days(p)\n            }\n            Some(\"liveness_check\") => true,\n            _ => false,\n        }\n    })\n}\n\n",
+      "source_digest": "8a2c7e0fe18b2b596085af5679fd7d5bbf4b6e360b481d359267b0e8f40267c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 809,
+      "end_line": 833,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    })\n}\n\nimpl ActionControl {\n    pub fn new(store: Arc<dyn ControlStore>, env: String, pod: String) -> Self {\n        let (seen_tx, seen_rx) = mpsc::channel(SEEN_QUEUE);\n        Self {\n            store,\n            snapshot: RwLock::new(Arc::new(Snapshot::default())),\n            local_writes: Mutex::new(HashMap::new()),\n            created_at: Instant::now(),\n            scan_timeout: SCAN_TIMEOUT,\n            save_budget: SAVE_BUDGET,\n            env,\n            pod,\n            seen_guard: Mutex::new(HashMap::new()),\n            seen_tx,\n            seen_rx: Mutex::new(Some(seen_rx)),\n            #[cfg(test)]\n            age_offset: Mutex::new(Duration::ZERO),\n        }\n    }\n\n    fn snapshot(&self) -> Arc<Snapshot> {\n        self.snapshot\n",
+      "source_digest": "2006812bfe85da2f38a979db3eb374fc15a2b3514053dace472069bf9c07a5df",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[global_allocator]\nstatic GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;\n\nuse std::{path::PathBuf, time::Duration};\n\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n",
+      "source_digest": "6ed1d822fc9a316683d817d362ebe05e1b3427ef2c4c83d87fb063ece2d6be18",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 61,
+      "end_line": 85,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n",
+      "source_digest": "acde26443fa3453ea8fda52d2defcf2aa4b350f988f5d32bd00a3deb37cef732",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 81,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "6d9bfc55034970054b53bbd9e3f28b458fe77b84a5fdfd213e49faec070b7e10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 83,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "080e0ab2ed2ac8899ae5ac3976b27d41512bbe0f1720cc37e076dfb60108ce83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 84,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "338f9def77d3112eacf00d1068db842fec4b853591924ffcce5163f2ead8dcd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 87,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "0a52c90688b3f6e6e5a604f8e6f75ff4ef83061307008bec21e4d66253e7fbf9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 245,
+      "end_line": 269,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n",
+      "source_digest": "0c8b8e899736f78334eca4c1bbc2cefb83e8dba5560a6401e0b9174db9b2f9ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 250,
+      "end_line": 274,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n",
+      "source_digest": "3b66c2eb9d34025ee21d73c23734bfa58ae0c5351ce0724f7fded35be761ac2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 252,
+      "end_line": 276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n",
+      "source_digest": "3b459aead22e76de83f09adc1f40d8923c400fbb73e20f139c3ebaed896c7c74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 260,
+      "end_line": 284,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n",
+      "source_digest": "76e68c7dd92cb925c03bff5084565e8c3996c0632a0efefd992d15aca69ad512",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 265,
+      "end_line": 289,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n",
+      "source_digest": "2ef43c2b2422d591adc1a5a26208dd2c4fd94f64917dc5fc488c0784ead24cdb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 271,
+      "end_line": 295,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n",
+      "source_digest": "45fa552996f5fb3a28052b8383ec9d4651425ec81f83214072c321e5a06d8942",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 319,
+      "end_line": 343,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n",
+      "source_digest": "028df223a225c87816005e22b8068f867d315e188915e5b7e3455e92da278c16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 374,
+      "end_line": 398,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n",
+      "source_digest": "da98d3da877c54d27d3233597981864602a1ab0f9a4a2c9d508c5583453b09ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2642ceb032b58f5490939194aeb1b8b8f1705ef04a1d7b323dbbc1cc7ef9c8f2",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "5c226fa6e9f6e37eacaa4833b98758b4565de415a0352d30d19e52c8008a917a",
+      "context_complete": true,
+      "task_id": "T-929273a5bcd9071099f7e4027591dae44506c35b84b0dd3b078f5a22e472ccbb",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2c44bd66527fe4a03d87e2c30120944c6c7a503bdf3058b4f8dcea78867c0426",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-ea5347b40b9c38a5299e7d33c925f27c2e5fe5b3bcbd797b511574a7a05cbbff",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c7d5b7bfb00a8178e2d44d2764f62a74f618495bf7c51d07baa4d32c01733d5b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-6cd4fd396d52d001226b0a848c603aaceb3a52aa25ba36a1c811f887fc4170c3",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3cd2df4edf6a9a9918be44030c1b77b23fcb4d449510545a14a68817e3c50ed1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-a0ca3ec7a4233c937f1924be60a58f2de495ef08d27e25b31dea7288111bd490",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b5b9ef6d9df29dc42bf87187648bfd9f90856dc24b0b4b79f6eb921c2abba985",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-4be50c273f14f35d2c6ca7c07277765b2224041ba61bb3ee78497803a1bedddf",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-40f544e2b67f6434fa8e825f6577b5750bf9883f353560f561f05abdd3ae437b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-40d9c1b52b4d2e9b916106f806847dd0465813e0c18f523b11e0a4a62bc37325",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fb25d18f0142cc4bce598ba1fd9b9f97603f4aecfd1ae7d53f2779019d166c81",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-e90cd7a719e1ecc1565a07368736fcb38858ea4cc30ad6545326c230116f3a72",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9cd0f4539e5e83ab4060702a5fff4113432cc731ce017bcd56517749ae8cd8a4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-359833267437c11f433a910c9f4ef5422f3eda0200123af9fd7d2f3ce0dfe1a2",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d1bb3b36331149a7ac4533f822c160d1765d3afac488af40d6200f4b878cff46",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-e077b6995af069c9a8c059dc03e085edf5c6f1a79dd0bb522c1e02487da5cf9b",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e9c2ad25dee6ac3dea5b124852b2b559d0c607fb64b55b20f9e0498e11862b70",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-52931d9fc194a9847b80116c554936690b3753472f3a4ded82ad0be7429d13d6",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cbe756403e269e38b5d218479d39c4b93c4c233d3cd03ca141adf4caf25a593d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-b3bdb42e0d74b3690a8f7277435330fec875284fb42fac8e131a9ff2ebb36bb9",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ba1c8afb7edd905b16600dcc7ba81180d4cd79095c2efcf6893aa90a6e1a2a63",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-c0ad6fc9cddc375bcaf696087d467fc267cb3148f7ad9773ee29c7ee5992632e",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fb49d13423dbb078a973c0138aa6ffeb5ba6f7957ba78fe3af1c1c1e745ce547",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-74a59c46a35f865763828878c7bbba51217ead9ce969334b38c8b370aac166de",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e0984111f59fcd4c56f0abdf79972e2bffa7457344b8c54a75b4859b4a013b01",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-d4e4664ec1ad18447c5edc7d58bf4ee3d80b716a738875210d702d575f01ab37",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7f42137fef215945ab36be82dc788d8773e49aed91307eddb88f94e371b9b641",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-3ee7b0b2910a7376c2fd687484370494ee6acc516a7bda93ad37750171e5757e",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ec3a6e2ee06ada1fe3aee3862cc3f4d39c0a3821b124d7f9ea268e1053eabaf9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-6e8013965a90a036f606ada29b5cc96493881824ea41c0c66d85948d06669cd6",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c994288bde59ac7997dc856f36f2a22747269ef863d0bbc040ca2d563509d7d8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-db6f8cd34ec74edf2a3cead2391af1784c2842209c1ab12a74938b2a00f35e8b",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-000e3e7eea0dd7004341253c7d46d54b90103fd31ba7a6d35494ae3b69e5f55e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-d7db3dc078df1c3d5d9ae93df4dfeae594054c7dc23de693838c5dd3482c5ed3",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1a8d8497a96ab1fc8d7d17b1bdb6c4168ae62bc096c2fb29057f3261a7af7d33",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-6a77cd3410f8027a637fc9bbbed98b213f79a2ad6fc03ed55abd6508712cccc6",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1f74259ab1e1a026d44772fafe9e38eb9b378fb2a3e1cf91c0a9398ea14b3b3e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-0b91e46ec1dcef1e9c847133365b29057665dfb7a652c762443138b1ee28987f",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-204a389f01bedd58dc0a069ef4e4fff33704613ba2c34e184973df15a83c0a66",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-b5dbb22b0cad16990b5f3f1f2c52c5ed12fb80b4497bf98822006baf2a79c584",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-07061dd56ea4bac5eba7e2fdca7ae9b724040d01cc63e786c1d347109bc85e5b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-eec13b493760573a41754ba1f89dbd5be24044f4f0126b1ff25fcda47448db82",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7880386da75c588183896d4eee15b6d90d3073147cf5779cf88a9b5c06981088",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-62274a7a0a8993fd96603c634ff5dbbb9a2059b87438c93015de520fb220b75e",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-46d73d509755606b27bc7dffa5d7e3d61c2219ac6bcf524c2546c77cab74ded7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-a5297ab12fccecd9b7b67fa7dbb59f9e5198881fc7c44dae2ca090c5d1498110",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-14d791b07b44837992ff0e1ca94af17f2700acde5124d2ffe179d9bcc917624f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-88692f81549ad97ecb810b5318b7698b225761a6f13038f97515ef1719e21b55",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-01228647087e670a1e944d5cc5d9d142691ab74bf29c0b9e1dcc96e731eb704a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-471aa00ba8d4abe392b465e618befb177ed82e327068fa35cf99df103309fcf2",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8e4716ead85aa5ea7f9cfade4964d7fa8239a2d535c4e387aa5fe3a10b0ad6cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-f61b52f74678021ee96230da4718986438177b39b59a1dbd50f010fe1b8de726",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-af70dba8e953e8d924c524e72481912a8ecd3b9bebdafe534e1588df3f622a40",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-e1ed122fac75f6c6b38173b1a591186f389e1133c54f551af977d8f6c545f4e8",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aa7ca038dca59a3d69f0c3140cc397d1f97014d477cbdebff3a8ef18979804c2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-447e6375f2c00b3f4d8faced0fc0ba941f9ce394bcfc6331bd9cae70d4627da9",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1120404c8c1e90f65839f1111a3f9a270b278074266d95664a6c2a86b0c6c59f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-448b999abd54a417b8a0a28868a6cf81ad3d92632e84837d5020c835bc05fb17",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-25d582edd51beebe900db316c115810f8e25619acc879df2d6caec1128a6eaf3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-3c8ae6c9709c37ac50a1a00b8ccc952f4084c59193f3985b1481c9a34eb65985",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b272293fc6f417f0888c4f38692d7842b63b94c98855c075fc2105fd9bb420e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-82cba2beb1f0f923622a7495fb8cb16be3937a8d21d3d4ec5dacd5f24e7a6b44",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b15a19cc1d4b6828f2f3e0f36376e8afd702917cb9df27a119c5ede91d45535",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-00969460704bdaf0c37638a6b290ed62880e0a8a29ad914c468c2a55a240d790",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fef5b0cd105871588e3a5f7d63b96eb9b54a7918fe50219687588cdae244832d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c80991b358009d3fa8cb28f471e42871cc66612d6787a757f08cd7f4a010dd9",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bd022453dd422ca55ff2f91343d8b4ba1cd545b506af35766546aef529c5c77e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-1302b28563d0dce4c4c7d9cc4da4835a32be0ce91d0652d05ecda2e02fe903ca",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ee20ae9f1cc6403e626fa8fde7ba19233ceb439e5aaf678b5c0f2e0bc7db43f0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-9cbf4db8a18ff00c73011be8b4bea859db0560254d1c0ccee399bf5453e9c96e",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-216e1a7fc00020be372711a686963cb21d544111f7ba33a115241632eaf25122",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-0182c1a77055e38b5a7bf5d7215b60feb6bb501f56c5fa2d7bd8d5c18ba4e039",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e62aca3ace548ee0f071381b0eb9cc45921ff9d1dd395deeed3fb89227ba463",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-9438990ab9ce37cc68a59a72974f3b8187b99bfe86f57dd5023264be8d8c7d57",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-91bf4f5859f09c52e8e82d358af54de7e5d9c3f1b6eed58760e28677b1795ea3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-6bc12584696297ee3c36479c95db72208c9d3257e01e435d54d1523f7adc349b",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/server.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-13fa6e75f2e1a9f51cfabfe831993aa22fa9e72733afd19ad53796f5bad37201",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "serve",
+        "VFServer",
+        "from_endpoints",
+        "filter_notifications",
+        "filter_tweets",
+        "get",
+        "server"
+      ],
+      "context_complete": false,
+      "task_id": "T-7abf582fa4f583cb60130ec49a16357c71354ff51d8f30b86f043cff4068e0a4",
+      "evidence_refs": [
+        "E41"
+      ]
+    }
+  ],
+  "task_id": "T-3be9eba0499a63a35cb21a9af115bad92a1b36dd912fc9c96a2c7875e1ba02fc"
+}

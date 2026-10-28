@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "path": "home-mixer/util/phoenix_request.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-e42bcc9f502dd4bb579fcce6190a69690e5509cb0d6899a06895e301a9cc05eb",
+  "change_scope": "changed_file",
+  "mechanism_group": "home-mixer/util",
+  "evidence": {
+    "E1": {
+      "path": "home-mixer/util/phoenix_request.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 329,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::candidate::{CandidateHelpers, PostCandidate, RetrievalSource};\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::{PhoenixExperimentOverrides, RerankerHeadTag};\nuse crate::util::post_engagers::set_post_engagers;\nuse rustc_hash::{FxHashMap, FxHashSet};\nuse std::collections::HashMap;\nuse std::sync::{Arc, LazyLock, RwLock};\nuse tracing::warn;\nuse xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::TOP_LOG_PROBS_NUM;\nuse xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;\nuse xai_geo_ip::zip_to_dma_code;\nuse xai_home_mixer_proto as pb;\nuse xai_recsys_proto::{\n    country_code_string_to_enum, CandidateSet, ClientContext, DeviceFeature,\n    PredictNextActionsRequest, ProductSurface, RetrieveTopKCandidatesResponse, TweetInfo,\n    UserContext,\n};\nuse xai_stats_receiver::global_stats_receiver;\n\nconst PHOENIX_CLIENT_MAX_CANDIDATES: usize = 2800;\nconst RETRIEVAL_VALUE_MODEL_WEIGHTS_METRIC: &str = \"PhoenixRetrieval.ValueModelWeights\";\nconst MAX_CACHED_VALUE_MODEL_WEIGHTS: usize = 64;\n\ntype ParsedValueModelWeights = Option<Arc<HashMap<String, f32>>>;\n\nstatic VALUE_MODEL_WEIGHTS: LazyLock<RwLock<HashMap<String, ParsedValueModelWeights>>> =\n    LazyLock::new(Default::default);\n\npub fn candidates_from_retrieval_response(\n    response: RetrieveTopKCandidatesResponse,\n    served_type_for_dataset: impl Fn(u32) -> pb::ServedType,\n    cluster: PhoenixRetrievalCluster,\n) -> Vec<PostCandidate> {\n    let scored: Vec<(TweetInfo, f32, pb::ServedType)> = response\n        .top_k_candidates\n        .into_iter()\n        .flat_map(|scored_candidates| scored_candidates.candidates)\n        .filter_map(|scored_candidate| {\n            let served_type = served_type_for_dataset(scored_candidate.dataset_type);\n            scored_candidate\n                .candidate\n                .map(|tweet_info| (tweet_info, scored_candidate.score, served_type))\n        })\n        .collect();\n    let positions = positions_within_served_type(&scored);\n\n    scored\n        .into_iter()\n        .zip(positions)\n        .map(\n            |((tweet_info, score, served_type), position)| PostCandidate {\n                tweet_id: tweet_info.tweet_id,\n                author_id: tweet_info.author_id,\n                in_reply_to_tweet_id: (tweet_info.in_reply_to_tweet_id != 0)\n                    .then_some(tweet_info.in_reply_to_tweet_id),\n                retweeted_tweet_id: (tweet_info.retweeted_tweet_id != 0)\n                    .then_some(tweet_info.retweeted_tweet_id),\n                retrieval_sources: vec![RetrievalSource {\n                    served_type,\n                    cluster: Some(cluster),\n                    score: Some(score),\n                    position: Some(position),\n                }],\n                served_type: Some(served_type),\n                ..Default::default()\n            },\n        )\n        .collect()\n}\n\nfn positions_within_served_type(scored: &[(TweetInfo, f32, pb::ServedType)]) -> Vec<u32> {\n    let mut order: Vec<usize> = (0..scored.len()).collect();\n    order.sort_by(|&a, &b| scored[b].1.total_cmp(&scored[a].1));\n    let mut next = FxHashMap::default();\n    let mut positions = vec![0; scored.len()];\n    for idx in order {\n        let position = next.entry(scored[idx].2).or_insert(0);\n        *position += 1;\n        positions[idx] = *position;\n    }\n    positions\n}\n\npub fn build_client_context(query: &ScoredPostsQuery) -> Option<ClientContext> {\n    if query.user_id == 0 {\n        return None;\n    }\n\n    Some(ClientContext {\n        user_id: query.user_id as i64,\n        app_id: query.client_app_id as i64,\n        country_code: query.country_code.clone(),\n        language_code: query.language_code.clone(),\n        user_roles: query.user_roles.clone(),\n        ip_address: query.ip_address.clone(),\n        client_version: query.client_version.clone(),\n        ..Default::default()\n    })\n}\n\npub fn build_user_context(query: &ScoredPostsQuery) -> Option<UserContext> {\n    Some(UserContext {\n        user_age_bracket: query\n            .user_demographics\n            .as_ref()\n            .map(|d| d.user_age_bracket)\n            .unwrap_or(0),\n        user_gender: query\n            .user_demographics\n            .as_ref()\n            .map(|d| d.user_gender)\n            .unwrap_or(0),\n        user_state: query\n            .user_demographics\n            .as_ref()\n            .map(|d| d.user_state)\n            .unwrap_or(0),\n        user_age_in_years: query.user_age_in_years.unwrap_or(0),\n        user_inferred_gender: query.user_inferred_gender.map(|v| v as i32).unwrap_or(0),\n        user_inferred_gender_score: query.user_inferred_gender_score.unwrap_or(0.0),\n        followed_grok_topics: query\n            .followed_grok_topics\n            .map(|t| t.to_vec())\n            .unwrap_or_default(),\n        followed_starter_packs: query\n            .followed_starter_packs\n            .map(|p| p.to_vec())\n            .unwrap_or_default(),\n        user_longitude: query\n            .ip_location\n            .as_ref()\n            .and_then(|l| l.longitude)\n            .unwrap_or(0.0) as f32,\n        user_latitude: query\n            .ip_location\n            .as_ref()\n            .and_then(|l| l.latitude)\n            .unwrap_or(0.0) as f32,\n        user_dma_code: zip_to_dma_code(\n            query\n                .ip_location\n                .as_ref()\n                .and_then(|l| l.zip_code.as_deref()),\n        ) as i32,\n        user_installed_apps: query.user_installed_apps.clone().unwrap_or_default(),\n        ..Default::default()\n    })\n}\n\npub fn build_device_feature(query: &ScoredPostsQuery) -> DeviceFeature {\n    DeviceFeature {\n        engaging_ip_country_code: country_code_string_to_enum(query.country_code.as_ref()) as i32,\n        device_network_type: query.device_network_type as i32,\n        timezone: query.time_zone as i32,\n        ip_address: query.ip_address.clone(),\n    }\n}\n\nfn followed_user_ids(query: &ScoredPostsQuery) -> FxHashSet<u64> {\n    query\n        .user_features\n        .followed_user_ids\n        .iter()\n        .copied()\n        .map(|id| id as u64)\n        .collect()\n}\n\nfn candidate_to_tweet_info(\n    c: &PostCandidate,\n    query: &ScoredPostsQuery,\n    followed_ids: &FxHashSet<u64>,\n    serve_time_ms: i64,\n) -> xai_recsys_proto::TweetInfo {\n    let is_followed = followed_ids.contains(&c.get_original_author_id())\n        || c.get_original_author_id() == query.user_id;\n    let mut tweet_info = c.as_tweet_info(is_followed);\n    if let Some(record) = &c.post_engagers {\n        set_post_engagers(&mut tweet_info, record, query.user_id, serve_time_ms);\n    }\n    tweet_info\n}\n\npub fn build_tweet_infos(\n    query: &ScoredPostsQuery,\n    candidates: &[PostCandidate],\n    serve_time_ms: i64,\n) -> Vec<xai_recsys_proto::TweetInfo> {\n    let followed_ids = followed_user_ids(query);\n    candidates\n        .iter()\n        .take(PHOENIX_CLIENT_MAX_CANDIDATES)\n        .map(|c| candidate_to_tweet_info(c, query, &followed_ids, serve_time_ms))\n        .collect()\n}\n\npub fn build_request_without_sequence_and_candidates(\n    query: &ScoredPostsQuery,\n    product_surface: ProductSurface,\n) -> PredictNextActionsRequest {\n    let candidate_set = CandidateSet {\n        user_id: query.user_id,\n        product_surface: product_surface as i32,\n        device_feature: Some(build_device_feature(query)),\n        ..Default::default()\n    };\n    PredictNextActionsRequest {\n        candidate_sets: vec![candidate_set],\n        return_logprob: true,\n        top_logprobs_num: TOP_LOG_PROBS_NUM,\n        return_backbone_scores: query.return_backbone_scores,\n        client_context: build_client_context(query),\n        user_context: build_user_context(query),\n        metadata: query.request_id.to_string(),\n        experiment_overrides: parse_experiment_overrides(\n            &query.params.get(PhoenixExperimentOverrides),\n        ),\n        ..Default::default()\n    }\n}\n\npub fn parse_experiment_overrides(spec: &str) -> std::collections::HashMap<String, String> {\n    spec.split(';')\n        .filter_map(|kv| {\n            let (k, v) = kv.split_once('=')?;\n            let (k, v) = (k.trim(), v.trim());\n            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))\n        })\n        .collect()\n}\n\npub fn retrieval_value_model_weights(spec: &str) -> HashMap<String, f32> {\n    if spec.is_empty() {\n        return HashMap::new();\n    }\n    let parsed = cached_value_model_weights(spec);\n    if let Some(receiver) = global_stats_receiver() {\n        let result = if parsed.is_some() { \"sent\" } else { \"invalid\" };\n        receiver.incr(\n            RETRIEVAL_VALUE_MODEL_WEIGHTS_METRIC,\n            &[(\"result\", result)],\n            1,\n        );\n    }\n    parsed\n        .map(|weights| weights.as_ref().clone())\n        .unwrap_or_default()\n}\n\nfn cached_value_model_weights(spec: &str) -> ParsedValueModelWeights {\n    if let Some(parsed) = VALUE_MODEL_WEIGHTS\n        .read()\n        .unwrap_or_else(|e| e.into_inner())\n        .get(spec)\n    {\n        return parsed.clone();\n    }\n    let parsed = parse_value_model_weights(spec)\n        .inspect_err(|e| {\n            warn!(\"rust_home_mixer_retrieval_value_model_weights {spec:?} is not sent: {e}\")\n        })\n        .ok()\n        .map(Arc::new);\n    let mut cache = VALUE_MODEL_WEIGHTS\n        .write()\n        .unwrap_or_else(|e| e.into_inner());\n    if cache.len() >= MAX_CACHED_VALUE_MODEL_WEIGHTS {\n        cache.clear();\n    }\n    cache.insert(spec.to_string(), parsed.clone());\n    parsed\n}\n\npub fn parse_value_model_weights(spec: &str) -> Result<HashMap<String, f32>, String> {\n    let weights: HashMap<String, f64> = serde_json::from_str(spec).map_err(|e| e.to_string())?;\n    weights\n        .into_iter()\n        .map(|(name, weight)| {\n            let weight = weight as f32;\n            if weight.is_finite() {\n                Ok((name, weight))\n            } else {\n                Err(format!(\"weight of {name:?} is not a finite f32\"))\n            }\n        })\n        .collect()\n}\n\npub fn build_prediction_request(\n    query: &ScoredPostsQuery,\n    candidates: &[PostCandidate],\n    product_surface: ProductSurface,\n    serve_time_ms: i64,\n) -> PredictNextActionsRequest {\n    let mut request = build_request_without_sequence_and_candidates(query, product_surface);\n    request.candidate_sets[0].candidates = build_tweet_infos(query, candidates, serve_time_ms);\n    let mut sequence = query.scoring_sequence.clone().unwrap_or_default();\n    sequence.reranker_head_tag = Some(query.params.get(RerankerHeadTag) as u32);\n    request.sequences = vec![sequence];\n    request.columnar_sequences = query.columnar_scoring_sequence.iter().cloned().collect();\n    request\n}\n\npub fn build_immersive_prediction_request(\n    query: &ScoredPostsQuery,\n    candidates: &[&PostCandidate],\n) -> PredictNextActionsRequest {\n    let mut request =\n        build_request_without_sequence_and_candidates(query, ProductSurface::GalleryPage);\n    request.return_backbone_scores = false;\n    let followed_ids = followed_user_ids(query);\n    request.candidate_sets[0].candidates = candidates\n        .iter()\n        .map(|candidate| {\n            let tweet_info =\n                candidate_to_tweet_info(candidate, query, &followed_ids, query.request_time_ms);\n            TweetInfo {\n                first_video_duration_ms: tweet_info.min_video_duration_ms,\n                ..tweet_info\n            }\n        })\n        .collect();\n    request.columnar_sequences = query\n        .immersive_columnar_scoring_sequence\n        .iter()\n        .cloned()\n        .collect();\n    request\n}\n",
+      "source_digest": "7631a019f8ab6d75622d9abceb0d9acf28bcd87303e0454d00cca560f9b9adb7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "home-mixer/util/phoenix_request.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 330,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::candidate::{CandidateHelpers, PostCandidate, RetrievalSource};\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::{PhoenixExperimentOverrides, RerankerHeadTag};\nuse crate::util::post_engagers::set_post_engagers;\nuse rustc_hash::{FxHashMap, FxHashSet};\nuse std::collections::HashMap;\nuse std::sync::{Arc, LazyLock, RwLock};\nuse tracing::warn;\nuse xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::TOP_LOG_PROBS_NUM;\nuse xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;\nuse xai_geo_ip::zip_to_dma_code;\nuse xai_home_mixer_proto as pb;\nuse xai_recsys_proto::{\n    country_code_string_to_enum, CandidateSet, ClientContext, DeviceFeature,\n    PredictNextActionsRequest, ProductSurface, RetrieveTopKCandidatesResponse, TweetInfo,\n    UserContext,\n};\nuse xai_stats_receiver::global_stats_receiver;\n\nconst PHOENIX_CLIENT_MAX_CANDIDATES: usize = 2800;\nconst RETRIEVAL_VALUE_MODEL_WEIGHTS_METRIC: &str = \"PhoenixRetrieval.ValueModelWeights\";\nconst MAX_CACHED_VALUE_MODEL_WEIGHTS: usize = 64;\n\ntype ParsedValueModelWeights = Option<Arc<HashMap<String, f32>>>;\n\nstatic VALUE_MODEL_WEIGHTS: LazyLock<RwLock<HashMap<String, ParsedValueModelWeights>>> =\n    LazyLock::new(Default::default);\n\npub fn candidates_from_retrieval_response(\n    response: RetrieveTopKCandidatesResponse,\n    served_type_for_dataset: impl Fn(u32) -> pb::ServedType,\n    cluster: PhoenixRetrievalCluster,\n) -> Vec<PostCandidate> {\n    let scored: Vec<(TweetInfo, f32, pb::ServedType)> = response\n        .top_k_candidates\n        .into_iter()\n        .flat_map(|scored_candidates| scored_candidates.candidates)\n        .filter_map(|scored_candidate| {\n            let served_type = served_type_for_dataset(scored_candidate.dataset_type);\n            scored_candidate\n                .candidate\n                .map(|tweet_info| (tweet_info, scored_candidate.score, served_type))\n        })\n        .collect();\n    let positions = positions_within_served_type(&scored);\n\n    scored\n        .into_iter()\n        .zip(positions)\n        .map(\n            |((tweet_info, score, served_type), position)| PostCandidate {\n                tweet_id: tweet_info.tweet_id,\n                author_id: tweet_info.author_id,\n                in_reply_to_tweet_id: (tweet_info.in_reply_to_tweet_id != 0)\n                    .then_some(tweet_info.in_reply_to_tweet_id),\n                retweeted_tweet_id: (tweet_info.retweeted_tweet_id != 0)\n                    .then_some(tweet_info.retweeted_tweet_id),\n                retrieval_sources: vec![RetrievalSource {\n                    served_type,\n                    cluster: Some(cluster),\n                    score: Some(score),\n                    position: Some(position),\n                }],\n                served_type: Some(served_type),\n                ..Default::default()\n            },\n        )\n        .collect()\n}\n\nfn positions_within_served_type(scored: &[(TweetInfo, f32, pb::ServedType)]) -> Vec<u32> {\n    let mut order: Vec<usize> = (0..scored.len()).collect();\n    order.sort_by(|&a, &b| scored[b].1.total_cmp(&scored[a].1));\n    let mut next = FxHashMap::default();\n    let mut positions = vec![0; scored.len()];\n    for idx in order {\n        let position = next.entry(scored[idx].2).or_insert(0);\n        *position += 1;\n        positions[idx] = *position;\n    }\n    positions\n}\n\npub fn build_client_context(query: &ScoredPostsQuery) -> Option<ClientContext> {\n    if query.user_id == 0 {\n        return None;\n    }\n\n    Some(ClientContext {\n        user_id: query.user_id as i64,\n        app_id: query.client_app_id as i64,\n        country_code: query.country_code.clone(),\n        language_code: query.language_code.clone(),\n        user_roles: query.user_roles.clone(),\n        ip_address: query.ip_address.clone(),\n        client_version: query.client_version.clone(),\n        ..Default::default()\n    })\n}\n\npub fn build_user_context(query: &ScoredPostsQuery) -> Option<UserContext> {\n    Some(UserContext {\n        user_age_bracket: query\n            .user_demographics\n            .as_ref()\n            .map(|d| d.user_age_bracket)\n            .unwrap_or(0),\n        user_gender: query\n            .user_demographics\n            .as_ref()\n            .map(|d| d.user_gender)\n            .unwrap_or(0),\n        user_state: query\n            .user_demographics\n            .as_ref()\n            .map(|d| d.user_state)\n            .unwrap_or(0),\n        user_age_in_years: query.user_age_in_years.unwrap_or(0),\n        user_inferred_gender: query.user_inferred_gender.map(|v| v as i32).unwrap_or(0),\n        user_inferred_gender_score: query.user_inferred_gender_score.unwrap_or(0.0),\n        followed_grok_topics: query\n            .followed_grok_topics\n            .map(|t| t.to_vec())\n            .unwrap_or_default(),\n        followed_starter_packs: query\n            .followed_starter_packs\n            .map(|p| p.to_vec())\n            .unwrap_or_default(),\n        user_longitude: query\n            .ip_location\n            .as_ref()\n            .and_then(|l| l.longitude)\n            .unwrap_or(0.0) as f32,\n        user_latitude: query\n            .ip_location\n            .as_ref()\n            .and_then(|l| l.latitude)\n            .unwrap_or(0.0) as f32,\n        user_dma_code: zip_to_dma_code(\n            query\n                .ip_location\n                .as_ref()\n                .and_then(|l| l.zip_code.as_deref()),\n        ) as i32,\n        user_installed_apps: query.user_installed_apps.clone().unwrap_or_default(),\n        recent_search_queries: query.recent_search_queries.clone(),\n        ..Default::default()\n    })\n}\n\npub fn build_device_feature(query: &ScoredPostsQuery) -> DeviceFeature {\n    DeviceFeature {\n        engaging_ip_country_code: country_code_string_to_enum(query.country_code.as_ref()) as i32,\n        device_network_type: query.device_network_type as i32,\n        timezone: query.time_zone as i32,\n        ip_address: query.ip_address.clone(),\n    }\n}\n\nfn followed_user_ids(query: &ScoredPostsQuery) -> FxHashSet<u64> {\n    query\n        .user_features\n        .followed_user_ids\n        .iter()\n        .copied()\n        .map(|id| id as u64)\n        .collect()\n}\n\nfn candidate_to_tweet_info(\n    c: &PostCandidate,\n    query: &ScoredPostsQuery,\n    followed_ids: &FxHashSet<u64>,\n    serve_time_ms: i64,\n) -> xai_recsys_proto::TweetInfo {\n    let is_followed = followed_ids.contains(&c.get_original_author_id())\n        || c.get_original_author_id() == query.user_id;\n    let mut tweet_info = c.as_tweet_info(is_followed);\n    if let Some(record) = &c.post_engagers {\n        set_post_engagers(&mut tweet_info, record, query.user_id, serve_time_ms);\n    }\n    tweet_info\n}\n\npub fn build_tweet_infos(\n    query: &ScoredPostsQuery,\n    candidates: &[PostCandidate],\n    serve_time_ms: i64,\n) -> Vec<xai_recsys_proto::TweetInfo> {\n    let followed_ids = followed_user_ids(query);\n    candidates\n        .iter()\n        .take(PHOENIX_CLIENT_MAX_CANDIDATES)\n        .map(|c| candidate_to_tweet_info(c, query, &followed_ids, serve_time_ms))\n        .collect()\n}\n\npub fn build_request_without_sequence_and_candidates(\n    query: &ScoredPostsQuery,\n    product_surface: ProductSurface,\n) -> PredictNextActionsRequest {\n    let candidate_set = CandidateSet {\n        user_id: query.user_id,\n        product_surface: product_surface as i32,\n        device_feature: Some(build_device_feature(query)),\n        ..Default::default()\n    };\n    PredictNextActionsRequest {\n        candidate_sets: vec![candidate_set],\n        return_logprob: true,\n        top_logprobs_num: TOP_LOG_PROBS_NUM,\n        return_backbone_scores: query.return_backbone_scores,\n        client_context: build_client_context(query),\n        user_context: build_user_context(query),\n        metadata: query.request_id.to_string(),\n        experiment_overrides: parse_experiment_overrides(\n            &query.params.get(PhoenixExperimentOverrides),\n        ),\n        ..Default::default()\n    }\n}\n\npub fn parse_experiment_overrides(spec: &str) -> std::collections::HashMap<String, String> {\n    spec.split(';')\n        .filter_map(|kv| {\n            let (k, v) = kv.split_once('=')?;\n            let (k, v) = (k.trim(), v.trim());\n            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))\n        })\n        .collect()\n}\n\npub fn retrieval_value_model_weights(spec: &str) -> HashMap<String, f32> {\n    if spec.is_empty() {\n        return HashMap::new();\n    }\n    let parsed = cached_value_model_weights(spec);\n    if let Some(receiver) = global_stats_receiver() {\n        let result = if parsed.is_some() { \"sent\" } else { \"invalid\" };\n        receiver.incr(\n            RETRIEVAL_VALUE_MODEL_WEIGHTS_METRIC,\n            &[(\"result\", result)],\n            1,\n        );\n    }\n    parsed\n        .map(|weights| weights.as_ref().clone())\n        .unwrap_or_default()\n}\n\nfn cached_value_model_weights(spec: &str) -> ParsedValueModelWeights {\n    if let Some(parsed) = VALUE_MODEL_WEIGHTS\n        .read()\n        .unwrap_or_else(|e| e.into_inner())\n        .get(spec)\n    {\n        return parsed.clone();\n    }\n    let parsed = parse_value_model_weights(spec)\n        .inspect_err(|e| {\n            warn!(\"rust_home_mixer_retrieval_value_model_weights {spec:?} is not sent: {e}\")\n        })\n        .ok()\n        .map(Arc::new);\n    let mut cache = VALUE_MODEL_WEIGHTS\n        .write()\n        .unwrap_or_else(|e| e.into_inner());\n    if cache.len() >= MAX_CACHED_VALUE_MODEL_WEIGHTS {\n        cache.clear();\n    }\n    cache.insert(spec.to_string(), parsed.clone());\n    parsed\n}\n\npub fn parse_value_model_weights(spec: &str) -> Result<HashMap<String, f32>, String> {\n    let weights: HashMap<String, f64> = serde_json::from_str(spec).map_err(|e| e.to_string())?;\n    weights\n        .into_iter()\n        .map(|(name, weight)| {\n            let weight = weight as f32;\n            if weight.is_finite() {\n                Ok((name, weight))\n            } else {\n                Err(format!(\"weight of {name:?} is not a finite f32\"))\n            }\n        })\n        .collect()\n}\n\npub fn build_prediction_request(\n    query: &ScoredPostsQuery,\n    candidates: &[PostCandidate],\n    product_surface: ProductSurface,\n    serve_time_ms: i64,\n) -> PredictNextActionsRequest {\n    let mut request = build_request_without_sequence_and_candidates(query, product_surface);\n    request.candidate_sets[0].candidates = build_tweet_infos(query, candidates, serve_time_ms);\n    let mut sequence = query.scoring_sequence.clone().unwrap_or_default();\n    sequence.reranker_head_tag = Some(query.params.get(RerankerHeadTag) as u32);\n    request.sequences = vec![sequence];\n    request.columnar_sequences = query.columnar_scoring_sequence.iter().cloned().collect();\n    request\n}\n\npub fn build_immersive_prediction_request(\n    query: &ScoredPostsQuery,\n    candidates: &[&PostCandidate],\n) -> PredictNextActionsRequest {\n    let mut request =\n        build_request_without_sequence_and_candidates(query, ProductSurface::GalleryPage);\n    request.return_backbone_scores = false;\n    let followed_ids = followed_user_ids(query);\n    request.candidate_sets[0].candidates = candidates\n        .iter()\n        .map(|candidate| {\n            let tweet_info =\n                candidate_to_tweet_info(candidate, query, &followed_ids, query.request_time_ms);\n            TweetInfo {\n                first_video_duration_ms: tweet_info.min_video_duration_ms,\n                ..tweet_info\n            }\n        })\n        .collect();\n    request.columnar_sequences = query\n        .immersive_columnar_scoring_sequence\n        .iter()\n        .cloned()\n        .collect();\n    request\n}\n",
+      "source_digest": "96fec0cc0b7dce9f35c1cd3094e6f6d1053ca8757441de5b3387860b7a71bb02",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "home-mixer/sources/phoenix_source.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 22,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::models::candidate::PostCandidate;\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::{\n    EnablePhoenixSource, PhoenixColdStartMaxResults, PhoenixMaxResults,\n    PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,\n    PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,\n    PhoenixXdsRetrievalMaxRetries, RetrievalValueModelWeights,\n};\nuse crate::util::phoenix_request::{\n    build_client_context, build_user_context, candidates_from_retrieval_response,\n    retrieval_value_model_weights,\n};\nuse rustc_hash::FxHashSet;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;\nuse xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::{\n    PhoenixRetrievalCluster, RetrievalExclusions,\n};\nuse xai_candidate_pipeline::component_library::utils::quality_factor;\nuse xai_candidate_pipeline::source::Source;\nuse xai_home_mixer_proto as pb;\n",
+      "source_digest": "72672813eed504fadcd8598751a3c9ec9105b0a83e949ef97fdd01354f57f675",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "home-mixer/sources/phoenix_source.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 110,
+      "end_line": 134,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<PostCandidate>, String> {\n        let user_id = query.user_id;\n\n        let sequence = query\n            .retrieval_sequence\n            .as_ref()\n            .ok_or_else(|| \"PhoenixSource: missing retrieval_sequence\".to_string())?;\n\n        let cluster = Self::resolve_cluster(query);\n        let client_context = build_client_context(query);\n        let user_context = build_user_context(query);\n\n        let response = self\n            .phoenix_retrieval_client\n            .retrieve_excluding(\n                cluster,\n                user_id,\n                sequence.clone(),\n                query.columnar_retrieval_sequence.clone(),\n                quality_factor::apply(query.params.get(PhoenixMaxResults)),\n                query.params.get(PhoenixColdStartMaxResults),\n                vec![],\n                None,\n",
+      "source_digest": "ea050d823506155844ee9a54f31f9298ab4c45710996cec62829cf0ba25cc818",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "home-mixer/query_hydrators/recent_search_queries_query_hydrator.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            query: String::new(),\n            ..q\n        })\n        .collect();\n    queries.sort_by_key(|q| std::cmp::Reverse(q.timestamp_ms));\n    queries.truncate(MAX_QUERIES);\n    RecentSearchQueries { queries }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::util::phoenix_request::build_user_context;\n\n    fn entry(timestamp_ms: i64, embedding_bytes: usize) -> RecentSearchQuery {\n        RecentSearchQuery {\n            query: format!(\"q{timestamp_ms}\"),\n            timestamp_ms,\n            embedding_bf16: vec![1u8; embedding_bytes].into(),\n        }\n    }\n\n    #[test]\n    fn select_matches_training_and_drops_text() {\n        let request_time_ms = 1_000;\n",
+      "source_digest": "45f164d5ca61f17137166edfca77032c316ea19968a70399734b9ef6d71a54f5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "home-mixer/query_hydrators/recent_search_queries_query_hydrator.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 102,
+      "end_line": 122,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let stored = RecentSearchQueries {\n            queries: vec![entry(900, EMBEDDING_BYTES), entry(2_000, EMBEDDING_BYTES)],\n        };\n        let hydrator = RecentSearchQueriesQueryHydrator::new(Arc::new(FakeStore(stored)));\n        let mut query = ScoredPostsQuery {\n            user_id: 7,\n            request_time_ms: 1_000,\n            ..Default::default()\n        };\n        let hydrated = hydrator.hydrate(&query).await.unwrap();\n        hydrator.update(&mut query, hydrated);\n\n        let sent = build_user_context(&query)\n            .unwrap()\n            .recent_search_queries\n            .unwrap();\n        assert_eq!(sent.queries.len(), 1);\n        assert_eq!(sent.queries[0].timestamp_ms, 900);\n        assert!(sent.queries[0].query.is_empty());\n    }\n}\n",
+      "source_digest": "d1b14385d20f110b366d6a39cbc6ff6a6d8190fb58f6092941e87bf00f9b6a50",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "home-mixer/sources/phoenix_source.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 22,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::models::candidate::PostCandidate;\nuse crate::models::query::ScoredPostsQuery;\nuse crate::params::{\n    EnablePhoenixSource, PhoenixColdStartMaxResults, PhoenixMaxResults,\n    PhoenixRetrievalExcludeSeenPosts, PhoenixRetrievalInferenceClusterId,\n    PhoenixRetrievalNewUserHistoryThreshold, PhoenixRetrievalNewUserInferenceClusterId,\n    PhoenixXdsRetrievalMaxRetries, RetrievalValueModelWeights,\n};\nuse crate::util::phoenix_request::{\n    build_client_context, build_user_context, candidates_from_retrieval_response,\n    retrieval_value_model_weights,\n};\nuse rustc_hash::FxHashSet;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;\nuse xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::{\n    PhoenixRetrievalCluster, RetrievalExclusions,\n};\nuse xai_candidate_pipeline::component_library::utils::quality_factor;\nuse xai_candidate_pipeline::source::Source;\nuse xai_home_mixer_proto as pb;\n",
+      "source_digest": "72672813eed504fadcd8598751a3c9ec9105b0a83e949ef97fdd01354f57f675",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "home-mixer/sources/phoenix_source.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 110,
+      "end_line": 134,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<PostCandidate>, String> {\n        let user_id = query.user_id;\n\n        let sequence = query\n            .retrieval_sequence\n            .as_ref()\n            .ok_or_else(|| \"PhoenixSource: missing retrieval_sequence\".to_string())?;\n\n        let cluster = Self::resolve_cluster(query);\n        let client_context = build_client_context(query);\n        let user_context = build_user_context(query);\n\n        let response = self\n            .phoenix_retrieval_client\n            .retrieve_excluding(\n                cluster,\n                user_id,\n                sequence.clone(),\n                query.columnar_retrieval_sequence.clone(),\n                quality_factor::apply(query.params.get(PhoenixMaxResults)),\n                query.params.get(PhoenixColdStartMaxResults),\n                vec![],\n                None,\n",
+      "source_digest": "ea050d823506155844ee9a54f31f9298ab4c45710996cec62829cf0ba25cc818",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e42bcc9f502dd4bb579fcce6190a69690e5509cb0d6899a06895e301a9cc05eb",
+      "change_scope": "changed_file",
+      "mechanism_group": "home-mixer/util",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "7531977cd93a5fa8429dcb729d8575a1d45765995b8e331532a43ccb5ecd06f7",
+      "context_complete": true,
+      "task_id": "T-bc11eb900e9fd85072b23c33552a45858f0171a662fec2e50f0f26469d7a1af7",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ba2a1f6b60f45bdf933421b7f0e4dea2fabccc1002743c84ec038c92b7808489",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/util",
+      "query_symbols": [
+        "build_user_context"
+      ],
+      "context_complete": false,
+      "task_id": "T-0b7243d6731e2ee1667537d1f63392273e7383bac7927382a6fb05461858452e",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-25f556f115aa27c4685fb9e912985e6234d60258f37434db0cfbab58afe64f82",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/util",
+      "query_symbols": [
+        "build_user_context"
+      ],
+      "context_complete": false,
+      "task_id": "T-b013302c590c52e2d7155e485f1314cb58c51e80c464d59fe0559f7a97f2c426",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4b6831f89b79e02bc5ac1374f3459aa427f0997752c71b4094eb395126479087",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/util",
+      "query_symbols": [
+        "build_user_context"
+      ],
+      "context_complete": false,
+      "task_id": "T-27902dd1184a48ddb046a8d5bec948b171c7b110ab629fbf68a16a9ff19982eb",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-774f626725c31a9d976cc16d43bafff1eae6561bda15a20df0e64cb3513c2f06",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/util",
+      "query_symbols": [
+        "build_user_context"
+      ],
+      "context_complete": false,
+      "task_id": "T-4a1cc50b1e35654675f076ffea9b7e381ac9b01cbebe026ad7a0461e16f76ef2",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c23dc1bb86bc935ee6e60510540c3e3abd94d98e2ad09ebbf083c0e49da9d20f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/util",
+      "query_symbols": [
+        "build_user_context"
+      ],
+      "context_complete": false,
+      "task_id": "T-66ecf23fc7fc9828227b1d075a5e9749e2a7ac5d6392f6c44ad96dea600be581",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/util/phoenix_request.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-494b9df1e6c5f7ca57e6ddf98f5b3c42e0a10a8d302d8abb83ae4c7e50d613fa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/util",
+      "query_symbols": [
+        "build_user_context"
+      ],
+      "context_complete": false,
+      "task_id": "T-4e4f9d96556494babe8c08dcc0acf0aaf62961df009d11cdd301ea7a28d892b2",
+      "evidence_refs": [
+        "E8"
+      ]
+    }
+  ],
+  "task_id": "T-c09ba341d9fd08e0408065e0a627ef135d4c081e6d01f04b65a1d456ca78c7c6"
+}

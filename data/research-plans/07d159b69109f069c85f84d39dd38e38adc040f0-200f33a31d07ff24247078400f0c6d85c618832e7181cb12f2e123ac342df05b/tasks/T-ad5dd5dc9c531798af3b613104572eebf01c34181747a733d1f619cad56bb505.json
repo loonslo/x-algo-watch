@@ -1,0 +1,1931 @@
+{
+  "schema_version": 1,
+  "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-39a466de9804e034acb4e9eacdac7e892e7814e07742555ff236f6f1e6048701",
+  "change_scope": "changed_file",
+  "mechanism_group": "home-mixer/side_effects",
+  "evidence": {
+    "E1": {
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 233,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::query::ScoredPostsQuery;\nuse crate::params::EnableAdsFunnelTrace;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};\nuse xai_ads_proto::funnel_trace::LiFunnelCounters;\nuse xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{\n    KafkaCluster, KafkaPublisherClient, ProdKafkaPublisherClient, FUNNEL_TRACE_TOPIC,\n};\nuse xai_candidate_pipeline::component_library::utils::funnel_trace::{\n    self, FunnelCounts, DROPPED_BLENDER_KEY, SERVED_KEY,\n};\nuse xai_candidate_pipeline::component_library::utils::{current_timestamp_millis, is_prod};\nuse xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};\nuse xai_home_mixer_proto::{feed_item, FeedItem};\nuse xai_recsys_proto::AdIndexInfo;\n\n#[derive(Clone)]\npub struct FunnelTraceSideEffect {\n    kafka_client: Arc<dyn KafkaPublisherClient>,\n    pod_id: String,\n}\n\nimpl FunnelTraceSideEffect {\n    pub fn new(kafka_client: Arc<dyn KafkaPublisherClient>) -> Self {\n        Self {\n            kafka_client,\n            pod_id: std::env::var(\"HOSTNAME\").unwrap_or_else(|_| \"unknown\".to_string()),\n        }\n    }\n\n    pub async fn prod() -> Self {\n        static FUNNEL_TRACE: tokio::sync::OnceCell<FunnelTraceSideEffect> =\n            tokio::sync::OnceCell::const_new();\n        FUNNEL_TRACE\n            .get_or_init(|| async {\n                Self::new(Arc::new(\n                    ProdKafkaPublisherClient::new(FUNNEL_TRACE_TOPIC, KafkaCluster::Ads).await,\n                ))\n            })\n            .await\n            .clone()\n    }\n}\n\n#[async_trait]\nimpl SideEffect<ScoredPostsQuery, FeedItem> for FunnelTraceSideEffect {\n    fn enable(&self, query: Arc<ScoredPostsQuery>) -> bool {\n        is_prod() && query.params.get(EnableAdsFunnelTrace)\n    }\n\n    async fn side_effect(\n        &self,\n        input: Arc<SideEffectInput<ScoredPostsQuery, FeedItem>>,\n    ) -> Result<(), String> {\n        let counts = input.query.ad_drops.read(|drops| {\n            funnel_counts(\n                &input.selected_candidates,\n                &input.non_selected_candidates,\n                drops,\n            )\n        });\n        if counts.is_empty() {\n            return Ok(());\n        }\n        let flush_timestamp_ms = current_timestamp_millis().unwrap_or_default() as i64;\n        let messages: Vec<LiFunnelCounters> = counts\n            .into_iter()\n            .map(|(line_item_id, counts)| LiFunnelCounters {\n                line_item_id,\n                counts,\n                flush_timestamp_ms,\n                pod_id: self.pod_id.clone(),\n            })\n            .collect();\n        funnel_trace::publish(self.kafka_client.as_ref(), messages).await\n    }\n}\n\nfn drop_key(reason: AdDropReason) -> &'static str {\n    match reason {\n        AdDropReason::TooFewPosts => \"dropped.too_few_posts\",\n        AdDropReason::SpacingCap => \"dropped.spacing_cap\",\n        AdDropReason::NoEligibleNeighbours => \"dropped.no_eligible_neighbours\",\n        AdDropReason::LowRiskNeighbour => \"dropped.low_risk_neighbour\",\n        AdDropReason::ExcludedHandle => \"dropped.excluded_handle\",\n        AdDropReason::ExcludedKeyword => \"dropped.excluded_keyword\",\n        AdDropReason::ServedNeighbour => \"dropped.served_neighbour\",\n        AdDropReason::Truncated => \"dropped.truncated\",\n        AdDropReason::Unspecified => DROPPED_BLENDER_KEY,\n    }\n}\n\nfn funnel_counts(\n    selected: &[FeedItem],\n    non_selected: &[FeedItem],\n    drops: &[DroppedAd],\n) -> FunnelCounts {\n    let any_traced = selected\n        .iter()\n        .chain(non_selected)\n        .any(|item| traced_ad(item).is_some())\n        || drops.iter().any(|drop| traced_drop(drop).is_some());\n    if !any_traced {\n        return FunnelCounts::new();\n    }\n    let reason_key = |impression_id: i64| {\n        drops\n            .iter()\n            .find(|drop| drop.impression_id == impression_id as u64)\n            .map_or(DROPPED_BLENDER_KEY, |drop| drop_key(drop.drop_reason()))\n    };\n    let selector_ad_ids: Vec<u64> = selected\n        .iter()\n        .chain(non_selected)\n        .filter_map(as_ad)\n        .map(|ad| ad.impression_id as u64)\n        .collect();\n    let served = selected\n        .iter()\n        .filter_map(traced_ad)\n        .map(|ad| (ad.line_item_id, SERVED_KEY));\n    let dropped_by_selector = non_selected\n        .iter()\n        .filter_map(traced_ad)\n        .map(|ad| (ad.line_item_id, reason_key(ad.impression_id)));\n    let dropped_after_selection = drops\n        .iter()\n        .filter(|drop| !selector_ad_ids.contains(&drop.impression_id))\n        .filter_map(|drop| {\n            traced_drop(drop).map(|ad| (ad.line_item_id, drop_key(drop.drop_reason())))\n        });\n    let mut counts = FunnelCounts::new();\n    for (line_item_id, key) in served\n        .chain(dropped_by_selector)\n        .chain(dropped_after_selection)\n    {\n        *counts\n            .entry(line_item_id)\n            .or_default()\n            .entry(key.to_string())\n            .or_default() += 1;\n    }\n    counts\n}\n\nfn as_ad(item: &FeedItem) -> Option<&AdIndexInfo> {\n    match &item.item {\n        Some(feed_item::Item::Ad(ad)) => Some(ad),\n        _ => None,\n    }\n}\n\nfn traced_ad(item: &FeedItem) -> Option<&AdIndexInfo> {\n    as_ad(item).filter(|ad| ad.funnel_traced)\n}\n\nfn traced_drop(drop: &DroppedAd) -> Option<&AdIndexInfo> {\n    drop.ad_info.as_ref().filter(|ad| ad.funnel_traced)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::ads::drops::dropped_ad;\n\n    fn ad(line_item_id: i64, impression_id: i64, funnel_traced: bool) -> AdIndexInfo {\n        AdIndexInfo {\n            line_item_id,\n            impression_id,\n            funnel_traced,\n            ..Default::default()\n        }\n    }\n\n    fn item(ad: AdIndexInfo) -> FeedItem {\n        FeedItem {\n            position: 0,\n            item: Some(feed_item::Item::Ad(ad)),\n        }\n    }\n\n    #[test]\n    fn traced_served_ad_counts_as_served() {\n        let counts = funnel_counts(&[item(ad(10, 1, true))], &[], &[]);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"served\"], 1);\n    }\n\n    #[test]\n    fn traced_non_selected_ad_counts_under_its_reason() {\n        let drops = vec![dropped_ad(&ad(10, 1, true), AdDropReason::SpacingCap)];\n        let counts = funnel_counts(&[], &[item(ad(10, 1, true))], &drops);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"dropped.spacing_cap\"], 1);\n    }\n\n    #[test]\n    fn traced_non_selected_ad_without_reason_counts_as_blender_drop() {\n        let counts = funnel_counts(&[], &[item(ad(10, 1, true))], &[]);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"dropped.blender\"], 1);\n    }\n\n    #[test]\n    fn traced_ad_dropped_after_selection_counts_under_its_reason() {\n        let drops = vec![dropped_ad(&ad(10, 1, true), AdDropReason::ServedNeighbour)];\n        let counts = funnel_counts(&[], &[], &drops);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"dropped.served_neighbour\"], 1);\n    }\n\n    #[test]\n    fn same_line_item_served_and_dropped_keeps_both_keys() {\n        let drops = vec![dropped_ad(&ad(10, 2, true), AdDropReason::SpacingCap)];\n        let counts = funnel_counts(&[item(ad(10, 1, true))], &[item(ad(10, 2, true))], &drops);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 2);\n        assert_eq!(counts[&10][\"served\"], 1);\n        assert_eq!(counts[&10][\"dropped.spacing_cap\"], 1);\n    }\n\n    #[test]\n    fn untraced_ads_produce_nothing() {\n        let drops = vec![dropped_ad(&ad(10, 3, false), AdDropReason::ServedNeighbour)];\n        let counts = funnel_counts(&[item(ad(10, 1, false))], &[item(ad(10, 2, false))], &drops);\n        assert!(counts.is_empty());\n    }\n}\n",
+      "source_digest": "38a4f1cfe87492a4c5d93657744cbb31117fc1067c62ab8a1697eff9739824cd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 222,
+      "end_line": 246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n",
+      "source_digest": "60822fd03a52dedcdfc454d79cb19ef3d88126589a6074db7e1ce23d53096a1f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 231,
+      "end_line": 255,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 241,
+      "end_line": 265,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n",
+      "source_digest": "3b459aead22e76de83f09adc1f40d8923c400fbb73e20f139c3ebaed896c7c74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 243,
+      "end_line": 267,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n",
+      "source_digest": "4ca00abdcb741990304e7b614ee58459b4bacb8a332fbda00b08c78c9e7e2130",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 245,
+      "end_line": 269,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n",
+      "source_digest": "b7b006b35b1fe3f31ce3912125bf0770ff79ecdc0de574376745ca30de840d86",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 246,
+      "end_line": 270,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n",
+      "source_digest": "8242ef5c14a5991139109c218fda95457bd79886c0d4526173cc2f34b07cadd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 255,
+      "end_line": 279,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 257,
+      "end_line": 281,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 280,
+      "end_line": 304,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n",
+      "source_digest": "5bce27df8a7dc08ba2686e279b096d9b4bcb36d5564c65be77058c4e5f04ec9e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 325,
+      "end_line": 349,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 420,
+      "end_line": 444,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub struct Matched {\n    pub lkey: String,\n    pub record: ActionControlRecord,\n}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Resolved {\n    pub matched: Option<Matched>,\n        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n",
+      "source_digest": "4e21a3212bda51d283103fedf962ef0899727531cc1cda7faba013aba29d5a82",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 430,
+      "end_line": 454,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n",
+      "source_digest": "c7c734b954066febeddb84c77d5a8584db6cb3657e4778f388a6bb24d30ecc10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 433,
+      "end_line": 457,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n    }\n\n    pub fn recording(&self) -> bool {\n",
+      "source_digest": "45772c2ff6ff6bd46d6f37d59ee1929611ee95883e3cc27d35ba317639387b2c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 450,
+      "end_line": 474,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n    }\n\n    pub fn recording(&self) -> bool {\n        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n            Some(\"global\")\n        } else if self.recording() {\n            Some(\"page\")\n        } else if self.producer_dry {\n            Some(\"producer\")\n        } else {\n            None\n        }\n",
+      "source_digest": "76deeacbe34d33ad8437035f7d002824a7cc2ac338c291808f5d45d60e5636a9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 458,
+      "end_line": 482,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n            Some(\"global\")\n        } else if self.recording() {\n            Some(\"page\")\n        } else if self.producer_dry {\n            Some(\"producer\")\n        } else {\n            None\n        }\n    }\n\n            pub fn incoming_dedup_class(&self, rules: u8) -> u8 {\n        self.dedup_class.unwrap_or(rules)\n    }\n\n            pub fn info_keys(&self) -> Vec<(String, String)> {\n        let mut keys = vec![(\n",
+      "source_digest": "f2a443a674e6bc079929faef05c23f03cab52b7b6578b0ae6e052c63cd1a88ec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 459,
+      "end_line": 483,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n            Some(\"global\")\n        } else if self.recording() {\n            Some(\"page\")\n        } else if self.producer_dry {\n            Some(\"producer\")\n        } else {\n            None\n        }\n    }\n\n            pub fn incoming_dedup_class(&self, rules: u8) -> u8 {\n        self.dedup_class.unwrap_or(rules)\n    }\n\n            pub fn info_keys(&self) -> Vec<(String, String)> {\n        let mut keys = vec![(\n            \"action_control_mode\".to_owned(),\n",
+      "source_digest": "5748c4c56a9310d52b8f94c1b7c42cd58b7ab03a0ace6d71ab6590700eca3299",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 183,
+      "end_line": 207,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 233,
+      "end_line": 257,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nfn page_class(actions: &[PageAction]) -> u8 {\n    page_specs(actions)\n        .iter()\n        .map(ActionSpec::dedup_action_class)\n        .max()\n        .unwrap_or(crate::dedup_cache::CLASS_NONE)\n}\n\n\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n",
+      "source_digest": "60822fd03a52dedcdfc454d79cb19ef3d88126589a6074db7e1ce23d53096a1f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 242,
+      "end_line": 266,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 251,
+      "end_line": 275,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 252,
+      "end_line": 276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n",
+      "source_digest": "3b459aead22e76de83f09adc1f40d8923c400fbb73e20f139c3ebaed896c7c74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 254,
+      "end_line": 278,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n",
+      "source_digest": "4ca00abdcb741990304e7b614ee58459b4bacb8a332fbda00b08c78c9e7e2130",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 256,
+      "end_line": 280,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n",
+      "source_digest": "b7b006b35b1fe3f31ce3912125bf0770ff79ecdc0de574376745ca30de840d86",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 257,
+      "end_line": 281,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n",
+      "source_digest": "8242ef5c14a5991139109c218fda95457bd79886c0d4526173cc2f34b07cadd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 266,
+      "end_line": 290,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 268,
+      "end_line": 292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 291,
+      "end_line": 315,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n                if parsed.is_none() {\n                    bad.push(format!(\"updated_by_keys={keys}\"));\n                }\n                out.updated_by_keys = Some(parsed.unwrap_or_default());\n            }\n        }\n        if !v.is_object() {\n            out.enabled = false;\n            bad.push(v.to_string());\n        }\n        if !bad.is_empty() {\n            let bad = bad.join(\", \");\n            let mut last = LAST_BAD.lock().unwrap_or_else(|p| p.into_inner());\n            if last.as_deref() != Some(bad.as_str()) {\n                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n",
+      "source_digest": "5bce27df8a7dc08ba2686e279b096d9b4bcb36d5564c65be77058c4e5f04ec9e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 336,
+      "end_line": 360,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 431,
+      "end_line": 455,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub struct Matched {\n    pub lkey: String,\n    pub record: ActionControlRecord,\n}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Resolved {\n    pub matched: Option<Matched>,\n        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n",
+      "source_digest": "f469d83d8cbef94025fc0a2b06dd965e2084f4931c5b711a5cbd5aa1afcadcee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 443,
+      "end_line": 467,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n",
+      "source_digest": "ed961668fa44b8e389692947127305fcd53b11f77ddffc393147cba89ef24dbd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 446,
+      "end_line": 470,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n",
+      "source_digest": "49012dce9cc03d020d356524c984717a0481f7e56a0e388cb64d5748d1221494",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 480,
+      "end_line": 504,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return None;\n        }\n        self.unlisted = true;\n        self.dedup_class = Some(page_class(&self.page_actions));\n        Some(self)\n    }\n\n    pub fn recording(&self) -> bool {\n        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n            Some(\"global\")\n        } else if self.recording() {\n            Some(\"page\")\n        } else if self.producer_dry {\n            Some(\"producer\")\n        } else {\n            None\n        }\n",
+      "source_digest": "40f09ba3ef9f40b77cad39d52f33094261220a1c5b6e0530032b5f0502e863d0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 488,
+      "end_line": 512,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n            Some(\"global\")\n        } else if self.recording() {\n            Some(\"page\")\n        } else if self.producer_dry {\n            Some(\"producer\")\n        } else {\n            None\n        }\n    }\n\n                pub fn incoming_dedup_class(&self, rules: impl FnOnce() -> u8) -> u8 {\n        self.dedup_class.unwrap_or_else(rules)\n    }\n\n            pub fn info_keys(&self) -> Vec<(String, String)> {\n        let mut keys = vec![(\n",
+      "source_digest": "401d7f3519732f4d3ea5129fdb4b75f6044c1297274da780d4d280c14a4f4149",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 489,
+      "end_line": 513,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n                pub fn record_only(&self) -> bool {\n        self.recording() || self.producer_dry\n    }\n\n        pub fn dry_run_source(&self, global: bool) -> Option<&'static str> {\n        if global {\n            Some(\"global\")\n        } else if self.recording() {\n            Some(\"page\")\n        } else if self.producer_dry {\n            Some(\"producer\")\n        } else {\n            None\n        }\n    }\n\n                pub fn incoming_dedup_class(&self, rules: impl FnOnce() -> u8) -> u8 {\n        self.dedup_class.unwrap_or_else(rules)\n    }\n\n            pub fn info_keys(&self) -> Vec<(String, String)> {\n        let mut keys = vec![(\n            \"action_control_mode\".to_owned(),\n",
+      "source_digest": "028922054e418077e506b5b4c76b737900ee5b29a54b73da9c75396d3fbbf00f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39a466de9804e034acb4e9eacdac7e892e7814e07742555ff236f6f1e6048701",
+      "change_scope": "changed_file",
+      "mechanism_group": "home-mixer/side_effects",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "ea5366298ce7572b7f5b15e026d4555240ec9378811a8fa4816ae7f72312e1eb",
+      "context_complete": true,
+      "task_id": "T-01eef1fdb1405960f3b28ded9aa1b7c178f5f73cde6eccf9e512ae9fab822f2b",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b017313f864fa45478691292933a80272e1ea849f113f407c7f523ca89999d5c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-9c9158351249cb1fd62cc3517db858a6b9252d9f72512251fe85dc8bc20228e7",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-51138ab52b7f78c0c61fe176ec4e812b6a3b05fac47557da716c2060543a1167",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-0929786380528f17117b56c1305b054083f7f317ecaa1b95181848c57256fb53",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-700c2d5032c9d0a9b40b57f48f09d52a60a04a87f7aa455d6b631c3000197d60",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-34c671f92d822a87d2d2d4168cdaf523b1eafd636e95319e7271620e2f687149",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-61501186ea70b8ba49b4923b8731c139b8f77f683e4bf0bce31b3014a7bac43a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-18fd6c679c81a28a8ba95c6462b43b47b580b06666e2cd924b18a7afac918878",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6a41faee1589a74c5e1997333d0a4c19b304c151738df6a5dc32c652460905f0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-dec5a073e9cb7d55dca5c79e92128f6bd331344b9824dbdb8b81cbba2d8357e1",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b5107d79fcbe9b73cfadc94e4b70b2edfa47dd227380b20a4d29678e3b0f84e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-c39c1a5fbf1cb01ba37902f23035bc54138ddf34c9cf135b14c1b34ff076f44b",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7421395fd5abbdf10b432e7802ce596f0c4aee3bb8f1ee30da458e1e864517c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-9e08381ae8b64cb33b5638f2a7eca1d86e607605ef360e41626466145ac0e761",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d419f51e8a9ce0bd8132bca7f04b25d5133b42633151048ad866dcbc03c658bf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c3cbc57b275b294fb97c1e5e68a42a7e65a29200ca6e75cd9fe1d754fa50e6d",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1a35e9bb7f83096aef3954a041717fb85d43afa3823c6c0f37741871a80bc9dc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-bb8f94a64ce88e5bacd0ee5155dc049c54490cb50bdba38c962d1c4b929e62c7",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9b016a48f36a7b8d69e27f8a4375aea97ccb2cf7a21889e160f0472530023375",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-45f0faf8c9c96dcb8ec7e60f8a9962f335c589e2ae1bfddf173e19d6cdad0405",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d2deac7672f4db83d27485061654420c9c8faf491f6b1f806b3acdaef5339156",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-a3b4818edf094514e79b6a80c6e10d625e16e6d3302263889be62f6eaf9e83fc",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e60886890be34210ad85645820a7c1d245c098249279c031a298984250edf5b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-b27a943040ffb701022b2fcdb926523da0a462deba8019183fba6a8fc725e565",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f80c161279cfd20aab31ab380b29158b718b7fa70909dbdf9ac75df0f57d4b0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-6f416b79df0bcf3ff27c02430478374fe45a67ffe09711cf8d70619210c9a3b3",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e22f71873a694396e3c28c3224aa19067a502503ff5a3ed030eba1d291339e5f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-d22519df5894787b18eb638d9f9543a66bfad1d791ddc8a0245f5a6f853d59d0",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6214e8fb22c4c8a23d3d738c775ba5274415352e9c2fea28b704bf1ed93e3896",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-f4e4e610d11d64602304ab7c1507a43152334ff727fc62d557300e6cc4236096",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7ad23145297347a7d0a1553e4ffb5fbb11dcd41ff9818b9a8b1cc312740b87e2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-50d01ad5010fc9c22b540349746d08385139b5ee45f4c82b9b82686fb6da103f",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cdf24b2b5463122237f67436a8576d67277b0f500889895b31cf2219b8d98539",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-4b20453a4a0892d5f7d90419d571d1d1e0f89ece62038f4319e5ef126ef78120",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e47cceee04c96f095946032c4d6ee6051eaf6da5aa9e01ee9b21833ed68bb94d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-a15b7dd53bf1996d5b82139026f52171d0e0c33f1a7e9f488d1c6b7dde620a68",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f403bd7c44fb0249124a1c25f2ea8cf103cb9a62cd068f3182a2a7b50f83922",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-92031a68edc5e371a73129c0201612786f37ee30225d2692e1c2ce3813a34271",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0d7c04449de27bf9ef26500692f6711b2ac696d978dbc2022482b304268ef895",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-a259bcd9e6fb44a12ddcc0f2e6e2917a85803cf8bd10e27fb2bb176bda8f302b",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d6db1e69217535855859d62f124bde29dfb5059ddd32be2a841c4a30b7546a48",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-710f32f8a1d6d41a7a165d1f51046b31b716adcc7b29251d612e05e87a6669e5",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-02c2b5ad6cab89d429af35e47841ad2b19b14cc35f2a6d6922f7bd1dbe8bb86e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-0be6c72f594894dd5e8b750a5cb3e11cf95d0ad58136eb2ca1e7211572d28d4e",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f5c954d50bb8a2237ace856ef46e64e05042d8eae27f618723a2a7a39eac262a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-150d9178bc6f2e7a03ede8392d8ab2a5dce409c723bd8271bf077b10f8ea0d42",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ddc4f9f72498c78dd84276d2c813fda8641173d5b813f6e08871624c19564d56",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-446025521f0d005ccffb9d4f6552b40e5d391826c173046fbd58b558705dcaab",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5e1ef4450d401dd71d72232a19abd2e2137ca9628b6f512e8aa1ff8130750416",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-9cd30a18fdafe6890070867e085aa7ce0479d0c862b45a5fd98f0467b9a4069a",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-215de6fcf25c43f9ca07c5c2f7976f958a06b3cb7e15f6f582171c6e529ef271",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-97ca0d71ed2f24b7141ef510bcb02d30e71f7ea8b7336becf54eee37e5b70d09",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6f81b03d158cf87e5b4686c5263fb5a2d8245596832c3a998efb78f4236f1cbe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-619e423c5fa8abf362122ea63038afe0d5fb07446f8aa4091f10839ac7f6f7fa",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dead58e3f7c0ec2c7c003a397f1432ed8bd4b095f02783d50613f9d5927fdd84",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-96d8f1727f310ebc45998c540448c3a3944abfe8dcfcabd367511b181fa81525",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-01906217ec5559f6768a00c72dec713b3bbe223dbef76b3cbfbdd3b8439f31e0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-4e4e04aaf73347f9d5859022d6fbaec6288d5aee8821bf7dbdba32effa96bc04",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f258e734b58252432522fd88d2c1a85264c54d8e955ceaac698308a00c67d1a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-252ea0488d652c1287cc77f93bf466ff417e1feb8c96c62bb5288e8d700f2caf",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-512f947bbcdf3f7041a4a9d0d1fc629e90f05b303a9b4789a8c3bf55f38cd914",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-934614021d53734cbd1c01c083a503f65b9e4e78db4e912938f8309cc311f984",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4fee947431bbb9e28258d08fe40e371c2c620f2e91774dc35f71957a381ad5d4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-0fa97b29908de833a9be5039931ba58cd71a218487257328dd265dfe8762f024",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-889ab0afc865dc54f08dd1d36f2fe3709b861929d885e094e8de0a2ea1c2e922",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-c4d5608ce51ac8d77ec44b5640e82b5392e39b48ec3018d075ecb8379fca98f5",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca013fd463958b58d68e4d3d64f0a8fe4fa64bdd887740155c9bd96f6f68889c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-681ad5a50c7a5c09a0f302d0e2e6e30b152bd8ea47846c260b7dbdcafa844766",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-78faf0202ce25787bd207d3ac5a0a6c89cbc47b03022bc9e9faa2331573808d3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-6681c223485b73179f94295d48683c9dab0d06f36ad5ecf88d3a63d48417ac3a",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a1879c70cce4f36244411575228b843194b84974eed49d14cad4971213829188",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-ed35d9e55a58b0b8053bb6fede663f7e171bb20dd379a6b82b6232b1f74bda08",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5de69e7d0336b6082a9e9e086bd0273723853e1c9ae0ca139cac44adf3318a53",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec12b122d0ad76862327a6e640b32c966def0c2cfebf78ad80ee756f407368b3",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e21ac3964973b75ba7023afd7f8043d0e13e88d52481f1f318fc1dbf56e60ab9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ea4273f9b4ffffd1a447c43128ee6eeef12ef62f4a1a5e9e535f9fb6a21423c",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-21c1e7e7151e4acb8420cb52d379d04cb75271f1469dc74ab3598364874b51f6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-5792e6489e303da4c74f8d0f4a06d056454a13a5ac7b92977e6665e94e345bfa",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7cf51bb326860894bd44c1f2683122ba8253332f9675732e58582f0af6272c5a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-f598ccb1bfe6a3b53a735dfad74ab024b3fa6b08148223dad0dab1d837aca30a",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c2bb545e772f3db8e5e81e3ccb10f5ed8845f7df87646979631e3a388232dcae",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-f475ac3cdd89a9aca64486dc8828a301dd09c94d6031bc6ad5177ab03c5085a8",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8643cdfa55057da86be561d3b25726c76440e0f54bbdcd55aaa7db1768fcf792",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-80a2936c94e7a2e1ee7df0e16e5147e9f33eda2bf52074175aef9c4e30ed2f12",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-04d85db5cda7ebf235a37a6776c1f2f111b24e58ea7851e62f2e171f40cf1325",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-72f71002daae0a883a1a4beb8a0aba7bf0d995941dd67b8677e17b3f51f3a8cd",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-240430ecfec249e1de65fbf90adf9dd7f3b8a90d103aea206aa6da4982b0a4eb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-8c235e71102bf5ff8633f880ae051ca4ea86bc2bdd499e221bc45db9f7fe1d5e",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-79f3cf81e1b8e688f695b09563abfeea0da0fe42838345df5e539ef01c2ea0c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-7dd7a95c8f2d8b35ccb260eef12fd788de5b4ba64990c3abaa421c313e67fc70",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aefe84a07a714f78b65bc00e10fd5abcc18947191cea0b7162749a8a5c5673cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-c71e1563216088f26924533bd29494b547097fe99245367a8ce07f97246c7ec5",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3ac76d9499e35bec6f4c387fa4bd229b18a927f4bba886e4d329faf2887ce2dd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-ce2b60d9806cb4c08607d50689f61339fc601156d64722c4f374d7bc2fdaa8e0",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6afbb3d98af9e1e875314f6112aabb432be9c6333c10745caaef590494ad16ea",
+      "change_scope": "supporting_context",
+      "mechanism_group": "home-mixer/side_effects",
+      "query_symbols": [
+        "FunnelTraceSideEffect",
+        "new",
+        "prod",
+        "enable",
+        "side_effect",
+        "drop_key",
+        "funnel_counts",
+        "as_ad"
+      ],
+      "context_complete": false,
+      "task_id": "T-ff5ea31f302bcf103a21f88080c675832443c9f4424e0a5440cdb152a29c6a85",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-ad5dd5dc9c531798af3b613104572eebf01c34181747a733d1f619cad56bb505"
+}

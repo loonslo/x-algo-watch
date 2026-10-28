@@ -1,0 +1,1293 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/fallback_cache.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-0ff86c1a3086a11c43baafcebe2f1b0a5c8d7d2429fc65fe46681533e7205828",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 343,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use std::sync::atomic::{AtomicU64, Ordering};\nuse std::time::Duration;\n\nuse quick_cache::sync::{Cache, EntryAction, EntryResult};\nuse quick_cache::OptionsBuilder;\n\nuse crate::hydration::batch::{Hydrated, RawHydrationBatch};\nuse crate::hydration::decode::author::AuthorFallbackCache;\nuse crate::hydration::decode::tweet::TweetFallbackCache;\nuse crate::hydration::metrics::{record_fallback_cache_entries, FallbackCacheCounts};\n\nconst CACHE_SHARDS: usize = 64;\nconst OCCUPANCY_SAMPLE_INTERVAL: u64 = 1024;\nconst NO_WAIT: Option<Duration> = Some(Duration::ZERO);\n\npub(crate) trait Column {\n    type Entry: Clone;\n    type Value: Clone;\n    type Stored;\n    const NAME: &'static str;\n\n    fn store(value: &Self::Value) -> Self::Stored;\n    fn new_entry(stored: Self::Stored) -> Self::Entry;\n    fn replace(entry: &mut Self::Entry, stored: Self::Stored) -> Option<Self::Stored>;\n    fn get(entry: &Self::Entry) -> Option<Self::Value>;\n    fn holds(entry: &Self::Entry) -> bool;\n    fn others_hold(entry: &Self::Entry) -> bool;\n    fn clear(entry: &mut Self::Entry) -> Option<Self::Stored>;\n}\n\n#[derive(Default)]\npub(crate) struct FallbackCaches {\n    pub(crate) tweets: Option<TweetFallbackCache>,\n    pub(crate) authors: Option<AuthorFallbackCache>,\n}\n\npub(crate) struct FallbackCache<E> {\n    cache: &'static str,\n    entries: Cache<u64, E>,\n    resolved_batches: AtomicU64,\n}\n\nimpl<E: Clone> FallbackCache<E> {\n    #[expect(\n        clippy::expect_used,\n        reason = \"both options `build` requires are set, so it cannot fail\"\n    )]\n    pub(crate) fn new(cache: &'static str, capacity: usize) -> Self {\n        let options = OptionsBuilder::new()\n            .shards(CACHE_SHARDS)\n            .estimated_items_capacity(capacity)\n            .weight_capacity(u64::try_from(capacity).unwrap_or(u64::MAX))\n            .build()\n            .expect(\"capacity options are set\");\n        let entries = Cache::with_options(\n            options,\n            Default::default(),\n            Default::default(),\n            Default::default(),\n        );\n        entries.reserve(capacity);\n        Self {\n            cache,\n            entries,\n            resolved_batches: AtomicU64::new(0),\n        }\n    }\n\n    pub(crate) fn resolve_hydration_batch<C: Column<Entry = E>>(\n        &self,\n        batch: RawHydrationBatch<C::Value>,\n    ) -> RawHydrationBatch<C::Value> {\n        let mut counts = FallbackCacheCounts::default();\n        let resolved = batch\n            .into_hydrated()\n            .into_iter()\n            .map(|(key, hydrated)| {\n                let hydrated = match hydrated {\n                    Hydrated::Found(value) => {\n                        counts.resident += usize::from(self.set::<C>(key, &value));\n                        counts.fresh += 1;\n                        Hydrated::Found(value)\n                    }\n                    Hydrated::NotFound => {\n                        counts.resident += usize::from(self.clear::<C>(key));\n                        counts.not_found += 1;\n                        Hydrated::NotFound\n                    }\n                    Hydrated::Partial(value) => {\n                        match self.entries.get(&key).as_ref().and_then(C::get) {\n                            Some(cached) => {\n                                counts.resident += 1;\n                                counts.partial_stale += 1;\n                                Hydrated::Found(cached)\n                            }\n                            None => {\n                                counts.partial += 1;\n                                Hydrated::Partial(value)\n                            }\n                        }\n                    }\n                    Hydrated::Failed(error) => {\n                        match self.entries.get(&key).as_ref().and_then(C::get) {\n                            Some(value) => {\n                                counts.stale += 1;\n                                Hydrated::Found(value)\n                            }\n                            None => {\n                                counts.unavailable += 1;\n                                Hydrated::Failed(error)\n                            }\n                        }\n                    }\n                };\n                (key, hydrated)\n            })\n            .collect();\n\n        counts.record(self.cache, C::NAME);\n        if self\n            .resolved_batches\n            .fetch_add(1, Ordering::Relaxed)\n            .is_multiple_of(OCCUPANCY_SAMPLE_INTERVAL)\n        {\n            record_fallback_cache_entries(self.cache, self.entries.len());\n        }\n        RawHydrationBatch::from_hydrated(resolved)\n    }\n\n    #[expect(\n        clippy::let_underscore_must_use,\n        reason = \"a placeholder insert fails only when a concurrent write already replaced it, and that write stands\"\n    )]\n    fn set<C: Column<Entry = E>>(&self, key: u64, value: &C::Value) -> bool {\n        let mut stored = Some(C::store(value));\n        let written = self.entries.entry(&key, NO_WAIT, |_, entry| {\n            EntryAction::Retain(stored.take().and_then(|stored| C::replace(entry, stored)))\n        });\n        match written {\n            EntryResult::Retained(previous) => previous.is_some(),\n            EntryResult::Vacant(guard) => {\n                if let Some(stored) = stored {\n                    let _ = guard.insert(C::new_entry(stored));\n                }\n                false\n            }\n            EntryResult::Removed(..) | EntryResult::Replaced(..) | EntryResult::Timeout => false,\n        }\n    }\n\n    fn clear<C: Column<Entry = E>>(&self, key: u64) -> bool {\n        let mut seen = None;\n        self.entries.remove_if(&key, |entry| {\n            let others_hold = C::others_hold(entry);\n            seen = Some((C::holds(entry), others_hold));\n            !others_hold\n        });\n        let Some((held, others_hold)) = seen else {\n            return false;\n        };\n        if held && others_hold {\n            let mut cleared = None;\n            self.entries.entry(&key, NO_WAIT, |_, entry| {\n                cleared = C::clear(entry);\n                if C::others_hold(entry) {\n                    EntryAction::Retain(())\n                } else {\n                    EntryAction::Remove\n                }\n            });\n        }\n        held\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::hydration::batch::{HydrationBatch, HydrationError};\n\n    type Pair = (Option<String>, Option<String>);\n\n    struct Left;\n    struct Right;\n\n    impl Column for Left {\n        type Entry = Pair;\n        type Value = String;\n        type Stored = String;\n        const NAME: &'static str = \"left\";\n\n        fn store(value: &String) -> String {\n            value.clone()\n        }\n        fn new_entry(stored: String) -> Pair {\n            (Some(stored), None)\n        }\n        fn replace(entry: &mut Pair, stored: String) -> Option<String> {\n            entry.0.replace(stored)\n        }\n        fn get(entry: &Pair) -> Option<String> {\n            entry.0.clone()\n        }\n        fn holds(entry: &Pair) -> bool {\n            entry.0.is_some()\n        }\n        fn others_hold(entry: &Pair) -> bool {\n            entry.1.is_some()\n        }\n        fn clear(entry: &mut Pair) -> Option<String> {\n            entry.0.take()\n        }\n    }\n\n    impl Column for Right {\n        type Entry = Pair;\n        type Value = String;\n        type Stored = String;\n        const NAME: &'static str = \"right\";\n\n        fn store(value: &String) -> String {\n            value.clone()\n        }\n        fn new_entry(stored: String) -> Pair {\n            (None, Some(stored))\n        }\n        fn replace(entry: &mut Pair, stored: String) -> Option<String> {\n            entry.1.replace(stored)\n        }\n        fn get(entry: &Pair) -> Option<String> {\n            entry.1.clone()\n        }\n        fn holds(entry: &Pair) -> bool {\n            entry.1.is_some()\n        }\n        fn others_hold(entry: &Pair) -> bool {\n            entry.0.is_some()\n        }\n        fn clear(entry: &mut Pair) -> Option<String> {\n            entry.1.take()\n        }\n    }\n\n    fn cache() -> FallbackCache<Pair> {\n        FallbackCache::new(\"test\", 8)\n    }\n\n    fn batch(\n        entries: impl IntoIterator<Item = (u64, Hydrated<String>)>,\n    ) -> HydrationBatch<u64, String> {\n        HydrationBatch::from_hydrated(entries.into_iter().collect())\n    }\n\n    fn found(value: &str) -> Hydrated<String> {\n        Hydrated::Found(value.to_string())\n    }\n\n    fn failed() -> Hydrated<String> {\n        Hydrated::Failed(HydrationError::Timeout)\n    }\n\n    #[test]\n    fn a_later_value_replaces_the_cached_one() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"old\"))]));\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"new\"))]));\n\n        let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert_eq!(failed.get(&1), Some(&\"new\".to_string()));\n    }\n\n    #[test]\n    fn a_partial_answer_takes_the_complete_entry_and_leaves_it() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"complete\"))]));\n\n        let partial = cache.resolve_hydration_batch::<Left>(batch([(\n            1,\n            Hydrated::Partial(\"partial\".to_string()),\n        )]));\n        let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert_eq!(partial.hydrated(&1), Some(&found(\"complete\")));\n        assert_eq!(later.hydrated(&1), Some(&found(\"complete\")));\n    }\n\n    #[test]\n    fn a_partial_answer_creates_no_entry() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(\n            1,\n            Hydrated::Partial(\"partial\".to_string()),\n        )]));\n\n        let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert_eq!(later.hydrated(&1), Some(&failed()));\n    }\n\n    #[test]\n    fn authoritative_not_found_invalidates_stale_value() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"cached\"))]));\n\n        cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));\n        let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert!(matches!(failed.hydrated(&1), Some(Hydrated::Failed(_))));\n    }\n\n    #[test]\n    fn each_column_serves_only_what_its_own_source_wrote() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"left\")), (2, found(\"left\"))]));\n        cache.resolve_hydration_batch::<Right>(batch([(1, found(\"right\"))]));\n\n        let left = cache.resolve_hydration_batch::<Left>(batch([(1, failed()), (2, failed())]));\n        let right = cache.resolve_hydration_batch::<Right>(batch([(1, failed()), (2, failed())]));\n\n        assert_eq!(left.hydrated(&1), Some(&found(\"left\")));\n        assert_eq!(left.hydrated(&2), Some(&found(\"left\")));\n        assert_eq!(right.hydrated(&1), Some(&found(\"right\")));\n        assert_eq!(right.hydrated(&2), Some(&failed()));\n    }\n\n    #[test]\n    fn a_not_found_clears_only_its_own_column() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"left\"))]));\n        cache.resolve_hydration_batch::<Right>(batch([(1, found(\"right\"))]));\n\n        cache.resolve_hydration_batch::<Right>(batch([(1, Hydrated::NotFound)]));\n        let left = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n        let right = cache.resolve_hydration_batch::<Right>(batch([(1, failed())]));\n\n        assert_eq!(left.hydrated(&1), Some(&found(\"left\")));\n        assert_eq!(right.hydrated(&1), Some(&failed()));\n\n        cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));\n        assert!(cache.entries.is_empty());\n    }\n}\n",
+      "source_digest": "1a94cb089acffeb767701ff1b6510dbeda27cb7801f4d3ba0e87b42a947bac23",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 343,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use std::sync::atomic::{AtomicU64, Ordering};\nuse std::time::Duration;\n\nuse quick_cache::sync::{Cache, EntryAction, EntryResult};\nuse quick_cache::OptionsBuilder;\n\nuse crate::hydration::batch::{Hydrated, RawHydrationBatch};\nuse crate::hydration::decode::author::AuthorFallbackCache;\nuse crate::hydration::decode::tweet::TweetFallbackCache;\nuse crate::hydration::metrics::{record_fallback_cache_entries, FallbackCacheCounts};\n\nconst CACHE_SHARDS: usize = 64;\nconst OCCUPANCY_SAMPLE_INTERVAL: u64 = 1024;\nconst NO_WAIT: Option<Duration> = Some(Duration::ZERO);\n\npub(crate) trait Column {\n    type Entry: Clone;\n    type Value: Clone;\n    type Stored;\n    const NAME: &'static str;\n\n    fn store(value: &Self::Value) -> Self::Stored;\n    fn new_entry(stored: Self::Stored) -> Self::Entry;\n    fn replace(entry: &mut Self::Entry, stored: Self::Stored) -> Option<Self::Stored>;\n    fn get(entry: &Self::Entry) -> Option<Self::Value>;\n    fn holds(entry: &Self::Entry) -> bool;\n    fn others_hold(entry: &Self::Entry) -> bool;\n    fn clear(entry: &mut Self::Entry) -> Option<Self::Stored>;\n}\n\n#[derive(Default)]\npub(crate) struct FallbackCaches {\n    pub(crate) tweets: Option<TweetFallbackCache>,\n    pub(crate) authors: Option<AuthorFallbackCache>,\n}\n\npub(crate) struct FallbackCache<E> {\n    cache: &'static str,\n    entries: Cache<u64, E>,\n    resolved_batches: AtomicU64,\n}\n\nimpl<E: Clone> FallbackCache<E> {\n    #[expect(\n        clippy::expect_used,\n        reason = \"both options `build` requires are set, so it cannot fail\"\n    )]\n    pub(crate) fn new(cache: &'static str, capacity: usize) -> Self {\n        let options = OptionsBuilder::new()\n            .shards(CACHE_SHARDS)\n            .estimated_items_capacity(capacity)\n            .weight_capacity(u64::try_from(capacity).unwrap_or(u64::MAX))\n            .build()\n            .expect(\"capacity options are set\");\n        let entries = Cache::with_options(\n            options,\n            Default::default(),\n            Default::default(),\n            Default::default(),\n        );\n        entries.reserve(capacity);\n        Self {\n            cache,\n            entries,\n            resolved_batches: AtomicU64::new(0),\n        }\n    }\n\n    pub(crate) fn resolve_hydration_batch<C: Column<Entry = E>>(\n        &self,\n        batch: RawHydrationBatch<C::Value>,\n    ) -> RawHydrationBatch<C::Value> {\n        let mut counts = FallbackCacheCounts::default();\n        let resolved = batch\n            .into_hydrated()\n            .into_iter()\n            .map(|(key, hydrated)| {\n                let hydrated = match hydrated {\n                    Hydrated::Found(value) => {\n                        counts.resident += usize::from(self.set::<C>(key, &value));\n                        counts.fresh += 1;\n                        Hydrated::Found(value)\n                    }\n                    Hydrated::NotFound => {\n                        counts.resident += usize::from(self.clear::<C>(key));\n                        counts.not_found += 1;\n                        Hydrated::NotFound\n                    }\n                    Hydrated::Partial(value) => {\n                        match self.entries.get(&key).as_ref().and_then(C::get) {\n                            Some(cached) => {\n                                counts.resident += 1;\n                                counts.partial_stale += 1;\n                                Hydrated::Found(cached)\n                            }\n                            None => {\n                                counts.partial += 1;\n                                Hydrated::Partial(value)\n                            }\n                        }\n                    }\n                    missed \u0040 (Hydrated::Failed | Hydrated::Unanswered) => {\n                        match self.entries.get(&key).as_ref().and_then(C::get) {\n                            Some(value) => {\n                                counts.stale += 1;\n                                Hydrated::Found(value)\n                            }\n                            None => {\n                                counts.unavailable += 1;\n                                missed\n                            }\n                        }\n                    }\n                };\n                (key, hydrated)\n            })\n            .collect();\n\n        counts.record(self.cache, C::NAME);\n        if self\n            .resolved_batches\n            .fetch_add(1, Ordering::Relaxed)\n            .is_multiple_of(OCCUPANCY_SAMPLE_INTERVAL)\n        {\n            record_fallback_cache_entries(self.cache, self.entries.len());\n        }\n        RawHydrationBatch::from_hydrated(resolved)\n    }\n\n    #[expect(\n        clippy::let_underscore_must_use,\n        reason = \"a placeholder insert fails only when a concurrent write already replaced it, and that write stands\"\n    )]\n    fn set<C: Column<Entry = E>>(&self, key: u64, value: &C::Value) -> bool {\n        let mut stored = Some(C::store(value));\n        let written = self.entries.entry(&key, NO_WAIT, |_, entry| {\n            EntryAction::Retain(stored.take().and_then(|stored| C::replace(entry, stored)))\n        });\n        match written {\n            EntryResult::Retained(previous) => previous.is_some(),\n            EntryResult::Vacant(guard) => {\n                if let Some(stored) = stored {\n                    let _ = guard.insert(C::new_entry(stored));\n                }\n                false\n            }\n            EntryResult::Removed(..) | EntryResult::Replaced(..) | EntryResult::Timeout => false,\n        }\n    }\n\n    fn clear<C: Column<Entry = E>>(&self, key: u64) -> bool {\n        let mut seen = None;\n        self.entries.remove_if(&key, |entry| {\n            let others_hold = C::others_hold(entry);\n            seen = Some((C::holds(entry), others_hold));\n            !others_hold\n        });\n        let Some((held, others_hold)) = seen else {\n            return false;\n        };\n        if held && others_hold {\n            let mut cleared = None;\n            self.entries.entry(&key, NO_WAIT, |_, entry| {\n                cleared = C::clear(entry);\n                if C::others_hold(entry) {\n                    EntryAction::Retain(())\n                } else {\n                    EntryAction::Remove\n                }\n            });\n        }\n        held\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::hydration::batch::HydrationBatch;\n\n    type Pair = (Option<String>, Option<String>);\n\n    struct Left;\n    struct Right;\n\n    impl Column for Left {\n        type Entry = Pair;\n        type Value = String;\n        type Stored = String;\n        const NAME: &'static str = \"left\";\n\n        fn store(value: &String) -> String {\n            value.clone()\n        }\n        fn new_entry(stored: String) -> Pair {\n            (Some(stored), None)\n        }\n        fn replace(entry: &mut Pair, stored: String) -> Option<String> {\n            entry.0.replace(stored)\n        }\n        fn get(entry: &Pair) -> Option<String> {\n            entry.0.clone()\n        }\n        fn holds(entry: &Pair) -> bool {\n            entry.0.is_some()\n        }\n        fn others_hold(entry: &Pair) -> bool {\n            entry.1.is_some()\n        }\n        fn clear(entry: &mut Pair) -> Option<String> {\n            entry.0.take()\n        }\n    }\n\n    impl Column for Right {\n        type Entry = Pair;\n        type Value = String;\n        type Stored = String;\n        const NAME: &'static str = \"right\";\n\n        fn store(value: &String) -> String {\n            value.clone()\n        }\n        fn new_entry(stored: String) -> Pair {\n            (None, Some(stored))\n        }\n        fn replace(entry: &mut Pair, stored: String) -> Option<String> {\n            entry.1.replace(stored)\n        }\n        fn get(entry: &Pair) -> Option<String> {\n            entry.1.clone()\n        }\n        fn holds(entry: &Pair) -> bool {\n            entry.1.is_some()\n        }\n        fn others_hold(entry: &Pair) -> bool {\n            entry.0.is_some()\n        }\n        fn clear(entry: &mut Pair) -> Option<String> {\n            entry.1.take()\n        }\n    }\n\n    fn cache() -> FallbackCache<Pair> {\n        FallbackCache::new(\"test\", 8)\n    }\n\n    fn batch(\n        entries: impl IntoIterator<Item = (u64, Hydrated<String>)>,\n    ) -> HydrationBatch<u64, String> {\n        HydrationBatch::from_hydrated(entries.into_iter().collect())\n    }\n\n    fn found(value: &str) -> Hydrated<String> {\n        Hydrated::Found(value.to_string())\n    }\n\n    fn failed() -> Hydrated<String> {\n        Hydrated::Failed\n    }\n\n    #[test]\n    fn a_later_value_replaces_the_cached_one() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"old\"))]));\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"new\"))]));\n\n        let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert_eq!(failed.get(&1), Some(&\"new\".to_string()));\n    }\n\n    #[test]\n    fn a_partial_answer_takes_the_complete_entry_and_leaves_it() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"complete\"))]));\n\n        let partial = cache.resolve_hydration_batch::<Left>(batch([(\n            1,\n            Hydrated::Partial(\"partial\".to_string()),\n        )]));\n        let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert_eq!(partial.hydrated(&1), Some(&found(\"complete\")));\n        assert_eq!(later.hydrated(&1), Some(&found(\"complete\")));\n    }\n\n    #[test]\n    fn a_partial_answer_creates_no_entry() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(\n            1,\n            Hydrated::Partial(\"partial\".to_string()),\n        )]));\n\n        let later = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert_eq!(later.hydrated(&1), Some(&failed()));\n    }\n\n    #[test]\n    fn authoritative_not_found_invalidates_stale_value() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"cached\"))]));\n\n        cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));\n        let failed = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n\n        assert!(matches!(failed.hydrated(&1), Some(Hydrated::Failed)));\n    }\n\n    #[test]\n    fn each_column_serves_only_what_its_own_source_wrote() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"left\")), (2, found(\"left\"))]));\n        cache.resolve_hydration_batch::<Right>(batch([(1, found(\"right\"))]));\n\n        let left = cache.resolve_hydration_batch::<Left>(batch([(1, failed()), (2, failed())]));\n        let right = cache.resolve_hydration_batch::<Right>(batch([(1, failed()), (2, failed())]));\n\n        assert_eq!(left.hydrated(&1), Some(&found(\"left\")));\n        assert_eq!(left.hydrated(&2), Some(&found(\"left\")));\n        assert_eq!(right.hydrated(&1), Some(&found(\"right\")));\n        assert_eq!(right.hydrated(&2), Some(&failed()));\n    }\n\n    #[test]\n    fn a_not_found_clears_only_its_own_column() {\n        let cache = cache();\n        cache.resolve_hydration_batch::<Left>(batch([(1, found(\"left\"))]));\n        cache.resolve_hydration_batch::<Right>(batch([(1, found(\"right\"))]));\n\n        cache.resolve_hydration_batch::<Right>(batch([(1, Hydrated::NotFound)]));\n        let left = cache.resolve_hydration_batch::<Left>(batch([(1, failed())]));\n        let right = cache.resolve_hydration_batch::<Right>(batch([(1, failed())]));\n\n        assert_eq!(left.hydrated(&1), Some(&found(\"left\")));\n        assert_eq!(right.hydrated(&1), Some(&failed()));\n\n        cache.resolve_hydration_batch::<Left>(batch([(1, Hydrated::NotFound)]));\n        assert!(cache.entries.is_empty());\n    }\n}\n",
+      "source_digest": "ca11b96bc29e857e499ad7956dd77696cccd71783eb9b0ad13ef0a21e0c5c81f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1250,
+      "end_line": 1274,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                                failures,\n                                \"action control: no successful read yet; this pod takes no Kafka work until one succeeds\"\n                            );\n                        }\n                    }\n                    Err(e) => {\n                        failures += 1;\n                        if failures == 1 || failures.is_multiple_of(REFRESH_ERROR_LOG_EVERY) {\n                            warn!(\n                                error = %e,\n                                failures,\n                                age_ms = this.snapshot_age_ms(),\n                                \"action control: read failed; keeping the last good list (live scopes run as recording only after 60 s)\"\n                            );\n                        }\n                    }\n                }\n                let wait = if this.is_loaded() {\n                    interval\n                } else {\n                    let wait = backoff;\n                    backoff = (backoff * 2).min(interval);\n                    wait\n                };\n                tokio::time::sleep(wait).await;\n",
+      "source_digest": "9999829714ecc1ae77035d57fcfa20b26206b6787b96dd7f607749708c7f6e51",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1393,
+      "end_line": 1417,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"written\"])\n                            .inc();\n                    }\n                    Err(e) => {\n                        failures += 1;\n                        metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"error\"])\n                            .inc();\n                        this.forget_seen(&key, None);\n                        if failures == 1 || failures.is_multiple_of(REFRESH_ERROR_LOG_EVERY) {\n                            warn!(error = %e, failures, key, \"action control: seen write failed; the next decision retries\");\n                        }\n                    }\n                }\n            }\n        }))\n    }\n\n    async fn scan_seen(&self) -> anyhow::Result<Vec<ActionControlSeen>> {\n        let rows = match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_PKEY)).await {\n            Ok(r) => r?,\n            Err(_) => anyhow::bail!(\"seen scan timed out\"),\n        };\n",
+      "source_digest": "02ee740c91583a679fbe293e5d79dec23965a8b92d965907ff0b6bed17b59492",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2067,
+      "end_line": 2091,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            after: rec.clone(),\n        };\n        let history_written = match serde_json::to_vec(&entry) {\n            Ok(v) => self\n                .store\n                .put(\n                    &format!(\"{HISTORY_PKEY_PREFIX}{}\", rec.head),\n                    &format!(\"{now_ms:013}-{:010}-{lkey}\", rec.version),\n                    v,\n                    HISTORY_TTL_SECS,\n                )\n                .await\n                .map_err(|e| warn!(error = %e, lkey, \"action control: history write failed\"))\n                .is_ok(),\n            Err(_) => false,\n        };\n        let readback = match self.get_record(&lkey).await {\n            Ok(Some((Some(r), _))) => r,\n            Ok(_) | Err(_) => {\n                return Err(SetError::Store(\n                    \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                        .into(),\n                ));\n            }\n        };\n",
+      "source_digest": "00bdd6c74ce5b7d11a3c2a46782d1d03af3c0778a17ec4f838b56d060602309c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2075,
+      "end_line": 2099,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    v,\n                    HISTORY_TTL_SECS,\n                )\n                .await\n                .map_err(|e| warn!(error = %e, lkey, \"action control: history write failed\"))\n                .is_ok(),\n            Err(_) => false,\n        };\n        let readback = match self.get_record(&lkey).await {\n            Ok(Some((Some(r), _))) => r,\n            Ok(_) | Err(_) => {\n                return Err(SetError::Store(\n                    \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                        .into(),\n                ));\n            }\n        };\n        if readback.write_nonce != rec.write_nonce {\n            return Err(SetError::LostRace(Some(readback)));\n        }\n        self.apply_local(lkey.clone(), rec.clone());\n        info!(\n            lkey,\n            mode = rec.mode.as_str(),\n            version = rec.version,\n",
+      "source_digest": "f2f698b9965ea7d87038909b85f8cd09cb642574e82f3a113564c05f228e9ec3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2282,
+      "end_line": 2306,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .map(|((_, l), v)| (l.clone(), v.clone()))\n                .collect();\n            rows.sort();\n            rows\n        }\n    }\n\n    #[async_trait]\n    impl ControlStore for MemControlStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.scans.fetch_add(1, Ordering::Relaxed);\n            if self.fail_scan.load(Ordering::Relaxed) {\n                anyhow::bail!(\"scan failed (test)\");\n            }\n            Ok(self.pkey_rows(pkey))\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            if self.fail_get.load(Ordering::Relaxed) {\n                anyhow::bail!(\"get failed (test)\");\n            }\n            Ok(self\n                .rows\n                .lock()\n                .unwrap()\n",
+      "source_digest": "96dd877632948441bb4f7fba97162ca28a81fbe82c97781af035b96d6401463e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2289,
+      "end_line": 2313,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[async_trait]\n    impl ControlStore for MemControlStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.scans.fetch_add(1, Ordering::Relaxed);\n            if self.fail_scan.load(Ordering::Relaxed) {\n                anyhow::bail!(\"scan failed (test)\");\n            }\n            Ok(self.pkey_rows(pkey))\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            if self.fail_get.load(Ordering::Relaxed) {\n                anyhow::bail!(\"get failed (test)\");\n            }\n            Ok(self\n                .rows\n                .lock()\n                .unwrap()\n                .get(&(pkey.to_owned(), lkey.to_owned()))\n                .cloned())\n        }\n\n        async fn put(\n            &self,\n            pkey: &str,\n",
+      "source_digest": "8f44a235b7af7cb9da2bfe43e6fed87f2350d0727f63c6d3cb42ae7bcf44e6a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2308,
+      "end_line": 2332,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .cloned())\n        }\n\n        async fn put(\n            &self,\n            pkey: &str,\n            lkey: &str,\n            value: Vec<u8>,\n            _ttl: u64,\n        ) -> anyhow::Result<()> {\n            let fails = self.record_write_fails(pkey);\n            if self.fail_put.load(Ordering::Relaxed) || fails == Some(false) {\n                anyhow::bail!(\"put failed (test)\");\n            }\n            let value = match (pkey == MH_PKEY, self.clobber_with.lock().unwrap().clone()) {\n                (true, Some(other)) => other,\n                _ => value,\n            };\n            self.rows\n                .lock()\n                .unwrap()\n                .insert((pkey.to_owned(), lkey.to_owned()), value);\n            if fails == Some(true) {\n                anyhow::bail!(\"put timed out after it landed (test)\");\n            }\n",
+      "source_digest": "77cba84b2cf2ee8758952b4b0905737673b96eaab123e9efb2490afac735442b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2327,
+      "end_line": 2351,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .lock()\n                .unwrap()\n                .insert((pkey.to_owned(), lkey.to_owned()), value);\n            if fails == Some(true) {\n                anyhow::bail!(\"put timed out after it landed (test)\");\n            }\n            Ok(())\n        }\n\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            let fails = self.record_write_fails(pkey);\n            if fails == Some(false) {\n                anyhow::bail!(\"delete failed (test)\");\n            }\n            self.rows\n                .lock()\n                .unwrap()\n                .remove(&(pkey.to_owned(), lkey.to_owned()));\n            if fails == Some(true) {\n                anyhow::bail!(\"delete timed out after it landed (test)\");\n            }\n            Ok(())\n        }\n    }\n\n",
+      "source_digest": "206df30ab0e9c06bd2b2799c414f92adcdd5ee1a717727f335af990e32660556",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2952,
+      "end_line": 2976,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert!(\n            !c(json!({CONFIG_KEY: {\"enabled\": \"no\"}})).enabled,\n            \"malformed = killed\"\n        );\n        assert!(!c(json!({CONFIG_KEY: false})).enabled, \"malformed = killed\");\n        assert!(!c(json!({CONFIG_KEY: {\"ignore_store\": \"yes\"}})).ignore_store);\n        assert!(c(json!({CONFIG_KEY: {\"ignore_store\": true}})).ignore_store);\n        let extra = c(json!({CONFIG_KEY: {\"aliases\": {\"New\": \"Old\", \"bad/name\": \"Old\"}}}));\n        assert_eq!(extra.aliases.len(), 1);\n    }\n\n    #[tokio::test]\n    async fn a_scan_cut_at_its_limit_is_a_failed_read() {\n        let (ac, store) = loaded(&[record(\"R\", None, None, ControlMode::Recording, vec![])]).await;\n        for i in 0..SCAN_LIMIT {\n            store.put_record(&record(\n                &format!(\"Filler{i}\"),\n                None,\n                None,\n                ControlMode::Rules,\n                vec![],\n            ));\n        }\n        assert!(ac.refresh().await.is_err());\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n",
+      "source_digest": "16cf5c7a2007d0b867ea57f3044358d0a4898ec1cb1d4c7cd0a2e235aa5155bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2969,
+      "end_line": 2993,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                None,\n                None,\n                ControlMode::Rules,\n                vec![],\n            ));\n        }\n        assert!(ac.refresh().await.is_err());\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n        assert_eq!(ac.pod_view().records, 1, \"last good list kept\");\n    }\n\n    #[tokio::test]\n    async fn failed_reads_keep_the_last_good_list() {\n        let (ac, store) = loaded(&[record(\"R\", None, None, ControlMode::Recording, vec![])]).await;\n        store.fail_scan.store(true, Ordering::Relaxed);\n        for _ in 0..3 {\n            assert!(ac.refresh().await.is_err());\n        }\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n    }\n\n    #[tokio::test]\n    async fn a_pod_booted_under_ignore_store_reads_before_deciding() {\n        let store = Arc::new(MemControlStore::default());\n        store.put_record(&record(\"R\", None, None, ControlMode::Recording, vec![]));\n",
+      "source_digest": "32e7aadf9e44169574e01317f944bc504cbd1084f2e5522af67342bf7f06c52b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3040,
+      "end_line": 3064,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let ac = Arc::new(ActionControl::new(\n            store.clone(),\n            \"prod\".into(),\n            String::new(),\n        ));\n        let task = ac.spawn_refresh_with(\n            || false,\n            Duration::from_millis(40),\n            Duration::from_millis(2),\n        );\n        wait_for_scans(&store, 4).await;\n        assert!(!ac.is_loaded());\n        assert!(!ac.ready(&on()), \"a failed first read is not an empty list\");\n        assert!(ac.is_stale(), \"never loaded counts as stale\");\n\n        store.fail_scan.store(false, Ordering::Relaxed);\n        tokio::time::timeout(Duration::from_secs(5), async {\n            while !ac.ready(&on()) {\n                tokio::time::sleep(Duration::from_millis(2)).await;\n            }\n        })\n        .await\n        .expect(\"ready once a read succeeds\");\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n        task.abort();\n",
+      "source_digest": "ae0e57650481906ea262e26eba3b2f5f23791ad78b7c6d8e866fd4d3539aaa8a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3532,
+      "end_line": 3556,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[tokio::test]\n    async fn an_unreadable_read_back_is_not_applied_locally() {\n        let (ac, store) = loaded(&[]).await;\n        *store.clobber_with.lock().unwrap() = Some(b\"{not json\".to_vec());\n        assert!(matches!(\n            set(&ac, put(\"H\", ControlMode::Recording, vec![])).await,\n            Err(SetError::Store(_))\n        ));\n        assert_eq!(resolve(&ac, \"H\", \"c\", &[]).mode, ControlMode::Rules);\n    }\n\n    #[tokio::test]\n    async fn failed_store_write_changes_nothing() {\n        let (ac, store) = loaded(&[]).await;\n        store.fail_put.store(true, Ordering::Relaxed);\n        assert!(matches!(\n            set(&ac, put(\"H\", ControlMode::Recording, vec![])).await,\n            Err(SetError::Store(_))\n        ));\n        assert_eq!(resolve(&ac, \"H\", \"c\", &[]).mode, ControlMode::Rules);\n        store.fail_put.store(false, Ordering::Relaxed);\n        store.fail_get.store(true, Ordering::Relaxed);\n        assert!(matches!(\n            set(&ac, put(\"H\", ControlMode::Recording, vec![])).await,\n            Err(SetError::Store(_))\n",
+      "source_digest": "6f73d0d396ac65493f8f99cb865eac13db8b9ea789f4a2b03cb39bf14cba4fd1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4553,
+      "end_line": 4577,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                &ResolveInput {\n                    confidence: Some(high_claim()),\n                    ..input(\"H\", \"c\", &[])\n                },\n                &on(),\n                |_| true,\n            );\n            assert_ne!(resolved.mode, ControlMode::Live, \"{fail_at}\");\n        }\n    }\n\n    #[tokio::test]\n    async fn a_failed_put_back_leaves_the_old_setup_or_the_confirmed_one() {\n        let failing = |store: &MemControlStore, writes: &[(usize, bool)]| {\n            store\n                .fail_record_writes\n                .lock()\n                .unwrap()\n                .extend(writes.iter().copied());\n        };\n        let may_have_applied = |out: Result<SetOutcome, SetError>| match out {\n            Err(SetError::Store(msg)) => assert!(msg.contains(\"may have applied\"), \"{msg}\"),\n            other => panic!(\"{other:?}\"),\n        };\n        let mode_of = |store: &MemControlStore, lkey: &str| {\n",
+      "source_digest": "30f45f9ee1a91c1d5b45b9e7c27a6fbab17ad037afe2aa78e75dce5be42fe36a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1023,
+      "end_line": 1047,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                                            async fn put_back(&self, written: &[Change], err: SetError, deadline: Instant) -> SetError {\n        let SetError::Store(msg) = err else {\n            return err;\n        };\n        for c in written.iter().rev() {\n            if self\n                .write_raw(&c.lkey, c.prior.clone(), deadline)\n                .await\n                .is_err()\n            {\n                return SetError::Store(format!(\n                    \"{msg}; putting {} back failed, so the save may have applied: the records \\\n                     before it keep what this save confirmed; reload to see what the store holds\",\n                    c.lkey\n                ));\n            }\n        }\n        SetError::Store(format!(\n            \"{msg}; every record this save wrote was put back as it was, so nothing changed\"\n        ))\n    }\n\n        async fn write_history(\n        &self,\n",
+      "source_digest": "c4b473b60b92df59916a53f621d31b9166c3a73c7aaa448f9c1df5a86335a32e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1063,
+      "end_line": 1087,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            before: before.cloned(),\n            after: rec.clone(),\n        };\n        let Ok(v) = serde_json::to_vec(&entry) else {\n            return false;\n        };\n        let pkey = format!(\"{HISTORY_PKEY_PREFIX}{}\", rec.head);\n        let hkey = format!(\"{now_ms:013}-{:010}-{lkey}\", rec.version);\n        let put = self.store.put(&pkey, &hkey, v, HISTORY_TTL_SECS);\n        match tokio::time::timeout(self.scan_timeout, put).await {\n            Ok(Ok(())) => true,\n            Ok(Err(e)) => {\n                warn!(error = %e, lkey, \"action control: history write failed\");\n                false\n            }\n            Err(_) => {\n                warn!(lkey, \"action control: history write timed out\");\n                false\n            }\n        }\n    }\n\n            async fn read_back_removed(&self, lkey: &str) -> Result<(), SetError> {\n        match self.get_record(lkey).await {\n            Ok(None) => Ok(()),\n",
+      "source_digest": "375b9479573c47b8b18825d5ff02f8f61f2bcb8ce974979676ca332288be546b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1078,
+      "end_line": 1102,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Err(_) => {\n                warn!(lkey, \"action control: history write timed out\");\n                false\n            }\n        }\n    }\n\n            async fn read_back_removed(&self, lkey: &str) -> Result<(), SetError> {\n        match self.get_record(lkey).await {\n            Ok(None) => Ok(()),\n            Ok(Some((r, _))) => Err(SetError::LostRace(r)),\n            Err(_) => Err(SetError::Store(\n                \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                    .into(),\n            )),\n        }\n    }\n\n            async fn read_back(&self, lkey: &str, rec: &ActionControlRecord) -> Result<(), SetError> {\n        match self.get_record(lkey).await {\n            Ok(Some((Some(r), _))) if r.write_nonce == rec.write_nonce => Ok(()),\n            Ok(Some((Some(r), _))) => Err(SetError::LostRace(Some(r))),\n            Ok(_) | Err(_) => Err(SetError::Store(\n                \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                    .into(),\n",
+      "source_digest": "8e35ef627bef3249465da141e790e4862c482ac149b58efbc9486f741375c1c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1089,
+      "end_line": 1106,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Err(_) => Err(SetError::Store(\n                \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                    .into(),\n            )),\n        }\n    }\n\n            async fn read_back(&self, lkey: &str, rec: &ActionControlRecord) -> Result<(), SetError> {\n        match self.get_record(lkey).await {\n            Ok(Some((Some(r), _))) if r.write_nonce == rec.write_nonce => Ok(()),\n            Ok(Some((Some(r), _))) => Err(SetError::LostRace(Some(r))),\n            Ok(_) | Err(_) => Err(SetError::Store(\n                \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                    .into(),\n            )),\n        }\n    }\n}\n",
+      "source_digest": "a1396321f24517e83e0a0ebca0b2c7f42a1a7b4bd77f41a86a88af0c8ca5acc8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 101,
+      "end_line": 125,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn answer(&self, method: &str, request: Value) -> Value {\n        let n = request\n            .get(\"actions\")\n            .and_then(Value::as_array)\n            .map_or(0, Vec::len);\n        self.calls\n            .lock()\n            .unwrap()\n            .push((method.to_owned(), request));\n        if n > 0 {\n            let ok: serde_json::Map<String, Value> =\n                (0..n).map(|i| (i.to_string(), json!({}))).collect();\n            json!({ \"successesfulActions\": ok, \"failedActions\": {} })\n        } else {\n            json!({ \"outcome\": { \"success\": { \"actionId\": \"test\" } } })\n        }\n    }\n}\n\nimpl AisClient {\n    pub fn connect(cfg: &AisClientConfig) -> Result<Self> {\n        let transcoder = Transcoder::from_schema_bytes(SCHEMA_AIS)\n            .context(\"failed to load AIS thrift schema\")?;\n\n        let intake = resolve_method(&transcoder, \"intakeAction\", INTAKE_RESPONSE_TYPE)?;\n",
+      "source_digest": "75e2392480c190318c39b8540f838019bc425e75218d4585f14e0dd3dc8bbc59",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 111,
+      "end_line": 135,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let ok: serde_json::Map<String, Value> =\n                (0..n).map(|i| (i.to_string(), json!({}))).collect();\n            json!({ \"successesfulActions\": ok, \"failedActions\": {} })\n        } else {\n            json!({ \"outcome\": { \"success\": { \"actionId\": \"test\" } } })\n        }\n    }\n}\n\nimpl AisClient {\n    pub fn connect(cfg: &AisClientConfig) -> Result<Self> {\n        let transcoder = Transcoder::from_schema_bytes(SCHEMA_AIS)\n            .context(\"failed to load AIS thrift schema\")?;\n\n        let intake = resolve_method(&transcoder, \"intakeAction\", INTAKE_RESPONSE_TYPE)?;\n        let multi = resolve_method(&transcoder, \"multiEntityIntakeAction\", MULTI_RESPONSE_TYPE)?;\n\n        let mux = ThriftMuxClient::new_mtls(\n            ThriftMuxConfig {\n                wily_path: cfg.wily_path.clone(),\n                zone: cfg.zone.clone(),\n                tls_server_name: Some(cfg.tls_server_name.clone()),\n                refresh_interval: Some(Duration::from_secs(30)),\n                ..Default::default()\n            },\n",
+      "source_digest": "58347701f4ccb4626e410d2e62aa33c3d1a69984eab34bf1acd7f12a6cad0f55",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 130,
+      "end_line": 154,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                wily_path: cfg.wily_path.clone(),\n                zone: cfg.zone.clone(),\n                tls_server_name: Some(cfg.tls_server_name.clone()),\n                refresh_interval: Some(Duration::from_secs(30)),\n                ..Default::default()\n            },\n            &cfg.s2s_cert_path,\n            &cfg.s2s_key_path,\n            &cfg.s2s_ca_path,\n        )\n        .with_context(|| {\n            format!(\n                \"failed to create AIS ThriftMux client for {}\",\n                cfg.wily_path\n            )\n        })?;\n\n        info!(\n            wily = %cfg.wily_path,\n            tls = %cfg.tls_server_name,\n            \"AIS ThriftMux client initialised\"\n        );\n\n        Ok(Self {\n            transcoder: Arc::new(transcoder),\n",
+      "source_digest": "3f7fbea998adbb07999f281bc31a8dfda398ea7f6fffe2201cf9bbcfc305fc77",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 219,
+      "end_line": 243,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n\n        let response_bytes = match self.mux.call_raw(&payload).await {\n            Ok(b) => {\n                record_ais_metrics(&meta.thrift_method_name, \"ok\", labels, start.elapsed());\n                b\n            }\n            Err(e) => {\n                record_ais_metrics(&meta.thrift_method_name, \"error\", labels, start.elapsed());\n                return Err(anyhow::anyhow!(\n                    \"AIS thriftmux {} failed: {e}\",\n                    meta.thrift_method_name\n                ));\n",
+      "source_digest": "6d86d10690f5c343be8ea9178a0afda8b38397e052b359d7ccb61160c1b0c247",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 229,
+      "end_line": 253,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n\n        let response_bytes = match self.mux.call_raw(&payload).await {\n            Ok(b) => {\n                record_ais_metrics(&meta.thrift_method_name, \"ok\", labels, start.elapsed());\n                b\n            }\n            Err(e) => {\n                record_ais_metrics(&meta.thrift_method_name, \"error\", labels, start.elapsed());\n                return Err(anyhow::anyhow!(\n                    \"AIS thriftmux {} failed: {e}\",\n                    meta.thrift_method_name\n                ));\n            }\n        };\n\n        let exceptions: Vec<DeclaredException<'_>> = meta\n            .exceptions\n            .iter()\n            .map(|e| DeclaredException {\n                field_id: e.field_id,\n                name: e.name.as_str(),\n                type_class: e.type_class.as_str(),\n",
+      "source_digest": "11c025c897e09137fcbd4f48daf9635a1c11b127179b3a0a23fb6036322a1615",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 247,
+      "end_line": 271,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let exceptions: Vec<DeclaredException<'_>> = meta\n            .exceptions\n            .iter()\n            .map(|e| DeclaredException {\n                field_id: e.field_id,\n                name: e.name.as_str(),\n                type_class: e.type_class.as_str(),\n            })\n            .collect();\n\n        self.transcoder\n            .decode_response_with_exceptions(&response_bytes, &meta.response_type, &exceptions)\n            .with_context(|| format!(\"AIS thrift decode failed ({})\", meta.thrift_method_name))\n    }\n}\n\nfn resolve_method(\n    transcoder: &Transcoder,\n    method_name: &str,\n    default_response: &str,\n) -> Result<MethodMeta> {\n    let method = transcoder\n        .lookup_method(AIS_SERVICE, method_name)\n        .or_else(|| transcoder.lookup_method(\"ais\", method_name))\n        .or_else(|| transcoder.lookup_method(\"ActionIntakeService\", method_name))\n",
+      "source_digest": "384eb05708a9c564bdeee2fd7c36753aeea1ae713db84ccd2c7d7bbb5ea11369",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 363,
+      "end_line": 387,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"actions\": actions,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n    }\n    req\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct MultiEntityCounts {\n    pub ok: usize,\n    pub failed: usize,\n}\n\nimpl MultiEntityCounts {\n    pub fn from_response(resp: &Value) -> Self {\n        Self {\n            ok: map_len(\n                resp.get(\"successesfulActions\")\n                    .or_else(|| resp.get(\"successfulActions\")),\n            ),\n            failed: map_len(resp.get(\"failedActions\")),\n        }\n    }\n",
+      "source_digest": "48289e5d89872d56b9332fb9397ae3db30391f5c9e8d4b44d45470eb97f2c77c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1334,
+      "end_line": 1358,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                                failures,\n                                \"action control: no successful read yet; this pod takes no Kafka work until one succeeds\"\n                            );\n                        }\n                    }\n                    Err(e) => {\n                        failures += 1;\n                        if failures == 1 || failures.is_multiple_of(REFRESH_ERROR_LOG_EVERY) {\n                            warn!(\n                                error = %e,\n                                failures,\n                                age_ms = this.snapshot_age_ms(),\n                                \"action control: read failed; keeping the last good list (live scopes run as recording only after 60 s)\"\n                            );\n                        }\n                    }\n                }\n                let wait = if this.is_loaded() {\n                    interval\n                } else {\n                    let wait = backoff;\n                    backoff = (backoff * 2).min(interval);\n                    wait\n                };\n                tokio::time::sleep(wait).await;\n",
+      "source_digest": "9999829714ecc1ae77035d57fcfa20b26206b6787b96dd7f607749708c7f6e51",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1477,
+      "end_line": 1501,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"written\"])\n                            .inc();\n                    }\n                    Err(e) => {\n                        failures += 1;\n                        metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"error\"])\n                            .inc();\n                        this.forget_seen(&key, None);\n                        if failures == 1 || failures.is_multiple_of(REFRESH_ERROR_LOG_EVERY) {\n                            warn!(error = %e, failures, key, \"action control: seen write failed; the next decision retries\");\n                        }\n                    }\n                }\n            }\n        }))\n    }\n\n    pub(crate) async fn scan_seen(&self) -> anyhow::Result<Vec<ActionControlSeen>> {\n        let rows = match tokio::time::timeout(self.scan_timeout, self.store.scan(SEEN_PKEY)).await {\n            Ok(r) => r?,\n            Err(_) => anyhow::bail!(\"seen scan timed out\"),\n        };\n",
+      "source_digest": "65ab6dcb370fdb78fa3be9fea52804bc68b85fabb167a16c827d3e18b538e401",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2185,
+      "end_line": 2209,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            after: rec.clone(),\n        };\n        let history_written = match serde_json::to_vec(&entry) {\n            Ok(v) => self\n                .store\n                .put(\n                    &format!(\"{HISTORY_PKEY_PREFIX}{}\", rec.head),\n                    &format!(\"{now_ms:013}-{:010}-{lkey}\", rec.version),\n                    v,\n                    HISTORY_TTL_SECS,\n                )\n                .await\n                .map_err(|e| warn!(error = %e, lkey, \"action control: history write failed\"))\n                .is_ok(),\n            Err(_) => false,\n        };\n        let readback = match self.get_record(&lkey).await {\n            Ok(Some((Some(r), _))) => r,\n            Ok(_) | Err(_) => {\n                return Err(SetError::Store(\n                    \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                        .into(),\n                ));\n            }\n        };\n",
+      "source_digest": "00bdd6c74ce5b7d11a3c2a46782d1d03af3c0778a17ec4f838b56d060602309c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2193,
+      "end_line": 2217,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    v,\n                    HISTORY_TTL_SECS,\n                )\n                .await\n                .map_err(|e| warn!(error = %e, lkey, \"action control: history write failed\"))\n                .is_ok(),\n            Err(_) => false,\n        };\n        let readback = match self.get_record(&lkey).await {\n            Ok(Some((Some(r), _))) => r,\n            Ok(_) | Err(_) => {\n                return Err(SetError::Store(\n                    \"the write landed but reading it back failed; pods pick up whatever the store holds within 5 s, so reload to see it\"\n                        .into(),\n                ));\n            }\n        };\n        if readback.write_nonce != rec.write_nonce {\n            return Err(SetError::LostRace(Some(readback)));\n        }\n        self.apply_local(lkey.clone(), rec.clone());\n        info!(\n            lkey,\n            mode = rec.mode.as_str(),\n            version = rec.version,\n",
+      "source_digest": "f2f698b9965ea7d87038909b85f8cd09cb642574e82f3a113564c05f228e9ec3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2400,
+      "end_line": 2424,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .map(|((_, l), v)| (l.clone(), v.clone()))\n                .collect();\n            rows.sort();\n            rows\n        }\n    }\n\n    #[async_trait]\n    impl ControlStore for MemControlStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.scans.fetch_add(1, Ordering::Relaxed);\n            if self.fail_scan.load(Ordering::Relaxed) {\n                anyhow::bail!(\"scan failed (test)\");\n            }\n            Ok(self.pkey_rows(pkey))\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            if self.fail_get.load(Ordering::Relaxed) {\n                anyhow::bail!(\"get failed (test)\");\n            }\n            Ok(self\n                .rows\n                .lock()\n                .unwrap()\n",
+      "source_digest": "96dd877632948441bb4f7fba97162ca28a81fbe82c97781af035b96d6401463e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2407,
+      "end_line": 2431,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[async_trait]\n    impl ControlStore for MemControlStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.scans.fetch_add(1, Ordering::Relaxed);\n            if self.fail_scan.load(Ordering::Relaxed) {\n                anyhow::bail!(\"scan failed (test)\");\n            }\n            Ok(self.pkey_rows(pkey))\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            if self.fail_get.load(Ordering::Relaxed) {\n                anyhow::bail!(\"get failed (test)\");\n            }\n            Ok(self\n                .rows\n                .lock()\n                .unwrap()\n                .get(&(pkey.to_owned(), lkey.to_owned()))\n                .cloned())\n        }\n\n        async fn put(\n            &self,\n            pkey: &str,\n",
+      "source_digest": "8f44a235b7af7cb9da2bfe43e6fed87f2350d0727f63c6d3cb42ae7bcf44e6a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2426,
+      "end_line": 2450,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .cloned())\n        }\n\n        async fn put(\n            &self,\n            pkey: &str,\n            lkey: &str,\n            value: Vec<u8>,\n            _ttl: u64,\n        ) -> anyhow::Result<()> {\n            let fails = self.record_write_fails(pkey);\n            if self.fail_put.load(Ordering::Relaxed) || fails == Some(false) {\n                anyhow::bail!(\"put failed (test)\");\n            }\n            let records = pkey == MH_PKEY || pkey == crate::head_guard::MH_PKEY;\n            let value = match (records, self.clobber_with.lock().unwrap().clone()) {\n                (true, Some(other)) => other,\n                _ => value,\n            };\n            self.rows\n                .lock()\n                .unwrap()\n                .insert((pkey.to_owned(), lkey.to_owned()), value);\n            if fails == Some(true) {\n                anyhow::bail!(\"put timed out after it landed (test)\");\n",
+      "source_digest": "2463abcd82c4c22f90fc970921cba3564177d55d9cd52afff698951970fba94e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2446,
+      "end_line": 2470,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .lock()\n                .unwrap()\n                .insert((pkey.to_owned(), lkey.to_owned()), value);\n            if fails == Some(true) {\n                anyhow::bail!(\"put timed out after it landed (test)\");\n            }\n            Ok(())\n        }\n\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            let fails = self.record_write_fails(pkey);\n            if fails == Some(false) {\n                anyhow::bail!(\"delete failed (test)\");\n            }\n            self.rows\n                .lock()\n                .unwrap()\n                .remove(&(pkey.to_owned(), lkey.to_owned()));\n            if fails == Some(true) {\n                anyhow::bail!(\"delete timed out after it landed (test)\");\n            }\n            Ok(())\n        }\n    }\n\n",
+      "source_digest": "206df30ab0e9c06bd2b2799c414f92adcdd5ee1a717727f335af990e32660556",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3379,
+      "end_line": 3403,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert!(\n            !c(json!({CONFIG_KEY: {\"enabled\": \"no\"}})).enabled,\n            \"malformed = killed\"\n        );\n        assert!(!c(json!({CONFIG_KEY: false})).enabled, \"malformed = killed\");\n        assert!(!c(json!({CONFIG_KEY: {\"ignore_store\": \"yes\"}})).ignore_store);\n        assert!(c(json!({CONFIG_KEY: {\"ignore_store\": true}})).ignore_store);\n        let extra = c(json!({CONFIG_KEY: {\"aliases\": {\"New\": \"Old\", \"bad/name\": \"Old\"}}}));\n        assert_eq!(extra.aliases.len(), 1);\n    }\n\n    #[tokio::test]\n    async fn a_scan_cut_at_its_limit_is_a_failed_read() {\n        let (ac, store) = loaded(&[record(\"R\", None, None, ControlMode::Recording, vec![])]).await;\n        for i in 0..SCAN_LIMIT {\n            store.put_record(&record(\n                &format!(\"Filler{i}\"),\n                None,\n                None,\n                ControlMode::Rules,\n                vec![],\n            ));\n        }\n        assert!(ac.refresh().await.is_err());\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n",
+      "source_digest": "16cf5c7a2007d0b867ea57f3044358d0a4898ec1cb1d4c7cd0a2e235aa5155bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3396,
+      "end_line": 3420,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                None,\n                None,\n                ControlMode::Rules,\n                vec![],\n            ));\n        }\n        assert!(ac.refresh().await.is_err());\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n        assert_eq!(ac.pod_view().records, 1, \"last good list kept\");\n    }\n\n    #[tokio::test]\n    async fn failed_reads_keep_the_last_good_list() {\n        let (ac, store) = loaded(&[record(\"R\", None, None, ControlMode::Recording, vec![])]).await;\n        store.fail_scan.store(true, Ordering::Relaxed);\n        for _ in 0..3 {\n            assert!(ac.refresh().await.is_err());\n        }\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n    }\n\n    #[tokio::test]\n    async fn a_pod_booted_under_ignore_store_reads_before_deciding() {\n        let store = Arc::new(MemControlStore::default());\n        store.put_record(&record(\"R\", None, None, ControlMode::Recording, vec![]));\n",
+      "source_digest": "32e7aadf9e44169574e01317f944bc504cbd1084f2e5522af67342bf7f06c52b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3467,
+      "end_line": 3491,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let ac = Arc::new(ActionControl::new(\n            store.clone(),\n            \"prod\".into(),\n            String::new(),\n        ));\n        let task = ac.spawn_refresh_with(\n            || false,\n            Duration::from_millis(40),\n            Duration::from_millis(2),\n        );\n        wait_for_scans(&store, 4).await;\n        assert!(!ac.is_loaded());\n        assert!(!ac.ready(&on()), \"a failed first read is not an empty list\");\n        assert!(ac.is_stale(), \"never loaded counts as stale\");\n\n        store.fail_scan.store(false, Ordering::Relaxed);\n        tokio::time::timeout(Duration::from_secs(5), async {\n            while !ac.ready(&on()) {\n                tokio::time::sleep(Duration::from_millis(2)).await;\n            }\n        })\n        .await\n        .expect(\"ready once a read succeeds\");\n        assert_eq!(resolve(&ac, \"R\", \"c\", &[]).mode, ControlMode::Recording);\n        task.abort();\n",
+      "source_digest": "ae0e57650481906ea262e26eba3b2f5f23791ad78b7c6d8e866fd4d3539aaa8a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4130,
+      "end_line": 4154,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[tokio::test]\n    async fn an_unreadable_read_back_is_not_applied_locally() {\n        let (ac, store) = loaded(&[]).await;\n        *store.clobber_with.lock().unwrap() = Some(b\"{not json\".to_vec());\n        assert!(matches!(\n            set(&ac, put(\"H\", ControlMode::Recording, vec![])).await,\n            Err(SetError::Store(_))\n        ));\n        assert_eq!(resolve(&ac, \"H\", \"c\", &[]).mode, ControlMode::Rules);\n    }\n\n    #[tokio::test]\n    async fn failed_store_write_changes_nothing() {\n        let (ac, store) = loaded(&[]).await;\n        store.fail_put.store(true, Ordering::Relaxed);\n        assert!(matches!(\n            set(&ac, put(\"H\", ControlMode::Recording, vec![])).await,\n            Err(SetError::Store(_))\n        ));\n        assert_eq!(resolve(&ac, \"H\", \"c\", &[]).mode, ControlMode::Rules);\n        store.fail_put.store(false, Ordering::Relaxed);\n        store.fail_get.store(true, Ordering::Relaxed);\n        assert!(matches!(\n            set(&ac, put(\"H\", ControlMode::Recording, vec![])).await,\n            Err(SetError::Store(_))\n",
+      "source_digest": "6f73d0d396ac65493f8f99cb865eac13db8b9ea789f4a2b03cb39bf14cba4fd1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5356,
+      "end_line": 5380,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                &ResolveInput {\n                    confidence: Some(high_claim()),\n                    ..input(\"H\", \"c\", &[])\n                },\n                &on(),\n                |_| true,\n            );\n            assert_ne!(resolved.mode, ControlMode::Live, \"{fail_at}\");\n        }\n    }\n\n    #[tokio::test]\n    async fn a_failed_put_back_leaves_the_old_setup_or_the_confirmed_one() {\n        let failing = |store: &MemControlStore, writes: &[(usize, bool)]| {\n            store\n                .fail_record_writes\n                .lock()\n                .unwrap()\n                .extend(writes.iter().copied());\n        };\n        let may_have_applied = |out: Result<SetOutcome, SetError>| match out {\n            Err(SetError::Store(msg)) => assert!(msg.contains(\"may have applied\"), \"{msg}\"),\n            other => panic!(\"{other:?}\"),\n        };\n        let mode_of = |store: &MemControlStore, lkey: &str| {\n",
+      "source_digest": "30f45f9ee1a91c1d5b45b9e7c27a6fbab17ad037afe2aa78e75dce5be42fe36a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1268,
+      "end_line": 1292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                                            async fn put_back(&self, written: &[Change], err: SetError, deadline: Instant) -> SetError {\n        let SetError::Store(msg) = err else {\n            return err;\n        };\n        for c in written.iter().rev() {\n            if self\n                .write_raw(&c.lkey, c.prior.clone(), deadline)\n                .await\n                .is_err()\n            {\n                return SetError::Store(format!(\n                    \"{msg}; putting {} back failed, so the save may have applied: the records \\\n                     before it keep what this save confirmed; reload to see what the store holds\",\n                    c.lkey\n                ));\n            }\n        }\n        SetError::Store(format!(\n            \"{msg}; every record this save wrote was put back as it was, so nothing changed\"\n        ))\n    }\n\n        async fn row_history(&self, head: &str) -> Option<Vec<ActionControlHistoryEntry>> {\n        let pkey = format!(\"{HISTORY_PKEY_PREFIX}{head}\");\n",
+      "source_digest": "c7499811ad47f458e13544ebe9861959dc63ae15ebd54758de884e6f4f9173f0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0ff86c1a3086a11c43baafcebe2f1b0a5c8d7d2429fc65fe46681533e7205828",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "91237c281795b21014ebba41eee3453e44128743e0d410b6c16c175d0e2117b6",
+      "context_complete": true,
+      "task_id": "T-25a8b9415f5bb47d9749b476ba06dc9b0aa3769bc31a8b895c893d718d4b09bb",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-66bcf4e1c1590b21ab6627c1100a28ca1ec3468208267f56c6a20871e03f56f5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-dda952786eebb3d71e6881e25850e58bd4c53ac35d68ec0c91884bb7820822a0",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8c9d6a2789da716ebc26a7722483f9853b64974445d4ff1c09131dd0bf61c644",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-0fa1982f0d64ad9f430d0c676925dc7838e9818166b2213d85f91a38cba8422a",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9b90dbe01f5e12d9063b0d2c722e6c503e34f08c770f05b326aa2de8c8cc52c9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-16617c4ec783ce4fffa44dd08170b3dfc7270ebf5f2628e24833f207e3a75ba7",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-01a65a58ab0135f83e2ee76c45d3d6205eb6326b06122dd9e08b6a42ef3377bd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-2c6e4662db1741aabad97b78bbe47db88a9319933be77a07e7acdccd67fafa1b",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e172ce1542ac9ec78fedced6f0b40aed1e1f68b8c5de854c06fb53217b3b5861",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-1026af971c44443d5ba1696efaa4b13d05e4e7d74e59254da27600f4e77bebab",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d173945b7523d95406557ea7e2639ba573019e6fde59c885bbe821475983ae32",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-250c10969407fadbf9cb12f56315bf1cbcd14593b93013974ffd7da714ccf90b",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8e020bdf6524cb8d28e721c34437d5fa7b0878fd6e2f415fc88014060d804401",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-34e04a847ad411a6e04260758c02bde9af91a23130b9f54074a7fef1b09f888e",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cd87f2737a1a98d5118bfddefc9668e41cd87fa82ba4194196f86ffc7ca269d0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-533bc4b3bdb12d3a5ddef6c9e1aa085c7209f2bafff5078a0a314afee2f62bc3",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-eb2fffefec9ed1864be9be1961f4ea5ebe160b60f6df0d1a152cfec87304e03e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-b52114304fb90f8631100ff9dd730655f5c085c8bfac7248e822fd7ff1b9f46d",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a27b7f798e5a86d19d3e1d9395cd8f620d77f4ba8cf2b2a98c9d16f735af6c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-ab28766db5149cd22826b4350e4ca48ef074f2886c4a3cacba9dd6a445c8107d",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ce51441f88851b7bea83590a3a23dcde00d76c48de4c355870047ba8dcbd9f7e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-15bd73149ea5132f5b4dbb3c15104abd4e1c627a39013411d71963194b8b6a72",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-058d43e5c163b21ecd4e8fae450bf5846e2e2a7fcc514e50cb6bf9f25d3fa27a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-06f63cf457aa5ce9ea820551b067e0adcf636afe185a7d45b20d1fa4d7bc3e60",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4c943fb2ffd6687dfcc9f90e6bd322663362e2212faf094487e15a8f5121c246",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-460bba2411382485b3a3fb3b514f12b7df09cde9b6d56d4c0b1f42264af22b80",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8680f97332baab7a6eb58a836bcd202a75e945d8d2004efdaf24a2c658d2e301",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-ad8f152a8e9d3729faa10aa76695d8bfb1414bdae5283e180b80ef549a77c80b",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3b95d33693e30186fedc1924b25bec347c537a20f9ec268fd080dcd63c978033",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-1e3a6f38216e291ab41f341942baec04dffb5ba618c6aa5a53983535f1f6c2c3",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3f793664c7acdbb40f96b32b0c1d9c372f9e58414c3663623e76c909e84faf39",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-567dd6785b3e7f1980dc83dd0866d92381f1670c2b14906142b6e2b4ab8cce51",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0b6768aa815843982b7f107f2baa92bec084ebb202b53235d68a69382a424876",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-d6f251e13cf0c656d7c582aab8387bdae0d1770107d56cf99c9c1b52a3f08803",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e9088975286ac9aed0f65d42c0706c69770a2a3b67f44d60077be48ede8202c8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-fe953498699005050d458578d0f71b21081174136b95afaa763de3b448cac886",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-833670ee8804864d92e93b918ddfbcf102db4a048dc669eb6d5170165d5cc657",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-5e04fcb522a5abbd109f94edd8e640170ce0895034a72a54f2e1e32653f18c0d",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ef52e324d51cdd81951e0e3d6a444b2526d10dfeedea32195acad0286d930384",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-72fc0dd8be3b9d0f10426ae554e8f94fef4ade73da2daec47abfcb7e271f8f75",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab1a4b162e13663ebe12566031120633efa5fe8f6d612a6d7ea993e4eef61ed8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-af7715a014ec6ce238ca017363513bf8991db22cdaf3849dd93a9668f29c5790",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6491a68c1c32cd524d26f90735606fb5aab1a3fd9ecd997a91104e322f536325",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-cb519006d6e06dbb9bf40ad046f3cf4398fff6cd75e621708da27ce65d1bdd5f",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-de17566f041498cb1e3db32eb28e00d1c0a9241bb9ec260f9cb2e15522bcfd7c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-3f65e70b2be6ac4aecf797adc8fc507867506f77611995f0dcbf089a36acc44c",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1c27cfa70c64edd61be716e898476556c5b6fca6a5eef9d3f6a55fa4d899fe72",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-e88dbcba4a362d54e10e9f0539c724564ffe49b553f763bc206d332187106af6",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-378c3f9ef694b18546fafca3083371795985a617d0a0ba2aeed1d61ec4259e3a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-f55c998b41763471602b0de7673d149c65069badb1d2142e6ae184f192bd7ae3",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-66c597ed31741a586c7d17f17c8c8a57bb89bafa60a9f90e82699b9b51f7297a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-ed17d21616c2bc28670eabaa003a1dbcf2cdefeeab755e6cc92124d02b866b22",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b174993dc3067ed214b8a8b33ba9a05e0246404fa0ee6f571aea84073a455aa7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-05540d686ce377931be2473dd7560e3864530b496b44d0703cef71b9870d471e",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ff1a26e4774fc7488cd6ddd522f8151efb2d428407af0289b1009f7eabd0cd11",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-b0454861115297756975132f74920514c90c3f0d86e046c322e8f0bcf120f55f",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0684cba9a8080264b4425e73aab1944a2a414e195fa0618b2ea32ec7c100baf3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-8f81bcbac8f3effceb4f5b9b5702cfb1c2cfa58d934a08eef63ad357f218e566",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8e78c0e1ae486a53614926ac1443a1eff1c508c5481ffeb11a358923ca677ec7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f0e47c61cfb02e0830b7606e921af74e358cd38ef7f3c360bb7de74cffdab5c",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9b23363fa0f09b4e41bbea24b81ec2a5765d4e38814269514e967f2268bc8ea2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-db8d2a99af448ea1e7a733ad47962827a539cd80000e702889f42f47c7754a02",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-058adb6ac0d235300e9566bd2b69632ad89dfc1820bf588e4832800c6909866f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-5fa45ffee15ef43eb92092928e235cbbeb8de08cf910bdd2c1dbea649f3b60b6",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3fbb5965c483723b95580b9fc8229acbd04b3875cf6d853017c4e54eeef3efa5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-16f68000d6d6bec7c28cd0311f45e197d0d339de62b0a0ed2c868a2fb98e3ede",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1d065ddc5438e14d57a217a8b3204eea96a8203367636a1338af9ce8b1f2f8ff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-e2ed6a94e32882101783412505dd6b389ba160dd2e98adfbe0742979da034773",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-02b21b2f244ac5236d30b54b1758bd60ecf845c14f580cca58714f72de943faa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-688df39d25db4f128c512dee887f6eea702823c3993e4d32adf6c644d5997a77",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-62e3ce2e97556f5569b31177397d910e1b7e6919fd807196949439dd88e0e68d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-aacc6d72a624fd808f7fe7732f08307cd45da9839cc828ad8d640bd8a42cc9dc",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c58e5305ccac39a1602b52423b65defbc7eaf4e3cbed047081ffbe20141fbfee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-063016d33931797ab7ac4986d6ded1bebd06c2c1186eac398930c773ae0dcc51",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/fallback_cache.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-34d11d574229d9e96e4d6e8912b6255ad7188de28bcfcef3acd5a2bbcc3b68ee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "failed"
+      ],
+      "context_complete": false,
+      "task_id": "T-197f93bf8f895aab1d220353d0ec328a0421c04f45d2f1e2c0560f2bca529c7c",
+      "evidence_refs": [
+        "E40"
+      ]
+    }
+  ],
+  "task_id": "T-330dbb5ae4336b9476966d643bdb30c19e4a502fe4a0bb0df8d3085dd364aa34"
+}

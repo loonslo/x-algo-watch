@@ -1,0 +1,972 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering-client/notifications.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-e42f2f9cb11dbf4eec3f62815956249a652677eea693dbe9e65db7e667746064",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering-client",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering-client/notifications.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 407,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use std::time::{Duration, Instant};\n\nuse anyhow::{bail, ensure, Result};\nuse xai_visibility_filtering_proto as vf_pb;\nuse xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;\nuse xai_x_rpc::balanced_channel::LoadBalancedChannel;\nuse xai_x_thrift::safety_level::SafetyLevel;\n\nuse crate::discovery::build_vf_xds_channel;\nuse crate::metrics::{ClientRpc, RequestMetrics};\nuse crate::vf_client::{\n    channel_error_to_anyhow, make_vf_client, timeout_as_deadline_exceeded, within_deadline,\n    xds_channel_params, XAI_VF_DEFAULT_TIMEOUT_MS,\n};\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum Notification {\n    Follow { actor_id: u64 },\n}\n\nimpl Notification {\n    fn into_proto(self) -> vf_pb::Notification {\n        match self {\n            Self::Follow { actor_id } => vf_pb::Notification {\n                actor_id,\n                kind: Some(vf_pb::notification::Kind::Follow(vf_pb::Follow {})),\n            },\n        }\n    }\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum NotificationOutcome {\n    Allowed,\n    Dropped {\n        reason: Option<vf_pb::NotificationDropReason>,\n    },\n    Failed,\n}\n\nimpl NotificationOutcome {\n    fn decode(outcome: Option<vf_pb::notification_visibility_result::Outcome>) -> Result<Self> {\n        use vf_pb::notification_visibility_result::Outcome;\n        Ok(match outcome {\n            Some(Outcome::Allowed(_)) => Self::Allowed,\n            Some(Outcome::Dropped(dropped)) => Self::Dropped {\n                reason: dropped.reason.map(|reason| {\n                    vf_pb::NotificationDropReason::try_from(reason).unwrap_or_default()\n                }),\n            },\n            Some(Outcome::Failed(_)) => Self::Failed,\n            None => bail!(\"missing VF notification outcome\"),\n        })\n    }\n}\n\npub struct NotificationsClient {\n    client: VisibilityFilteringServiceClient<LoadBalancedChannel>,\n    timeout: Duration,\n}\n\nimpl NotificationsClient {\n    pub async fn connect(datacenter: &str) -> Result<Self> {\n        let channel = build_vf_xds_channel(&xds_channel_params(\"vf-notifications\", datacenter))\n            .await\n            .map_err(channel_error_to_anyhow)?;\n        Ok(Self {\n            client: make_vf_client(channel),\n            timeout: Duration::from_millis(XAI_VF_DEFAULT_TIMEOUT_MS),\n        })\n    }\n\n    pub async fn filter_notifications(\n        &self,\n        safety_level: SafetyLevel,\n        recipient_id: u64,\n        notifications: &[Notification],\n    ) -> Result<Vec<NotificationOutcome>> {\n        let request_metrics = RequestMetrics::start(ClientRpc::FilterNotifications);\n        self.filter_notifications_recording(\n            safety_level,\n            recipient_id,\n            notifications,\n            request_metrics,\n        )\n        .await\n    }\n\n    async fn filter_notifications_recording(\n        &self,\n        safety_level: SafetyLevel,\n        recipient_id: u64,\n        notifications: &[Notification],\n        mut request_metrics: RequestMetrics,\n    ) -> Result<Vec<NotificationOutcome>> {\n        let mut rpc = tonic::Request::new(vf_pb::FilterNotificationsRequest {\n            safety_level: safety_level.0,\n            recipient_id,\n            notifications: notifications.iter().map(|n| n.into_proto()).collect(),\n        });\n        rpc.set_timeout(self.timeout);\n        let mut client = self.client.clone();\n        let outcomes = within_deadline(self.timeout, async {\n            let batch_start = Instant::now();\n            let response = client\n                .filter_notifications(rpc)\n                .await\n                .map_err(timeout_as_deadline_exceeded);\n            request_metrics.batch(\n                batch_start.elapsed(),\n                response.as_ref().err().map(tonic::Status::code),\n            );\n            decode_response(notifications.len(), response?.into_inner())\n        })\n        .await;\n        match &outcomes {\n            Ok(_) => request_metrics.answered(0),\n            Err(_) => request_metrics.failed(),\n        }\n        outcomes\n    }\n}\n\nfn decode_response(\n    sent: usize,\n    response: vf_pb::FilterNotificationsResponse,\n) -> Result<Vec<NotificationOutcome>> {\n    ensure!(\n        response.results.len() == sent,\n        \"VF notification count mismatch\"\n    );\n    response\n        .results\n        .into_iter()\n        .map(|result| NotificationOutcome::decode(result.outcome))\n        .collect()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::test_support::RecordingReceiver;\n    use std::sync::{Arc, Mutex};\n    use tokio::sync::watch;\n    use tokio_stream::wrappers::TcpListenerStream;\n    use tonic::codec::CompressionEncoding;\n    use tonic::transport::Server;\n    use tonic::{Request, Response, Status};\n    use vf_pb::notification_visibility_result::Outcome;\n    use vf_pb::visibility_filtering_service_server::{\n        VisibilityFilteringService, VisibilityFilteringServiceServer,\n    };\n    use xai_x_rpc::balanced_channel::LbPolicy;\n    use xai_x_rpc::endpoint_source::EndpointSource;\n    use xai_x_rpc::endpoint_weights::{uniform_weights, EndpointWeights};\n\n    const RECIPIENT: u64 = 7;\n\n    type Answer =\n        fn(&vf_pb::FilterNotificationsRequest) -> Vec<vf_pb::NotificationVisibilityResult>;\n\n    struct AnswerStub {\n        requests: Arc<Mutex<Vec<vf_pb::FilterNotificationsRequest>>>,\n        answer: Answer,\n    }\n\n    #[tonic::async_trait]\n    impl VisibilityFilteringService for AnswerStub {\n        async fn filter_notifications(\n            &self,\n            request: Request<vf_pb::FilterNotificationsRequest>,\n        ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {\n            let request = request.into_inner();\n            let results = (self.answer)(&request);\n            self.requests.lock().unwrap().push(request);\n            Ok(Response::new(vf_pb::FilterNotificationsResponse {\n                results,\n            }))\n        }\n    }\n\n    struct HangStub;\n\n    #[tonic::async_trait]\n    impl VisibilityFilteringService for HangStub {\n        async fn filter_notifications(\n            &self,\n            _: Request<vf_pb::FilterNotificationsRequest>,\n        ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {\n            std::future::pending().await\n        }\n    }\n\n    struct UnimplementedStub;\n\n    impl VisibilityFilteringService for UnimplementedStub {}\n\n    struct FixedEndpoints(watch::Receiver<EndpointWeights>);\n\n    impl EndpointSource for FixedEndpoints {\n        fn watch(self) -> watch::Receiver<EndpointWeights> {\n            self.0\n        }\n    }\n\n    async fn filter_against<S: VisibilityFilteringService>(\n        stub: S,\n        timeout_ms: u64,\n        notifications: &[Notification],\n    ) -> (Result<Vec<NotificationOutcome>>, Arc<RecordingReceiver>) {\n        let listener = tokio::net::TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let addr = listener.local_addr().unwrap();\n        let server = tokio::spawn(\n            Server::builder()\n                .add_service(\n                    VisibilityFilteringServiceServer::new(stub)\n                        .accept_compressed(CompressionEncoding::Zstd)\n                        .send_compressed(CompressionEncoding::Zstd),\n                )\n                .serve_with_incoming(TcpListenerStream::new(listener)),\n        );\n        let (_endpoints, rx) = watch::channel(uniform_weights([addr]));\n        let channel = LoadBalancedChannel::builder(FixedEndpoints(rx))\n            .lb_policy(LbPolicy::least_request())\n            .channel()\n            .await\n            .unwrap();\n        let client = NotificationsClient {\n            client: make_vf_client(channel),\n            timeout: Duration::from_millis(timeout_ms),\n        };\n        let sr = Arc::new(RecordingReceiver::default());\n        let request_metrics =\n            RequestMetrics::with_receiver(ClientRpc::FilterNotifications, Some(sr.clone()));\n        let result = client\n            .filter_notifications_recording(\n                SafetyLevel::NOTIFICATIONS_FOLLOW,\n                RECIPIENT,\n                notifications,\n                request_metrics,\n            )\n            .await;\n        server.abort();\n        (result, sr)\n    }\n\n    fn visibility_result(outcome: Option<Outcome>) -> vf_pb::NotificationVisibilityResult {\n        vf_pb::NotificationVisibilityResult { outcome }\n    }\n\n    fn by_actor(\n        request: &vf_pb::FilterNotificationsRequest,\n    ) -> Vec<vf_pb::NotificationVisibilityResult> {\n        request\n            .notifications\n            .iter()\n            .map(|n| {\n                visibility_result(Some(match n.actor_id {\n                    10 => Outcome::Allowed(vf_pb::Allowed {}),\n                    11 => Outcome::Dropped(vf_pb::Dropped {\n                        reason: Some(vf_pb::NotificationDropReason::RecipientBlocksActor as i32),\n                    }),\n                    13 => Outcome::Dropped(vf_pb::Dropped { reason: Some(99) }),\n                    _ => Outcome::Failed(vf_pb::Failed {}),\n                }))\n            })\n            .collect()\n    }\n\n    fn follows(actors: &[u64]) -> Vec<Notification> {\n        actors\n            .iter()\n            .map(|&actor_id| Notification::Follow { actor_id })\n            .collect()\n    }\n\n    #[tokio::test]\n    async fn sends_the_level_number_and_follows_and_records_a_completed_call_with_outcomes_in_request_order(\n    ) {\n        let requests = Arc::new(Mutex::new(Vec::new()));\n        let (outcomes, sr) = filter_against(\n            AnswerStub {\n                requests: requests.clone(),\n                answer: by_actor,\n            },\n            1_000,\n            &follows(&[11, 10, 12, 11, 13]),\n        )\n        .await;\n        assert_eq!(\n            outcomes.unwrap(),\n            vec![\n                NotificationOutcome::Dropped {\n                    reason: Some(vf_pb::NotificationDropReason::RecipientBlocksActor)\n                },\n                NotificationOutcome::Allowed,\n                NotificationOutcome::Failed,\n                NotificationOutcome::Dropped {\n                    reason: Some(vf_pb::NotificationDropReason::RecipientBlocksActor)\n                },\n                NotificationOutcome::Dropped {\n                    reason: Some(vf_pb::NotificationDropReason::Unspecified)\n                },\n            ]\n        );\n        let follow = |actor_id| vf_pb::Notification {\n            actor_id,\n            kind: Some(vf_pb::notification::Kind::Follow(vf_pb::Follow {})),\n        };\n        assert_eq!(\n            *requests.lock().unwrap(),\n            vec![vf_pb::FilterNotificationsRequest {\n                safety_level: 246,\n                recipient_id: RECIPIENT,\n                notifications: vec![follow(11), follow(10), follow(12), follow(11), follow(13)],\n            }]\n        );\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications|requests=completed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=success\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n    }\n\n    #[tokio::test]\n    async fn a_short_response_a_missing_outcome_an_rpc_error_or_a_missed_deadline_fails_the_call() {\n        let answer_stub = |answer| AnswerStub {\n            requests: Arc::default(),\n            answer,\n        };\n        let notifications = follows(&[10, 11]);\n        let (short, sr) = filter_against(\n            answer_stub(|request| {\n                let mut results = by_actor(request);\n                results.pop();\n                results\n            }),\n            1_000,\n            &notifications,\n        )\n        .await;\n        assert_eq!(\n            short.unwrap_err().to_string(),\n            \"VF notification count mismatch\"\n        );\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications|requests=failed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=success\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n        let (missing, sr) = filter_against(\n            answer_stub(|request| {\n                let mut results = by_actor(request);\n                results[1].outcome = None;\n                results\n            }),\n            1_000,\n            &notifications,\n        )\n        .await;\n        assert_eq!(\n            missing.unwrap_err().to_string(),\n            \"missing VF notification outcome\"\n        );\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications|requests=failed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=success\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n\n        let code = |result: Result<Vec<NotificationOutcome>>| {\n            result\n                .unwrap_err()\n                .downcast_ref::<Status>()\n                .map(Status::code)\n        };\n        let (unimplemented, sr) = filter_against(UnimplementedStub, 1_000, &notifications).await;\n        assert_eq!(code(unimplemented), Some(tonic::Code::Unimplemented));\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications_batch_error|code=other\",\n                \"incr vf_client_filter_notifications|requests=failed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=error\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n        let (deadline, sr) = filter_against(HangStub, 50, &notifications).await;\n        assert_eq!(code(deadline), Some(tonic::Code::DeadlineExceeded));\n        assert_eq!(\n            sr.counter(\"vf_client_filter_notifications|requests=failed\"),\n            1\n        );\n        assert!(sr\n            .series()\n            .contains(&\"observe_vm vf_client_filter_notifications_latency_ms_vm\".to_string()));\n    }\n}\n",
+      "source_digest": "b535e0161c4a982d9a72b197638881ed6fed0339133002c68a4d1ab94ca2a61d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering-client/notifications.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 427,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use std::time::{Duration, Instant};\n\nuse anyhow::{bail, ensure, Result};\nuse xai_visibility_filtering_proto as vf_pb;\nuse xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;\nuse xai_x_rpc::balanced_channel::LoadBalancedChannel;\nuse xai_x_thrift::safety_level::SafetyLevel;\n\nuse crate::discovery::build_vf_xds_channel;\nuse crate::metrics::{ClientRpc, RequestMetrics};\nuse crate::vf_client::{\n    channel_error_to_anyhow, make_vf_client, timeout_as_deadline_exceeded, within_deadline,\n    xds_channel_params, XAI_VF_DEFAULT_TIMEOUT_MS,\n};\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum Notification {\n    Follow { actor_id: u64 },\n    FollowRequestAccepted { actor_id: u64 },\n}\n\nimpl Notification {\n    fn into_proto(self) -> vf_pb::Notification {\n        match self {\n            Self::Follow { actor_id } => vf_pb::Notification {\n                actor_id,\n                kind: Some(vf_pb::notification::Kind::Follow(vf_pb::Follow {})),\n            },\n            Self::FollowRequestAccepted { actor_id } => vf_pb::Notification {\n                actor_id,\n                kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(\n                    vf_pb::FollowRequestAccepted {},\n                )),\n            },\n        }\n    }\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum NotificationOutcome {\n    Allowed,\n    Dropped {\n        reason: Option<vf_pb::NotificationDropReason>,\n    },\n    Failed,\n}\n\nimpl NotificationOutcome {\n    fn decode(outcome: Option<vf_pb::notification_visibility_result::Outcome>) -> Result<Self> {\n        use vf_pb::notification_visibility_result::Outcome;\n        Ok(match outcome {\n            Some(Outcome::Allowed(_)) => Self::Allowed,\n            Some(Outcome::Dropped(dropped)) => Self::Dropped {\n                reason: dropped.reason.map(|reason| {\n                    vf_pb::NotificationDropReason::try_from(reason).unwrap_or_default()\n                }),\n            },\n            Some(Outcome::Failed(_)) => Self::Failed,\n            None => bail!(\"missing VF notification outcome\"),\n        })\n    }\n}\n\npub struct NotificationsClient {\n    client: VisibilityFilteringServiceClient<LoadBalancedChannel>,\n    timeout: Duration,\n}\n\nimpl NotificationsClient {\n    pub async fn connect(datacenter: &str) -> Result<Self> {\n        let channel = build_vf_xds_channel(&xds_channel_params(\"vf-notifications\", datacenter))\n            .await\n            .map_err(channel_error_to_anyhow)?;\n        Ok(Self {\n            client: make_vf_client(channel),\n            timeout: Duration::from_millis(XAI_VF_DEFAULT_TIMEOUT_MS),\n        })\n    }\n\n    pub async fn filter_notifications(\n        &self,\n        safety_level: SafetyLevel,\n        recipient_id: u64,\n        notifications: &[Notification],\n    ) -> Result<Vec<NotificationOutcome>> {\n        let request_metrics = RequestMetrics::start(ClientRpc::FilterNotifications);\n        self.filter_notifications_recording(\n            safety_level,\n            recipient_id,\n            notifications,\n            request_metrics,\n        )\n        .await\n    }\n\n    async fn filter_notifications_recording(\n        &self,\n        safety_level: SafetyLevel,\n        recipient_id: u64,\n        notifications: &[Notification],\n        mut request_metrics: RequestMetrics,\n    ) -> Result<Vec<NotificationOutcome>> {\n        let mut rpc = tonic::Request::new(vf_pb::FilterNotificationsRequest {\n            safety_level: safety_level.0,\n            recipient_id,\n            notifications: notifications.iter().map(|n| n.into_proto()).collect(),\n        });\n        rpc.set_timeout(self.timeout);\n        let mut client = self.client.clone();\n        let outcomes = within_deadline(self.timeout, async {\n            let batch_start = Instant::now();\n            let response = client\n                .filter_notifications(rpc)\n                .await\n                .map_err(timeout_as_deadline_exceeded);\n            request_metrics.batch(\n                batch_start.elapsed(),\n                response.as_ref().err().map(tonic::Status::code),\n            );\n            decode_response(notifications.len(), response?.into_inner())\n        })\n        .await;\n        match &outcomes {\n            Ok(_) => request_metrics.answered(0),\n            Err(_) => request_metrics.failed(),\n        }\n        outcomes\n    }\n}\n\nfn decode_response(\n    sent: usize,\n    response: vf_pb::FilterNotificationsResponse,\n) -> Result<Vec<NotificationOutcome>> {\n    ensure!(\n        response.results.len() == sent,\n        \"VF notification count mismatch\"\n    );\n    response\n        .results\n        .into_iter()\n        .map(|result| NotificationOutcome::decode(result.outcome))\n        .collect()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::test_support::RecordingReceiver;\n    use std::sync::{Arc, Mutex};\n    use tokio::sync::watch;\n    use tokio_stream::wrappers::TcpListenerStream;\n    use tonic::codec::CompressionEncoding;\n    use tonic::transport::Server;\n    use tonic::{Request, Response, Status};\n    use vf_pb::notification_visibility_result::Outcome;\n    use vf_pb::visibility_filtering_service_server::{\n        VisibilityFilteringService, VisibilityFilteringServiceServer,\n    };\n    use xai_x_rpc::balanced_channel::LbPolicy;\n    use xai_x_rpc::endpoint_source::EndpointSource;\n    use xai_x_rpc::endpoint_weights::{uniform_weights, EndpointWeights};\n\n    const RECIPIENT: u64 = 7;\n\n    type Answer =\n        fn(&vf_pb::FilterNotificationsRequest) -> Vec<vf_pb::NotificationVisibilityResult>;\n\n    struct AnswerStub {\n        requests: Arc<Mutex<Vec<vf_pb::FilterNotificationsRequest>>>,\n        answer: Answer,\n    }\n\n    #[tonic::async_trait]\n    impl VisibilityFilteringService for AnswerStub {\n        async fn filter_notifications(\n            &self,\n            request: Request<vf_pb::FilterNotificationsRequest>,\n        ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {\n            let request = request.into_inner();\n            let results = (self.answer)(&request);\n            self.requests.lock().unwrap().push(request);\n            Ok(Response::new(vf_pb::FilterNotificationsResponse {\n                results,\n            }))\n        }\n    }\n\n    struct HangStub;\n\n    #[tonic::async_trait]\n    impl VisibilityFilteringService for HangStub {\n        async fn filter_notifications(\n            &self,\n            _: Request<vf_pb::FilterNotificationsRequest>,\n        ) -> Result<Response<vf_pb::FilterNotificationsResponse>, Status> {\n            std::future::pending().await\n        }\n    }\n\n    struct UnimplementedStub;\n\n    impl VisibilityFilteringService for UnimplementedStub {}\n\n    struct FixedEndpoints(watch::Receiver<EndpointWeights>);\n\n    impl EndpointSource for FixedEndpoints {\n        fn watch(self) -> watch::Receiver<EndpointWeights> {\n            self.0\n        }\n    }\n\n    async fn filter_against<S: VisibilityFilteringService>(\n        stub: S,\n        timeout_ms: u64,\n        notifications: &[Notification],\n    ) -> (Result<Vec<NotificationOutcome>>, Arc<RecordingReceiver>) {\n        let listener = tokio::net::TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let addr = listener.local_addr().unwrap();\n        let server = tokio::spawn(\n            Server::builder()\n                .add_service(\n                    VisibilityFilteringServiceServer::new(stub)\n                        .accept_compressed(CompressionEncoding::Zstd)\n                        .send_compressed(CompressionEncoding::Zstd),\n                )\n                .serve_with_incoming(TcpListenerStream::new(listener)),\n        );\n        let (_endpoints, rx) = watch::channel(uniform_weights([addr]));\n        let channel = LoadBalancedChannel::builder(FixedEndpoints(rx))\n            .lb_policy(LbPolicy::least_request())\n            .channel()\n            .await\n            .unwrap();\n        let client = NotificationsClient {\n            client: make_vf_client(channel),\n            timeout: Duration::from_millis(timeout_ms),\n        };\n        let sr = Arc::new(RecordingReceiver::default());\n        let request_metrics =\n            RequestMetrics::with_receiver(ClientRpc::FilterNotifications, Some(sr.clone()));\n        let result = client\n            .filter_notifications_recording(\n                SafetyLevel::NOTIFICATIONS_FOLLOW,\n                RECIPIENT,\n                notifications,\n                request_metrics,\n            )\n            .await;\n        server.abort();\n        (result, sr)\n    }\n\n    fn visibility_result(outcome: Option<Outcome>) -> vf_pb::NotificationVisibilityResult {\n        vf_pb::NotificationVisibilityResult { outcome }\n    }\n\n    fn by_actor(\n        request: &vf_pb::FilterNotificationsRequest,\n    ) -> Vec<vf_pb::NotificationVisibilityResult> {\n        request\n            .notifications\n            .iter()\n            .map(|n| {\n                visibility_result(Some(match n.actor_id {\n                    10 => Outcome::Allowed(vf_pb::Allowed {}),\n                    11 => Outcome::Dropped(vf_pb::Dropped {\n                        reason: Some(vf_pb::NotificationDropReason::RecipientBlocksActor as i32),\n                    }),\n                    13 => Outcome::Dropped(vf_pb::Dropped { reason: Some(99) }),\n                    _ => Outcome::Failed(vf_pb::Failed {}),\n                }))\n            })\n            .collect()\n    }\n\n    #[test]\n    fn a_follow_request_accepted_sends_its_own_kind() {\n        assert_eq!(\n            Notification::FollowRequestAccepted { actor_id: 10 }.into_proto(),\n            vf_pb::Notification {\n                actor_id: 10,\n                kind: Some(vf_pb::notification::Kind::FollowRequestAccepted(\n                    vf_pb::FollowRequestAccepted {},\n                )),\n            }\n        );\n    }\n\n    fn follows(actors: &[u64]) -> Vec<Notification> {\n        actors\n            .iter()\n            .map(|&actor_id| Notification::Follow { actor_id })\n            .collect()\n    }\n\n    #[tokio::test]\n    async fn sends_the_level_number_and_follows_and_records_a_completed_call_with_outcomes_in_request_order(\n    ) {\n        let requests = Arc::new(Mutex::new(Vec::new()));\n        let (outcomes, sr) = filter_against(\n            AnswerStub {\n                requests: requests.clone(),\n                answer: by_actor,\n            },\n            1_000,\n            &follows(&[11, 10, 12, 11, 13]),\n        )\n        .await;\n        assert_eq!(\n            outcomes.unwrap(),\n            vec![\n                NotificationOutcome::Dropped {\n                    reason: Some(vf_pb::NotificationDropReason::RecipientBlocksActor)\n                },\n                NotificationOutcome::Allowed,\n                NotificationOutcome::Failed,\n                NotificationOutcome::Dropped {\n                    reason: Some(vf_pb::NotificationDropReason::RecipientBlocksActor)\n                },\n                NotificationOutcome::Dropped {\n                    reason: Some(vf_pb::NotificationDropReason::Unspecified)\n                },\n            ]\n        );\n        let follow = |actor_id| vf_pb::Notification {\n            actor_id,\n            kind: Some(vf_pb::notification::Kind::Follow(vf_pb::Follow {})),\n        };\n        assert_eq!(\n            *requests.lock().unwrap(),\n            vec![vf_pb::FilterNotificationsRequest {\n                safety_level: 246,\n                recipient_id: RECIPIENT,\n                notifications: vec![follow(11), follow(10), follow(12), follow(11), follow(13)],\n            }]\n        );\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications|requests=completed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=success\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n    }\n\n    #[tokio::test]\n    async fn a_short_response_a_missing_outcome_an_rpc_error_or_a_missed_deadline_fails_the_call() {\n        let answer_stub = |answer| AnswerStub {\n            requests: Arc::default(),\n            answer,\n        };\n        let notifications = follows(&[10, 11]);\n        let (short, sr) = filter_against(\n            answer_stub(|request| {\n                let mut results = by_actor(request);\n                results.pop();\n                results\n            }),\n            1_000,\n            &notifications,\n        )\n        .await;\n        assert_eq!(\n            short.unwrap_err().to_string(),\n            \"VF notification count mismatch\"\n        );\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications|requests=failed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=success\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n        let (missing, sr) = filter_against(\n            answer_stub(|request| {\n                let mut results = by_actor(request);\n                results[1].outcome = None;\n                results\n            }),\n            1_000,\n            &notifications,\n        )\n        .await;\n        assert_eq!(\n            missing.unwrap_err().to_string(),\n            \"missing VF notification outcome\"\n        );\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications|requests=failed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=success\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n\n        let code = |result: Result<Vec<NotificationOutcome>>| {\n            result\n                .unwrap_err()\n                .downcast_ref::<Status>()\n                .map(Status::code)\n        };\n        let (unimplemented, sr) = filter_against(UnimplementedStub, 1_000, &notifications).await;\n        assert_eq!(code(unimplemented), Some(tonic::Code::Unimplemented));\n        assert_eq!(\n            sr.series(),\n            [\n                \"incr vf_client_filter_notifications_batch_error|code=other\",\n                \"incr vf_client_filter_notifications|requests=failed\",\n                \"observe_vm vf_client_filter_notifications_batch_latency_ms_vm|result=error\",\n                \"observe_vm vf_client_filter_notifications_latency_ms_vm\",\n            ]\n        );\n        let (deadline, sr) = filter_against(HangStub, 50, &notifications).await;\n        assert_eq!(code(deadline), Some(tonic::Code::DeadlineExceeded));\n        assert_eq!(\n            sr.counter(\"vf_client_filter_notifications|requests=failed\"),\n            1\n        );\n        assert!(sr\n            .series()\n            .contains(&\"observe_vm vf_client_filter_notifications_latency_ms_vm\".to_string()));\n    }\n}\n",
+      "source_digest": "2d97b69bfc9ea0bcb2eac2c7fe6fd38e403354f9723deaf60743a034c853ff47",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1630,
+      "end_line": 1654,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .as_deref()\n            .is_some_and(|u| u.len() > MAX_NAME_LEN)\n        {\n            return bad(\n                \"updated_by_too_long\",\n                format!(\"updated_by is longer than {MAX_NAME_LEN} bytes\"),\n            );\n        }\n        match req.mode {\n            ControlMode::Rules if !req.actions.is_empty() => {\n                return bad(\n                    \"rules_takes_no_actions\",\n                    \"mode rules follows the GrowthBook rules; send actions: []\".into(),\n                );\n            }\n            ControlMode::Live if req.actions.is_empty() => {\n                return bad(\n                    \"live_needs_actions\",\n                    \"mode live needs at least one action\".into(),\n                );\n            }\n            _ => {}\n        }\n        let mut kinds = HashSet::new();\n        for a in &req.actions {\n",
+      "source_digest": "adae47267c55b06a205dc659c8b445da1f27945d7c7bc6546305b4b805d98400",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2478,
+      "end_line": 2502,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n        assert_eq!(\n            resolve(&ac, \"H\", \"c2\", &[\"band_a\"]).page_actions,\n            vec![LIVENESS]\n        );\n        assert_eq!(resolve(&ac, \"H\", \"c2\", &[]).page_actions, vec![SUSPEND]);\n        let r = resolve(&ac, \"H\", \"c1\", &[\"band_a\"]);\n        assert_eq!(r.matched.unwrap().lkey, \"user/cb/H/c1/band_a\");\n        assert_eq!(r.mode, ControlMode::Live);\n    }\n\n    #[tokio::test]\n    async fn no_record_follows_the_rules() {\n        let (ac, _) = loaded(&[live(\"Other\", None, None, vec![SUSPEND])]).await;\n        let r = resolve(&ac, \"H\", \"c\", &[\"x\"]);\n        assert_eq!(r, Resolved::default());\n        assert!(!r.record_only());\n        assert_eq!(r.incoming_dedup_class(2), 2);\n        assert_eq!(resolve(&ac, \"\", \"c\", &[]).matched, None);\n    }\n\n    #[tokio::test]\n    async fn band_matches_through_the_dry_run_prefix() {\n        let (ac, _) = loaded(&[live(\"H\", None, Some(\"band_a\"), vec![LIVENESS])]).await;\n        let r = resolve(&ac, \"H\", \"c\", &[\"dry_run__band_a\"]);\n",
+      "source_digest": "53ec12e34747fc57cdb9b5f9acef7cbab5718210b2b5bbd16066dc2df03deee5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4336,
+      "end_line": 4360,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (ac, _) = loaded(&[record(\"H\", None, None, ControlMode::Rows, vec![])]).await;\n        let leave = ActionControlPutRequest {\n            expected_version: Some(1),\n            confirm: None,\n            ..put(\"H\", ControlMode::Rules, vec![])\n        };\n        assert_eq!(code(set(&ac, leave.clone()).await), \"confirm_required\");\n        let mut every_rules = vec![record(\"H\", None, None, ControlMode::Rows, vec![])];\n        every_rules.extend(LevelRow::ALL.map(|r| row_rec(\"H\", r, ControlMode::Rules, vec![])));\n        let (ac, _) = loaded(&every_rules).await;\n        assert!(\n            set(&ac, leave).await.is_ok(),\n            \"every row already follows the rules\"\n        );\n    }\n\n            struct HoldingStore {\n        inner: MemControlStore,\n        marker_scans: AtomicUsize,\n        first_checked: tokio::sync::Notify,\n        second_done: tokio::sync::Notify,\n    }\n\n    #[async_trait]\n    impl ControlStore for HoldingStore {\n",
+      "source_digest": "a919b806a696da6a0f7a1469cc05475b95ea845ab26de3e5a220da2de105bd3a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 463,
+      "end_line": 487,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let r = row.as_str();\n    let bad = |code: &'static str, msg: String| Err(SetError::Invalid(code, msg));\n    match mode {\n        ControlMode::Rows => {\n            return bad(\n                \"invalid_row\",\n                format!(\"the {r} row's mode is rules, recording or live\"),\n            );\n        }\n        ControlMode::Rules if !actions.is_empty() => {\n            return bad(\n                \"rules_takes_no_actions\",\n                format!(\"the {r} row follows the GrowthBook rules; send actions: []\"),\n            );\n        }\n        ControlMode::Live if actions.is_empty() => {\n            return bad(\n                \"live_needs_actions\",\n                format!(\"the {r} row is live and needs at least one action\"),\n            );\n        }\n        _ => {}\n    }\n    let mut kinds = HashSet::new();\n    for a in actions {\n",
+      "source_digest": "855036367938009d1b4e9c46ddb57649668e564653873328286094ec6ddc4de6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 343,
+      "end_line": 367,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    .await;\n    let t = b\n        .run_fresh(&bb1(&[\"anchor_campaign_user\"], Account::Clean))\n        .await;\n    assert_eq!(ais_names(&t), vec![\"bounceViaTemplate\"]);\n    assert_eq!(info(&t)[\"action_control_scope\"], \"band\");\n    let t = b\n        .run_fresh(&bb1(&[\"anchor_campaign_suspend\"], Account::Clean))\n        .await;\n    assert_eq!(\n        ais_names(&t),\n        vec![\"suspendUser\"],\n        \"the other band follows the rules\"\n    );\n    assert_eq!(info(&t)[\"matched_rule_id\"], \"anchor_campaign_suspend\");\n    assert_eq!(info(&t)[\"action_control_mode\"], \"rules\");\n}\n\n#[tokio::test]\nasync fn global_dry_run_records_only_like_the_other_two_sources() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    for (records, want_peek) in [\n        (\n            vec![live(BB1.0, None, vec![LIVENESS])],\n",
+      "source_digest": "24c5645042d847b097fca2a802d55a7445791bad71632ef884cd98710f5d2d6c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/lib.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4908,
+      "end_line": 4932,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            vec![GatedAction::PERMANENT_SUSPEND],\n            \"all-perm set stays permanent\"\n        );\n        assert!(gated_actions(&[label()], &c).is_empty());\n        assert!(gated_actions(&[label(), ActionSpec::Captcha], &c).is_empty());\n        assert!(gated_actions(&[ActionSpec::Arkose, ActionSpec::SpamLivenessCheck], &c).is_empty());\n        assert!(gated_actions(&[], &c).is_empty());\n        assert_eq!(HoldGateConfig::default().kinds, vec![GateKind::Suspend]);\n        assert!(HoldGateConfig::default().labels.is_empty());\n    }\n\n                        #[test]\n    fn label_detection_follows_kinds_and_labels() {\n        let c = label_cfg(&[\"SpamHighRecall\"]);\n        assert_eq!(\n            gated_actions(&[labels_spec(&[\"SpamHighRecall\"])], &c),\n            vec![gated_label(\"SpamHighRecall\")]\n        );\n        assert_eq!(\n            gated_actions(\n                &[\n                    labels_spec(&[\"SpamMediumRecall\", \"SpamHighRecall\"]),\n                    ActionSpec::Captcha,\n                ],\n                &c\n",
+      "source_digest": "fcb7822f4c1039c9efd01a69a8de8320ecfd91071f70ff94acaafeb17d8696cd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1508,
+      "end_line": 1532,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) -> (Lookup, u64, bool) {\n        if !cfg.enabled() || !cfg.covers_topic(topic) {\n            return (Lookup::Disabled, 0, false);\n        }\n        if let Some(holds) = self.cached(user_id, labels) {\n            return (Lookup::Holds(holds), 0, true);\n        }\n        let Some(store) = self.store.as_ref() else {\n            if !self.no_store_logged.swap(true, Ordering::Relaxed) {\n                error!(\n                    mode = cfg.mode.as_str(),\n                    \"overturn-hold gate is {} but OVERTURN_HOLD_LEDGER_URL is unset: every probe \\\n                     fails and follows on_probe_error={} (logged once)\",\n                    cfg.mode.as_str(),\n                    cfg.on_probe_error.as_str()\n                );\n            }\n            return (\n                Lookup::ProbeError(ProbeError::from(&HoldStoreError::NotConfigured)),\n                0,\n                false,\n            );\n        };\n\n        let (trial, generation) = match self.breaker_before_probe(cfg.timeout_ms) {\n",
+      "source_digest": "4959b6a4fafd5ad1b3b4fd30bd3b4cc56113bb64444134be9ef5ce28b920f192",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3014,
+      "end_line": 3038,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            HoldStoreError::Unreachable(\"x\".into())\n                .to_string()\n                .starts_with(\"ledger service unreachable:\")\n        );\n        assert!(\n            HoldStoreError::Decode(\"x\".into())\n                .to_string()\n                .starts_with(\"response decode:\")\n        );\n    }\n\n                            #[tokio::test]\n    async fn db_connected_gauge_follows_the_probe_class_in_the_gate() {\n        let _serial = METRICS_LOCK.lock().await;\n        let fwd = |status: u16, code: LedgerCode| HoldStoreError::Upstream {\n            status,\n            code: Some(code),\n        };\n        for (err, want) in [\n            (HoldStoreError::Unreachable(\"refused\".into()), Some(false)),\n            (\n                HoldStoreError::Timeout(Duration::from_millis(1)),\n                Some(false),\n            ),\n            (fwd(503, LedgerCode::ConnectRefused), Some(true)),\n",
+      "source_digest": "4bf423f4efe71bb8b20de6d9944614cce9882697fb16ff2d4be71b62d0e6a287",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-ledger-service/src/tls.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 200,
+      "end_line": 224,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(tls_server_end_point(&[]), None);\n        assert_eq!(tls_server_end_point(b\"not a certificate\"), None);\n        assert_eq!(tls_server_end_point(&[0x30, 0x03, 0x02, 0x01]), None);\n        let cert = Certificate::from_der(TEST_CERT).unwrap();\n        let tbs_only = x509_cert::der::Encode::to_der(&cert.tbs_certificate).unwrap();\n        assert!(TbsCertificate::from_der(&tbs_only).is_ok());\n        assert_eq!(tls_server_end_point(&tbs_only), None);\n        let truncated = &TEST_CERT[..TEST_CERT.len() - 1];\n        assert_eq!(tls_server_end_point(truncated), None);\n    }\n\n    #[test]\n    fn digest_table_follows_rfc_5929() {\n        for (oid, expected_len) in [\n            (ID_SHA_1, 32),\n            (SHA_1_WITH_RSA_ENCRYPTION, 32),\n            (ID_SHA_256, 32),\n            (SHA_256_WITH_RSA_ENCRYPTION, 32),\n            (ECDSA_WITH_SHA_256, 32),\n            (ID_SHA_384, 48),\n            (SHA_384_WITH_RSA_ENCRYPTION, 48),\n            (ECDSA_WITH_SHA_384, 48),\n            (ID_SHA_512, 64),\n            (SHA_512_WITH_RSA_ENCRYPTION, 64),\n        ] {\n",
+      "source_digest": "573d11701559806f9167ff5c3552970d218f96405cf2096e3c0634d7f6520f2b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "bdsm/runtime/manhattan_arrow_adapter.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 182,
+      "end_line": 206,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        total = int(valid.sum())\n        if total == 0:\n            continue\n\n        from collections import Counter\n\n        counts = Counter(acts.tolist())\n\n        server_actions = sum(counts.get(i, 0) for i in PROTO_SERVER_ACTIONS)\n        renders = counts.get(12, 0)\n        dwells = counts.get(11, 0)\n        clicks = counts.get(29, 0)\n        follows = counts.get(21, 0) + counts.get(61, 0)\n        replies = counts.get(4, 0)\n        favs = counts.get(1, 0)\n        retweets = counts.get(6, 0)\n        photo = counts.get(14, 0)\n        distinct_types = len(counts)\n        distinct_targets = len(\n            set(author_ids[b, s] for s in range(S) if valid[s] and author_ids[b, s] > 0)\n        )\n        distinct_posts = len(\n            set(tweet_ids[b, s] for s in range(S) if valid[s] and tweet_ids[b, s] > 0)\n        )\n        dwell_vals = dwell_times[b][valid & (dwell_times[b] > 0)]\n",
+      "source_digest": "74c9cd023f6f58db98dc1cb6c863e41566b5b8bf5413f6435254df134d0b2d65",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "bdsm/runtime/manhattan_arrow_adapter.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 197,
+      "end_line": 221,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        retweets = counts.get(6, 0)\n        photo = counts.get(14, 0)\n        distinct_types = len(counts)\n        distinct_targets = len(\n            set(author_ids[b, s] for s in range(S) if valid[s] and author_ids[b, s] > 0)\n        )\n        distinct_posts = len(\n            set(tweet_ids[b, s] for s in range(S) if valid[s] and tweet_ids[b, s] > 0)\n        )\n        dwell_vals = dwell_times[b][valid & (dwell_times[b] > 0)]\n        avg_dwell = int(dwell_vals.mean()) if len(dwell_vals) > 0 else 0\n        server_pct = round(100 * server_actions / total) if total > 0 else 0\n        client_follows = counts.get(21, 0)\n\n        summary_counters[b] = [\n            total,\n            server_pct,\n            renders,\n            dwells,\n            avg_dwell,\n            distinct_types,\n            distinct_targets,\n            distinct_posts,\n            follows,\n            replies,\n",
+      "source_digest": "0c9d8e826999805edae7c3f34fd22d1f92060d6f99d60497e0f140f924c77dc1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "bdsm/runtime/manhattan_arrow_adapter.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 208,
+      "end_line": 232,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        server_pct = round(100 * server_actions / total) if total > 0 else 0\n        client_follows = counts.get(21, 0)\n\n        summary_counters[b] = [\n            total,\n            server_pct,\n            renders,\n            dwells,\n            avg_dwell,\n            distinct_types,\n            distinct_targets,\n            distinct_posts,\n            follows,\n            replies,\n            favs,\n            retweets,\n            clicks,\n            photo,\n            client_follows,\n        ]\n\n    batch = {\n        \"user_ids_raw\": user_ids,\n        \"tweet_ids_raw\": tweet_ids,\n        \"author_ids_raw\": author_ids,\n",
+      "source_digest": "745819bebd174a24de8820e8d4ad8ea6eeca9737c15a328ed7d885bf7597a3b7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "bdsm/runtime/manhattan_arrow_adapter.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 214,
+      "end_line": 238,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            renders,\n            dwells,\n            avg_dwell,\n            distinct_types,\n            distinct_targets,\n            distinct_posts,\n            follows,\n            replies,\n            favs,\n            retweets,\n            clicks,\n            photo,\n            client_follows,\n        ]\n\n    batch = {\n        \"user_ids_raw\": user_ids,\n        \"tweet_ids_raw\": tweet_ids,\n        \"author_ids_raw\": author_ids,\n        \"summary_counters\": summary_counters,\n        \"action_seq\": {\n            \"action_types\": action_multihot,\n            \"continuous_actions\": continuous_actions,\n            \"product_surface\": product_surface,\n            \"client_app_id\": client_app_id,\n",
+      "source_digest": "b5502ac2767418a445f7dd74bc475d8862b84e3a3de6d1200a768176bc09cd9c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "bdsm/runtime/proto_gen/abuse_inference_pb2.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3,
+      "end_line": 27,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from google.protobuf import runtime_version as _runtime_version\nfrom google.protobuf import symbol_database as _symbol_database\nfrom google.protobuf.internal import builder as _builder\n\n_runtime_version.ValidateProtobufRuntimeVersion(\n    _runtime_version.Domain.PUBLIC, 6, 31, 1, \"\", \"abuse_inference.proto\"\n)\n\n_sym_db = _symbol_database.Default()\n\n\nDESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(\n    b'\\n\\x15\\x61\\x62use_inference.proto\\x12\\x16xai.abuse.inference.v1\"I\\n\\x0b\\x41\\x63tionCount\\x12\\x16\\n\\x0e\\x61\\x63tion_type_id\\x18\\x01 \\x01(\\x05\\x12\\r\\n\\x05\\x63ount\\x18\\x02 \\x01(\\r\\x12\\x13\\n\\x0b\\x61\\x63tion_name\\x18\\x03 \\x01(\\t\";\\n\\tFiredHead\\x12\\x0c\\n\\x04name\\x18\\x01 \\x01(\\t\\x12\\r\\n\\x05score\\x18\\x02 \\x01(\\x01\\x12\\x11\\n\\tthreshold\\x18\\x03 \\x01(\\x01\"\\xbf\\x03\\n\\x0fSummaryCounters\\x12\\x13\\n\\x0breason_code\\x18\\x01 \\x01(\\t\\x12\\x15\\n\\rtotal_actions\\x18\\x02 \\x01(\\r\\x12\\x12\\n\\nserver_pct\\x18\\x03 \\x01(\\r\\x12\\x0f\\n\\x07renders\\x18\\x04 \\x01(\\r\\x12\\x0e\\n\\x06\\x64wells\\x18\\x05 \\x01(\\r\\x12\\x14\\n\\x0c\\x61vg_dwell_ms\\x18\\x06 \\x01(\\r\\x12\\x1d\\n\\x15\\x64istinct_action_types\\x18\\x07 \\x01(\\r\\x12\\x18\\n\\x10\\x64istinct_targets\\x18\\x08 \\x01(\\r\\x12\\x16\\n\\x0e\\x64istinct_posts\\x18\\t \\x01(\\r\\x12\\x13\\n\\x0b\\x61pi_follows\\x18\\n \\x01(\\r\\x12\\x13\\n\\x0b\\x61pi_replies\\x18\\x0b \\x01(\\r\\x12\\x10\\n\\x08\\x61pi_favs\\x18\\x0c \\x01(\\r\\x12\\x14\\n\\x0c\\x61pi_retweets\\x18\\r \\x01(\\r\\x12\\x15\\n\\rclient_clicks\\x18\\x0e \\x01(\\r\\x12\\x1b\\n\\x13\\x63lient_photo_expand\\x18\\x0f \\x01(\\r\\x12\\x16\\n\\x0e\\x63lient_follows\\x18\\x10 \\x01(\\r\\x12\\x0e\\n\\x06labels\\x18\\x11 \\x03(\\t\\x12\\x36\\n\\x0b\\x66ired_heads\\x18\\x12 \\x03(\\x0b\\x32!.xai.abuse.inference.v1.FiredHead\"\\x80\\x03\\n\\x13SequenceUpdateEvent\\x12\\x0f\\n\\x07user_id\\x18\\x01 \\x01(\\x03\\x12\\x13\\n\\x0bwrite_ts_ms\\x18\\x02 \\x01(\\x03\\x12\\x1b\\n\\x13latest_action_ts_ms\\x18\\x03 \\x01(\\x03\\x12\\x18\\n\\x10sequence_version\\x18\\x04 \\x01(\\x03\\x12\\x1c\\n\\x14sequence_fingerprint\\x18\\x05 \\x01(\\t\\x12\\x14\\n\\x0csequence_len\\x18\\x06 \\x01(\\r\\x12\\x1a\\n\\x12\\x64\\x65lta_action_count\\x18\\x07 \\x01(\\r\\x12\\x19\\n\\x11reply_count_delta\\x18\\x08 \\x01(\\r\\x12\\x1a\\n\\x12\\x66ollow_count_delta\\x18\\t \\x01(\\r\\x12\\x1a\\n\\x12report_count_delta\\x18\\n \\x01(\\r\\x12\\x1a\\n\\x12render_count_delta\\x18\\x0b \\x01(\\r\\x12\\x19\\n\\x11\\x64well_count_delta\\x18\\x0c \\x01(\\r\\x12\\x18\\n\\x10prior_score_tier\\x18\\r \\x01(\\t\\x12\\x18\\n\\x10producer_version\\x18\\x0e \\x01(\\t\"\\xec\\x01\\n\\x0cScoreRequest\\x12\\x0f\\n\\x07user_id\\x18\\x01 \\x01(\\x03\\x12\\x1c\\n\\x14target_model_version\\x18\\x02 \\x01(\\t\\x12\\x16\\n\\x0equeue_priority\\x18\\x03 \\x01(\\t\\x12\\x16\\n\\x0e\\x65nqueue_reason\\x18\\x04 \\x01(\\t\\x12\\x15\\n\\renqueue_ts_ms\\x18\\x05 \\x01(\\x03\\x12\\x18\\n\\x10sequence_version\\x18\\x06 \\x01(\\x03\\x12\\x1c\\n\\x14sequence_fingerprint\\x18\\x07 \\x01(\\t\\x12\\x17\\n\\x0ftrigger_sources\\x18\\x08 \\x03(\\t\\x12\\x15\\n\\rforce_rescore\\x18\\t \\x01(\\x08\"\\xb4\\x01\\n\\rDecodedAction\\x12\\x0b\\n\\x03idx\\x18\\x01 \\x01(\\r\\x12\\x13\\n\\x0b\\x61\\x63tion_type\\x18\\x02 \\x01(\\t\\x12\\x10\\n\\x08tweet_id\\x18\\x03 \\x01(\\x03\\x12\\x11\\n\\tauthor_id\\x18\\x04 \\x01(\\x03\\x12\\x1a\\n\\x12\\x65ngagement_time_ms\\x18\\x05 \\x01(\\x03\\x12\\x10\\n\\x08\\x64well_ms\\x18\\x06 \\x01(\\x01\\x12\\x17\\n\\x0fproduct_surface\\x18\\x07 \\x01(\\t\\x12\\x15\\n\\rclient_app_id\\x18\\x08 \\x01(\\x03\"\\xf4\\x04\\n\\x0bScoreResult\\x12\\x0f\\n\\x07user_id\\x18\\x01 \\x01(\\x03\\x12\\x15\\n\\rmodel_version\\x18\\x02 \\x01(\\t\\x12\\x13\\n\\x0bscore_ts_ms\\x18\\x03 \\x01(\\x03\\x12\\x14\\n\\x0cscore_status\\x18\\x04 \\x01(\\t\\x12\\x16\\n\\x0equeue_priority\\x18\\x05 \\x01(\\t\\x12\\x16\\n\\x0e\\x65nqueue_reason\\x18\\x06 \\x01(\\t\\x12\\x1b\\n\\x13latest_action_ts_ms\\x18\\x07 \\x01(\\x03\\x12\\x1f\\n\\x17scored_sequence_version\\x18\\x08 \\x01(\\x03\\x12#\\n\\x1bscored_sequence_fingerprint\\x18\\t \\x01(\\t\\x12\\x14\\n\\x0csequence_len\\x18\\n \\x01(\\r\\x12\\x17\\n\\x0fraw_head_scores\\x18\\x0b \\x03(\\x01\\x12\\x38\\n\\x07summary\\x18\\x0c \\x01(\\x0b\\x32\\'.xai.abuse.inference.v1.SummaryCounters\\x12\\x43\\n\\x16\\x61\\x63tion_counts_non_zero\\x18\\r \\x03(\\x0b\\x32#.xai.abuse.inference.v1.ActionCount\\x12\\x19\\n\\x11scorer_latency_ms\\x18\\x0e \\x01(\\r\\x12!\\n\\x19manhattan_read_latency_ms\\x18\\x0f \\x01(\\r\\x12 \\n\\x18\\x66\\x65\\x61ture_build_latency_ms\\x18\\x10 \\x01(\\r\\x12\\x17\\n\\x0ftrigger_sources\\x18\\x11 \\x03(\\t\\x12>\\n\\x0f\\x64\\x65\\x63oded_actions\\x18\\x12 \\x03(\\x0b\\x32%.xai.abuse.inference.v1.DecodedAction\\x12\\x18\\n\\x10\\x65nforcement_note\\x18\\x13 \\x01(\\t\"\\xc0\\x03\\n\\x14TriggerActivityState\\x12\\x0f\\n\\x07user_id\\x18\\x01 \\x01(\\x03\\x12\\x1c\\n\\x14\\x61\\x63tive_model_version\\x18\\x02 \\x01(\\t\\x12&\\n\\x1elast_seen_sequence_fingerprint\\x18\\x03 \\x01(\\t\\x12\\x1d\\n\\x15last_seen_write_ts_ms\\x18\\x04 \\x01(\\x03\\x12%\\n\\x1dlast_seen_latest_action_ts_ms\\x18\\x05 \\x01(\\x03\\x12\\x1e\\n\\x16last_seen_sequence_len\\x18\\x06 \\x01(\\r\\x12!\\n\\x19last_enqueued_fingerprint\\x18\\x07 \\x01(\\t\\x12\\x1a\\n\\x12last_enqueue_ts_ms\\x18\\x08 \\x01(\\x03\\x12\\x1b\\n\\x13last_enqueue_reason\\x18\\t \\x01(\\t\\x12\\x1b\\n\\x13last_queue_priority\\x18\\n \\x01(\\t\\x12\\x1f\\n\\x17last_scored_fingerprint\\x18\\x0b \\x01(\\t\\x12\\x18\\n\\x10last_score_ts_ms\\x18\\x0c \\x01(\\x03\\x12\\x16\\n\\x0elast_risk_tier\\x18\\r \\x01(\\t\\x12\\x1f\\n\\x17last_state_update_ts_ms\\x18\\x0e \\x01(\\x03\"\\xe1\\x01\\n\\x17RiskTierTransitionEvent\\x12\\x0f\\n\\x07user_id\\x18\\x01 \\x01(\\x03\\x12\\x15\\n\\rmodel_version\\x18\\x02 \\x01(\\t\\x12\\x1a\\n\\x12previous_risk_tier\\x18\\x03 \\x01(\\t\\x12\\x15\\n\\rnew_risk_tier\\x18\\x04 \\x01(\\t\\x12\\x16\\n\\x0e\\x61ggregate_risk\\x18\\x05 \\x01(\\x01\\x12#\\n\\x1bscored_sequence_fingerprint\\x18\\x06 \\x01(\\t\\x12\\x13\\n\\x0bscore_ts_ms\\x18\\x07 \\x01(\\x03\\x12\\x19\\n\\x11transition_reason\\x18\\x08 \\x01(\\tb\\x06proto3'\n)\n\n_globals = globals()\n_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)\n_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, \"abuse_inference_pb2\", _globals)\nif not _descriptor._USE_C_DESCRIPTORS:\n    DESCRIPTOR._loaded_options = None\n    _globals[\"_ACTIONCOUNT\"]._serialized_start = 49\n    _globals[\"_ACTIONCOUNT\"]._serialized_end = 122\n    _globals[\"_FIREDHEAD\"]._serialized_start = 124\n    _globals[\"_FIREDHEAD\"]._serialized_end = 183\n    _globals[\"_SUMMARYCOUNTERS\"]._serialized_start = 186\n",
+      "source_digest": "4167c3e45a983476595aa30fc899deb76b539223fa272b72a58ef7ab3a6a30ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "bdsm/runtime/score_results_sink_focal.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 8,
+      "end_line": 32,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import threading\nimport uuid as _uuid\nimport zlib\nimport dataclasses\nfrom dataclasses import dataclass, field\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n\nimport numpy as np\n\nfrom gizmoduck_age import get_user_age_hours\nfrom login_starter_pack_counter import get_login_pack_age_minutes\nfrom pipeline_security import kafka_ssl_config, safe_pickle_loads\nfrom starter_pack_follows import get_followed_pack_count\n\nlogging.basicConfig(level=logging.INFO, format=\"%(asctime)s %(levelname)s %(message)s\")\nlog = logging.getLogger(\"results_sink\")\n\nimport sys as _sys\n\n\ndef kafka_cert_config(bootstrap: str) -> dict:\n    if not bootstrap or \":9094\" in bootstrap or \"scram\" in bootstrap:\n        raise SystemExit(\n            f\"Kafka bootstrap {bootstrap!r} is the password listener or empty; \"\n            \"use the certificate listener (port 9095)\"\n",
+      "source_digest": "36f9f7c935f953a1af163932e9c88bbacc00b800d8b0912c05aff31cc5adb7ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "bdsm/runtime/score_results_sink_focal.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 414,
+      "end_line": 438,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        type=int,\n        default=1440,\n        help=\"Skip FollowBot enforcement when the user was shown the login \"\n        \"starter pack (loginStarterPacksCounter Strato column) within \"\n        \"this many minutes. Set to 0 to disable the gate entirely. \"\n        \"Default 1440 (24h); empirical p100 sus_ts - counter_ts in 7d \"\n        \"of FollowBot suspensions was ~17.5h.\",\n    )\n    parser.add_argument(\n        \"--starter-pack-gate-mode\",\n        default=\"off\",\n        choices=(\"off\", \"dry_run\", \"challenge\"),\n        help=\"FollowBot starter-pack-follows gate (starterpacks/followPacksStore \"\n        \"Strato column, no TTL — covers resurrected accounts the 14d \"\n        \"loginStarterPacksCounter misses). Only consulted when FollowBot \"\n        \"met its 2D threshold, so Strato load is bounded to the FollowBot \"\n        \"rate. 'off' (default) = disabled. 'dry_run' = suspend as today \"\n        \"but add an inert enforcement_starter_pack_would_skip audit label. \"\n        \"'challenge' = suppress suspension and route the user to the \"\n        \"deterministic arkose/captcha split instead (pack membership is \"\n        \"common among legit users — 21.8%% base rate in follow-heavy \"\n        \"legit-scored users, 2026-07-15 — so challenge, never free-pass.)\",\n    )\n    parser.add_argument(\n        \"--cusp-liveness-sample-per-10k\",\n",
+      "source_digest": "cc066f4aabdfd4a40d914759c065c1e7c235a8907b3ebd264abd74b9881e2893",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "bdsm/runtime/score_results_sink_focal.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 717,
+      "end_line": 741,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"(liveness OFF, --challenge-liveness-per-10k=0)\"\n        )\n    if args.dwell_dropout_check_url:\n        log.info(\n            f\"client_dwell_dropout gate {'DRY-RUN' if args.dwell_dropout_dry_run else 'ENABLED'}: \"\n            f\"url={args.dwell_dropout_check_url} fail_{'open' if args.dwell_dropout_fail_open else 'closed'} \"\n            f\"cache_ttl={args.dwell_dropout_cache_ttl_days}d\"\n        )\n    else:\n        log.info(\"client_dwell_dropout gate DISABLED (--dwell-dropout-check-url unset)\")\n    if args.starter_pack_gate_mode != \"off\":\n        log.info(\n            f\"Starter-pack-follows gate ENABLED mode={args.starter_pack_gate_mode} \"\n            f\"(starterpacks/followPacksStore; FollowBot-only; \"\n            f\"{'audit label only' if args.starter_pack_gate_mode == 'dry_run' else 'suspension -> arkose/captcha challenge'})\"\n        )\n    else:\n        log.info(\"Starter-pack-follows gate DISABLED (--starter-pack-gate-mode=off)\")\n    if paused_liveness_heads and args.paused_head_liveness_sample_per_10k > 0:\n        _thr = {h: pol.paused_liveness_thresholds[h] for h in paused_liveness_heads}\n        log.info(\n            f\"Paused-head->liveness ENABLED: heads={paused_liveness_heads} \"\n            f\"sample={args.paused_head_liveness_sample_per_10k}/10000 thresholds={_thr}\"\n        )\n    else:\n",
+      "source_digest": "7a724c6c49ac8649c54a5b0015c5a93388e145aee97f86ebfa4aaad04d46631f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "bdsm/runtime/score_results_sink_focal.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 722,
+      "end_line": 746,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            f\"url={args.dwell_dropout_check_url} fail_{'open' if args.dwell_dropout_fail_open else 'closed'} \"\n            f\"cache_ttl={args.dwell_dropout_cache_ttl_days}d\"\n        )\n    else:\n        log.info(\"client_dwell_dropout gate DISABLED (--dwell-dropout-check-url unset)\")\n    if args.starter_pack_gate_mode != \"off\":\n        log.info(\n            f\"Starter-pack-follows gate ENABLED mode={args.starter_pack_gate_mode} \"\n            f\"(starterpacks/followPacksStore; FollowBot-only; \"\n            f\"{'audit label only' if args.starter_pack_gate_mode == 'dry_run' else 'suspension -> arkose/captcha challenge'})\"\n        )\n    else:\n        log.info(\"Starter-pack-follows gate DISABLED (--starter-pack-gate-mode=off)\")\n    if paused_liveness_heads and args.paused_head_liveness_sample_per_10k > 0:\n        _thr = {h: pol.paused_liveness_thresholds[h] for h in paused_liveness_heads}\n        log.info(\n            f\"Paused-head->liveness ENABLED: heads={paused_liveness_heads} \"\n            f\"sample={args.paused_head_liveness_sample_per_10k}/10000 thresholds={_thr}\"\n        )\n    else:\n        log.info(\"Paused-head->liveness DISABLED (no heads or sample=0)\")\n    if spam_bounce_heads and args.spam_bounce_sample_per_10k > 0:\n        _sb_thr = {h: pol.spam_bounce_thresholds[h] for h in spam_bounce_heads}\n        log.info(\n            f\"Spam-bounce (official-client) ENABLED: heads={spam_bounce_heads} \"\n",
+      "source_digest": "18f83d969431dc0923751252e6d8eed3dc11aa6584c41500e45c7f8f5b474ab7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "bdsm/runtime/score_results_sink_focal.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 895,
+      "end_line": 919,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        _pack_count = get_followed_pack_count(uid_int, r, metrics)\n        if _pack_count is not None and _pack_count > 0:\n            log.info(\n                f\"starter_pack_gate uid={uid_int} \"\n                f\"pack_count={_pack_count} \"\n                f\"mode={args.starter_pack_gate_mode}\"\n            )\n            if args.starter_pack_gate_mode == \"dry_run\":\n                metrics[\"starter_pack_gate_would_skip\"] += 1\n                user_labels.append(\"enforcement_starter_pack_would_skip\")\n            else:\n                dec.enforcement_met = False\n                dec.age_gate_skip_reason = \"starter_pack_follows\"\n                dec.starter_pack_challenge = True\n                metrics[\"starter_pack_gate_challenged_followbot\"] += 1\n\n    if dec.enforcement_met and args.dwell_dropout_check_url:\n        if client_dwell_dropout(r, uid_int, args, metrics):\n            metrics[\"enforcement_skipped_dwell_dropout\"] += 1\n            if args.dwell_dropout_dry_run:\n                user_labels.append(\"enforcement_dwell_dropout_would_skip\")\n            else:\n                dec.enforcement_met = False\n                dec.age_gate_skip_reason = \"dwell_dropout\"\n\n",
+      "source_digest": "3ad5583275f02ff27ded3e4e451639c04456436690f36d241a225824b0f25d39",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "bdsm/runtime/score_results_sink_focal.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 936,
+      "end_line": 960,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if dec.enforcement_met:\n        user_labels.append(\"enforcement_threshold_reached\")\n        if dec.enforcement_head and dec.enforcement_head not in user_labels:\n            user_labels.append(dec.enforcement_head)\n    elif dec.age_gate_skip_reason == \"new_user_followbot\":\n        user_labels.append(\"enforcement_skipped_new_user_followbot\")\n        if dec.enforcement_head and dec.enforcement_head not in user_labels:\n            user_labels.append(dec.enforcement_head)\n    elif dec.age_gate_skip_reason == \"login_starter_pack\":\n        user_labels.append(\"enforcement_skipped_login_starter_pack\")\n        if dec.enforcement_head and dec.enforcement_head not in user_labels:\n            user_labels.append(dec.enforcement_head)\n    elif dec.age_gate_skip_reason == \"starter_pack_follows\":\n        user_labels.append(\"enforcement_skipped_starter_pack\")\n        if dec.enforcement_head and dec.enforcement_head not in user_labels:\n            user_labels.append(dec.enforcement_head)\n        if dec.starter_pack_challenge and claim_action(\n            r,\n            \"liveness\",\n            uid_int,\n            int(args.liveness_cooldown_days * 86400),\n            args.liveness_max_per_window,\n            args.liveness_cooldown_fail_open,\n        ):\n            dec.sp_emitted = True\n",
+      "source_digest": "c2caf7bdc169afe315806fe920f616f407b142dafaea9357fda8aa56b5cf58c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "bdsm/runtime/starter_pack_follows.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import logging\nimport os\nimport time\nfrom typing import Optional\n\nimport requests\n\nlog = logging.getLogger(\"starter_pack_follows\")\n\nSTRATO_URL = (\n    os.environ.get(\"STRATO_BASE_URL\", \"https://strato.example.com\")\n    + \"/op/fetch/starterpacks/followPacksStore\"\n)\n\nREQUEST_TIMEOUT_SEC = 1.0\n\nREDIS_TTL_SEC = 6 * 60 * 60\n_LOCAL_TTL_SEC = 6 * 60 * 60\n_LOCAL_CACHE_MAX = 100_000\n_LOCAL_CACHE: \"dict[int, tuple[int, float]]\" = {}\n",
+      "source_digest": "a39ca13d4354ba09f9b01ff15dbc9596c183c431968ee22a042dabeb46ab7f6d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "bdsm/runtime/starter_pack_follows.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 43,
+      "end_line": 67,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            STRATO_URL,\n            json=[user_id, None],\n            timeout=REQUEST_TIMEOUT_SEC,\n        )\n        if resp.status_code != 200:\n            return None\n        body = resp.json()\n        v = body.get(\"v\")\n        if v is None:\n            return 0\n        return len(v)\n    except Exception as e:\n        log.debug(f\"starter_pack_follows fetch failed for {user_id}: {e}\")\n        return None\n\n\ndef get_followed_pack_count(\n    user_id: int,\n    redis_client=None,\n    metrics: Optional[dict] = None,\n) -> Optional[int]:\n    cached = _local_cache_get(user_id)\n    if cached is not None:\n        if metrics is not None:\n            metrics[\"starter_pack_cache_local\"] = metrics.get(\"starter_pack_cache_local\", 0) + 1\n",
+      "source_digest": "e89e6f3e1052a752d12a475e2d58a6edbb50be5b7c568012ca788d382f566308",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "home-mixer/candidate_hydrators/bidirectional_follow_hydrator.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 45,
+      "end_line": 69,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .socialgraph_client\n                .check_followed_by(query.user_id, &authors)\n                .await\n            {\n                Ok(m) => m,\n                Err(e) => return candidates.iter().map(|_| Err(e.to_string())).collect(),\n            }\n        };\n\n        candidates\n            .iter()\n            .map(|c| {\n                let author_follows_viewer = followers.contains(&c.author_id);\n                Ok(PostCandidate {\n                    author_follows_viewer: check_all_authors.then_some(author_follows_viewer),\n                    is_mutual_follow_author: Some(\n                        author_follows_viewer && following.contains(&(c.author_id as i64)),\n                    ),\n                    ..Default::default()\n                })\n            })\n            .collect()\n    }\n\n    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {\n",
+      "source_digest": "9cabd77f37d46b10b5ec1098fead8157eb2195e98aa78646c60811fc714354f0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "home-mixer/candidate_hydrators/bidirectional_follow_hydrator.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 47,
+      "end_line": 71,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .await\n            {\n                Ok(m) => m,\n                Err(e) => return candidates.iter().map(|_| Err(e.to_string())).collect(),\n            }\n        };\n\n        candidates\n            .iter()\n            .map(|c| {\n                let author_follows_viewer = followers.contains(&c.author_id);\n                Ok(PostCandidate {\n                    author_follows_viewer: check_all_authors.then_some(author_follows_viewer),\n                    is_mutual_follow_author: Some(\n                        author_follows_viewer && following.contains(&(c.author_id as i64)),\n                    ),\n                    ..Default::default()\n                })\n            })\n            .collect()\n    }\n\n    fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {\n        candidate.is_mutual_follow_author = hydrated.is_mutual_follow_author;\n        candidate.author_follows_viewer = hydrated.author_follows_viewer;\n",
+      "source_digest": "8106661533fa88947069ea90bf5031d03ff90258a4b60114d7827a200651b5cc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1707,
+      "end_line": 1731,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .as_deref()\n            .is_some_and(|u| u.len() > MAX_NAME_LEN)\n        {\n            return bad(\n                \"updated_by_too_long\",\n                format!(\"updated_by is longer than {MAX_NAME_LEN} bytes\"),\n            );\n        }\n        match req.mode {\n            ControlMode::Rules if !req.actions.is_empty() => {\n                return bad(\n                    \"rules_takes_no_actions\",\n                    \"mode rules follows the GrowthBook rules; send actions: []\".into(),\n                );\n            }\n            ControlMode::Live if req.actions.is_empty() => {\n                return bad(\n                    \"live_needs_actions\",\n                    \"mode live needs at least one action\".into(),\n                );\n            }\n            _ => {}\n        }\n        let mut kinds = HashSet::new();\n        for a in &req.actions {\n",
+      "source_digest": "adae47267c55b06a205dc659c8b445da1f27945d7c7bc6546305b4b805d98400",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2600,
+      "end_line": 2624,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n        assert_eq!(\n            resolve(&ac, \"H\", \"c2\", &[\"band_a\"]).page_actions,\n            vec![LIVENESS]\n        );\n        assert_eq!(resolve(&ac, \"H\", \"c2\", &[]).page_actions, vec![SUSPEND]);\n        let r = resolve(&ac, \"H\", \"c1\", &[\"band_a\"]);\n        assert_eq!(r.matched.unwrap().lkey, \"user/cb/H/c1/band_a\");\n        assert_eq!(r.mode, ControlMode::Live);\n    }\n\n    #[tokio::test]\n    async fn no_record_follows_the_rules() {\n        let (ac, _) = loaded(&[live(\"Other\", None, None, vec![SUSPEND])]).await;\n        let r = resolve(&ac, \"H\", \"c\", &[\"x\"]);\n        assert_eq!(r, Resolved::default());\n        assert!(!r.record_only());\n        assert_eq!(r.incoming_dedup_class(|| 2), 2);\n        assert_eq!(resolve(&ac, \"\", \"c\", &[]).matched, None);\n    }\n\n    #[tokio::test]\n    async fn band_matches_through_the_dry_run_prefix() {\n        let (ac, _) = loaded(&[live(\"H\", None, Some(\"band_a\"), vec![LIVENESS])]).await;\n        let r = resolve(&ac, \"H\", \"c\", &[\"dry_run__band_a\"]);\n",
+      "source_digest": "5ec421c37572dd1e4110ccd8c96c23ffa56b9780ed19d5a40218c26b611da634",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5139,
+      "end_line": 5163,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (ac, _) = loaded(&[record(\"H\", None, None, ControlMode::Rows, vec![])]).await;\n        let leave = ActionControlPutRequest {\n            expected_version: Some(1),\n            confirm: None,\n            ..put(\"H\", ControlMode::Rules, vec![])\n        };\n        assert_eq!(code(set(&ac, leave.clone()).await), \"confirm_required\");\n        let mut every_rules = vec![record(\"H\", None, None, ControlMode::Rows, vec![])];\n        every_rules.extend(LevelRow::ALL.map(|r| row_rec(\"H\", r, ControlMode::Rules, vec![])));\n        let (ac, _) = loaded(&every_rules).await;\n        assert!(\n            set(&ac, leave).await.is_ok(),\n            \"every row already follows the rules\"\n        );\n    }\n\n            struct HoldingStore {\n        inner: MemControlStore,\n        marker_scans: AtomicUsize,\n        first_checked: tokio::sync::Notify,\n        second_done: tokio::sync::Notify,\n    }\n\n    #[async_trait]\n    impl ControlStore for HoldingStore {\n",
+      "source_digest": "a919b806a696da6a0f7a1469cc05475b95ea845ab26de3e5a220da2de105bd3a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e42f2f9cb11dbf4eec3f62815956249a652677eea693dbe9e65db7e667746064",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering-client",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "4f66667aa8569965d98a74c86d7e1eebfce0710dea9b388086eef4ecadabdab6",
+      "context_complete": true,
+      "task_id": "T-aeaa6ae2c53bf753f8acdf808b2ae0e14c57ecbb4a27930332efebd270f3065f",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7308e957f876327485f41f5ac34172507405f7fea8970d1700bdcb3919af72e2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4aa73dbfaa11111cffd5f4d157f86db19b019aef994a504b61a9215c31c5ecf3",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-07542efa356827e12a6c54643fd6cd9276057c9201d9b5be32a55696fc56b4c1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-ac23a3e01ac9328508082bba766100c2376a617b09e0ba0717e4cf3b4a7fbca6",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-45c72c48942568ed8ab5061989a010df9e9e7ae229af0a285134d1da62e710ec",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-d81b6cfa17744bb85e748bff57f7bc979fbfaba98597c752ca34c9c56cf1a05c",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7f3387cd2db0abf305266dec64f648a920cfd8958bc9fddadd24f383b255b3ed",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-70e677e7c75babb7de873b883d11d512d310d6a63d7af26a47e4cbaaf056b608",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9caee131db404c6697673f55dd4f8ca8f36e971b2598bd2d784b2ba8c38dfe44",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-c9e952ab9a036fc9b9c4704fb9acc9c1daabbc49024ec6ca097fa68c68a2e6e3",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-41c3da6635845d6585a354d5aacb1f9729286b426db83719e9ef0ee7b9e46cb5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-ebec2858f31663a07fa9179b1bca68e2bed8612617fa2ae9adc1e8407b65f3be",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e9b60199f3d5981406f45d280074563019c02ea9cc76d18934ee04ef173d25fb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-e4215a41c765df3d5e973ae462b7ff23f0219e3e16b5182b24f367261d8fb198",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c26879efcd004b9322cfdbbad0aeee30f3e0ae2e1369f1dbe9ab58ca79c1e638",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-59d49436172b7086a87416264fe5095760e8c1b6e3d9278d1ec7fc89cd1e4c16",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cd0ac0bffed9565b194d10d2df724774d9f4cc8fe96f4e1ebf03b207b70e9d45",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-edf2e3c3800ba3b2a5d36b736e9ffe8d07b3884f06a39c6d7127709f2b2a5858",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6e09436c382f3cc2dbfc3a0bb6467c5b3cac9acff9804e6145134e2c2138851e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4ac90db3fc7caa2cc3d137ed1894d687922bddcb338a892b663d2db6573930e9",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab6b8346c3b22df07213043e570f6b79d4a2c5714876a23c77d79542570a723c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-119b819a6f151e3f7e3eae1e8df372f37313e2fecbf3e8e371cbb472ffd5f91a",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fdc977a9582c094aee090fac6fa34d2e13317c4dd2d243f004048b5fce121e4a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-96577852c835e81b3210114919be57306ea761799128c42ca6c0b8008fc96fc6",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cca0d4aeee7fe2bbc7746d2a43de0bdfefceb42a01625e63188cf7e970ac2979",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-c722e4f14d4ce124167539cc8be9a8440e864f0ae81f279d9810a8e61270f4f9",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d57e32e3dec9fa899df1dfee7fe589feb7aaccc9a88bbea7e6b2d961413d2a6b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-e24b214d301f32b675c7494f6b0ac6c9fa92921b27378b05c45f5c8ded8e7c88",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-06486b8c9a2c9f76720eb8a3a0900bda8d665486155cce27d14666dc295bd46d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-efac67ad6567083dbf6fc4ff291fb9fef79cb61147cc42a4db02cef1245303f5",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-177e4ca3c771413c354bc56615fe3727db437abe9505b07e0db227fd60b4dd8e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4bd2143020a023f7a828788ee2cf4088de9a3766620ee10b5a4a39d48b5a713f",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-75bb7a6fcbd2d1dc73212c0f986c67a2bba6951dbf5960c45952790144d0f5c6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4e6ef970ebbafc1f8fa1bdf71004b8c8eba6fc597809d583ebbeaa2359d5368c",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2f64be6a447d4fdda7d4a523ef51466e1576dda9f184deb19ea4401c14dffa79",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-62db7ef0aaa8aab74a53438bde1d0eead9a1e7e1af61d3f5f7b1f5beb4b18193",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6e56464cc42a9316221ab809cc4743649ed4d2c61aaf5aa90df4d1033e297d26",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4977051099cd6c088dbfd9853c7dcea035ab6f8959ac0c0f7703284e317ba909",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f73154eb333a3bee462818513539a77bbea39d1fbac1f2a1c84511282432b55",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-1913b70f7e963ddf078553f81871730b90ecfd8c711b25f0f7c13f087cf4cc78",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7a849b7584248a58971a22a41b14b5a5cff57ebb05b85774237f075a5b2a6855",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-bdeee152441302d1b8120c0f1850933df49ca5960f0e0daf4b628dfdf240f357",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-90033e187fde81125f588f030600eac88e0b45041754f1bd69a663b53b96d8cc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-ab22f9b730837cf063f39e2da33a9327188336f9db79b27f204c67862359d935",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7bda0bbc0feffb2174ed24602b4fd26ff8482c6e24c145c161dd5c5fd150f834",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-eba59b43eeadce7e30291faadcfada255267ca9ba68f657aeffcf8f35a9a0305",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5282f11f11b8de6bdeff7ba4b2127df5ad9be867bc46e09c1b05ff6cf8d37e7d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-70037ffc510d07d1df489da65be3d25d93126a936c60cbb289b2c4c6713b8135",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f57ebdaa2987acd002dd2a53c102f12c5ca524fd4b43866489a57dec60fd6b6c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-954dff305772116615e50069f3634df8fd16c0036b634ccadfc41b928db4c714",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-28f763c3462511e8bd6f8515e647c477a6c1753b6d1658e1ee827ea02789ee03",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-4e6ee3bd4dc5330d6a8ab69be40fa63c4c83625b81811f1db4560909d928f65d",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering-client/notifications.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-78b86440d0b548b5ecc025c7e84042b3dd3d6b95ae0cd7fc3e4641eb5444caba",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering-client",
+      "query_symbols": [
+        "a_follow_request_accepted_sends_its_own_kind",
+        "follows"
+      ],
+      "context_complete": false,
+      "task_id": "T-43dbebd71481e05fce65c37b521b29fcc8c2f57fadf61923fb9a1059b82221d0",
+      "evidence_refs": [
+        "E29"
+      ]
+    }
+  ],
+  "task_id": "T-54723a32224df1faac10ad5d212db3f9630ed8b3f99fd7cf776b0d871dfb1188"
+}

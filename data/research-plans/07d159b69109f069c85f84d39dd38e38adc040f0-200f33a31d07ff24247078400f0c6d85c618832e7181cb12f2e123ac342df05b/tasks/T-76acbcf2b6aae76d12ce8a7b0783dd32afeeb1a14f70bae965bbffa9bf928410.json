@@ -1,0 +1,1635 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/decode/viewer.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-936dfb9d867257d9a645c3294577f4217b6672e8a2feb9b4a1c232990933f12b",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 297,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::{ViewerAge, ViewerProfile};\nuse xai_core_entities::entities::{\n    AccessPolicy, GizmoduckUser, Labels, Safety, SubscriptionLevel, VerifiedType,\n};\nuse xai_core_entities::gizmoduck_client::{QueryFields, ViewerData};\nuse xai_x_thrift::user_labels::LabelValue;\n\nfn has_verified_badge(data: &ViewerData) -> bool {\n    matches!(\n        data.verified_type,\n        Some(VerifiedType::Business | VerifiedType::Government)\n    ) || data.is_blue_verified\n}\n\nfn has_idv_premium(data: &ViewerData) -> bool {\n    matches!(\n        data.subscription_level,\n        Some(SubscriptionLevel::Premium | SubscriptionLevel::PremiumPlus)\n    ) || matches!(\n        data.verified_type,\n        Some(VerifiedType::Business | VerifiedType::Government)\n    )\n}\n\nfn has_age_verified_18_label(labels: &Labels) -> bool {\n    labels\n        .labels\n        .iter()\n        .any(|label| LabelValue(label.label_value) == LabelValue::AGE_VERIFIED_18)\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum ViewerState {\n    Offboarded,\n    Erased,\n    Deactivated,\n    Suspended,\n    Active,\n}\n\nimpl ViewerState {\n    fn of(safety: &Safety) -> Self {\n        if safety.offboarded {\n            Self::Offboarded\n        } else if safety.erased {\n            Self::Erased\n        } else if safety.deactivated {\n            Self::Deactivated\n        } else if safety.suspended {\n            Self::Suspended\n        } else {\n            Self::Active\n        }\n    }\n}\n\n#[derive(Default)]\npub(crate) struct DecodedViewer {\n    pub(crate) profile: ViewerProfile,\n    pub(crate) has_age_verified_18_label: bool,\n    pub(crate) state: Option<ViewerState>,\n}\n\npub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]) -> DecodedViewer {\n    match user {\n        Some(user) => DecodedViewer {\n            profile: ViewerProfile {\n                is_new_account: is_new_account(user.created_at_msec),\n                ..profile(ViewerData::from_user(user, fields))\n            },\n            has_age_verified_18_label: has_age_verified_18_label(&user.labels),\n            state: Some(ViewerState::of(&user.safety)),\n        },\n        None => DecodedViewer::default(),\n    }\n}\n\nfn is_new_account(created_at_msec: Option<i64>) -> bool {\n    const NEW_ACCOUNT_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);\n    let Some(created_at) = created_at_msec\n        .and_then(|ms| u64::try_from(ms).ok())\n        .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))\n    else {\n        return false;\n    };\n    std::time::SystemTime::now()\n        .duration_since(created_at)\n        .is_ok_and(|age| age < NEW_ACCOUNT_AGE)\n}\n\nfn profile(data: ViewerData) -> ViewerProfile {\n    let viewer_age = data\n        .age_in_years\n        .map_or(ViewerAge::NotStated, ViewerAge::Known);\n    ViewerProfile {\n        allows_sensitive_media: data.nsfw_view.unwrap_or(false),\n        viewer_age,\n        has_verified_badge: has_verified_badge(&data),\n        has_idv_premium: has_idv_premium(&data),\n        is_read_only: data.access_policy == AccessPolicy::BounceAllPublicWrites,\n        account_country_code: data.account_country_code.map(|c| c.to_ascii_lowercase()),\n        is_new_account: false,\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use xai_core_entities::entities::Label;\n\n    #[test]\n    fn a_found_viewer_without_an_age_has_none_stated_whatever_its_state() {\n        for (data, expected_age, expected_sensitive_media) in [\n            (\n                ViewerData {\n                    user_exists: true,\n                    nsfw_view: Some(false),\n                    age_in_years: None,\n                    ..Default::default()\n                },\n                ViewerAge::NotStated,\n                false,\n            ),\n            (\n                ViewerData {\n                    user_exists: true,\n                    nsfw_view: Some(true),\n                    age_in_years: Some(30),\n                    ..Default::default()\n                },\n                ViewerAge::Known(30),\n                true,\n            ),\n            (\n                ViewerData {\n                    user_exists: false,\n                    age_in_years: None,\n                    ..Default::default()\n                },\n                ViewerAge::NotStated,\n                false,\n            ),\n        ] {\n            let viewer = profile(data);\n            assert_eq!(viewer.viewer_age, expected_age);\n            assert_eq!(viewer.allows_sensitive_media, expected_sensitive_media);\n        }\n    }\n\n    #[test]\n    fn verified_badge_requires_org_type_or_blue_check() {\n        let cases = [\n            (Some(VerifiedType::Business), false, true),\n            (Some(VerifiedType::Government), false, true),\n            (None, true, true),\n            (Some(VerifiedType::User), false, false),\n            (Some(VerifiedType::Notable), false, false),\n            (None, false, false),\n        ];\n        for (verified_type, is_blue_verified, expected) in cases {\n            let data = ViewerData {\n                verified_type,\n                is_blue_verified,\n                ..Default::default()\n            };\n            assert_eq!(\n                profile(data).has_verified_badge,\n                expected,\n                \"{verified_type:?} blue={is_blue_verified}\"\n            );\n        }\n    }\n\n    #[test]\n    fn only_bounce_all_public_writes_makes_the_viewer_read_only() {\n        for (access_policy, expected) in [\n            (AccessPolicy::Normal, false),\n            (AccessPolicy::BounceAll, false),\n            (AccessPolicy::BounceAllWritesAndNpci, false),\n            (AccessPolicy::BounceAllPublicWrites, true),\n            (AccessPolicy::BounceOnUnsuspension, false),\n        ] {\n            let viewer = profile(ViewerData {\n                access_policy,\n                ..Default::default()\n            });\n            assert_eq!(viewer.is_read_only, expected, \"{access_policy:?}\");\n        }\n    }\n\n    #[test]\n    fn idv_premium_is_a_premium_tier_or_an_org_verified_type() {\n        use SubscriptionLevel::{Basic, Premium, PremiumPlus};\n        use VerifiedType::{Business, Government, Notable, User};\n        let cases = [\n            (Some(Premium), None, true),\n            (Some(PremiumPlus), None, true),\n            (Some(Basic), Some(Business), true),\n            (None, Some(Government), true),\n            (Some(Basic), Some(User), false),\n            (None, Some(Notable), false),\n            (None, None, false),\n        ];\n        for (subscription_level, verified_type, expected) in cases {\n            let data = ViewerData {\n                subscription_level,\n                verified_type,\n                ..Default::default()\n            };\n            assert_eq!(\n                profile(data).has_idv_premium,\n                expected,\n                \"{subscription_level:?} {verified_type:?}\"\n            );\n        }\n    }\n\n    #[test]\n    fn only_the_age_verified_18_label_marks_the_viewer() {\n        let labels = |values: &[LabelValue]| Labels {\n            labels: values\n                .iter()\n                .map(|value| Label {\n                    label_value: value.0,\n                    created_at_msec: 0,\n                })\n                .collect(),\n        };\n        for (values, expected) in [\n            (\n                &[LabelValue::AGE_VERIFIED_16, LabelValue::AGE_VERIFIED_18][..],\n                true,\n            ),\n            (&[LabelValue::AGE_VERIFIED_16], false),\n            (&[], false),\n        ] {\n            let user = GizmoduckUser {\n                labels: labels(values),\n                ..Default::default()\n            };\n            let fields = [QueryFields::SAFETY, QueryFields::LABELS];\n            assert_eq!(\n                decode_viewer(Some(&user), &fields).has_age_verified_18_label,\n                expected,\n                \"{values:?}\"\n            );\n        }\n    }\n\n    #[test]\n    fn viewer_state_takes_the_first_set_flag_and_a_missing_viewer_has_none() {\n        let all = Safety {\n            offboarded: true,\n            erased: true,\n            deactivated: true,\n            suspended: true,\n            ..Default::default()\n        };\n        for (safety, expected) in [\n            (all.clone(), ViewerState::Offboarded),\n            (\n                Safety {\n                    offboarded: false,\n                    ..all.clone()\n                },\n                ViewerState::Erased,\n            ),\n            (\n                Safety {\n                    suspended: true,\n                    deactivated: true,\n                    ..Default::default()\n                },\n                ViewerState::Deactivated,\n            ),\n            (\n                Safety {\n                    suspended: true,\n                    ..Default::default()\n                },\n                ViewerState::Suspended,\n            ),\n            (Safety::default(), ViewerState::Active),\n        ] {\n            let user = GizmoduckUser {\n                safety,\n                ..Default::default()\n            };\n            assert_eq!(\n                decode_viewer(Some(&user), &[QueryFields::SAFETY]).state,\n                Some(expected)\n            );\n        }\n        assert_eq!(decode_viewer(None, &[QueryFields::SAFETY]).state, None);\n    }\n}\n",
+      "source_digest": "a87d1920a1141defd4309ec15f1f97a170a2cbd761b79e0de268c45fdcad238e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 341,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::{NotificationFilters, ViewerAge, ViewerProfile};\nuse std::time::Duration;\nuse xai_core_entities::entities::{\n    AccessPolicy, GizmoduckUser, Labels, Safety, SubscriptionLevel, UniversalQualityFiltering,\n    VerifiedType,\n};\nuse xai_core_entities::gizmoduck_client::{QueryFields, ViewerData};\nuse xai_x_thrift::user_labels::LabelValue;\n\nfn has_verified_badge(data: &ViewerData) -> bool {\n    matches!(\n        data.verified_type,\n        Some(VerifiedType::Business | VerifiedType::Government)\n    ) || data.is_blue_verified\n}\n\nfn has_idv_premium(data: &ViewerData) -> bool {\n    matches!(\n        data.subscription_level,\n        Some(SubscriptionLevel::Premium | SubscriptionLevel::PremiumPlus)\n    ) || matches!(\n        data.verified_type,\n        Some(VerifiedType::Business | VerifiedType::Government)\n    )\n}\n\nfn has_age_verified_18_label(labels: &Labels) -> bool {\n    labels\n        .labels\n        .iter()\n        .any(|label| LabelValue(label.label_value) == LabelValue::AGE_VERIFIED_18)\n}\n\nfn has_blink_label(labels: &Labels) -> bool {\n    labels.labels.iter().any(|label| {\n        [\n            LabelValue::BLINK_WORST,\n            LabelValue::BLINK_BAD,\n            LabelValue::BLINK_QUESTIONABLE,\n        ]\n        .contains(&LabelValue(label.label_value))\n    })\n}\n\nfn notification_filters(user: &GizmoduckUser, fields: &[QueryFields]) -> NotificationFilters {\n    let Some(settings) = user\n        .mute_settings\n        .as_ref()\n        .filter(|_| fields.contains(&QueryFields::MUTE_SETTINGS))\n    else {\n        return NotificationFilters::default();\n    };\n    let filters = &settings.advanced_notification_filters;\n    NotificationFilters {\n        no_confirmed_email: filters.filter_no_confirmed_email,\n        no_confirmed_phone: filters.filter_no_confirmed_phone,\n        default_profile_image: filters.filter_default_profile_image,\n        new_users: filters.filter_new_users,\n        not_followed_by: filters.filter_not_followed_by,\n    }\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum ViewerState {\n    Offboarded,\n    Erased,\n    Deactivated,\n    Suspended,\n    Active,\n}\n\nimpl ViewerState {\n    fn of(safety: &Safety) -> Self {\n        if safety.offboarded {\n            Self::Offboarded\n        } else if safety.erased {\n            Self::Erased\n        } else if safety.deactivated {\n            Self::Deactivated\n        } else if safety.suspended {\n            Self::Suspended\n        } else {\n            Self::Active\n        }\n    }\n}\n\n#[derive(Default)]\npub(crate) struct DecodedViewer {\n    pub(crate) profile: ViewerProfile,\n    pub(crate) has_age_verified_18_label: bool,\n    pub(crate) state: Option<ViewerState>,\n}\n\npub(crate) fn decode_viewer(user: Option<&GizmoduckUser>, fields: &[QueryFields]) -> DecodedViewer {\n    match user {\n        Some(user) => DecodedViewer {\n            profile: ViewerProfile {\n                is_new_account: is_younger_than(user.created_at_msec, NEW_VIEWER_AGE),\n                has_uqf_enabled: fields.contains(&QueryFields::SAFETY)\n                    && user.safety.universal_quality_filtering\n                        == UniversalQualityFiltering::Enabled,\n                has_blink_label: fields.contains(&QueryFields::LABELS)\n                    && has_blink_label(&user.labels),\n                notification_filters: notification_filters(user, fields),\n                ..profile(ViewerData::from_user(user, fields))\n            },\n            has_age_verified_18_label: has_age_verified_18_label(&user.labels),\n            state: Some(ViewerState::of(&user.safety)),\n        },\n        None => DecodedViewer::default(),\n    }\n}\n\nconst NEW_VIEWER_AGE: Duration = Duration::from_secs(24 * 60 * 60);\n\npub(super) fn is_younger_than(created_at_msec: Option<i64>, age: Duration) -> bool {\n    let Some(created_at) = created_at_msec\n        .and_then(|ms| u64::try_from(ms).ok())\n        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms))\n    else {\n        return false;\n    };\n    std::time::SystemTime::now()\n        .duration_since(created_at)\n        .is_ok_and(|elapsed| elapsed < age)\n}\n\nfn profile(data: ViewerData) -> ViewerProfile {\n    let viewer_age = data\n        .age_in_years\n        .map_or(ViewerAge::NotStated, ViewerAge::Known);\n    ViewerProfile {\n        allows_sensitive_media: data.nsfw_view.unwrap_or(false),\n        viewer_age,\n        has_verified_badge: has_verified_badge(&data),\n        has_idv_premium: has_idv_premium(&data),\n        is_read_only: data.access_policy == AccessPolicy::BounceAllPublicWrites,\n        account_country_code: data.account_country_code.map(|c| c.to_ascii_lowercase()),\n        is_new_account: false,\n        is_suspended: data.is_suspended,\n        is_deactivated: data.is_deactivated,\n        has_uqf_enabled: false,\n        mention_filter_is_following: data.opted_out_oon,\n        has_blink_label: false,\n        notification_filters: NotificationFilters::default(),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use xai_core_entities::entities::Label;\n\n    #[test]\n    fn a_found_viewer_without_an_age_has_none_stated_whatever_its_state() {\n        for (data, expected_age, expected_sensitive_media) in [\n            (\n                ViewerData {\n                    user_exists: true,\n                    nsfw_view: Some(false),\n                    age_in_years: None,\n                    ..Default::default()\n                },\n                ViewerAge::NotStated,\n                false,\n            ),\n            (\n                ViewerData {\n                    user_exists: true,\n                    nsfw_view: Some(true),\n                    age_in_years: Some(30),\n                    ..Default::default()\n                },\n                ViewerAge::Known(30),\n                true,\n            ),\n            (\n                ViewerData {\n                    user_exists: false,\n                    age_in_years: None,\n                    ..Default::default()\n                },\n                ViewerAge::NotStated,\n                false,\n            ),\n        ] {\n            let viewer = profile(data);\n            assert_eq!(viewer.viewer_age, expected_age);\n            assert_eq!(viewer.allows_sensitive_media, expected_sensitive_media);\n        }\n    }\n\n    #[test]\n    fn verified_badge_requires_org_type_or_blue_check() {\n        let cases = [\n            (Some(VerifiedType::Business), false, true),\n            (Some(VerifiedType::Government), false, true),\n            (None, true, true),\n            (Some(VerifiedType::User), false, false),\n            (Some(VerifiedType::Notable), false, false),\n            (None, false, false),\n        ];\n        for (verified_type, is_blue_verified, expected) in cases {\n            let data = ViewerData {\n                verified_type,\n                is_blue_verified,\n                ..Default::default()\n            };\n            assert_eq!(\n                profile(data).has_verified_badge,\n                expected,\n                \"{verified_type:?} blue={is_blue_verified}\"\n            );\n        }\n    }\n\n    #[test]\n    fn only_bounce_all_public_writes_makes_the_viewer_read_only() {\n        for (access_policy, expected) in [\n            (AccessPolicy::Normal, false),\n            (AccessPolicy::BounceAll, false),\n            (AccessPolicy::BounceAllWritesAndNpci, false),\n            (AccessPolicy::BounceAllPublicWrites, true),\n            (AccessPolicy::BounceOnUnsuspension, false),\n        ] {\n            let viewer = profile(ViewerData {\n                access_policy,\n                ..Default::default()\n            });\n            assert_eq!(viewer.is_read_only, expected, \"{access_policy:?}\");\n        }\n    }\n\n    #[test]\n    fn idv_premium_is_a_premium_tier_or_an_org_verified_type() {\n        use SubscriptionLevel::{Basic, Premium, PremiumPlus};\n        use VerifiedType::{Business, Government, Notable, User};\n        let cases = [\n            (Some(Premium), None, true),\n            (Some(PremiumPlus), None, true),\n            (Some(Basic), Some(Business), true),\n            (None, Some(Government), true),\n            (Some(Basic), Some(User), false),\n            (None, Some(Notable), false),\n            (None, None, false),\n        ];\n        for (subscription_level, verified_type, expected) in cases {\n            let data = ViewerData {\n                subscription_level,\n                verified_type,\n                ..Default::default()\n            };\n            assert_eq!(\n                profile(data).has_idv_premium,\n                expected,\n                \"{subscription_level:?} {verified_type:?}\"\n            );\n        }\n    }\n\n    #[test]\n    fn only_the_age_verified_18_label_marks_the_viewer() {\n        let labels = |values: &[LabelValue]| Labels {\n            labels: values\n                .iter()\n                .map(|value| Label {\n                    label_value: value.0,\n                    created_at_msec: 0,\n                })\n                .collect(),\n        };\n        for (values, expected) in [\n            (\n                &[LabelValue::AGE_VERIFIED_16, LabelValue::AGE_VERIFIED_18][..],\n                true,\n            ),\n            (&[LabelValue::AGE_VERIFIED_16], false),\n            (&[], false),\n        ] {\n            let user = GizmoduckUser {\n                labels: labels(values),\n                ..Default::default()\n            };\n            let fields = [QueryFields::SAFETY, QueryFields::LABELS];\n            assert_eq!(\n                decode_viewer(Some(&user), &fields).has_age_verified_18_label,\n                expected,\n                \"{values:?}\"\n            );\n        }\n    }\n\n    #[test]\n    fn viewer_state_takes_the_first_set_flag_and_a_missing_viewer_has_none() {\n        let all = Safety {\n            offboarded: true,\n            erased: true,\n            deactivated: true,\n            suspended: true,\n            ..Default::default()\n        };\n        for (safety, expected) in [\n            (all.clone(), ViewerState::Offboarded),\n            (\n                Safety {\n                    offboarded: false,\n                    ..all.clone()\n                },\n                ViewerState::Erased,\n            ),\n            (\n                Safety {\n                    suspended: true,\n                    deactivated: true,\n                    ..Default::default()\n                },\n                ViewerState::Deactivated,\n            ),\n            (\n                Safety {\n                    suspended: true,\n                    ..Default::default()\n                },\n                ViewerState::Suspended,\n            ),\n            (Safety::default(), ViewerState::Active),\n        ] {\n            let user = GizmoduckUser {\n                safety,\n                ..Default::default()\n            };\n            assert_eq!(\n                decode_viewer(Some(&user), &[QueryFields::SAFETY]).state,\n                Some(expected)\n            );\n        }\n        assert_eq!(decode_viewer(None, &[QueryFields::SAFETY]).state, None);\n    }\n}\n",
+      "source_digest": "c0b040ee5be493e5773e2e8f06b6fa8d4444cf56204e6e5c8e831fbc0b133110",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/lib.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 5731,
+      "end_line": 5755,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &self,\n            _user_id: u64,\n            _query_fields: &[QueryFields],\n        ) -> anyhow::Result<ViewerData> {\n            unimplemented!()\n        }\n        async fn get_pcf_labels(\n            &self,\n            _user_ids: Vec<i64>,\n        ) -> HashMap<i64, anyhow::Result<PCFLabel>> {\n            unimplemented!()\n        }\n        async fn get_profile_description_languages(\n            &self,\n            _user_ids: Vec<i64>,\n        ) -> HashMap<i64, anyhow::Result<Option<String>>> {\n            unimplemented!()\n        }\n        async fn get_user_fields(\n            &self,\n            _user_ids: Vec<i64>,\n        ) -> HashMap<i64, anyhow::Result<UserFields>> {\n            unimplemented!()\n        }\n        async fn get_by_screen_name(\n",
+      "source_digest": "af6ef0fd2596f4786d5475177d90d332184a961423756196cd6a4f8ba01b8608",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 102,
+      "end_line": 126,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    val pushClients = user.devices\n      .map(_.appPushDevices.flatMap(_.clientApplicationId))\n      .toSeq.flatten\n      .toSet\n\n    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n",
+      "source_digest": "91ec43586872b643ef0c2243a532ed051bd0a8c9f981a4bff4b7cc976a2cde1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 103,
+      "end_line": 127,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      .map(_.appPushDevices.flatMap(_.clientApplicationId))\n      .toSeq.flatten\n      .toSet\n\n    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n",
+      "source_digest": "6d6d5c09701b8ed32a6ea1e8e2d47601cd6d4d99deae64291667b36b1f90337a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 105,
+      "end_line": 129,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      .toSet\n\n    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n      }\n      .getOrElse(Nil)\n",
+      "source_digest": "44bcfc7034f9a4067f2b15bd0b77a0dc21fa2b4a1b879be71234b96fbe475a83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 107,
+      "end_line": 131,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n      }\n      .getOrElse(Nil)\n\n    userProfileTokens.map { token => (\"profile_token\", token) }.toSet\n",
+      "source_digest": "8572397a8a5b356fcf9861b7da06d37f51f376c9da2978d39ce7b3c454456e80",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 119,
+      "end_line": 143,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n      }\n      .getOrElse(Nil)\n\n    userProfileTokens.map { token => (\"profile_token\", token) }.toSet\n  }\n\n  private def getSafetyFeatures(safety: Safety) = {\n    Set(\n      (\"signup_category\", safety.signupCategory.value.toString),\n      (\"is_verified\", safety.verified.toString)\n    )\n  }\n\n  private[loaders] def processCombinedUser(cu: CombinedUser) = {\n    val features = for {\n      user <- cu.user\n",
+      "source_digest": "e6123fe75cdf83c4b641dacba9ef853da0bf0c573b7c334318c298d9ba909cf8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfUserCreate.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 31,
+      "end_line": 55,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    if (user.isSetAccount()) {\n      final Account account = user.getAccount();\n      builder.putValue(OPTIONAL, BotMakerFeatures.creationIp, account.getCreation_ip())\n          .putValue(OPTIONAL, BotMakerFeatures.accountLanguage, account.getLanguage());\n      if (account.isSetCreated_via()) {\n        builder.putValue(REQUIRED, BotMakerFeatures.accountCreatedVia, account.getCreated_via())\n            .putPositive(OPTIONAL, BotMakerFeatures.applicationId,\n                BotMakerFeatures.transformCreatedViaToApplicationId(account.getCreated_via()));\n      }\n    }\n    if (user.isSetProfile()) {\n      final Profile profile = user.getProfile();\n      builder.putValue(OPTIONAL, BotMakerFeatures.firstAndLastName, profile.getName());\n      builder.putValue(OPTIONAL, BotMakerFeatures.screenName, profile.getScreen_name());\n    }\n    if (user.isSetSafety()) {\n      final Safety safety = user.getSafety();\n      if (safety.isSetSignup_creation_source()) {\n        builder.putValue(OPTIONAL, BotMakerFeatures.signupCreationSource,\n            safety.signup_creation_source.name());\n      }\n    }\n\n    twitterContextFeatures.applyAll(builder);\n",
+      "source_digest": "7dbe3481baf7a60907992b76e520959c05bd05b5eaf124d0958b930883cc82f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfUserCreate.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 32,
+      "end_line": 56,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if (user.isSetAccount()) {\n      final Account account = user.getAccount();\n      builder.putValue(OPTIONAL, BotMakerFeatures.creationIp, account.getCreation_ip())\n          .putValue(OPTIONAL, BotMakerFeatures.accountLanguage, account.getLanguage());\n      if (account.isSetCreated_via()) {\n        builder.putValue(REQUIRED, BotMakerFeatures.accountCreatedVia, account.getCreated_via())\n            .putPositive(OPTIONAL, BotMakerFeatures.applicationId,\n                BotMakerFeatures.transformCreatedViaToApplicationId(account.getCreated_via()));\n      }\n    }\n    if (user.isSetProfile()) {\n      final Profile profile = user.getProfile();\n      builder.putValue(OPTIONAL, BotMakerFeatures.firstAndLastName, profile.getName());\n      builder.putValue(OPTIONAL, BotMakerFeatures.screenName, profile.getScreen_name());\n    }\n    if (user.isSetSafety()) {\n      final Safety safety = user.getSafety();\n      if (safety.isSetSignup_creation_source()) {\n        builder.putValue(OPTIONAL, BotMakerFeatures.signupCreationSource,\n            safety.signup_creation_source.name());\n      }\n    }\n\n    twitterContextFeatures.applyAll(builder);\n  }\n",
+      "source_digest": "d5094034f23d46adc56b1935f0def207ddd83a61400abac9870227de7b32ff4b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfUserCreate.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 33,
+      "end_line": 57,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      final Account account = user.getAccount();\n      builder.putValue(OPTIONAL, BotMakerFeatures.creationIp, account.getCreation_ip())\n          .putValue(OPTIONAL, BotMakerFeatures.accountLanguage, account.getLanguage());\n      if (account.isSetCreated_via()) {\n        builder.putValue(REQUIRED, BotMakerFeatures.accountCreatedVia, account.getCreated_via())\n            .putPositive(OPTIONAL, BotMakerFeatures.applicationId,\n                BotMakerFeatures.transformCreatedViaToApplicationId(account.getCreated_via()));\n      }\n    }\n    if (user.isSetProfile()) {\n      final Profile profile = user.getProfile();\n      builder.putValue(OPTIONAL, BotMakerFeatures.firstAndLastName, profile.getName());\n      builder.putValue(OPTIONAL, BotMakerFeatures.screenName, profile.getScreen_name());\n    }\n    if (user.isSetSafety()) {\n      final Safety safety = user.getSafety();\n      if (safety.isSetSignup_creation_source()) {\n        builder.putValue(OPTIONAL, BotMakerFeatures.signupCreationSource,\n            safety.signup_creation_source.name());\n      }\n    }\n\n    twitterContextFeatures.applyAll(builder);\n  }\n}\n",
+      "source_digest": "e3d5a3292580ef33c4e76e4c4d976a07f6f3c377db5d09da5f7d7ce749e5ba39",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "botmaker/src/java/com/twitter/botmaker/compiler/Compiler.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1470,
+      "end_line": 1494,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "          new String[]{\"Variable\", \"Variable\", \"T\", \"Collection\"},\n          new String[]{\n              \"the variable 1 name\",\n              \"the variable 2 name\",\n              \"the operation to run\",\n              \"the collection\"\n          },\n          \"T\"\n      ),\n      BotMakerDoc.of(\n          \"GetInputFeature\",\n          \"Get input feature value by name. For example, \"\n              + \"GetInputFeature(\\\"profile.auth.hashedPassword.before\\\")\",\n          ActionLevel.NO_ACTION,\n          new String[]{\"FeatureName\"},\n          new String[]{\"input feature name\"},\n          \"Object\"\n      ),\n      BotMakerDoc.of(\n          \"GetOrElse\",\n          \"Get the value of the feature name or the value supplied if not.\"\n              + \"NOTE: The type of the feature has to match the type else value. Things will\"\n              + \"fail in runtime otherwise.\",\n          ActionLevel.NO_ACTION,\n          new String[]{\"FeatureName\", \"T\"},\n",
+      "source_digest": "13b0007e15b57377f4372fe853c494322c8656ec2cc555f3cbf072125ddce18d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "class User(BaseModel):\n    id: int | None = None\n    handle: str | None = None\n    name: str | None = None\n    bio: str | None = None\n    follower_count: int | None = None\n    following_count: int | None = None\n    subscription_level: str | None = None\n    signup_country_code: str | None = None\n    is_protected: bool | None = None\n    created_at: datetime | None = None\n    reply_history: list[\"Post\"] | None = None\n    profile_location: str | None = None\n    has_missing_client_events: bool | None = None\n    tfe_top_country: str | None = None\n    account_lang: str | None = None\n    num_replies_last_24hrs: float | None = None\n    has_risky_user_safety_label: bool | None = None\n    num_legit_blocks_received_last_24hrs: float | None = None\n    urls: list[str] | None = None\n    affiliated_business: AffiliatedBusiness | None = None\n    recent_posts: list[\"Post\"] | None = None\n    profile_image: \"Image | None\" = None\n    profile_banner: \"Image | None\" = None\n    blocked_count: int | None = None\n",
+      "source_digest": "a76eb4fc34e8ec9d53fc92aafaa168c73ff7ab19b586c3e2ce68c67728e9cb1e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    created_at: datetime | None = None\n    reply_history: list[\"Post\"] | None = None\n    profile_location: str | None = None\n    has_missing_client_events: bool | None = None\n    tfe_top_country: str | None = None\n    account_lang: str | None = None\n    num_replies_last_24hrs: float | None = None\n    has_risky_user_safety_label: bool | None = None\n    num_legit_blocks_received_last_24hrs: float | None = None\n    urls: list[str] | None = None\n    affiliated_business: AffiliatedBusiness | None = None\n    recent_posts: list[\"Post\"] | None = None\n    profile_image: \"Image | None\" = None\n    profile_banner: \"Image | None\" = None\n    blocked_count: int | None = None\n\n    \u0040classmethod\n    def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> \"User\":\n        return cls(\n            id=int(author_metadata.userId)\n            if author_metadata.userId is not None\n            else None,\n            handle=author_metadata.userHandle,\n            name=author_metadata.userName,\n            bio=author_metadata.userBio,\n",
+      "source_digest": "201fae47c0f584898ff227ce0462b2a4dd46d2bfb929cd9e23628ef6dacca4ec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 31,
+      "end_line": 55,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    reply_history: list[\"Post\"] | None = None\n    profile_location: str | None = None\n    has_missing_client_events: bool | None = None\n    tfe_top_country: str | None = None\n    account_lang: str | None = None\n    num_replies_last_24hrs: float | None = None\n    has_risky_user_safety_label: bool | None = None\n    num_legit_blocks_received_last_24hrs: float | None = None\n    urls: list[str] | None = None\n    affiliated_business: AffiliatedBusiness | None = None\n    recent_posts: list[\"Post\"] | None = None\n    profile_image: \"Image | None\" = None\n    profile_banner: \"Image | None\" = None\n    blocked_count: int | None = None\n\n    \u0040classmethod\n    def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> \"User\":\n        return cls(\n            id=int(author_metadata.userId)\n            if author_metadata.userId is not None\n            else None,\n            handle=author_metadata.userHandle,\n            name=author_metadata.userName,\n            bio=author_metadata.userBio,\n            follower_count=int(author_metadata.followerCount)\n",
+      "source_digest": "d76f72f00a11b59477a1e06b8bd0202dc293266676c9aff65fc1c68e1c541175",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 80,
+      "end_line": 104,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            if hasattr(author_metadata, \"hasRiskyUserSafetyLabel\")\n            else None,\n            num_legit_blocks_received_last_24hrs=author_metadata.numLegitBlocksReceivedLast24Hrs\n            if hasattr(author_metadata, \"numLegitBlocksReceivedLast24Hrs\")\n            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n",
+      "source_digest": "3137d6a9632db7ad9ae17ade1bcfbf8d46a597a7f9063bc2ba0ab8418c38b06e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 81,
+      "end_line": 105,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            else None,\n            num_legit_blocks_received_last_24hrs=author_metadata.numLegitBlocksReceivedLast24Hrs\n            if hasattr(author_metadata, \"numLegitBlocksReceivedLast24Hrs\")\n            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n    convo_image: ConvoImage | None = None\n",
+      "source_digest": "dd622853a40a4135b888972e4a87783f3ea195d89bad05190b09a0c8e1cac195",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 83,
+      "end_line": 107,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            if hasattr(author_metadata, \"numLegitBlocksReceivedLast24Hrs\")\n            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n    convo_image: ConvoImage | None = None\n    dark_mode_image: ConvoImage | None = None\n    light_mode_image: ConvoImage | None = None\n",
+      "source_digest": "306ce518aced3ff817105b77ff9079d01ab51105b81f4f38f6a0d8cb5f30932c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 84,
+      "end_line": 108,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n    convo_image: ConvoImage | None = None\n    dark_mode_image: ConvoImage | None = None\n    light_mode_image: ConvoImage | None = None\n    clahe_image: ConvoImage | None = None\n",
+      "source_digest": "c61b85b4bea3fd24ac6a9f9932884dc66f57e4402af317b3c509b61695679669",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "grox/core/data_loaders/post_mapper.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 358,
+      "end_line": 382,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            tfe_top_country=user_metadata.tfeTopCountry,\n            account_lang=user_metadata.accountLang,\n            num_replies_last_24hrs=user_metadata.numRepliesLast24Hrs,\n            has_risky_user_safety_label=user_metadata.hasRiskyUserSafetyLabel,\n            num_legit_blocks_received_last_24hrs=user_metadata.numLegitBlocksReceivedLast24Hrs,\n            urls=user_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=user_metadata.affiliatedBusinessMetadata.name,\n                url=user_metadata.affiliatedBusinessMetadata.url,\n            )\n            if user_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=user_metadata.profileImageUrl)\n            if user_metadata.profileImageUrl\n            else None,\n            profile_banner=Image(url=user_metadata.profileBannerImageUrl)\n            if user_metadata.profileBannerImageUrl\n            else None,\n            blocked_count=user_metadata.blockedCount,\n        )\n\n    \u0040classmethod\n    def _from_strato_cardmetadataV2_to_cardV2(\n        cls, card_metadata_v2: StratoCardMetadataV2\n    ) -> CardV2:\n",
+      "source_digest": "51ed1bd3224533ddfba3e85f86d25d40809386c56bcbbf92aa72a56fe5a8e333",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "grox/core/data_loaders/post_mapper.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 359,
+      "end_line": 383,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            account_lang=user_metadata.accountLang,\n            num_replies_last_24hrs=user_metadata.numRepliesLast24Hrs,\n            has_risky_user_safety_label=user_metadata.hasRiskyUserSafetyLabel,\n            num_legit_blocks_received_last_24hrs=user_metadata.numLegitBlocksReceivedLast24Hrs,\n            urls=user_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=user_metadata.affiliatedBusinessMetadata.name,\n                url=user_metadata.affiliatedBusinessMetadata.url,\n            )\n            if user_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=user_metadata.profileImageUrl)\n            if user_metadata.profileImageUrl\n            else None,\n            profile_banner=Image(url=user_metadata.profileBannerImageUrl)\n            if user_metadata.profileBannerImageUrl\n            else None,\n            blocked_count=user_metadata.blockedCount,\n        )\n\n    \u0040classmethod\n    def _from_strato_cardmetadataV2_to_cardV2(\n        cls, card_metadata_v2: StratoCardMetadataV2\n    ) -> CardV2:\n        legacy_card = None\n",
+      "source_digest": "461106adcb367ba2c30aa64232c4cbf5ba657c72cfd093cca135e87acbef1eb3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "grox/core/data_loaders/post_mapper.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 361,
+      "end_line": 385,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            has_risky_user_safety_label=user_metadata.hasRiskyUserSafetyLabel,\n            num_legit_blocks_received_last_24hrs=user_metadata.numLegitBlocksReceivedLast24Hrs,\n            urls=user_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=user_metadata.affiliatedBusinessMetadata.name,\n                url=user_metadata.affiliatedBusinessMetadata.url,\n            )\n            if user_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=user_metadata.profileImageUrl)\n            if user_metadata.profileImageUrl\n            else None,\n            profile_banner=Image(url=user_metadata.profileBannerImageUrl)\n            if user_metadata.profileBannerImageUrl\n            else None,\n            blocked_count=user_metadata.blockedCount,\n        )\n\n    \u0040classmethod\n    def _from_strato_cardmetadataV2_to_cardV2(\n        cls, card_metadata_v2: StratoCardMetadataV2\n    ) -> CardV2:\n        legacy_card = None\n        if card_metadata_v2.legacyCardMetadata:\n            if card_metadata_v2.legacyCardMetadata.thumbnailImage:\n",
+      "source_digest": "aa3b954a21aa3ce56ddcd5aed8a0d04c87dd5263a54e77699352e691d7558cfd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "grox/core/data_loaders/post_mapper.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 362,
+      "end_line": 386,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            num_legit_blocks_received_last_24hrs=user_metadata.numLegitBlocksReceivedLast24Hrs,\n            urls=user_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=user_metadata.affiliatedBusinessMetadata.name,\n                url=user_metadata.affiliatedBusinessMetadata.url,\n            )\n            if user_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=user_metadata.profileImageUrl)\n            if user_metadata.profileImageUrl\n            else None,\n            profile_banner=Image(url=user_metadata.profileBannerImageUrl)\n            if user_metadata.profileBannerImageUrl\n            else None,\n            blocked_count=user_metadata.blockedCount,\n        )\n\n    \u0040classmethod\n    def _from_strato_cardmetadataV2_to_cardV2(\n        cls, card_metadata_v2: StratoCardMetadataV2\n    ) -> CardV2:\n        legacy_card = None\n        if card_metadata_v2.legacyCardMetadata:\n            if card_metadata_v2.legacyCardMetadata.thumbnailImage:\n                thumbnail_image = Image(\n",
+      "source_digest": "1a0b582d794e488fcdba887c7f3b6c687f14e560a54f690d17feec0ee07bce3c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "grox/core/lm/thread.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 13,
+      "end_line": 37,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "class ThreadRenderer:\n    \u0040classmethod\n    def render(\n        cls,\n        post: Post,\n        role: Role = Role.USER,\n        separator=SEPARATOR,\n        include_signals: bool = False,\n        include_follower_count: bool = False,\n    ) -> Message:\n        message = Message(role=role, content=[], separator=separator)\n        message.content.append(\n            \"\\n# Reply Author Info\\n\\nThe user profile and any signals below describe the author of the reply being evaluated (the final post of the thread).\\n\"\n        )\n        message.content.extend(UserRenderer.render(post.user))\n        if include_signals:\n            message.content.extend(cls._render_signals(post))\n        message.content.extend(\n            cls._render_thread(post, include_follower_count=include_follower_count)\n        )\n        return message\n\n    \u0040classmethod\n    def _render_signals(cls, post: Post) -> list[Content]:\n        lines: list[str] = []\n",
+      "source_digest": "d328c22b278eb9cbe5887595a3d7018b73a092019983cbb7b6f64647a78094df",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "grox/core/lm/user.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 24,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from grox.core.lm.convo import Content\nfrom grox.core.data_loaders.data_types import User\nfrom grox.core.lm.post import LitePostRenderer\n\n\nclass UserRenderer:\n    \u0040classmethod\n    def render(\n        cls,\n        user: User | None,\n        include_stats: bool = False,\n        include_profile_urls: bool = False,\n        include_affiliate_business: bool = False,\n        include_recent_posts: bool = False,\n    ) -> list[Content]:\n        if not user:\n            return []\n        profile = f\"\"\"# User Profile\nHere are the user details.\n  - Name: {user.name}\n  - Username: \u0040{user.handle}\n  - User Bio: '{user.bio or \"\"}'\n  - Profile Location: {user.profile_location or \"\"}\n\"\"\"\n",
+      "source_digest": "83c0ea2848e0d70c8b2fd125444f842b7760cdcab9624cca6916f4af121c8a85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "grox/core/lm/user.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 6,
+      "end_line": 30,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "class UserRenderer:\n    \u0040classmethod\n    def render(\n        cls,\n        user: User | None,\n        include_stats: bool = False,\n        include_profile_urls: bool = False,\n        include_affiliate_business: bool = False,\n        include_recent_posts: bool = False,\n    ) -> list[Content]:\n        if not user:\n            return []\n        profile = f\"\"\"# User Profile\nHere are the user details.\n  - Name: {user.name}\n  - Username: \u0040{user.handle}\n  - User Bio: '{user.bio or \"\"}'\n  - Profile Location: {user.profile_location or \"\"}\n\"\"\"\n        if include_profile_urls and user.urls:\n            profile += f\"\"\"  - Profile URLs: {\", \".join(user.urls)}\n\"\"\"\n        if include_affiliate_business and user.affiliated_business:\n            profile += f\"\"\"  - Affiliated Business: Name is {user.affiliated_business.name} and URL is {user.affiliated_business.url}\"\"\"\n        if include_stats:\n",
+      "source_digest": "362f8922f7a107077ddaa0a411b35a1f9766cc5907a0ff43e10551ed7ce15870",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/lib.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5762,
+      "end_line": 5786,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &self,\n            _user_id: u64,\n            _query_fields: &[QueryFields],\n        ) -> anyhow::Result<ViewerData> {\n            unimplemented!()\n        }\n        async fn get_pcf_labels(\n            &self,\n            _user_ids: Vec<i64>,\n        ) -> HashMap<i64, anyhow::Result<PCFLabel>> {\n            unimplemented!()\n        }\n        async fn get_profile_description_languages(\n            &self,\n            _user_ids: Vec<i64>,\n        ) -> HashMap<i64, anyhow::Result<Option<String>>> {\n            unimplemented!()\n        }\n        async fn get_user_fields(\n            &self,\n            _user_ids: Vec<i64>,\n        ) -> HashMap<i64, anyhow::Result<UserFields>> {\n            unimplemented!()\n        }\n        async fn get_by_screen_name(\n",
+      "source_digest": "af6ef0fd2596f4786d5475177d90d332184a961423756196cd6a4f8ba01b8608",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 102,
+      "end_line": 126,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    val pushClients = user.devices\n      .map(_.appPushDevices.flatMap(_.clientApplicationId))\n      .toSeq.flatten\n      .toSet\n\n    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n",
+      "source_digest": "91ec43586872b643ef0c2243a532ed051bd0a8c9f981a4bff4b7cc976a2cde1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 103,
+      "end_line": 127,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      .map(_.appPushDevices.flatMap(_.clientApplicationId))\n      .toSeq.flatten\n      .toSet\n\n    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n",
+      "source_digest": "6d6d5c09701b8ed32a6ea1e8e2d47601cd6d4d99deae64291667b36b1f90337a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 105,
+      "end_line": 129,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      .toSet\n\n    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n      }\n      .getOrElse(Nil)\n",
+      "source_digest": "44bcfc7034f9a4067f2b15bd0b77a0dc21fa2b4a1b879be71234b96fbe475a83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 107,
+      "end_line": 131,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pushDevices\n      .map { device => (\"push_device\", device) } ++\n      pushClients\n        .map { client => (\"push_client\", client.toString) }\n  }\n\n  private def getUserProfileFeatures(user: User) = {\n    val userProfileTokens = user.profile\n      .map { profile =>\n        try {\n          val profileLang = languageIdentifier.identify(profile.description).getLocale\n          TokenizerHelper\n            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n      }\n      .getOrElse(Nil)\n\n    userProfileTokens.map { token => (\"profile_token\", token) }.toSet\n",
+      "source_digest": "8572397a8a5b356fcf9861b7da06d37f51f376c9da2978d39ce7b3c454456e80",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "agatha/scalding/data/loaders/CombinedUserDataLoader.scala",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 119,
+      "end_line": 143,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .tokenizeTweet(profile.description, profileLang, PenguinVersion.PENGUIN_6)\n            .tokens\n            .asScala\n            .distinct\n            .toList\n        } catch {\n          case _: IllegalArgumentException =>\n            Nil\n        }\n      }\n      .getOrElse(Nil)\n\n    userProfileTokens.map { token => (\"profile_token\", token) }.toSet\n  }\n\n  private def getSafetyFeatures(safety: Safety) = {\n    Set(\n      (\"signup_category\", safety.signupCategory.value.toString),\n      (\"is_verified\", safety.verified.toString)\n    )\n  }\n\n  private[loaders] def processCombinedUser(cu: CombinedUser) = {\n    val features = for {\n      user <- cu.user\n",
+      "source_digest": "e6123fe75cdf83c4b641dacba9ef853da0bf0c573b7c334318c298d9ba909cf8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfUserCreate.java",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 31,
+      "end_line": 55,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    if (user.isSetAccount()) {\n      final Account account = user.getAccount();\n      builder.putValue(OPTIONAL, BotMakerFeatures.creationIp, account.getCreation_ip())\n          .putValue(OPTIONAL, BotMakerFeatures.accountLanguage, account.getLanguage());\n      if (account.isSetCreated_via()) {\n        builder.putValue(REQUIRED, BotMakerFeatures.accountCreatedVia, account.getCreated_via())\n            .putPositive(OPTIONAL, BotMakerFeatures.applicationId,\n                BotMakerFeatures.transformCreatedViaToApplicationId(account.getCreated_via()));\n      }\n    }\n    if (user.isSetProfile()) {\n      final Profile profile = user.getProfile();\n      builder.putValue(OPTIONAL, BotMakerFeatures.firstAndLastName, profile.getName());\n      builder.putValue(OPTIONAL, BotMakerFeatures.screenName, profile.getScreen_name());\n    }\n    if (user.isSetSafety()) {\n      final Safety safety = user.getSafety();\n      if (safety.isSetSignup_creation_source()) {\n        builder.putValue(OPTIONAL, BotMakerFeatures.signupCreationSource,\n            safety.signup_creation_source.name());\n      }\n    }\n\n    twitterContextFeatures.applyAll(builder);\n",
+      "source_digest": "7dbe3481baf7a60907992b76e520959c05bd05b5eaf124d0958b930883cc82f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfUserCreate.java",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 32,
+      "end_line": 56,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if (user.isSetAccount()) {\n      final Account account = user.getAccount();\n      builder.putValue(OPTIONAL, BotMakerFeatures.creationIp, account.getCreation_ip())\n          .putValue(OPTIONAL, BotMakerFeatures.accountLanguage, account.getLanguage());\n      if (account.isSetCreated_via()) {\n        builder.putValue(REQUIRED, BotMakerFeatures.accountCreatedVia, account.getCreated_via())\n            .putPositive(OPTIONAL, BotMakerFeatures.applicationId,\n                BotMakerFeatures.transformCreatedViaToApplicationId(account.getCreated_via()));\n      }\n    }\n    if (user.isSetProfile()) {\n      final Profile profile = user.getProfile();\n      builder.putValue(OPTIONAL, BotMakerFeatures.firstAndLastName, profile.getName());\n      builder.putValue(OPTIONAL, BotMakerFeatures.screenName, profile.getScreen_name());\n    }\n    if (user.isSetSafety()) {\n      final Safety safety = user.getSafety();\n      if (safety.isSetSignup_creation_source()) {\n        builder.putValue(OPTIONAL, BotMakerFeatures.signupCreationSource,\n            safety.signup_creation_source.name());\n      }\n    }\n\n    twitterContextFeatures.applyAll(builder);\n  }\n",
+      "source_digest": "d5094034f23d46adc56b1935f0def207ddd83a61400abac9870227de7b32ff4b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfUserCreate.java",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 33,
+      "end_line": 57,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      final Account account = user.getAccount();\n      builder.putValue(OPTIONAL, BotMakerFeatures.creationIp, account.getCreation_ip())\n          .putValue(OPTIONAL, BotMakerFeatures.accountLanguage, account.getLanguage());\n      if (account.isSetCreated_via()) {\n        builder.putValue(REQUIRED, BotMakerFeatures.accountCreatedVia, account.getCreated_via())\n            .putPositive(OPTIONAL, BotMakerFeatures.applicationId,\n                BotMakerFeatures.transformCreatedViaToApplicationId(account.getCreated_via()));\n      }\n    }\n    if (user.isSetProfile()) {\n      final Profile profile = user.getProfile();\n      builder.putValue(OPTIONAL, BotMakerFeatures.firstAndLastName, profile.getName());\n      builder.putValue(OPTIONAL, BotMakerFeatures.screenName, profile.getScreen_name());\n    }\n    if (user.isSetSafety()) {\n      final Safety safety = user.getSafety();\n      if (safety.isSetSignup_creation_source()) {\n        builder.putValue(OPTIONAL, BotMakerFeatures.signupCreationSource,\n            safety.signup_creation_source.name());\n      }\n    }\n\n    twitterContextFeatures.applyAll(builder);\n  }\n}\n",
+      "source_digest": "e3d5a3292580ef33c4e76e4c4d976a07f6f3c377db5d09da5f7d7ce749e5ba39",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "botmaker/src/java/com/twitter/botmaker/compiler/Compiler.java",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1470,
+      "end_line": 1494,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "          new String[]{\"Variable\", \"Variable\", \"T\", \"Collection\"},\n          new String[]{\n              \"the variable 1 name\",\n              \"the variable 2 name\",\n              \"the operation to run\",\n              \"the collection\"\n          },\n          \"T\"\n      ),\n      BotMakerDoc.of(\n          \"GetInputFeature\",\n          \"Get input feature value by name. For example, \"\n              + \"GetInputFeature(\\\"profile.auth.hashedPassword.before\\\")\",\n          ActionLevel.NO_ACTION,\n          new String[]{\"FeatureName\"},\n          new String[]{\"input feature name\"},\n          \"Object\"\n      ),\n      BotMakerDoc.of(\n          \"GetOrElse\",\n          \"Get the value of the feature name or the value supplied if not.\"\n              + \"NOTE: The type of the feature has to match the type else value. Things will\"\n              + \"fail in runtime otherwise.\",\n          ActionLevel.NO_ACTION,\n          new String[]{\"FeatureName\", \"T\"},\n",
+      "source_digest": "13b0007e15b57377f4372fe853c494322c8656ec2cc555f3cbf072125ddce18d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "class User(BaseModel):\n    id: int | None = None\n    handle: str | None = None\n    name: str | None = None\n    bio: str | None = None\n    follower_count: int | None = None\n    following_count: int | None = None\n    subscription_level: str | None = None\n    signup_country_code: str | None = None\n    is_protected: bool | None = None\n    created_at: datetime | None = None\n    reply_history: list[\"Post\"] | None = None\n    profile_location: str | None = None\n    has_missing_client_events: bool | None = None\n    tfe_top_country: str | None = None\n    account_lang: str | None = None\n    num_replies_last_24hrs: float | None = None\n    has_risky_user_safety_label: bool | None = None\n    num_legit_blocks_received_last_24hrs: float | None = None\n    urls: list[str] | None = None\n    affiliated_business: AffiliatedBusiness | None = None\n    recent_posts: list[\"Post\"] | None = None\n    profile_image: \"Image | None\" = None\n    profile_banner: \"Image | None\" = None\n    blocked_count: int | None = None\n",
+      "source_digest": "a76eb4fc34e8ec9d53fc92aafaa168c73ff7ab19b586c3e2ce68c67728e9cb1e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    created_at: datetime | None = None\n    reply_history: list[\"Post\"] | None = None\n    profile_location: str | None = None\n    has_missing_client_events: bool | None = None\n    tfe_top_country: str | None = None\n    account_lang: str | None = None\n    num_replies_last_24hrs: float | None = None\n    has_risky_user_safety_label: bool | None = None\n    num_legit_blocks_received_last_24hrs: float | None = None\n    urls: list[str] | None = None\n    affiliated_business: AffiliatedBusiness | None = None\n    recent_posts: list[\"Post\"] | None = None\n    profile_image: \"Image | None\" = None\n    profile_banner: \"Image | None\" = None\n    blocked_count: int | None = None\n\n    \u0040classmethod\n    def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> \"User\":\n        return cls(\n            id=int(author_metadata.userId)\n            if author_metadata.userId is not None\n            else None,\n            handle=author_metadata.userHandle,\n            name=author_metadata.userName,\n            bio=author_metadata.userBio,\n",
+      "source_digest": "201fae47c0f584898ff227ce0462b2a4dd46d2bfb929cd9e23628ef6dacca4ec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 31,
+      "end_line": 55,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    reply_history: list[\"Post\"] | None = None\n    profile_location: str | None = None\n    has_missing_client_events: bool | None = None\n    tfe_top_country: str | None = None\n    account_lang: str | None = None\n    num_replies_last_24hrs: float | None = None\n    has_risky_user_safety_label: bool | None = None\n    num_legit_blocks_received_last_24hrs: float | None = None\n    urls: list[str] | None = None\n    affiliated_business: AffiliatedBusiness | None = None\n    recent_posts: list[\"Post\"] | None = None\n    profile_image: \"Image | None\" = None\n    profile_banner: \"Image | None\" = None\n    blocked_count: int | None = None\n\n    \u0040classmethod\n    def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> \"User\":\n        return cls(\n            id=int(author_metadata.userId)\n            if author_metadata.userId is not None\n            else None,\n            handle=author_metadata.userHandle,\n            name=author_metadata.userName,\n            bio=author_metadata.userBio,\n            follower_count=int(author_metadata.followerCount)\n",
+      "source_digest": "d76f72f00a11b59477a1e06b8bd0202dc293266676c9aff65fc1c68e1c541175",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 80,
+      "end_line": 104,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            if hasattr(author_metadata, \"hasRiskyUserSafetyLabel\")\n            else None,\n            num_legit_blocks_received_last_24hrs=author_metadata.numLegitBlocksReceivedLast24Hrs\n            if hasattr(author_metadata, \"numLegitBlocksReceivedLast24Hrs\")\n            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n",
+      "source_digest": "3137d6a9632db7ad9ae17ade1bcfbf8d46a597a7f9063bc2ba0ab8418c38b06e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 81,
+      "end_line": 105,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            else None,\n            num_legit_blocks_received_last_24hrs=author_metadata.numLegitBlocksReceivedLast24Hrs\n            if hasattr(author_metadata, \"numLegitBlocksReceivedLast24Hrs\")\n            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n    convo_image: ConvoImage | None = None\n",
+      "source_digest": "dd622853a40a4135b888972e4a87783f3ea195d89bad05190b09a0c8e1cac195",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 83,
+      "end_line": 107,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            if hasattr(author_metadata, \"numLegitBlocksReceivedLast24Hrs\")\n            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n    convo_image: ConvoImage | None = None\n    dark_mode_image: ConvoImage | None = None\n    light_mode_image: ConvoImage | None = None\n",
+      "source_digest": "306ce518aced3ff817105b77ff9079d01ab51105b81f4f38f6a0d8cb5f30932c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "grox/core/data_loaders/data_types.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 84,
+      "end_line": 108,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            else None,\n            urls=author_metadata.urls,\n            affiliated_business=AffiliatedBusiness(\n                name=author_metadata.affiliatedBusinessMetadata.name,\n                url=author_metadata.affiliatedBusinessMetadata.url,\n            )\n            if author_metadata.affiliatedBusinessMetadata\n            else None,\n            profile_image=Image(url=author_metadata.profileImageUrl)\n            if getattr(author_metadata, \"profileImageUrl\", None)\n            else None,\n            profile_banner=Image(url=author_metadata.profileBannerImageUrl)\n            if getattr(author_metadata, \"profileBannerImageUrl\", None)\n            else None,\n            blocked_count=getattr(author_metadata, \"blockedCount\", None),\n        )\n\n\nclass Image(BaseModel):\n    id: str | None = None\n    url: str | None = None\n    convo_image: ConvoImage | None = None\n    dark_mode_image: ConvoImage | None = None\n    light_mode_image: ConvoImage | None = None\n    clahe_image: ConvoImage | None = None\n",
+      "source_digest": "c61b85b4bea3fd24ac6a9f9932884dc66f57e4402af317b3c509b61695679669",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-936dfb9d867257d9a645c3294577f4217b6672e8a2feb9b4a1c232990933f12b",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "f79861b1e71f158ba6138c9b158287e38859ea04d96828a038b24a1d0d00d77a",
+      "context_complete": true,
+      "task_id": "T-301665eef9e76b0dd5f5ec027235f9731279622e31ed92d04930566017783c28",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8a5a882fd3fdf5bff070000549fce2507c57b81439ba6d5b791c51f8bc0b0676",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-03bae79667ffaa21accb0bcb5b8d0aa9a26f4cf151632d121767d90cdd66f8dc",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-11c967551c8c954e8b747518203f049784d37ff5d18006863427ec926489fe80",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-93f9adb3b5ee3dba4607295ff603be621699606042dba1d391a3d02aec947d6d",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b2c90292db72434327a0dfbaf4b3962b72e7bfef9b35ab34a65dc7e1cc388425",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-e87193513b6a8cd6dafb263aba0bee6a691dcff1cf00a1373997c43025880780",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5d11f10469aa28ab3a6d09d463e457c2bd66c263b126c5b9901f23e0c46f3944",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-139ea5d8fa1030fc407bffc6cac8131ae9cced57cd518b7258e9e96e379bf108",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-df96f2709cadeb26670561bac632d486ba87a061a4baaf0c9b3faf6c91e59bd6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-17d2602fe1a76e851d52b0d5e31b0e51dab6b0438131f9940f6096cac1cd711b",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8268985e4aeb8b7d2211771cba1c1a4853bd01866b842f8520d0a7eb90efdda6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-5240b353c08dc9e167087fbbc02ce083aa9b34a7e709c97afdc122f674a9f92a",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3116b2774803082ee85d2126066573dbf9b4d2c04ebef3ffec5208a99b522994",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-1a0dab5f876d044d979fb4a7596dc0aea8dd1bcbdaacadc98be79bfefae7848a",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3b01a78b551d5ca76955cdca1ff8ff05f153c268d7512a6181960fb6f3901887",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec610aa7bf2a879fdd8cc66e0a8b656916eef4e4c155ca0cf8a8059d4b52068b",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5fe90ee9a8bef3c78cbf17a1ad777985f01d51304259fb0d941b50cefb9e714c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-29a7708a8995c4218843e0fc6ee34ccf583d9446e8778058a5fb25e7ecbd0bdc",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9bee9d4cc0990b6372059fd78a22959b54004b1d773af14746f0765a62ef6c59",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-12f3bc459da69666f0f137d41bfb1302e3a8fe058ab9c8b7379ca152a993c8ec",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-219856cd149cfc734a442dcdb9d81fe609bc4aa4aae460871c8af786efb65e64",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-df7d8b5768508076229605c1da931e568f23bc5ddca02ab018b2cc61ce66585f",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a979e98e10c029db99678cfe4cf87d36c403eb19861cd15c4629f1a0dfe07d17",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-e4b753c442758775f99bf5ea138b8d080cda9f4fe58eb9c6b679709d35417c58",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c097ae53ac847693c3352375dc7d9569eea669df029e5a5edfb0b66ade369382",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-201b84d1d4e2f01ce5f58a360ae65a491c1c83a07d9e3f5289517132c24e5f89",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c514eceede2a19ea25e1af2b6ce97b7cade088adf1aa9cf01f31f3fbbb5423d7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-d9c92d7ae6daf4183710bd93d7cea664d8ecd09d89cf99f8392c90e07384a674",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-16f3d785c89de529b8f626c34ef940d5dda8cbfe2698e3f24fe02cfdf0bef0b5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-e5057207f18a3e3fc23b7a5af6fcfe16724a64b16367e2a7760ae8a0525e2138",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1e6e384dbfb4ec712aed7a700721c56b74ad75b7d08298f5ea9c2acf2b8636b0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-ae0582e4dfa485ca600538ade6f785fe0a7ab69573669df3219e2e73177b4227",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0058b3d1ab1d58b9be17ee2b39d9be8e13e33b9ad0f89ae2005e5555e0e68d15",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-f1fa67f26048c943665468f23b395f70453a884469a1f9f6cf19095a0d02727d",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d3b0539af1733c9b110cc03dbef06745e775b6055ae287b08644934547ee0558",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-e7348bad46584ef13e5be35c5ad2c32e9b5a3c21d88991e041b4a6f40211abba",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-df7758fe7d5b08fdc40b9a156de06afa49ab111a7a677689ddc5f0e2eef10e16",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-eebd011bd381e165e42375943abd621f6ee13aa527591f5fb40a32522eefdf73",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a49765efb07b92d5d763bfddcda7b46c16f430c4432a95bdb25d723cc3959ef3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-ea32fd728d99aa151471e3649f18264b9fb9cd3845b99c090a8764820b0873ca",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2d807f8890a9945d7c034356d149e45be8c2331ef8bf508ebb408e2d53b6dc95",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-316f3fc4a434c463d9233df339fb8c47d57416c0ddb03db6f22947ead2c632c7",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0a6168ac24c0f53cf15290b6b732cc62c0fe646fffa577e3482d94187fc3be40",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-6436106b6da2e39a85b742fc28311a41b010a09e474e9f0179de9caac7fc51a7",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4459b75e402fd4a2785f749d9f080d194fa297a6ac4ec8dea2ea77296baa6355",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-0f0ee4015f5696eb77ae4e93de5691b752d534a3a197da09b72a0a221e352572",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1491b273f5df354dc91bdfa9b3a2144a4727f86fb55e8f150722762091b04b8b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-902c9949df03049549ca22473473823d976a9fa7b59d8c866cb1ea216135ccc8",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f187121dda80e382251e3868f59aa38f413040b62783f03b3adb7fb4fb0e6b88",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-65d8a6f25b5a2768151eea8147aca75a7939e6cf111bad59c3ba88a353ffcb77",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-35ae0beb03b68723edf87f5100120b47ca228b57ce4b21bd39adc49fabaabc38",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-acb100cd880b3ebfa81e65ba97662fbcdfd4c1a8a8a8c0b7576afcb22179c973",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f1b82691e99402b6d6a3353d2e41cf4b07994af12b1527f051bddbf70cf48121",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-1a6a9abbaaf4b3285817fbcacd575401ea2b042afd93b5708ef4b972cb0c8476",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dc4cadc82411f23a4fff3abfe86508bcb9c5a8946dad4bab0acd549fd6d3a037",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-873245925eb90fdd66fd4dcc61e1e04c6f5990cd951e479ba5773e396518e391",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e32825ada355af0dbeab6d443f0f4ccd8533fee2dc0889c9ba1cc128e76e2b1a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-f3354f1f259957c628eda76d5bafee560768af4908c1e25e9251fb630659fb8e",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ad69192a28e6036910681a7df8d42d51f40cd3721361c36e28884970f0ba50f0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-ece9ce62c0fbf3476513f44779c540de3b3d4d02f98385e1f60e7bc87944e05f",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8a07efee63222417fb3b50a2e01696f072d21bdb4bf5e8877c189149d1850396",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-b8ac56706408e2030cf4c4d5288f85d8b03342ff4e3680673b013cab05bcfc55",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2b92208106dd8b691cbc88949e969f12d0774ef6853324d4c09d91fe749c8486",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-4a23fce20963b331547d24b7e58eb78cc9a4c501e4cede2def36702f459ea24e",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a2435018f5fea215cb16600b45c307594ba42697a5f81009057958406ceceaf6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-2d6f4058995044567312ec2d6602f900995841620db9d3392e2646a48f70cdd1",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-66a57bb6bec757dbce8cf3d8743f7473d6bfc7c738a4417a49226b1a6d938ace",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-61dc3d5439360a3c9c23949ec100ce5624444e5d54621ab291c0dd98e936b171",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a4334da3a184e425974bc87cd2c0ebb2ad17f2690c37f66fdfe8a14fa4d99675",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a9e50aa316202aae3ca02ac18de4c2395dd4ffddf5e107a9b8fa8cc9e5b47d1",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-004faa767520d545c508ac8830afdd03ebcc1fd3172dc6dc1983b3513a920ede",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ee1448574204fc1e910f9df391a9e19936f03a7b8ad6ce5670c3f1df8088678",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-be132a3e2414f6bd508ddb69e11ec23655660c762ae6ffbff73f9ee19667e640",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-f22de8811f2416188084842d361ad159a9defe445fa6a72244f5b55479b13608",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7a9fe45951d04cc32ae0ba2077863b3d56987baca18bbfebc01382c4283c47e4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-8078f2662591dfd28fcd46776f8b766fa2ee21daf8274e38d6b16dc2e23f50b9",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4f969eec4f90f2dadfcc3eeb0a51fb748cc460ec62232bc1aeeadfe3cffbd5bd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-4fb43b097de212159a37c99875e7a83dc82c07644afc61a9b84167f49e73d802",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5bc71d54b5d8406be7b86ee643c47e902db6b1e4789774c77e1324143ba48d60",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-39d03074922145b6cffd6e56219c8f4e70e8ffa8b0fd2851b609c676dbfdbc5a",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/decode/viewer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-51a81fbac699589e4674bf46e6cf1deeb901ad4f8687ed6800c417bb2e152545",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "has_age_verified_18_label",
+        "has_blink_label",
+        "notification_filters",
+        "decode_viewer",
+        "is_new_account",
+        "is_younger_than",
+        "profile"
+      ],
+      "context_complete": false,
+      "task_id": "T-b37e33b6029259f513f20a4bc12300d1853be2101a76837ae716057682548884",
+      "evidence_refs": [
+        "E43"
+      ]
+    }
+  ],
+  "task_id": "T-76acbcf2b6aae76d12ce8a7b0783dd32afeeb1a14f70bae965bbffa9bf928410"
+}

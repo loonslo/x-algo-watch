@@ -1,0 +1,469 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-695094660c67b2f043cfa7244a103f4686bed8b07afc44ed301a4b68abf7e7ce",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 400,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport jax\nimport jax.numpy as jnp\nfrom jax.ad_checkpoint import checkpoint_name\n\n_CANDIDATE_ATTENTION_CACHE: dict = {}\n\n\ndef candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):\n    from xrex.cutedsl.ranker_attention_fa4 import cutedsl_arch\n    from xrex.cutedsl.ranker_attention_varlen_fa4 import zeros_after\n\n    total_q, num_q_heads, head_dim = q_shape\n    total_k, num_kv_heads, _ = k_shape\n    arch = cutedsl_arch()\n    sm_scale = float(sm_scale)\n    cache_key = (arch, total_q, total_k, num_seqs, num_q_heads, num_kv_heads, head_dim, sm_scale)\n    if cache_key in _CANDIDATE_ATTENTION_CACHE:\n        return _CANDIDATE_ATTENTION_CACHE[cache_key]\n\n    import cuda.bindings.driver as cuda_driver\n    import cutlass\n    import cutlass.cute as cute\n    from cutlass.jax import cutlass_call\n\n    from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess\n    from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess\n\n    if arch not in (90, 100):\n        raise NotImplementedError(\n            \"Ranker candidate-only attention supports only SM90 (H100) and SM100 (GB200/GB300). \"\n            \"On this GPU, set seqpack_candidate_packing=False and candidate_only_attn_impl=None \"\n            \"to compute every token and keep only the candidates' outputs.\"\n        )\n\n    qpk = num_q_heads // num_kv_heads\n    q_heads_per_bwd_head = qpk if arch == 90 else 1\n    bwd_qpk = qpk // q_heads_per_bwd_head\n    bwd_rows, bwd_num_heads = total_q * q_heads_per_bwd_head, num_q_heads // q_heads_per_bwd_head\n    tile_n = 128\n    bwd_tile_m = 64 if arch == 90 else 128\n    hdr = ((head_dim + 31) // 32) * 32\n    bwd_rows_padded = (bwd_rows + num_seqs * bwd_tile_m + bwd_tile_m - 1) // bwd_tile_m * bwd_tile_m\n    total_k_padded = (total_k + num_seqs * tile_n + tile_n - 1) // tile_n * tile_n\n\n    if arch == 90:\n        from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90\n\n        fa_fwd = FlashAttentionForwardSm90(\n            cutlass.BFloat16,\n            head_dim,\n            head_dim,\n            qpk,\n            is_causal=False,\n            is_local=False,\n            pack_gqa=qpk > 1,\n            tile_m=128,\n            tile_n=tile_n,\n            num_stages=2,\n            num_threads=384,\n            Q_in_regs=False,\n            intra_wg_overlap=True,\n            mma_pv_is_rs=True,\n        )\n    else:\n        from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100\n\n        fa_fwd = FlashAttentionForwardSm100(\n            head_dim=head_dim,\n            head_dim_v=head_dim,\n            qhead_per_kvhead=qpk,\n            is_causal=False,\n            is_local=False,\n            pack_gqa=qpk > 1 and 128 % qpk == 0,\n            q_stage=1,\n            is_persistent=False,\n            is_varlen_q=True,\n        )\n\n    \u0040cute.jit\n    def launch_fwd(\n        stream: cuda_driver.CUstream,\n        mQ,\n        mK,\n        mV,\n        mCuQ,\n        mCuK,\n        mSeqUsedK,\n        mO,\n        mLSE,\n        softmax_scale: cutlass.Float32,\n    ):\n        fa_fwd(mQ, mK, mV, mO, mLSE, softmax_scale, mCuQ, mCuK, None, mSeqUsedK, stream=stream)\n\n    fwd_call = cutlass_call(\n        launch_fwd,\n        output_shape_dtype=[\n            jax.ShapeDtypeStruct((total_q, num_q_heads, head_dim), jnp.bfloat16),\n            jax.ShapeDtypeStruct((num_q_heads, total_q), jnp.float32),\n        ],\n        use_static_tensors=False,\n        softmax_scale=cutlass.Float32(sm_scale),\n    )\n\n    fa_pre = FlashAttentionBackwardPreprocess(\n        cutlass.BFloat16, head_dim, head_dim, tile_m=bwd_tile_m\n    )\n\n    \u0040cute.jit\n    def launch_pre(stream: cuda_driver.CUstream, mO, mdO, mLSE, mCuQ, mdPsum, mLSElog2):\n        fa_pre(mO, mdO, mdPsum, mLSE, mLSElog2, None, mCuQ, None, None, stream)\n\n    pre_call = cutlass_call(\n        launch_pre,\n        output_shape_dtype=[\n            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),\n            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),\n        ],\n        use_static_tensors=False,\n    )\n\n    if arch == 90:\n        from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90\n\n        bwd_atom_layout_dkv = 2\n        fa_bwd = FlashAttentionBackwardSm90(\n            cutlass.BFloat16,\n            head_dim,\n            head_dim,\n            bwd_qpk,\n            False,\n            is_local=False,\n            deterministic=False,\n            tile_m=bwd_tile_m,\n            tile_n=tile_n,\n            Q_stage=2,\n            dO_stage=2,\n            PdS_stage=2,\n            SdP_swapAB=True,\n            dKV_swapAB=False,\n            dQ_swapAB=False,\n            AtomLayoutMSdP=1,\n            AtomLayoutNdKV=bwd_atom_layout_dkv,\n            AtomLayoutMdQ=1,\n            num_threads=384,\n        )\n        post_threads = 256\n    else:\n        from xrex.cutedsl.ranker_fa4.flash_bwd_sm100 import FlashAttentionBackwardSm100\n\n        bwd_atom_layout_dkv = 1\n        fa_bwd = FlashAttentionBackwardSm100(\n            head_dim=head_dim,\n            head_dim_v=head_dim,\n            qhead_per_kvhead=qpk,\n            is_causal=False,\n            is_local=False,\n        )\n        post_threads = 128\n    dkv_postprocess = bwd_qpk > 1\n    dkv_out = jax.ShapeDtypeStruct(\n        (num_kv_heads, total_k_padded * hdr)\n        if dkv_postprocess\n        else (total_k, num_kv_heads, head_dim),\n        jnp.float32 if dkv_postprocess else jnp.bfloat16,\n    )\n    dq_accum_shape = (bwd_num_heads, bwd_rows_padded * hdr)\n\n    \u0040cute.jit\n    def launch_bwd(\n        stream: cuda_driver.CUstream,\n        mQ,\n        mK,\n        mV,\n        mdO,\n        mLSElog2,\n        mdPsum,\n        mCuQ,\n        mCuK,\n        mSeqUsedK,\n        mdQaccum,\n        mdK,\n        mdV,\n        softmax_scale: cutlass.Float32,\n    ):\n        fa_bwd(\n            mQ,\n            mK,\n            mV,\n            mdO,\n            mLSElog2,\n            mdPsum,\n            mdQaccum,\n            mdK,\n            mdV,\n            softmax_scale,\n            mCuQ,\n            mCuK,\n            None,\n            mSeqUsedK,\n            stream=stream,\n        )\n\n    bwd_call = cutlass_call(\n        launch_bwd,\n        output_shape_dtype=[\n            jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),\n            dkv_out,\n            dkv_out,\n        ],\n        input_output_aliases={9: 0, 10: 1, 11: 2},\n        use_static_tensors=False,\n        softmax_scale=cutlass.Float32(sm_scale),\n    )\n\n    def postprocess(tile_m, atom_layout, out_shape, scale, with_seqused):\n        fa_post = FlashAttentionBackwardPostprocess(\n            cutlass.BFloat16,\n            head_dim,\n            arch,\n            tile_m=tile_m,\n            num_threads=post_threads,\n            AtomLayoutMdQ=atom_layout,\n        )\n\n        if with_seqused:\n\n            \u0040cute.jit\n            def launch(\n                stream: cuda_driver.CUstream, mAccum, mCu, mSeqUsed, mOut, scale: cutlass.Float32\n            ):\n                fa_post(mAccum, mOut, scale, mCu, mSeqUsed, stream)\n\n        else:\n\n            \u0040cute.jit\n            def launch(stream: cuda_driver.CUstream, mAccum, mCu, mOut, scale: cutlass.Float32):\n                fa_post(mAccum, mOut, scale, mCu, None, stream)\n\n        return cutlass_call(\n            launch,\n            output_shape_dtype=[jax.ShapeDtypeStruct(out_shape, jnp.bfloat16)],\n            use_static_tensors=False,\n            scale=cutlass.Float32(scale),\n        )\n\n    kv_shape = (total_k, num_kv_heads, head_dim)\n    post_dq = postprocess(bwd_tile_m, 1, (bwd_rows, bwd_num_heads, head_dim), sm_scale, False)\n    post_dk = post_dv = None\n    if dkv_postprocess:\n        post_dk = postprocess(tile_n, bwd_atom_layout_dkv, kv_shape, sm_scale, True)\n        post_dv = postprocess(tile_n, bwd_atom_layout_dkv, kv_shape, 1.0, True)\n\n    def fold_q_heads(x):\n        if q_heads_per_bwd_head == 1:\n            return x\n        x = x.reshape(total_q, bwd_num_heads, q_heads_per_bwd_head, *x.shape[2:]).swapaxes(1, 2)\n        return x.reshape(bwd_rows, bwd_num_heads, *x.shape[3:])\n\n    def unfold_q_heads(x):\n        if q_heads_per_bwd_head == 1:\n            return x\n        x = x.reshape(total_q, q_heads_per_bwd_head, bwd_num_heads, *x.shape[2:]).swapaxes(1, 2)\n        return x.reshape(total_q, num_q_heads, *x.shape[3:])\n\n    def self_scores(q, k_self, query_valid):\n        k_rep = jnp.repeat(k_self, qpk, axis=1)\n        s = jnp.einsum(\"thd,thd->th\", q.astype(jnp.float32), k_rep.astype(jnp.float32))\n        return jnp.where(query_valid[:, None], s * sm_scale, -jnp.inf)\n\n    def forward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k):\n        query_valid = jnp.arange(total_q) < cu_q[-1]\n        o_hist, lse_hist = fwd_call(q, k_keys, v_keys, cu_q, cu_k, used_k)\n        lse_hist = jnp.where(query_valid[:, None], lse_hist.T, -jnp.inf)\n        s = self_scores(q, k_self, query_valid)\n        lse = jnp.logaddexp(lse_hist, s)\n        lse_safe = jnp.where(query_valid[:, None], lse, 0.0)\n        w_hist = jnp.where(query_valid[:, None], jnp.exp(lse_hist - lse_safe), 0.0)\n        w_self = jnp.where(query_valid[:, None], jnp.exp(s - lse_safe), 0.0)\n        v_rep = jnp.repeat(v_self, qpk, axis=1).astype(jnp.float32)\n        o_hist = jnp.where(query_valid[:, None, None], o_hist.astype(jnp.float32), 0.0)\n        o = (w_hist[..., None] * o_hist + w_self[..., None] * v_rep).astype(jnp.bfloat16)\n        return o, lse_safe\n\n    def backward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k, o, lse, do):\n        query_valid = jnp.arange(total_q) < cu_q[-1]\n        do = jnp.where(query_valid[:, None, None], do, 0).astype(jnp.bfloat16)\n        bwd_cu_rows = cu_q if q_heads_per_bwd_head == 1 else cu_q * q_heads_per_bwd_head\n        bwd_do = fold_q_heads(do)\n        dpsum, lse_log2 = pre_call(fold_q_heads(o), bwd_do, fold_q_heads(lse).T, bwd_cu_rows)\n        dq_accum = zeros_after(dq_accum_shape, jnp.float32, do)\n        dk_init = zeros_after(dkv_out.shape, dkv_out.dtype, do)\n        dv_init = zeros_after(dkv_out.shape, dkv_out.dtype, do)\n        dq_accum, dk_keys, dv_keys = bwd_call(\n            fold_q_heads(q),\n            k_keys,\n            v_keys,\n            bwd_do,\n            lse_log2,\n            dpsum,\n            bwd_cu_rows,\n            cu_k,\n            used_k,\n            dq_accum,\n            dk_init,\n            dv_init,\n        )\n        (dq,) = post_dq(dq_accum, bwd_cu_rows)\n        if post_dk is not None and post_dv is not None:\n            (dk_keys,) = post_dk(dk_keys, cu_k, used_k)\n            (dv_keys,) = post_dv(dv_keys, cu_k, used_k)\n        marks = jnp.zeros(total_k + 1, jnp.int32).at[cu_k[:-1]].add(1)\n        marks = marks.at[cu_k[:-1] + used_k].add(-1)\n        key_valid = jnp.cumsum(marks[:-1]) > 0\n        dq = jnp.where(query_valid[:, None, None], unfold_q_heads(dq), 0)\n        dk_keys = jnp.where(key_valid[:, None, None], dk_keys, 0)\n        dv_keys = jnp.where(key_valid[:, None, None], dv_keys, 0)\n\n        s = self_scores(q, k_self, query_valid)\n        p_self = jnp.where(query_valid[:, None], jnp.exp(s - lse), 0.0)\n        do32 = do.astype(jnp.float32)\n        delta = jnp.sum(do32 * o.astype(jnp.float32), axis=-1)\n        v_rep = jnp.repeat(v_self, qpk, axis=1).astype(jnp.float32)\n        ds = p_self * (jnp.sum(do32 * v_rep, axis=-1) - delta)\n        ds = jnp.where(query_valid[:, None], ds, 0.0)\n        k_rep = jnp.repeat(k_self, qpk, axis=1).astype(jnp.float32)\n        dq = dq.astype(jnp.float32) + ds[..., None] * k_rep * sm_scale\n\n        def group_sum(x):\n            return x.reshape(total_q, num_kv_heads, qpk, head_dim).sum(axis=2)\n\n        dk_self = group_sum(ds[..., None] * q.astype(jnp.float32) * sm_scale)\n        dv_self = group_sum(p_self[..., None] * do32)\n        return (\n            dq.astype(q.dtype),\n            dk_keys.astype(k_keys.dtype),\n            dv_keys.astype(v_keys.dtype),\n            dk_self.astype(k_self.dtype),\n            dv_self.astype(v_self.dtype),\n        )\n\n    _CANDIDATE_ATTENTION_CACHE[cache_key] = (forward, backward)\n    return forward, backward\n\n\ndef ranker_attention_varlen_candidate_only_fa4(\n    candidate_q,\n    history_k,\n    history_v,\n    own_k,\n    own_v,\n    candidate_cu_seqlens,\n    history_key_starts,\n    history_key_counts,\n    sm_scale,\n):\n    forward, backward = candidate_attention_fwd_bwd(\n        candidate_q.shape, history_k.shape, candidate_cu_seqlens.shape[0] - 1, sm_scale\n    )\n\n    \u0040jax.custom_vjp\n    def attention(*args):\n        return forward(*args)[0]\n\n    def attention_fwd(*args):\n        o, lse = forward(*args)\n        o = checkpoint_name(o, \"cutedsl_attn_outputs\")\n        lse = checkpoint_name(lse, \"cutedsl_attn_outputs\")\n        return o, (*args, o, lse)\n\n    def attention_bwd(res, do):\n        return backward(*res, do) + (None, None, None)\n\n    attention.defvjp(attention_fwd, attention_bwd)\n    return attention(\n        candidate_q,\n        history_k,\n        history_v,\n        own_k,\n        own_v,\n        candidate_cu_seqlens,\n        history_key_starts,\n        history_key_counts,\n    )\n\n\ndef ranker_attention_candidate_only_fa4(\n    candidate_q, history_k, history_v, own_k, own_v, hist_valid_len, sm_scale\n):\n    batch_size, num_candidates = candidate_q.shape[:2]\n    row_starts = jnp.arange(batch_size + 1, dtype=jnp.int32)\n    output = ranker_attention_varlen_candidate_only_fa4(\n        *(jax.lax.collapse(x, 0, 2) for x in (candidate_q, history_k, history_v, own_k, own_v)),\n        row_starts * num_candidates,\n        row_starts * history_k.shape[1],\n        hist_valid_len,\n        sm_scale,\n    )\n    return output.reshape(candidate_q.shape)\n",
+      "source_digest": "48b0c9cd759577a30738710183e6148b94e6fac5702e39e47af83bea2e92705a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 395,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport jax\nimport jax.numpy as jnp\nfrom jax.ad_checkpoint import checkpoint_name\n\n_CANDIDATE_ATTENTION_CACHE: dict = {}\n\n\ndef candidate_attention_fwd_bwd(q_shape, k_shape, num_seqs, sm_scale):\n    from xrex.cutedsl.ranker_attention_fa4 import cutedsl_arch\n    from xrex.cutedsl.ranker_attention_varlen_fa4 import zeros_after\n\n    total_q, num_q_heads, head_dim = q_shape\n    total_k, num_kv_heads, _ = k_shape\n    arch = cutedsl_arch()\n    sm_scale = float(sm_scale)\n    cache_key = (arch, total_q, total_k, num_seqs, num_q_heads, num_kv_heads, head_dim, sm_scale)\n    if cache_key in _CANDIDATE_ATTENTION_CACHE:\n        return _CANDIDATE_ATTENTION_CACHE[cache_key]\n\n    import cuda.bindings.driver as cuda_driver\n    import cutlass\n    import cutlass.cute as cute\n    from cutlass.jax import cutlass_call\n\n    from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess\n    from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess\n\n    if arch not in (90, 100):\n        raise NotImplementedError(\n            \"Ranker candidate-only attention supports only SM90 (H100) and SM100 (GB200/GB300). \"\n            \"On this GPU, set seqpack_candidate_packing=False and candidate_only_attn_impl=None \"\n            \"to compute every token and keep only the candidates' outputs.\"\n        )\n\n    qpk = num_q_heads // num_kv_heads\n    q_heads_per_bwd_head = qpk if arch == 90 else 1\n    bwd_qpk = qpk // q_heads_per_bwd_head\n    bwd_rows, bwd_num_heads = total_q * q_heads_per_bwd_head, num_q_heads // q_heads_per_bwd_head\n    tile_n = 128\n    bwd_tile_m = 64 if arch == 90 else 128\n    hdr = ((head_dim + 31) // 32) * 32\n    bwd_rows_padded = (bwd_rows + num_seqs * bwd_tile_m + bwd_tile_m - 1) // bwd_tile_m * bwd_tile_m\n    total_k_padded = (total_k + num_seqs * tile_n + tile_n - 1) // tile_n * tile_n\n\n    if arch == 90:\n        from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90\n\n        fa_fwd = FlashAttentionForwardSm90(\n            cutlass.BFloat16,\n            head_dim,\n            head_dim,\n            qpk,\n            is_causal=False,\n            is_local=False,\n            pack_gqa=qpk > 1,\n            tile_m=128,\n            tile_n=tile_n,\n            num_stages=2,\n            num_threads=384,\n            Q_in_regs=False,\n            intra_wg_overlap=True,\n            mma_pv_is_rs=True,\n        )\n    else:\n        from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100\n\n        fa_fwd = FlashAttentionForwardSm100(\n            head_dim=head_dim,\n            head_dim_v=head_dim,\n            qhead_per_kvhead=qpk,\n            is_causal=False,\n            is_local=False,\n            pack_gqa=qpk > 1 and 128 % qpk == 0,\n            q_stage=1,\n            is_persistent=False,\n            is_varlen_q=True,\n        )\n\n    \u0040cute.jit\n    def launch_fwd(\n        stream: cuda_driver.CUstream,\n        mQ,\n        mK,\n        mV,\n        mCuQ,\n        mCuK,\n        mSeqUsedK,\n        mO,\n        mLSE,\n        softmax_scale: cutlass.Float32,\n    ):\n        fa_fwd(mQ, mK, mV, mO, mLSE, softmax_scale, mCuQ, mCuK, None, mSeqUsedK, stream=stream)\n\n    fwd_call = cutlass_call(\n        launch_fwd,\n        output_shape_dtype=[\n            jax.ShapeDtypeStruct((total_q, num_q_heads, head_dim), jnp.bfloat16),\n            jax.ShapeDtypeStruct((num_q_heads, total_q), jnp.float32),\n        ],\n        use_static_tensors=False,\n        softmax_scale=cutlass.Float32(sm_scale),\n    )\n\n    fa_pre = FlashAttentionBackwardPreprocess(\n        cutlass.BFloat16, head_dim, head_dim, tile_m=bwd_tile_m\n    )\n\n    \u0040cute.jit\n    def launch_pre(stream: cuda_driver.CUstream, mO, mdO, mLSE, mCuQ, mdPsum, mLSElog2):\n        fa_pre(mO, mdO, mdPsum, mLSE, mLSElog2, None, mCuQ, None, None, stream)\n\n    pre_call = cutlass_call(\n        launch_pre,\n        output_shape_dtype=[\n            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),\n            jax.ShapeDtypeStruct((bwd_num_heads, bwd_rows_padded), jnp.float32),\n        ],\n        use_static_tensors=False,\n    )\n\n    if arch == 90:\n        from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90\n\n        bwd_atom_layout_dkv = 2\n        fa_bwd = FlashAttentionBackwardSm90(\n            cutlass.BFloat16,\n            head_dim,\n            head_dim,\n            bwd_qpk,\n            False,\n            is_local=False,\n            deterministic=False,\n            tile_m=bwd_tile_m,\n            tile_n=tile_n,\n            Q_stage=2,\n            dO_stage=2,\n            PdS_stage=2,\n            SdP_swapAB=True,\n            dKV_swapAB=False,\n            dQ_swapAB=False,\n            AtomLayoutMSdP=1,\n            AtomLayoutNdKV=bwd_atom_layout_dkv,\n            AtomLayoutMdQ=1,\n            num_threads=384,\n        )\n        post_threads = 256\n    else:\n        from xrex.cutedsl.ranker_fa4.flash_bwd_sm100 import FlashAttentionBackwardSm100\n\n        bwd_atom_layout_dkv = 1\n        fa_bwd = FlashAttentionBackwardSm100(\n            head_dim=head_dim,\n            head_dim_v=head_dim,\n            qhead_per_kvhead=qpk,\n            is_causal=False,\n            is_local=False,\n        )\n        post_threads = 128\n    dkv_postprocess = bwd_qpk > 1\n    dkv_out = jax.ShapeDtypeStruct(\n        (num_kv_heads, total_k_padded * hdr)\n        if dkv_postprocess\n        else (total_k, num_kv_heads, head_dim),\n        jnp.float32 if dkv_postprocess else jnp.bfloat16,\n    )\n    dq_accum_shape = (bwd_num_heads, bwd_rows_padded * hdr)\n    bwd_accumulators = [jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32), dkv_out, dkv_out]\n\n    \u0040cute.jit\n    def launch_bwd(\n        stream: cuda_driver.CUstream,\n        mQ,\n        mK,\n        mV,\n        mdO,\n        mLSElog2,\n        mdPsum,\n        mCuQ,\n        mCuK,\n        mSeqUsedK,\n        mdQaccum,\n        mdK,\n        mdV,\n        softmax_scale: cutlass.Float32,\n    ):\n        fa_bwd(\n            mQ,\n            mK,\n            mV,\n            mdO,\n            mLSElog2,\n            mdPsum,\n            mdQaccum,\n            mdK,\n            mdV,\n            softmax_scale,\n            mCuQ,\n            mCuK,\n            None,\n            mSeqUsedK,\n            stream=stream,\n        )\n\n    bwd_call = cutlass_call(\n        launch_bwd,\n        output_shape_dtype=bwd_accumulators,\n        input_output_aliases={9: 0, 10: 1, 11: 2},\n        use_static_tensors=False,\n        softmax_scale=cutlass.Float32(sm_scale),\n    )\n\n    def postprocess(tile_m, atom_layout, out_shape, scale, with_seqused):\n        fa_post = FlashAttentionBackwardPostprocess(\n            cutlass.BFloat16,\n            head_dim,\n            arch,\n            tile_m=tile_m,\n            num_threads=post_threads,\n            AtomLayoutMdQ=atom_layout,\n        )\n\n        if with_seqused:\n\n            \u0040cute.jit\n            def launch(\n                stream: cuda_driver.CUstream, mAccum, mCu, mSeqUsed, mOut, scale: cutlass.Float32\n            ):\n                fa_post(mAccum, mOut, scale, mCu, mSeqUsed, stream)\n\n        else:\n\n            \u0040cute.jit\n            def launch(stream: cuda_driver.CUstream, mAccum, mCu, mOut, scale: cutlass.Float32):\n                fa_post(mAccum, mOut, scale, mCu, None, stream)\n\n        return cutlass_call(\n            launch,\n            output_shape_dtype=[jax.ShapeDtypeStruct(out_shape, jnp.bfloat16)],\n            use_static_tensors=False,\n            scale=cutlass.Float32(scale),\n        )\n\n    kv_shape = (total_k, num_kv_heads, head_dim)\n    post_dq = postprocess(bwd_tile_m, 1, (bwd_rows, bwd_num_heads, head_dim), sm_scale, False)\n    post_dk = post_dv = None\n    if dkv_postprocess:\n        post_dk = postprocess(tile_n, bwd_atom_layout_dkv, kv_shape, sm_scale, True)\n        post_dv = postprocess(tile_n, bwd_atom_layout_dkv, kv_shape, 1.0, True)\n\n    def fold_q_heads(x):\n        if q_heads_per_bwd_head == 1:\n            return x\n        x = x.reshape(total_q, bwd_num_heads, q_heads_per_bwd_head, *x.shape[2:]).swapaxes(1, 2)\n        return x.reshape(bwd_rows, bwd_num_heads, *x.shape[3:])\n\n    def unfold_q_heads(x):\n        if q_heads_per_bwd_head == 1:\n            return x\n        x = x.reshape(total_q, q_heads_per_bwd_head, bwd_num_heads, *x.shape[2:]).swapaxes(1, 2)\n        return x.reshape(total_q, num_q_heads, *x.shape[3:])\n\n    def self_scores(q, k_self, query_valid):\n        k_rep = jnp.repeat(k_self, qpk, axis=1)\n        s = jnp.einsum(\"thd,thd->th\", q.astype(jnp.float32), k_rep.astype(jnp.float32))\n        return jnp.where(query_valid[:, None], s * sm_scale, -jnp.inf)\n\n    def forward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k):\n        query_valid = jnp.arange(total_q) < cu_q[-1]\n        o_hist, lse_hist = fwd_call(q, k_keys, v_keys, cu_q, cu_k, used_k)\n        lse_hist = jnp.where(query_valid[:, None], lse_hist.T, -jnp.inf)\n        s = self_scores(q, k_self, query_valid)\n        lse = jnp.logaddexp(lse_hist, s)\n        lse_safe = jnp.where(query_valid[:, None], lse, 0.0)\n        w_hist = jnp.where(query_valid[:, None], jnp.exp(lse_hist - lse_safe), 0.0)\n        w_self = jnp.where(query_valid[:, None], jnp.exp(s - lse_safe), 0.0)\n        v_rep = jnp.repeat(v_self, qpk, axis=1).astype(jnp.float32)\n        o_hist = jnp.where(query_valid[:, None, None], o_hist.astype(jnp.float32), 0.0)\n        o = (w_hist[..., None] * o_hist + w_self[..., None] * v_rep).astype(jnp.bfloat16)\n        return o, lse_safe\n\n    def backward(q, k_keys, v_keys, k_self, v_self, cu_q, cu_k, used_k, o, lse, do):\n        query_valid = jnp.arange(total_q) < cu_q[-1]\n        do = jnp.where(query_valid[:, None, None], do, 0).astype(jnp.bfloat16)\n        bwd_cu_rows = cu_q if q_heads_per_bwd_head == 1 else cu_q * q_heads_per_bwd_head\n        bwd_do = fold_q_heads(do)\n        dpsum, lse_log2 = pre_call(fold_q_heads(o), bwd_do, fold_q_heads(lse).T, bwd_cu_rows)\n        dq_accum_init, dk_init, dv_init = zeros_after(do, *bwd_accumulators)\n        dq_accum, dk_keys, dv_keys = bwd_call(\n            fold_q_heads(q),\n            k_keys,\n            v_keys,\n            bwd_do,\n            lse_log2,\n            dpsum,\n            bwd_cu_rows,\n            cu_k,\n            used_k,\n            dq_accum_init,\n            dk_init,\n            dv_init,\n        )\n        (dq,) = post_dq(dq_accum, bwd_cu_rows)\n        if post_dk is not None and post_dv is not None:\n            (dk_keys,) = post_dk(dk_keys, cu_k, used_k)\n            (dv_keys,) = post_dv(dv_keys, cu_k, used_k)\n        marks = jnp.zeros(total_k + 1, jnp.int32).at[cu_k[:-1]].add(1)\n        marks = marks.at[cu_k[:-1] + used_k].add(-1)\n        key_valid = jnp.cumsum(marks[:-1]) > 0\n        dq = jnp.where(query_valid[:, None, None], unfold_q_heads(dq), 0)\n        dk_keys = jnp.where(key_valid[:, None, None], dk_keys, 0)\n        dv_keys = jnp.where(key_valid[:, None, None], dv_keys, 0)\n\n        s = self_scores(q, k_self, query_valid)\n        p_self = jnp.where(query_valid[:, None], jnp.exp(s - lse), 0.0)\n        do32 = do.astype(jnp.float32)\n        delta = jnp.sum(do32 * o.astype(jnp.float32), axis=-1)\n        v_rep = jnp.repeat(v_self, qpk, axis=1).astype(jnp.float32)\n        ds = p_self * (jnp.sum(do32 * v_rep, axis=-1) - delta)\n        ds = jnp.where(query_valid[:, None], ds, 0.0)\n        k_rep = jnp.repeat(k_self, qpk, axis=1).astype(jnp.float32)\n        dq = dq.astype(jnp.float32) + ds[..., None] * k_rep * sm_scale\n\n        def group_sum(x):\n            return x.reshape(total_q, num_kv_heads, qpk, head_dim).sum(axis=2)\n\n        dk_self = group_sum(ds[..., None] * q.astype(jnp.float32) * sm_scale)\n        dv_self = group_sum(p_self[..., None] * do32)\n        return (\n            dq.astype(q.dtype),\n            dk_keys.astype(k_keys.dtype),\n            dv_keys.astype(v_keys.dtype),\n            dk_self.astype(k_self.dtype),\n            dv_self.astype(v_self.dtype),\n        )\n\n    _CANDIDATE_ATTENTION_CACHE[cache_key] = (forward, backward)\n    return forward, backward\n\n\ndef ranker_attention_varlen_candidate_only_fa4(\n    candidate_q,\n    history_k,\n    history_v,\n    own_k,\n    own_v,\n    candidate_cu_seqlens,\n    history_key_starts,\n    history_key_counts,\n    sm_scale,\n):\n    forward, backward = candidate_attention_fwd_bwd(\n        candidate_q.shape, history_k.shape, candidate_cu_seqlens.shape[0] - 1, sm_scale\n    )\n\n    \u0040jax.custom_vjp\n    def attention(*args):\n        return forward(*args)[0]\n\n    def attention_fwd(*args):\n        o, lse = forward(*args)\n        o = checkpoint_name(o, \"cutedsl_attn_outputs\")\n        lse = checkpoint_name(lse, \"cutedsl_attn_outputs\")\n        return o, (*args, o, lse)\n\n    def attention_bwd(res, do):\n        return backward(*res, do) + (None, None, None)\n\n    attention.defvjp(attention_fwd, attention_bwd)\n    return attention(\n        candidate_q,\n        history_k,\n        history_v,\n        own_k,\n        own_v,\n        candidate_cu_seqlens,\n        history_key_starts,\n        history_key_counts,\n    )\n\n\ndef ranker_attention_candidate_only_fa4(\n    candidate_q, history_k, history_v, own_k, own_v, hist_valid_len, sm_scale\n):\n    batch_size, num_candidates = candidate_q.shape[:2]\n    row_starts = jnp.arange(batch_size + 1, dtype=jnp.int32)\n    output = ranker_attention_varlen_candidate_only_fa4(\n        *(jax.lax.collapse(x, 0, 2) for x in (candidate_q, history_k, history_v, own_k, own_v)),\n        row_starts * num_candidates,\n        row_starts * history_k.shape[1],\n        hist_valid_len,\n        sm_scale,\n    )\n    return output.reshape(candidate_q.shape)\n",
+      "source_digest": "d5dda4a6cc01d20461c6abbd221fd5f5a673b787221193bfd805264f2d6303f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 406,
+      "end_line": 430,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                score_mod=score_mod,\n                score_mod_bwd=score_mod_bwd,\n            )\n            post_threads = 128\n            post_dq_atom_layout = 1\n        dk_accum_shape = (batch_size, num_kv_heads, sr_k * hdr)\n        dkv_out = jax.ShapeDtypeStruct(\n            dk_accum_shape if dKV_postprocess else k_shape,\n            jnp.float32 if dKV_postprocess else jnp.bfloat16,\n        )\n\n        \u0040cute.jit\n        def launch_bwd(\n            stream: cuda_driver.CUstream,\n            mQ: cute.Tensor,\n            mK: cute.Tensor,\n            mV: cute.Tensor,\n            mdO: cute.Tensor,\n            mLSE: cute.Tensor,\n            mdPsum: cute.Tensor,\n            mMaskCnt: cute.Tensor,\n            mMaskIdx: cute.Tensor,\n            mFullCnt: cute.Tensor,\n            mFullIdx: cute.Tensor,\n            mDiagCnt: cute.Tensor,\n",
+      "source_digest": "24f33258c8c7d6a0646cb1554a39fd4c4da1719cea75efebc8a3f5ae08906289",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 458,
+      "end_line": 482,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                mdO,\n                mLSE,\n                mdPsum,\n                mdQa,\n                mdKa,\n                mdVa,\n                softmax_scale,\n                blocksparse_tensors=bs,\n                stream=stream,\n            )\n\n        bwd_call = cutlass_call(\n            launch_bwd,\n            output_shape_dtype=[\n                jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),\n                dkv_out,\n                dkv_out,\n            ],\n            input_output_aliases={14: 0, 15: 1, 16: 2},\n            use_static_tensors=False,\n            softmax_scale=cutlass.Float32(sm_scale),\n        )\n\n        fa_post_dq = FlashAttentionBackwardPostprocess(\n            cutlass.BFloat16,\n",
+      "source_digest": "105c5a4ae8a41fcf00886587ab0928a5099f67ff759086c815e4b1ceee62ebb4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_candidate_packed_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport jax\nfrom jax.ad_checkpoint import checkpoint_name\n\nfrom xrex.cutedsl.ranker_attention_candidate_only_fa4 import candidate_attention_fwd_bwd\n\n\ndef ranker_attention_varlen_candidate_packed_fa4(\n    q,\n    k,\n    v,\n    sm_scale,\n    block_sparse_layout,\n    valid_block_upper,\n    valid_block_lower,\n    candidate_cu_seqlens,\n    candidate_key_starts,\n",
+      "source_digest": "dc27f9b6acde66472149e9448361448f8565638425712cb39ee9639326e9011d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_candidate_packed_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 21,
+      "end_line": 45,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "):\n    from xrex.cutedsl.ranker_attention_varlen_fa4 import (\n        varlen_backward,\n        varlen_forward,\n        varlen_kernels,\n    )\n\n    assert q.shape[0] == 1, \"one packed sequence per device\"\n    region_start = int(history_region_len)\n    kernels, bs_args = varlen_kernels(\n        q, k, v, sm_scale, block_sparse_layout, valid_block_upper, valid_block_lower\n    )\n    cand_forward, cand_backward = candidate_attention_fwd_bwd(\n        q[0, region_start:].shape, k[0].shape, candidate_cu_seqlens.shape[0] - 1, sm_scale\n    )\n\n    def candidate_inputs(q, k, v, cand_cu, key_starts, key_counts):\n        keys, values = k[0], v[0]\n        return (\n            q[0, region_start:],\n            keys,\n            values,\n            keys[region_start:],\n            values[region_start:],\n            cand_cu,\n",
+      "source_digest": "db61d2933a06d2ec55f519c0ca5aa2fd4b045cd9d0bc3bddfb81dedf91a41c0c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 587,
+      "end_line": 611,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                score_mod_bwd=score_mod_bwd,\n            )\n            post_threads = 128\n            post_dq_atom_layout = 1\n        dq_accum_shape = (batch_size, num_q_heads, sr_q * hdr)\n        dk_accum_shape = (batch_size, num_kv_heads, sr_k * hdr)\n        dkv_out = jax.ShapeDtypeStruct(\n            dk_accum_shape if dKV_postprocess else k_shape,\n            jnp.float32 if dKV_postprocess else jnp.bfloat16,\n        )\n\n        \u0040cute.jit\n        def launch_bwd(\n            stream: cuda_driver.CUstream,\n            mQ,\n            mK,\n            mV,\n            mdO,\n            mLSE,\n            mdPsum,\n            mMaskCnt,\n            mMaskIdx,\n            mFullCnt,\n            mFullIdx,\n            mDiagCnt,\n",
+      "source_digest": "6508a9204f263e4a28e09aae9f8f3011de28c193c703e1b71b62b57b492b4a43",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 639,
+      "end_line": 663,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                mdO,\n                mLSE,\n                mdPsum,\n                mdQa,\n                mdKa,\n                mdVa,\n                softmax_scale,\n                blocksparse_tensors=bs,\n                stream=stream,\n            )\n\n        bwd_call = cutlass_call(\n            launch_bwd,\n            output_shape_dtype=[\n                jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),\n                dkv_out,\n                dkv_out,\n            ],\n            input_output_aliases={14: 0, 15: 1, 16: 2},\n            use_static_tensors=False,\n            softmax_scale=cutlass.Float32(sm_scale),\n        )\n\n        fa_post_dq = FlashAttentionBackwardPostprocess(\n            cutlass.BFloat16,\n",
+      "source_digest": "105c5a4ae8a41fcf00886587ab0928a5099f67ff759086c815e4b1ceee62ebb4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 449,
+      "end_line": 473,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                score_mod=score_mod,\n                score_mod_bwd=score_mod_bwd,\n            )\n            post_threads = 128\n            post_dq_atom_layout = 1\n        dk_accum_shape = (batch_size, num_kv_heads, sr_k * hdr)\n        dkv_out = jax.ShapeDtypeStruct(\n            dk_accum_shape if dKV_postprocess else k_shape,\n            jnp.float32 if dKV_postprocess else jnp.bfloat16,\n        )\n\n        \u0040cute.jit\n        def launch_bwd(\n            stream: cuda_driver.CUstream,\n            mQ: cute.Tensor,\n            mK: cute.Tensor,\n            mV: cute.Tensor,\n            mdO: cute.Tensor,\n            mLSE: cute.Tensor,\n            mdPsum: cute.Tensor,\n            mMaskCnt: cute.Tensor,\n            mMaskIdx: cute.Tensor,\n            mFullCnt: cute.Tensor,\n            mFullIdx: cute.Tensor,\n            mDiagCnt: cute.Tensor,\n",
+      "source_digest": "24f33258c8c7d6a0646cb1554a39fd4c4da1719cea75efebc8a3f5ae08906289",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 517,
+      "end_line": 541,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    mdO,\n                    mLSE,\n                    mdPsum,\n                    mdQa,\n                    mdKa,\n                    mdVa,\n                    softmax_scale,\n                    blocksparse_tensors=bs,\n                    stream=stream,\n                )\n\n        bwd_call = cutlass_call(\n            launch_bwd,\n            output_shape_dtype=[\n                jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),\n                dkv_out,\n                dkv_out,\n            ],\n            input_output_aliases=(\n                {16: 0, 17: 1, 18: 2} if centered_stats else {14: 0, 15: 1, 16: 2}\n            ),\n            use_static_tensors=False,\n            softmax_scale=cutlass.Float32(sm_scale),\n        )\n\n",
+      "source_digest": "e4a66e1e5b1e5f54dd484d8998901888693c49643aadba73038ed691d6e9e8c7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_candidate_packed_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 19,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport jax\nimport jax.numpy as jnp\nfrom jax.ad_checkpoint import checkpoint_name\n\nfrom xrex.cutedsl.ranker_attention_candidate_only_fa4 import candidate_attention_fwd_bwd\n\n\ndef ranker_attention_varlen_candidate_packed_fa4(\n    q,\n    k,\n    v,\n    sm_scale,\n    block_sparse_layout,\n    valid_block_upper,\n    valid_block_lower,\n    candidate_cu_seqlens,\n    candidate_key_starts,\n",
+      "source_digest": "18c80b6410b5fac4d5f475a34575d873818d950d4497d39db363c24e54bf5212",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_candidate_packed_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 22,
+      "end_line": 46,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "):\n    from xrex.cutedsl.ranker_attention_varlen_fa4 import (\n        varlen_backward,\n        varlen_forward,\n        varlen_kernels,\n    )\n\n    assert q.shape[0] == 1, \"one packed sequence per device\"\n    region_start = int(history_region_len)\n    kernels, bs_args = varlen_kernels(\n        q, k, v, sm_scale, block_sparse_layout, valid_block_upper, valid_block_lower\n    )\n    cand_forward, cand_backward = candidate_attention_fwd_bwd(\n        q[0, region_start:].shape, k[0].shape, candidate_cu_seqlens.shape[0] - 1, sm_scale\n    )\n\n    def candidate_inputs(q, k, v, cand_cu, key_starts, key_counts):\n        keys, values = k[0], v[0]\n        return (\n            q[0, region_start:],\n            keys,\n            values,\n            keys[region_start:],\n            values[region_start:],\n            cand_cu,\n",
+      "source_digest": "db61d2933a06d2ec55f519c0ca5aa2fd4b045cd9d0bc3bddfb81dedf91a41c0c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 606,
+      "end_line": 630,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            )\n            post_threads = 128\n            post_dq_atom_layout = 1\n        dq_accum_shape = (batch_size, num_q_heads, sr_q * hdr)\n        dk_accum_shape = (batch_size, num_kv_heads, sr_k * hdr)\n        dkv_out = jax.ShapeDtypeStruct(\n            dk_accum_shape if dKV_postprocess else k_shape,\n            jnp.float32 if dKV_postprocess else jnp.bfloat16,\n        )\n        bwd_accumulators = [jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32), dkv_out, dkv_out]\n\n        \u0040cute.jit\n        def launch_bwd(\n            stream: cuda_driver.CUstream,\n            mQ,\n            mK,\n            mV,\n            mdO,\n            mLSE,\n            mdPsum,\n            mMaskCnt,\n            mMaskIdx,\n            mFullCnt,\n            mFullIdx,\n            mDiagCnt,\n",
+      "source_digest": "f7aeec154e23155e23c90abae74d63d87c08962b78f3d710c1ee45abecc5d907",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 674,
+      "end_line": 698,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    mdO,\n                    mLSE,\n                    mdPsum,\n                    mdQa,\n                    mdKa,\n                    mdVa,\n                    softmax_scale,\n                    blocksparse_tensors=bs,\n                    stream=stream,\n                )\n\n        bwd_call = cutlass_call(\n            launch_bwd,\n            output_shape_dtype=bwd_accumulators,\n            input_output_aliases=(\n                {16: 0, 17: 1, 18: 2} if centered_stats else {14: 0, 15: 1, 16: 2}\n            ),\n            use_static_tensors=False,\n            softmax_scale=cutlass.Float32(sm_scale),\n        )\n\n        fa_post_dq = FlashAttentionBackwardPostprocess(\n            cutlass.BFloat16,\n            head_dim,\n            arch,\n",
+      "source_digest": "b765bee9a8d4c55f8806d91d4713b4e845d0fd0ea07a7aac74d7a0c5fb69a47e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-695094660c67b2f043cfa7244a103f4686bed8b07afc44ed301a4b68abf7e7ce",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "417c8e3413f12f2babe2d0e8053344b0285fcb2bb8caf15fbbc2f40135fbab8a",
+      "context_complete": true,
+      "task_id": "T-ac51ba17fc9c350b406b03025bad4e7da19123abd2057837ca6c09f946f28912",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b903abf642bccec7bed367d78a6eaf9b569059b925a70d77d75926a689a3caf6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-ba027bc5638e304263f7ce797eb2269ab15352dafe2f8d135e1ef4395714db8d",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f6bdabe98850cea8336e12b43ba91a8af6c9f789cdc39dab346324b5026f533b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-c3bc5841c5f16b42df2bdeeeb4d44415d1dfc0e090a8cb83a3331ea4ed7db1e7",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-85e43b0dcf3f14d044d09ad083b2a7ff0e2ecd5ec6150c6724a09a06295caca3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-9c33f91fbbea95119c9f2fb6b5131734186ffdc971268b173426eb8368f95b0f",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7729c7b6f59c6d182fbfd424f8733b8a2d70cd1e4347a8c39d308ae2c59d566d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-0f7a111972ac1def71ca5febbf4819c53ccf1410e6f4e428c6830e924443a739",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-2caa94db73a1f6517950f3855a9de68d5ecb63177e9407ba9641540107542299",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-fc20c1ca1d24120378c7331828361a5385e02a2c7b6b56352180e353cc825d1f",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9de86ce89c77b7b8e8a603aa3ab36829f0dc82159d47acb301b136c3c0518889",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ae8102d883ea3dc5d174fff358e77fe78948c402b1e7e553131319719c50203",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-23ebc93f311f119568176b6fd46cf284d5dcb0e85b30e2d49e2b60b71c631509",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-a7e4f7031f212d29b6353fe4014918cbee36b843640859662be15a19f5b789ab",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ba52e3e1bb4e00eb761bb71b2ec6ce7cd3e7fb9468adcc679471f87a1c828854",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-a7f04d73bc7b143a8df81c649e9c95b71b0043f297b9c786dd093c1e705fe629",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d119f41875eb791c426be416c492cc2a786b0bec564b8c4a93d544541a462a48",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-12d5b0fad19a9f15fb52530812a2b3eb209c46e5b1c552e06835e9fd61d825e4",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c448620dfe089b755c30c1e3c2e89b2ec22abcc4c544b1343802b8a1c01d8b74",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-ffc0ef7d0d92737013c2be31ba99d3a97d788efb3e1af0c7ecda90e5171653d0",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8f4883bab02549d6768fb0593c25acf8a03e7a23fa57c098409c6e7d432922bf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-db31765346cb46fe859801780a3a3654d5780df761fe4915af20d162c0271f54",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/ranker_attention_candidate_only_fa4.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9382cb733dab402605f0c6ddea22ca71621af8dafa46869c978ef500922ef4d3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "candidate_attention_fwd_bwd",
+        "launch_bwd"
+      ],
+      "context_complete": false,
+      "task_id": "T-e3d11e8bf633ac362b6dc4647589049f17510668d22b0834d10ebe0d04f354a4",
+      "evidence_refs": [
+        "E14"
+      ]
+    }
+  ],
+  "task_id": "T-23f4fabf674d869ac42d88357a022b22526a75f95881e1e5d8069dd269f18431"
+}

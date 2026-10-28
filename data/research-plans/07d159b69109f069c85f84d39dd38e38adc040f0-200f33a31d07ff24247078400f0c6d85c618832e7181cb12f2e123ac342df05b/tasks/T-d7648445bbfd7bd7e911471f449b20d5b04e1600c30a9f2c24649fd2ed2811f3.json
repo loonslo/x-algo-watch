@@ -1,0 +1,781 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/quote.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-44042f2da542653ab8d64f0c6bcab87af2368ab2078b2b90f8cb2ca329d86e89",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 30,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "use crate::hydration::request_context;\nuse crate::metrics::{self as ft_metrics, Rpc};\nuse crate::models::{Decided, Evaluation, EvaluationKey, PlacedCandidate, Placement, Verdict};\nuse crate::post_evaluator::{PostBatch, PostEvaluation, PostEvaluator, UserEvaluation};\nuse crate::retweet;\nuse crate::rules::{QuoteEntries, RuleId, SafetyLevel};\nuse crate::treatment;\nuse std::collections::HashMap;\nuse std::sync::Arc;\nuse tokio::sync::Semaphore;\nuse tokio::time::Instant;\nuse xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;\n\npub(crate) const QUOTE_PASS: &str = \"vf_quote_pass\";\nconst SHED: &str = \"shed\";\nconst MAX_SHADOW_PASSES_IN_FLIGHT: usize = 32;\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub(crate) enum QuotePassMode {\n    Off,\n    Shadow,\n}\n\n#[derive(Clone, Debug, PartialEq, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum PassOutcome {\n    OuterWithheld,\n    OuterAbsent,\n    InnerUnresolved,\n    FailedOpen,\n",
+      "source_digest": "d75deb29dfd31ef357f4b047532afb40efd99d61701f1caa5cd194428efa9b59",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 29,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "use crate::hydration::{request_context, Cause, Unresolved};\nuse crate::metrics::{self as ft_metrics, Rpc};\nuse crate::models::{Decided, Evaluation, EvaluationKey, PlacedCandidate, Placement, Verdict};\nuse crate::post_evaluator::{AuthorJudgement, PostBatch, PostEvaluation, PostEvaluator};\nuse crate::retweet;\nuse crate::rules::{QuoteEntries, RuleId, SafetyLevel};\nuse std::collections::HashMap;\nuse std::sync::Arc;\nuse tokio::sync::Semaphore;\nuse tokio::time::Instant;\nuse xai_x_thrift::safety_result::FilteredReason as ThriftFilteredReason;\n\npub(crate) const QUOTE_PASS: &str = \"vf_quote_pass\";\nconst SHED: &str = \"shed\";\nconst MAX_SHADOW_PASSES_IN_FLIGHT: usize = 32;\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub(crate) enum QuotePassMode {\n    Off,\n    Shadow,\n}\n\n#[derive(Clone, Debug, PartialEq, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum PassOutcome {\n    OuterWithheld,\n    OuterAbsent,\n    InnerUnresolved,\n    FailedOpen,\n",
+      "source_digest": "a11238740134694538c2ebe03614750863ece9d0baca65407059a1ea59c2ca63",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 47,
+      "end_line": 109,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    }\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) struct Rerendered {\n    pub(crate) by: RuleId,\n    pub(crate) reason: &'static ThriftFilteredReason,\n}\n\n#[derive(Clone, Copy, Debug)]\npub(crate) enum QuoteRendering<'a> {\n    Served,\n    Rerendered(&'a Rerendered),\n    Omitted,\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) struct QuotePass {\n    pub(crate) key: EvaluationKey,\n    pub(crate) outcome: PassOutcome,\n    pub(crate) author: Option<Evaluation>,\n}\n\nimpl QuotePass {\n    pub(crate) fn decided_by(\n        &self,\n        served_rule: Option<(SafetyLevel, &'static str)>,\n    ) -> Option<(SafetyLevel, &'static str)> {\n        match self.outcome.rendering() {\n            QuoteRendering::Rerendered(_) => self\n                .author\n                .as_ref()\n                .and_then(|author| treatment::decided_by(author.verdict()))\n                .map(|rule| (SafetyLevel::QuotedTweetRules, rule)),\n            QuoteRendering::Served => served_rule,\n            QuoteRendering::Omitted => None,\n        }\n    }\n}\n\nfn quoted_authors(request: &PostBatch) -> Option<PostBatch> {\n    let quotes: Vec<PlacedCandidate> = request\n        .candidates\n        .iter()\n        .filter(|placed| matches!(placed.placement, Placement::InnerQuoted { .. }))\n        .copied()\n        .collect();\n    (!quotes.is_empty()).then(|| PostBatch {\n        viewer_id: request.viewer_id,\n        country_code: request.country_code.clone(),\n        client_capability: request.client_capability,\n        safety_level: SafetyLevel::QuotedTweetRules,\n        candidates: quotes,\n        rpc: request.rpc,\n    })\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) enum Passes {\n    Skipped,\n    Shed,\n    Ran(Vec<QuotePass>),\n}\n",
+      "source_digest": "83e145d18143653a41c33106e6087cf53b1303272373beed2d7b281e27764cfc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 46,
+      "end_line": 91,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    }\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) struct Rerendered {\n    pub(crate) by: RuleId,\n    pub(crate) reason: &'static ThriftFilteredReason,\n}\n\n#[derive(Clone, Copy, Debug)]\npub(crate) enum QuoteRendering<'a> {\n    Served,\n    Rerendered(&'a Rerendered),\n    Omitted,\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) struct QuotePass {\n    pub(crate) key: EvaluationKey,\n    pub(crate) outcome: PassOutcome,\n    pub(crate) author: Option<Evaluation>,\n}\n\nfn quoted_authors(request: &PostBatch) -> Option<PostBatch> {\n    let quotes: Vec<PlacedCandidate> = request\n        .candidates\n        .iter()\n        .filter(|placed| matches!(placed.placement, Placement::InnerQuoted { .. }))\n        .copied()\n        .collect();\n    (!quotes.is_empty()).then(|| PostBatch {\n        viewer_id: request.viewer_id,\n        country_code: request.country_code.clone(),\n        client_capability: request.client_capability,\n        safety_level: SafetyLevel::QuotedTweetRules,\n        candidates: quotes,\n        rpc: request.rpc,\n    })\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) enum Passes {\n    Skipped,\n    Shed,\n    Ran(Vec<QuotePass>),\n}\n",
+      "source_digest": "5aacadfc128c27844a766a66d8b57131859e4c8ca048fc8c160f2bed75feb916",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 198,
+      "end_line": 244,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            None => Passes::Skipped,\n            Some(authors) => {\n                Passes::Ran(quote_pass(post_evaluator, self.level, authors, outcomes).await)\n            }\n        }\n    }\n}\n\nasync fn quote_pass(\n    post_evaluator: &PostEvaluator,\n    level: SafetyLevel,\n    authors: PostBatch,\n    outcomes: &[PostEvaluation],\n) -> Vec<QuotePass> {\n    let authors = post_evaluator.evaluate_authors(authors).await;\n    let passes = passes(level, outcomes, &authors);\n    record(level, &passes);\n    passes\n}\n\nfn passes(\n    level: SafetyLevel,\n    outcomes: &[PostEvaluation],\n    authors: &HashMap<EvaluationKey, UserEvaluation>,\n) -> Vec<QuotePass> {\n    let outers: HashMap<_, _> = outcomes\n        .iter()\n        .filter(|outcome| outcome.placement == Placement::Standalone)\n        .map(|outcome| (outcome.tweet_id, &outcome.evaluation))\n        .collect();\n    outcomes\n        .iter()\n        .filter_map(|outcome| {\n            let Placement::InnerQuoted { outer } = outcome.placement else {\n                return None;\n            };\n            let author = authors.get(&outcome.key());\n            Some(QuotePass {\n                key: outcome.key(),\n                outcome: pass(\n                    level,\n                    outers.get(&outer).copied(),\n                    &outcome.evaluation,\n                    author,\n                ),\n                author: author.map(|author| author.evaluation.clone()),\n            })\n",
+      "source_digest": "5b498bfc6c8ade8ff10836fcf94a1534e5068e7f6dee7ccb0811b43d12a595a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 180,
+      "end_line": 226,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            None => Passes::Skipped,\n            Some(authors) => {\n                Passes::Ran(quote_pass(post_evaluator, self.level, authors, outcomes).await)\n            }\n        }\n    }\n}\n\nasync fn quote_pass(\n    post_evaluator: &PostEvaluator,\n    level: SafetyLevel,\n    authors: PostBatch,\n    outcomes: &[PostEvaluation],\n) -> Vec<QuotePass> {\n    let authors = post_evaluator.evaluate_authors(authors).await;\n    let passes = passes(level, outcomes, &authors);\n    record(level, &passes);\n    passes\n}\n\nfn passes(\n    level: SafetyLevel,\n    outcomes: &[PostEvaluation],\n    authors: &HashMap<EvaluationKey, AuthorJudgement>,\n) -> Vec<QuotePass> {\n    let outers: HashMap<_, _> = outcomes\n        .iter()\n        .filter(|outcome| outcome.placement == Placement::Standalone)\n        .map(|outcome| (outcome.tweet_id, &outcome.evaluation))\n        .collect();\n    outcomes\n        .iter()\n        .filter_map(|outcome| {\n            let Placement::InnerQuoted { outer } = outcome.placement else {\n                return None;\n            };\n            let author = authors.get(&outcome.key());\n            Some(QuotePass {\n                key: outcome.key(),\n                outcome: pass(\n                    level,\n                    outers.get(&outer).copied(),\n                    &outcome.evaluation,\n                    author,\n                ),\n                author: author.and_then(AuthorJudgement::evaluation),\n            })\n",
+      "source_digest": "34c25cf03c0da3e16c4d898b3df71ea36cd5255c276877d24faa1ad6f6f8cd00",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 220,
+      "end_line": 266,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    outcomes: &[PostEvaluation],\n    authors: &HashMap<EvaluationKey, UserEvaluation>,\n) -> Vec<QuotePass> {\n    let outers: HashMap<_, _> = outcomes\n        .iter()\n        .filter(|outcome| outcome.placement == Placement::Standalone)\n        .map(|outcome| (outcome.tweet_id, &outcome.evaluation))\n        .collect();\n    outcomes\n        .iter()\n        .filter_map(|outcome| {\n            let Placement::InnerQuoted { outer } = outcome.placement else {\n                return None;\n            };\n            let author = authors.get(&outcome.key());\n            Some(QuotePass {\n                key: outcome.key(),\n                outcome: pass(\n                    level,\n                    outers.get(&outer).copied(),\n                    &outcome.evaluation,\n                    author,\n                ),\n                author: author.map(|author| author.evaluation.clone()),\n            })\n        })\n        .collect()\n}\n\nfn pass(\n    level: SafetyLevel,\n    outer: Option<&Evaluation>,\n    inner: &Evaluation,\n    author: Option<&UserEvaluation>,\n) -> PassOutcome {\n    match outer {\n        None => return PassOutcome::OuterAbsent,\n        Some(Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n",
+      "source_digest": "8a3573c881243766e69adeb7f3d6dc200ef32dc8429b92a79fd656f0cc40b7c3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 202,
+      "end_line": 248,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    outcomes: &[PostEvaluation],\n    authors: &HashMap<EvaluationKey, AuthorJudgement>,\n) -> Vec<QuotePass> {\n    let outers: HashMap<_, _> = outcomes\n        .iter()\n        .filter(|outcome| outcome.placement == Placement::Standalone)\n        .map(|outcome| (outcome.tweet_id, &outcome.evaluation))\n        .collect();\n    outcomes\n        .iter()\n        .filter_map(|outcome| {\n            let Placement::InnerQuoted { outer } = outcome.placement else {\n                return None;\n            };\n            let author = authors.get(&outcome.key());\n            Some(QuotePass {\n                key: outcome.key(),\n                outcome: pass(\n                    level,\n                    outers.get(&outer).copied(),\n                    &outcome.evaluation,\n                    author,\n                ),\n                author: author.and_then(AuthorJudgement::evaluation),\n            })\n        })\n        .collect()\n}\n\nfn pass(\n    level: SafetyLevel,\n    outer: Option<&Evaluation>,\n    inner: &Evaluation,\n    author: Option<&AuthorJudgement>,\n) -> PassOutcome {\n    match outer {\n        None => return PassOutcome::OuterAbsent,\n        Some(Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n",
+      "source_digest": "90c8795b7ff7df53bf9601816f5ccc32ebe488727b576dcbd7f3585362f850c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 230,
+      "end_line": 276,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        .filter_map(|outcome| {\n            let Placement::InnerQuoted { outer } = outcome.placement else {\n                return None;\n            };\n            let author = authors.get(&outcome.key());\n            Some(QuotePass {\n                key: outcome.key(),\n                outcome: pass(\n                    level,\n                    outers.get(&outer).copied(),\n                    &outcome.evaluation,\n                    author,\n                ),\n                author: author.map(|author| author.evaluation.clone()),\n            })\n        })\n        .collect()\n}\n\nfn pass(\n    level: SafetyLevel,\n    outer: Option<&Evaluation>,\n    inner: &Evaluation,\n    author: Option<&UserEvaluation>,\n) -> PassOutcome {\n    match outer {\n        None => return PassOutcome::OuterAbsent,\n        Some(Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n            | Evaluation::NotFound(_)\n            | Evaluation::Failed(_),\n        ) => return PassOutcome::OuterWithheld,\n    }\n    match (inner, author, judge(level, author)) {\n        (\n            Evaluation::NotFound(_),\n            Some(_),\n            judged \u0040 (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),\n        ) => judged,\n",
+      "source_digest": "3f6dbbb6d510c1a378d5a6ffcf685c7ae2a48765dd579bff3a5ac81ab8cf1582",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 212,
+      "end_line": 258,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        .filter_map(|outcome| {\n            let Placement::InnerQuoted { outer } = outcome.placement else {\n                return None;\n            };\n            let author = authors.get(&outcome.key());\n            Some(QuotePass {\n                key: outcome.key(),\n                outcome: pass(\n                    level,\n                    outers.get(&outer).copied(),\n                    &outcome.evaluation,\n                    author,\n                ),\n                author: author.and_then(AuthorJudgement::evaluation),\n            })\n        })\n        .collect()\n}\n\nfn pass(\n    level: SafetyLevel,\n    outer: Option<&Evaluation>,\n    inner: &Evaluation,\n    author: Option<&AuthorJudgement>,\n) -> PassOutcome {\n    match outer {\n        None => return PassOutcome::OuterAbsent,\n        Some(Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n            | Evaluation::NotFound(_)\n            | Evaluation::Failed(_),\n        ) => return PassOutcome::OuterWithheld,\n    }\n    match (inner, author, judge(level, author)) {\n        (\n            Evaluation::NotFound(_),\n            Some(\n                AuthorJudgement::Judged(_)\n                | AuthorJudgement::Unresolved(Unresolved {\n",
+      "source_digest": "76800259da4ef1d79abebac4e6d2f2c7273e33cbfd935dc8ca6d26742679d635",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 251,
+      "end_line": 297,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    outer: Option<&Evaluation>,\n    inner: &Evaluation,\n    author: Option<&UserEvaluation>,\n) -> PassOutcome {\n    match outer {\n        None => return PassOutcome::OuterAbsent,\n        Some(Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n            | Evaluation::NotFound(_)\n            | Evaluation::Failed(_),\n        ) => return PassOutcome::OuterWithheld,\n    }\n    match (inner, author, judge(level, author)) {\n        (\n            Evaluation::NotFound(_),\n            Some(_),\n            judged \u0040 (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),\n        ) => judged,\n        (Evaluation::NotFound(_) | Evaluation::Failed(_), _, _) => PassOutcome::InnerUnresolved,\n        (Evaluation::Complete { .. } | Evaluation::Partial { .. }, _, judged) => judged,\n    }\n}\n\nfn judge(level: SafetyLevel, author: Option<&UserEvaluation>) -> PassOutcome {\n    let Some(author) = author.filter(|author| author.failed.is_empty()) else {\n        return PassOutcome::FailedOpen;\n    };\n    match &author.evaluation {\n        Evaluation::Complete {\n            verdict: Verdict::Withheld(Decided { id, .. }),\n            ..\n        } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),\n        Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        } => PassOutcome::Passed,\n        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {\n            PassOutcome::FailedOpen\n        }\n",
+      "source_digest": "1b198c982b8abe3414f406babe241fdb6ef3912e7951adf6e57a0b94d74b84a3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 233,
+      "end_line": 285,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    outer: Option<&Evaluation>,\n    inner: &Evaluation,\n    author: Option<&AuthorJudgement>,\n) -> PassOutcome {\n    match outer {\n        None => return PassOutcome::OuterAbsent,\n        Some(Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n            | Evaluation::NotFound(_)\n            | Evaluation::Failed(_),\n        ) => return PassOutcome::OuterWithheld,\n    }\n    match (inner, author, judge(level, author)) {\n        (\n            Evaluation::NotFound(_),\n            Some(\n                AuthorJudgement::Judged(_)\n                | AuthorJudgement::Unresolved(Unresolved {\n                    cause: Cause::Failed,\n                    ..\n                }),\n            ),\n            judged \u0040 (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),\n        ) => judged,\n        (Evaluation::NotFound(_) | Evaluation::Failed(_), _, _) => PassOutcome::InnerUnresolved,\n        (Evaluation::Complete { .. } | Evaluation::Partial { .. }, _, judged) => judged,\n    }\n}\n\nfn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {\n    let Some(AuthorJudgement::Judged(evaluation)) = author else {\n        return PassOutcome::FailedOpen;\n    };\n    match evaluation {\n        Evaluation::Complete {\n            verdict: Verdict::Withheld(Decided { id, .. }),\n            ..\n        } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),\n        Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        } => PassOutcome::Passed,\n        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {\n            PassOutcome::FailedOpen\n        }\n",
+      "source_digest": "59779de0035aa6bdaa5ff19aad4aa32025f70a07d5391a218e517972e576df50",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 259,
+      "end_line": 309,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            ..\n        }) => {}\n        Some(\n            Evaluation::Complete {\n                verdict: Verdict::Withheld(_),\n                ..\n            }\n            | Evaluation::Partial { .. }\n            | Evaluation::NotFound(_)\n            | Evaluation::Failed(_),\n        ) => return PassOutcome::OuterWithheld,\n    }\n    match (inner, author, judge(level, author)) {\n        (\n            Evaluation::NotFound(_),\n            Some(_),\n            judged \u0040 (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),\n        ) => judged,\n        (Evaluation::NotFound(_) | Evaluation::Failed(_), _, _) => PassOutcome::InnerUnresolved,\n        (Evaluation::Complete { .. } | Evaluation::Partial { .. }, _, judged) => judged,\n    }\n}\n\nfn judge(level: SafetyLevel, author: Option<&UserEvaluation>) -> PassOutcome {\n    let Some(author) = author.filter(|author| author.failed.is_empty()) else {\n        return PassOutcome::FailedOpen;\n    };\n    match &author.evaluation {\n        Evaluation::Complete {\n            verdict: Verdict::Withheld(Decided { id, .. }),\n            ..\n        } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),\n        Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        } => PassOutcome::Passed,\n        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {\n            PassOutcome::FailedOpen\n        }\n    }\n}\n\nfn rerender(level: SafetyLevel, by: RuleId) -> Option<Rerendered> {\n    let QuoteEntries::Judged { rerenders } = level.spec().quote_entries else {\n        return None;\n    };\n    let (_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;\n    Some(Rerendered { by, reason })\n}\n\nfn record(level: SafetyLevel, passes: &[QuotePass]) {\n",
+      "source_digest": "8c1bc6d5214669c688034ff9ab659b6c927ed09594a81817e8d2d1b9f72a13ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 247,
+      "end_line": 297,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            }\n            | Evaluation::Partial { .. }\n            | Evaluation::NotFound(_)\n            | Evaluation::Failed(_),\n        ) => return PassOutcome::OuterWithheld,\n    }\n    match (inner, author, judge(level, author)) {\n        (\n            Evaluation::NotFound(_),\n            Some(\n                AuthorJudgement::Judged(_)\n                | AuthorJudgement::Unresolved(Unresolved {\n                    cause: Cause::Failed,\n                    ..\n                }),\n            ),\n            judged \u0040 (PassOutcome::Dropped(_) | PassOutcome::FailedOpen),\n        ) => judged,\n        (Evaluation::NotFound(_) | Evaluation::Failed(_), _, _) => PassOutcome::InnerUnresolved,\n        (Evaluation::Complete { .. } | Evaluation::Partial { .. }, _, judged) => judged,\n    }\n}\n\nfn judge(level: SafetyLevel, author: Option<&AuthorJudgement>) -> PassOutcome {\n    let Some(AuthorJudgement::Judged(evaluation)) = author else {\n        return PassOutcome::FailedOpen;\n    };\n    match evaluation {\n        Evaluation::Complete {\n            verdict: Verdict::Withheld(Decided { id, .. }),\n            ..\n        } => rerender(level, *id).map_or(PassOutcome::NotRerendered, PassOutcome::Dropped),\n        Evaluation::Complete {\n            verdict: Verdict::Shown { .. },\n            ..\n        } => PassOutcome::Passed,\n        Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => {\n            PassOutcome::FailedOpen\n        }\n    }\n}\n\nfn rerender(level: SafetyLevel, by: RuleId) -> Option<Rerendered> {\n    let QuoteEntries::Judged { rerenders } = level.spec().quote_entries else {\n        return None;\n    };\n    let (_, reason) = rerenders.iter().find(|(id, _)| *id == by)?;\n    Some(Rerendered { by, reason })\n}\n\nfn record(level: SafetyLevel, passes: &[QuotePass]) {\n",
+      "source_digest": "9f68a03c7cecbe26095e4203fd7f1039170f476a54158cc7316c679ef9b45c17",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 318,
+      "end_line": 377,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            count,\n        );\n    }\n    ft_metrics::record_verdicts(\n        Rpc::EvaluateTweets,\n        SafetyLevel::QuotedTweetRules,\n        passes.iter().filter_map(|pass| match pass.outcome {\n            PassOutcome::Dropped(_) | PassOutcome::Passed => {\n                pass.author.as_ref().map(Evaluation::verdict)\n            }\n            PassOutcome::OuterWithheld\n            | PassOutcome::OuterAbsent\n            | PassOutcome::InnerUnresolved\n            | PassOutcome::FailedOpen\n            | PassOutcome::NotRerendered => None,\n        }),\n    );\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::clients::socialgraph_client::Graph;\n    use crate::evaluate_tweets::{EntryComparator, EvaluateTweetsEndpoint};\n    use crate::hydration::fallback_cache::FallbackCaches;\n    use crate::hydration::inventory::Source;\n    use crate::hydration::sources::{suspended, Fault, InMemorySources};\n    use crate::hydration::tweet_fallback_cache;\n    use crate::metrics::thread_recorded;\n    use crate::models::TweetId;\n    use crate::params::limited_actions_copy::LimitedActionsCopy;\n    use crate::params::ClientSwitches;\n    use crate::rules::RuleEngine;\n    use std::time::Duration;\n    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};\n    use tokio::time::timeout;\n    use tonic::Request;\n    use vf_pb::tweet_evaluation::Outcome;\n    use xai_core_entities::entities::{\n        GizmoduckUser, GizmoduckUserResult, Safety, UserResponseState,\n    };\n    use xai_twittercontext_proto::TwitterContextViewer;\n    use xai_visibility_filtering_proto as vf_pb;\n    use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;\n\n    const VIEWER: u64 = 50;\n    const QUOTED_AUTHOR: u64 = 20;\n    const QUOTING_AUTHOR: u64 = 30;\n    const INNER: u64 = 1;\n    const OUTER: u64 = 9;\n\n    struct Captured(UnboundedSender<Passes>);\n\n    impl EntryComparator for Captured {\n        fn compare(\n            &self,\n            _: Option<u64>,\n            _: Option<&TwitterContextViewer>,\n            _: Option<&str>,\n            _: SafetyLevel,\n",
+      "source_digest": "0981bdf56b1aedc9817ad4b142aaa8a0343c975a9f1c27a3092c7afe8c62d943",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 306,
+      "end_line": 363,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            count,\n        );\n    }\n    ft_metrics::record_verdicts(\n        Rpc::EvaluateTweets,\n        SafetyLevel::QuotedTweetRules,\n        passes.iter().filter_map(|pass| match pass.outcome {\n            PassOutcome::Dropped(_) | PassOutcome::Passed => {\n                pass.author.as_ref().map(Evaluation::verdict)\n            }\n            PassOutcome::OuterWithheld\n            | PassOutcome::OuterAbsent\n            | PassOutcome::InnerUnresolved\n            | PassOutcome::FailedOpen\n            | PassOutcome::NotRerendered => None,\n        }),\n    );\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::clients::socialgraph_client::Graph;\n    use crate::evaluate_tweets::EntryComparator;\n    use crate::hydration::fallback_cache::FallbackCaches;\n    use crate::hydration::inventory::Source;\n    use crate::hydration::sources::{suspended, Fault, InMemorySources};\n    use crate::hydration::tweet_fallback_cache;\n    use crate::metrics::thread_recorded;\n    use crate::models::TweetId;\n    use crate::rules::RuleEngine;\n    use crate::scenario::{tweet_data, Wire};\n    use std::time::Duration;\n    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};\n    use tokio::time::timeout;\n    use vf_pb::tweet_evaluation::Outcome;\n    use xai_core_entities::entities::{\n        GizmoduckUser, GizmoduckUserResult, Safety, UserResponseState,\n    };\n    use xai_twittercontext_proto::TwitterContextViewer;\n    use xai_visibility_filtering_proto as vf_pb;\n    use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;\n\n    const VIEWER: u64 = 50;\n    const QUOTED_AUTHOR: u64 = 20;\n    const QUOTING_AUTHOR: u64 = 30;\n    const INNER: u64 = 1;\n    const OUTER: u64 = 9;\n\n    struct Captured(UnboundedSender<Passes>);\n\n    impl EntryComparator for Captured {\n        fn compare(\n            &self,\n            _: Option<u64>,\n            _: Option<&TwitterContextViewer>,\n            _: Option<&str>,\n            _: SafetyLevel,\n",
+      "source_digest": "bc83f380cef145ce2e44ee30e90c1e88ac9a03474a7e79e10518f994d613f8b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 363,
+      "end_line": 427,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    const VIEWER: u64 = 50;\n    const QUOTED_AUTHOR: u64 = 20;\n    const QUOTING_AUTHOR: u64 = 30;\n    const INNER: u64 = 1;\n    const OUTER: u64 = 9;\n\n    struct Captured(UnboundedSender<Passes>);\n\n    impl EntryComparator for Captured {\n        fn compare(\n            &self,\n            _: Option<u64>,\n            _: Option<&TwitterContextViewer>,\n            _: Option<&str>,\n            _: SafetyLevel,\n            _: &[PostEvaluation],\n            quote_passes: &Passes,\n        ) {\n            self.0.send(quote_passes.clone()).unwrap();\n        }\n    }\n\n    struct Served {\n        endpoint: EvaluateTweetsEndpoint,\n        compared: UnboundedReceiver<Passes>,\n    }\n\n    impl Served {\n        fn new(world: Arc<InMemorySources>, caches: FallbackCaches, mode: QuotePassMode) -> Self {\n            let (captured, compared) = unbounded_channel();\n            let endpoint = EvaluateTweetsEndpoint::new(\n                Arc::new(PostEvaluator::new(\n                    world,\n                    RuleEngine::for_tests(),\n                    Arc::new(caches),\n                )),\n                ClientSwitches::for_tests(),\n                LimitedActionsCopy::from_json(\"[]\"),\n                Some(Box::new(Captured(captured))),\n            )\n            .with_quote_pass(mode);\n            Self { endpoint, compared }\n        }\n\n        async fn outcomes(\n            &self,\n            viewer_id: Option<u64>,\n            tweets: Vec<vf_pb::TweetData>,\n        ) -> Vec<Outcome> {\n            self.endpoint\n                .handle(Request::new(vf_pb::EvaluateTweetsRequest {\n                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,\n                    viewer_id,\n                    tweets,\n                }))\n                .await\n                .unwrap()\n                .into_inner()\n                .results\n                .into_iter()\n                .map(|result| result.outcome.unwrap())\n                .collect()\n        }\n\n        async fn compared(&mut self) -> Passes {\n",
+      "source_digest": "d46dd7bbcab1daed3192b47dc3674c1ece101e2cbfe76da4a93b24244bb7f724",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 349,
+      "end_line": 403,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    const VIEWER: u64 = 50;\n    const QUOTED_AUTHOR: u64 = 20;\n    const QUOTING_AUTHOR: u64 = 30;\n    const INNER: u64 = 1;\n    const OUTER: u64 = 9;\n\n    struct Captured(UnboundedSender<Passes>);\n\n    impl EntryComparator for Captured {\n        fn compare(\n            &self,\n            _: Option<u64>,\n            _: Option<&TwitterContextViewer>,\n            _: Option<&str>,\n            _: SafetyLevel,\n            _: &[PostEvaluation],\n            quote_passes: &Passes,\n        ) {\n            self.0.send(quote_passes.clone()).unwrap();\n        }\n    }\n\n    struct Served {\n        wire: Wire,\n        compared: UnboundedReceiver<Passes>,\n    }\n\n    impl Served {\n        fn new(world: Arc<InMemorySources>, caches: FallbackCaches, mode: QuotePassMode) -> Self {\n            let (captured, compared) = unbounded_channel();\n            let wire = Wire::serving(world, caches, Some(Box::new(Captured(captured))), mode);\n            Self { wire, compared }\n        }\n\n        async fn outcomes(\n            &self,\n            viewer_id: Option<u64>,\n            tweets: Vec<vf_pb::TweetData>,\n        ) -> Vec<Outcome> {\n            self.wire\n                .send(vf_pb::EvaluateTweetsRequest {\n                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,\n                    viewer_id,\n                    tweets,\n                })\n                .await\n                .unwrap()\n        }\n\n        async fn compared(&mut self) -> Passes {\n            timeout(Duration::from_secs(5), self.compared.recv())\n                .await\n                .expect(\"the comparator hears of every request\")\n                .unwrap()\n        }\n",
+      "source_digest": "fbffe370663dcbc70bec2a667ce259cfaf922f05b5c69b4eb827f3ac379ecca0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 389,
+      "end_line": 447,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "\n    impl Served {\n        fn new(world: Arc<InMemorySources>, caches: FallbackCaches, mode: QuotePassMode) -> Self {\n            let (captured, compared) = unbounded_channel();\n            let endpoint = EvaluateTweetsEndpoint::new(\n                Arc::new(PostEvaluator::new(\n                    world,\n                    RuleEngine::for_tests(),\n                    Arc::new(caches),\n                )),\n                ClientSwitches::for_tests(),\n                LimitedActionsCopy::from_json(\"[]\"),\n                Some(Box::new(Captured(captured))),\n            )\n            .with_quote_pass(mode);\n            Self { endpoint, compared }\n        }\n\n        async fn outcomes(\n            &self,\n            viewer_id: Option<u64>,\n            tweets: Vec<vf_pb::TweetData>,\n        ) -> Vec<Outcome> {\n            self.endpoint\n                .handle(Request::new(vf_pb::EvaluateTweetsRequest {\n                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,\n                    viewer_id,\n                    tweets,\n                }))\n                .await\n                .unwrap()\n                .into_inner()\n                .results\n                .into_iter()\n                .map(|result| result.outcome.unwrap())\n                .collect()\n        }\n\n        async fn compared(&mut self) -> Passes {\n            timeout(Duration::from_secs(5), self.compared.recv())\n                .await\n                .expect(\"the comparator hears of every request\")\n                .unwrap()\n        }\n\n        async fn serve(\n            &mut self,\n            viewer_id: Option<u64>,\n            tweets: Vec<vf_pb::TweetData>,\n        ) -> (Vec<Outcome>, Vec<QuotePass>) {\n            let outcomes = self.outcomes(viewer_id, tweets).await;\n            (outcomes, self.compared().await.ran().to_vec())\n        }\n    }\n\n    fn author(safety: Safety) -> GizmoduckUserResult {\n        GizmoduckUserResult {\n            user: Some(GizmoduckUser {\n                safety,\n",
+      "source_digest": "994bc22c56a42d1e07051c9bc8fa8e198c97664bc7d5c07ef44a41e243c609b4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 365,
+      "end_line": 418,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            quote_passes: &Passes,\n        ) {\n            self.0.send(quote_passes.clone()).unwrap();\n        }\n    }\n\n    struct Served {\n        wire: Wire,\n        compared: UnboundedReceiver<Passes>,\n    }\n\n    impl Served {\n        fn new(world: Arc<InMemorySources>, caches: FallbackCaches, mode: QuotePassMode) -> Self {\n            let (captured, compared) = unbounded_channel();\n            let wire = Wire::serving(world, caches, Some(Box::new(Captured(captured))), mode);\n            Self { wire, compared }\n        }\n\n        async fn outcomes(\n            &self,\n            viewer_id: Option<u64>,\n            tweets: Vec<vf_pb::TweetData>,\n        ) -> Vec<Outcome> {\n            self.wire\n                .send(vf_pb::EvaluateTweetsRequest {\n                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,\n                    viewer_id,\n                    tweets,\n                })\n                .await\n                .unwrap()\n        }\n\n        async fn compared(&mut self) -> Passes {\n            timeout(Duration::from_secs(5), self.compared.recv())\n                .await\n                .expect(\"the comparator hears of every request\")\n                .unwrap()\n        }\n\n        async fn serve(\n            &mut self,\n            viewer_id: Option<u64>,\n            tweets: Vec<vf_pb::TweetData>,\n        ) -> (Vec<Outcome>, Vec<QuotePass>) {\n            let outcomes = self.outcomes(viewer_id, tweets).await;\n            (outcomes, self.compared().await.ran().to_vec())\n        }\n    }\n\n    fn author(safety: Safety) -> GizmoduckUserResult {\n        GizmoduckUserResult {\n            user: Some(GizmoduckUser {\n                safety,\n",
+      "source_digest": "e2de85ec6b293a23c45f6fd21cf01a475ca6bb01a50e9c48c78d35ff85e37f50",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 459,
+      "end_line": 514,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    }\n\n    fn world() -> InMemorySources {\n        InMemorySources::default()\n            .tweet(INNER, QUOTED_AUTHOR)\n            .tweet(OUTER, QUOTING_AUTHOR)\n            .authors(&[QUOTED_AUTHOR, QUOTING_AUTHOR])\n    }\n\n    fn deleted_inner() -> InMemorySources {\n        InMemorySources::default()\n            .tweet(OUTER, QUOTING_AUTHOR)\n            .quote(OUTER, INNER, QUOTED_AUTHOR)\n            .authors(&[QUOTED_AUTHOR, QUOTING_AUTHOR])\n    }\n\n    fn live_inner_of_a_not_found_author() -> InMemorySources {\n        InMemorySources::default()\n            .tweet(INNER, QUOTED_AUTHOR)\n            .tweet(OUTER, QUOTING_AUTHOR)\n            .authors(&[QUOTING_AUTHOR])\n    }\n\n    fn entry(tweet_id: u64, outer_tweet_id: Option<u64>) -> vf_pb::TweetData {\n        vf_pb::TweetData {\n            tweet_id,\n            quote_context: outer_tweet_id\n                .map(|outer_tweet_id| vf_pb::QuoteContext { outer_tweet_id }),\n        }\n    }\n\n    fn quote_with_outer() -> Vec<vf_pb::TweetData> {\n        vec![entry(OUTER, None), entry(INNER, Some(OUTER))]\n    }\n\n    async fn serve(\n        world: Arc<InMemorySources>,\n        mode: QuotePassMode,\n        viewer_id: Option<u64>,\n        tweets: Vec<vf_pb::TweetData>,\n    ) -> (Vec<Outcome>, Vec<QuotePass>) {\n        Served::new(world, FallbackCaches::default(), mode)\n            .serve(viewer_id, tweets)\n            .await\n    }\n\n    fn dropped(rule: &str, reason: ThriftFilteredReason) -> PassOutcome {\n        PassOutcome::Dropped(Rerendered {\n            by: RuleId::of_rule_name(rule).unwrap(),\n            reason: Box::leak(Box::new(reason)),\n        })\n    }\n\n    fn erased_drop() -> PassOutcome {\n        dropped(\n            \"erased_author/drop/inactive\",\n",
+      "source_digest": "44de71b6bf9bfcaa17ac9180534ef83595b83d23d0b2d1785235a953833dc884",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 430,
+      "end_line": 477,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    }\n\n    fn world() -> InMemorySources {\n        InMemorySources::default()\n            .tweet(INNER, QUOTED_AUTHOR)\n            .tweet(OUTER, QUOTING_AUTHOR)\n            .authors(&[QUOTED_AUTHOR, QUOTING_AUTHOR])\n    }\n\n    fn deleted_inner() -> InMemorySources {\n        InMemorySources::default()\n            .tweet(OUTER, QUOTING_AUTHOR)\n            .quote(OUTER, INNER, QUOTED_AUTHOR)\n            .authors(&[QUOTED_AUTHOR, QUOTING_AUTHOR])\n    }\n\n    fn live_inner_of_a_not_found_author() -> InMemorySources {\n        InMemorySources::default()\n            .tweet(INNER, QUOTED_AUTHOR)\n            .tweet(OUTER, QUOTING_AUTHOR)\n            .authors(&[QUOTING_AUTHOR])\n    }\n\n    fn quote_with_outer() -> Vec<vf_pb::TweetData> {\n        vec![tweet_data(OUTER, None), tweet_data(INNER, Some(OUTER))]\n    }\n\n    async fn serve(\n        world: Arc<InMemorySources>,\n        mode: QuotePassMode,\n        viewer_id: Option<u64>,\n        tweets: Vec<vf_pb::TweetData>,\n    ) -> (Vec<Outcome>, Vec<QuotePass>) {\n        Served::new(world, FallbackCaches::default(), mode)\n            .serve(viewer_id, tweets)\n            .await\n    }\n\n    fn dropped(rule: &str, reason: ThriftFilteredReason) -> PassOutcome {\n        PassOutcome::Dropped(Rerendered {\n            by: RuleId::of_rule_name(rule).unwrap(),\n            reason: Box::leak(Box::new(reason)),\n        })\n    }\n\n    fn erased_drop() -> PassOutcome {\n        dropped(\n            \"erased_author/drop/inactive\",\n",
+      "source_digest": "c3b1e671e8a2234e67bfae85667c9dee53519028cb95dd7813d7d2707edc247a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 496,
+      "end_line": 549,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        mode: QuotePassMode,\n        viewer_id: Option<u64>,\n        tweets: Vec<vf_pb::TweetData>,\n    ) -> (Vec<Outcome>, Vec<QuotePass>) {\n        Served::new(world, FallbackCaches::default(), mode)\n            .serve(viewer_id, tweets)\n            .await\n    }\n\n    fn dropped(rule: &str, reason: ThriftFilteredReason) -> PassOutcome {\n        PassOutcome::Dropped(Rerendered {\n            by: RuleId::of_rule_name(rule).unwrap(),\n            reason: Box::leak(Box::new(reason)),\n        })\n    }\n\n    fn erased_drop() -> PassOutcome {\n        dropped(\n            \"erased_author/drop/inactive\",\n            ThriftFilteredReason::AuthorIsDeactivated(true),\n        )\n    }\n\n    #[tokio::test]\n    async fn the_shadow_pass_judges_the_outer_first_then_the_quoted_author_and_serves_as_off() {\n        let quote = || EvaluationKey {\n            tweet_id: TweetId(INNER),\n            placement: Placement::InnerQuoted {\n                outer: TweetId(OUTER),\n            },\n        };\n        let deactivated = Safety {\n            deactivated: true,\n            ..Default::default()\n        };\n        let erased = Safety {\n            erased: true,\n            ..Default::default()\n        };\n        let offboarded = Safety {\n            offboarded: true,\n            ..Default::default()\n        };\n        let cases = [\n            (\n                \"passed\",\n                Some(VIEWER),\n                world(),\n                quote_with_outer(),\n                PassOutcome::Passed,\n            ),\n            (\n                \"deactivated\",\n                Some(VIEWER),\n",
+      "source_digest": "c2649485b6748d71b0d3dda4be94f0e7573d5ba3b0ec6cd6040744afb6fa4de4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 459,
+      "end_line": 523,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        mode: QuotePassMode,\n        viewer_id: Option<u64>,\n        tweets: Vec<vf_pb::TweetData>,\n    ) -> (Vec<Outcome>, Vec<QuotePass>) {\n        Served::new(world, FallbackCaches::default(), mode)\n            .serve(viewer_id, tweets)\n            .await\n    }\n\n    fn dropped(rule: &str, reason: ThriftFilteredReason) -> PassOutcome {\n        PassOutcome::Dropped(Rerendered {\n            by: RuleId::of_rule_name(rule).unwrap(),\n            reason: Box::leak(Box::new(reason)),\n        })\n    }\n\n    fn erased_drop() -> PassOutcome {\n        dropped(\n            \"erased_author/drop/inactive\",\n            ThriftFilteredReason::AuthorIsDeactivated(true),\n        )\n    }\n\n    struct PassCase {\n        name: &'static str,\n        viewer_id: Option<u64>,\n        world: InMemorySources,\n        tweets: Vec<vf_pb::TweetData>,\n        outcome: PassOutcome,\n    }\n\n    fn case(name: &'static str, world: InMemorySources, outcome: PassOutcome) -> PassCase {\n        PassCase {\n            name,\n            viewer_id: Some(VIEWER),\n            world,\n            tweets: quote_with_outer(),\n            outcome,\n        }\n    }\n\n    fn pass_cases() -> Vec<PassCase> {\n        let deactivated = Safety {\n            deactivated: true,\n            ..Default::default()\n        };\n        let erased = Safety {\n            erased: true,\n            ..Default::default()\n        };\n        let offboarded = Safety {\n            offboarded: true,\n            ..Default::default()\n        };\n        vec![\n            case(\"passed\", world(), PassOutcome::Passed),\n            case(\n                \"deactivated\",\n                world().user(QUOTED_AUTHOR, author(deactivated.clone())),\n                dropped(\n                    \"deactivated_author/drop\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            case(\n",
+      "source_digest": "781ce41ee743a5419f5f46c799f463c5f907be9dcfe2ed4c36532b2da11fda57",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 516,
+      "end_line": 745,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        )\n    }\n\n    #[tokio::test]\n    async fn the_shadow_pass_judges_the_outer_first_then_the_quoted_author_and_serves_as_off() {\n        let quote = || EvaluationKey {\n            tweet_id: TweetId(INNER),\n            placement: Placement::InnerQuoted {\n                outer: TweetId(OUTER),\n            },\n        };\n        let deactivated = Safety {\n            deactivated: true,\n            ..Default::default()\n        };\n        let erased = Safety {\n            erased: true,\n            ..Default::default()\n        };\n        let offboarded = Safety {\n            offboarded: true,\n            ..Default::default()\n        };\n        let cases = [\n            (\n                \"passed\",\n                Some(VIEWER),\n                world(),\n                quote_with_outer(),\n                PassOutcome::Passed,\n            ),\n            (\n                \"deactivated\",\n                Some(VIEWER),\n                world().user(QUOTED_AUTHOR, author(deactivated.clone())),\n                quote_with_outer(),\n                dropped(\n                    \"deactivated_author/drop\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            (\n                \"erased\",\n                Some(VIEWER),\n                world().user(QUOTED_AUTHOR, author(erased)),\n                quote_with_outer(),\n                dropped(\n                    \"erased_author/drop/inactive\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            (\n                \"offboarded\",\n                Some(VIEWER),\n                world().user(QUOTED_AUTHOR, author(offboarded)),\n                quote_with_outer(),\n                dropped(\n                    \"offboarded_author/drop/inactive\",\n                    ThriftFilteredReason::AuthorAccountIsInactive(true),\n                ),\n            ),\n            (\n                \"suspended\",\n                Some(VIEWER),\n                world().user(QUOTED_AUTHOR, suspended()),\n                quote_with_outer(),\n                dropped(\n                    \"suspended_author/drop\",\n                    ThriftFilteredReason::AuthorIsSuspended(true),\n                ),\n            ),\n            (\n                \"quoted author blocks quoting author\",\n                Some(VIEWER),\n                world().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),\n                quote_with_outer(),\n                dropped(\n                    \"quoted_author_blocks_quoting_author/drop/author_block_viewer\",\n                    ThriftFilteredReason::AuthorBlockViewer(true),\n                ),\n            ),\n            (\n                \"viewer blocks author\",\n                Some(VIEWER),\n                world().edge(Graph::Blocks, VIEWER, QUOTED_AUTHOR),\n                quote_with_outer(),\n                dropped(\n                    \"viewer_blocks_author/drop\",\n                    ThriftFilteredReason::UnspecifiedReason(true),\n                ),\n            ),\n            (\n                \"viewer mutes author\",\n                Some(VIEWER),\n                world().edge(Graph::Mutes, VIEWER, QUOTED_AUTHOR),\n                quote_with_outer(),\n                dropped(\n                    \"quoted_viewer_mutes_author_not_following/drop\",\n                    ThriftFilteredReason::UnspecifiedReason(true),\n                ),\n            ),\n            (\n                \"protected\",\n                Some(VIEWER),\n                world().user(QUOTED_AUTHOR, protected()),\n                quote_with_outer(),\n                dropped(\n                    \"protected_quoted_author/drop\",\n                    ThriftFilteredReason::AuthorIsProtected(true),\n                ),\n            ),\n            (\n                \"outer withheld\",\n                Some(VIEWER),\n                world().user(QUOTING_AUTHOR, suspended()),\n                quote_with_outer(),\n                PassOutcome::OuterWithheld,\n            ),\n            (\n                \"outer not found\",\n                Some(VIEWER),\n                InMemorySources::default()\n                    .tweet(INNER, QUOTED_AUTHOR)\n                    .authors(&[QUOTED_AUTHOR]),\n                quote_with_outer(),\n                PassOutcome::OuterWithheld,\n            ),\n            (\n                \"outer failed\",\n                Some(VIEWER),\n                world().fail_key(Source::TesPureCoreData, OUTER),\n                quote_with_outer(),\n                PassOutcome::OuterWithheld,\n            ),\n            (\n                \"outer absent\",\n                Some(VIEWER),\n                world().user(QUOTED_AUTHOR, suspended()),\n                vec![entry(INNER, Some(OUTER))],\n                PassOutcome::OuterAbsent,\n            ),\n            (\n                \"inner deleted\",\n                Some(VIEWER),\n                InMemorySources::default()\n                    .tweet(OUTER, QUOTING_AUTHOR)\n                    .authors(&[QUOTING_AUTHOR]),\n                quote_with_outer(),\n                PassOutcome::InnerUnresolved,\n            ),\n            (\n                \"deleted inner whose author blocks the quoting author\",\n                Some(VIEWER),\n                deleted_inner().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),\n                quote_with_outer(),\n                dropped(\n                    \"quoted_author_blocks_quoting_author/drop/author_block_viewer\",\n                    ThriftFilteredReason::AuthorBlockViewer(true),\n                ),\n            ),\n            (\n                \"deleted inner of a deactivated author\",\n                Some(VIEWER),\n                deleted_inner().user(QUOTED_AUTHOR, author(deactivated)),\n                quote_with_outer(),\n                dropped(\n                    \"deactivated_author/drop\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            (\n                \"deleted inner of a protected author\",\n                Some(VIEWER),\n                deleted_inner().user(QUOTED_AUTHOR, protected()),\n                quote_with_outer(),\n                dropped(\n                    \"protected_quoted_author/drop\",\n                    ThriftFilteredReason::AuthorIsProtected(true),\n                ),\n            ),\n            (\n                \"deleted inner whose author level 65 does not drop\",\n                Some(VIEWER),\n                deleted_inner(),\n                quote_with_outer(),\n                PassOutcome::InnerUnresolved,\n            ),\n            (\n                \"deleted inner of a not-found author\",\n                Some(VIEWER),\n                InMemorySources::default()\n                    .tweet(OUTER, QUOTING_AUTHOR)\n                    .quote(OUTER, INNER, QUOTED_AUTHOR)\n                    .authors(&[QUOTING_AUTHOR]),\n                quote_with_outer(),\n                erased_drop(),\n            ),\n            (\n                \"live inner of a not-found author\",\n                Some(VIEWER),\n                live_inner_of_a_not_found_author(),\n                quote_with_outer(),\n                erased_drop(),\n            ),\n            (\n                \"live inner of a soft user\",\n                Some(VIEWER),\n                world().user(\n                    QUOTED_AUTHOR,\n                    GizmoduckUserResult {\n                        user: None,\n                        response_state: Some(UserResponseState::SoftUser),\n                    },\n                ),\n                quote_with_outer(),\n                erased_drop(),\n            ),\n            (\n                \"deleted inner whose author lookup failed\",\n                Some(VIEWER),\n                deleted_inner().fail_key(Source::GizmoduckAuthor, QUOTED_AUTHOR),\n                quote_with_outer(),\n                PassOutcome::FailedOpen,\n            ),\n            (\n                \"live inner whose author lookup failed\",\n                Some(VIEWER),\n                world().fail_key(Source::GizmoduckAuthor, QUOTED_AUTHOR),\n                quote_with_outer(),\n                PassOutcome::InnerUnresolved,\n",
+      "source_digest": "ccc4116ed8c20a2963e8c7da23ba392cee6250f60d1716549be6ebd08d108fcc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "visibility-filtering/quote.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 490,
+      "end_line": 677,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    fn case(name: &'static str, world: InMemorySources, outcome: PassOutcome) -> PassCase {\n        PassCase {\n            name,\n            viewer_id: Some(VIEWER),\n            world,\n            tweets: quote_with_outer(),\n            outcome,\n        }\n    }\n\n    fn pass_cases() -> Vec<PassCase> {\n        let deactivated = Safety {\n            deactivated: true,\n            ..Default::default()\n        };\n        let erased = Safety {\n            erased: true,\n            ..Default::default()\n        };\n        let offboarded = Safety {\n            offboarded: true,\n            ..Default::default()\n        };\n        vec![\n            case(\"passed\", world(), PassOutcome::Passed),\n            case(\n                \"deactivated\",\n                world().user(QUOTED_AUTHOR, author(deactivated.clone())),\n                dropped(\n                    \"deactivated_author/drop\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            case(\n                \"erased\",\n                world().user(QUOTED_AUTHOR, author(erased)),\n                dropped(\n                    \"erased_author/drop/inactive\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            case(\n                \"offboarded\",\n                world().user(QUOTED_AUTHOR, author(offboarded)),\n                dropped(\n                    \"offboarded_author/drop/inactive\",\n                    ThriftFilteredReason::AuthorAccountIsInactive(true),\n                ),\n            ),\n            case(\n                \"suspended\",\n                world().user(QUOTED_AUTHOR, suspended()),\n                dropped(\n                    \"suspended_author/drop\",\n                    ThriftFilteredReason::AuthorIsSuspended(true),\n                ),\n            ),\n            case(\n                \"quoted author blocks quoting author\",\n                world().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),\n                dropped(\n                    \"quoted_author_blocks_quoting_author/drop/author_block_viewer\",\n                    ThriftFilteredReason::AuthorBlockViewer(true),\n                ),\n            ),\n            case(\n                \"viewer blocks author\",\n                world().edge(Graph::Blocks, VIEWER, QUOTED_AUTHOR),\n                dropped(\n                    \"viewer_blocks_author/drop\",\n                    ThriftFilteredReason::UnspecifiedReason(true),\n                ),\n            ),\n            case(\n                \"viewer mutes author\",\n                world().edge(Graph::Mutes, VIEWER, QUOTED_AUTHOR),\n                dropped(\n                    \"quoted_viewer_mutes_author_not_following/drop\",\n                    ThriftFilteredReason::UnspecifiedReason(true),\n                ),\n            ),\n            case(\n                \"protected\",\n                world().user(QUOTED_AUTHOR, protected()),\n                dropped(\n                    \"protected_quoted_author/drop\",\n                    ThriftFilteredReason::AuthorIsProtected(true),\n                ),\n            ),\n            case(\n                \"outer withheld\",\n                world().user(QUOTING_AUTHOR, suspended()),\n                PassOutcome::OuterWithheld,\n            ),\n            case(\n                \"outer not found\",\n                InMemorySources::default()\n                    .tweet(INNER, QUOTED_AUTHOR)\n                    .authors(&[QUOTED_AUTHOR]),\n                PassOutcome::OuterWithheld,\n            ),\n            case(\n                \"outer failed\",\n                world().fail_key(Source::TesPureCoreData, OUTER),\n                PassOutcome::OuterWithheld,\n            ),\n            PassCase {\n                tweets: vec![tweet_data(INNER, Some(OUTER))],\n                ..case(\n                    \"outer absent\",\n                    world().user(QUOTED_AUTHOR, suspended()),\n                    PassOutcome::OuterAbsent,\n                )\n            },\n            case(\n                \"inner deleted\",\n                InMemorySources::default()\n                    .tweet(OUTER, QUOTING_AUTHOR)\n                    .authors(&[QUOTING_AUTHOR]),\n                PassOutcome::InnerUnresolved,\n            ),\n            case(\n                \"deleted inner whose author blocks the quoting author\",\n                deleted_inner().edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR),\n                dropped(\n                    \"quoted_author_blocks_quoting_author/drop/author_block_viewer\",\n                    ThriftFilteredReason::AuthorBlockViewer(true),\n                ),\n            ),\n            case(\n                \"deleted inner of a deactivated author\",\n                deleted_inner().user(QUOTED_AUTHOR, author(deactivated)),\n                dropped(\n                    \"deactivated_author/drop\",\n                    ThriftFilteredReason::AuthorIsDeactivated(true),\n                ),\n            ),\n            case(\n                \"deleted inner of a protected author\",\n                deleted_inner().user(QUOTED_AUTHOR, protected()),\n                dropped(\n                    \"protected_quoted_author/drop\",\n                    ThriftFilteredReason::AuthorIsProtected(true),\n                ),\n            ),\n            case(\n                \"deleted inner whose author level 65 does not drop\",\n                deleted_inner(),\n                PassOutcome::InnerUnresolved,\n            ),\n            case(\n                \"deleted inner of a not-found author\",\n                InMemorySources::default()\n                    .tweet(OUTER, QUOTING_AUTHOR)\n                    .quote(OUTER, INNER, QUOTED_AUTHOR)\n                    .authors(&[QUOTING_AUTHOR]),\n                erased_drop(),\n            ),\n            case(\n                \"live inner of a not-found author\",\n                live_inner_of_a_not_found_author(),\n                erased_drop(),\n            ),\n            case(\n                \"live inner of a soft user\",\n                world().user(\n                    QUOTED_AUTHOR,\n                    GizmoduckUserResult {\n                        user: None,\n                        response_state: Some(UserResponseState::SoftUser),\n                    },\n                ),\n                erased_drop(),\n            ),\n            case(\n                \"deleted inner whose author lookup failed\",\n                deleted_inner().fail_key(Source::GizmoduckAuthor, QUOTED_AUTHOR),\n                PassOutcome::FailedOpen,\n            ),\n            case(\n                \"live inner whose author lookup failed\",\n                world().fail_key(Source::GizmoduckAuthor, QUOTED_AUTHOR),\n                PassOutcome::InnerUnresolved,\n            ),\n            case(\n                \"deleted inner whose outer's quoted tweet lookup failed\",\n                deleted_inner()\n                    .edge(Graph::Blocks, QUOTED_AUTHOR, QUOTING_AUTHOR)\n",
+      "source_digest": "d197b3c78cd4772bf0146dc7e095afd86e14356bbdcb92ee1c322fe3eae1141d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-44042f2da542653ab8d64f0c6bcab87af2368ab2078b2b90f8cb2ca329d86e89",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 1,
+      "part": 1,
+      "change_range": {
+        "before_start": 1,
+        "before_count": 10,
+        "after_start": 1,
+        "after_count": 9
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-9022320a7f1d60e39ee15fcf8872e21e1a45ee2443bc8a031da6edcaff55b97e",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-73b38ec0bf731943b1439ffd7eb46dca6721e598ae1bffb29ebdbc91c9a26518",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 2,
+      "part": 1,
+      "change_range": {
+        "before_start": 67,
+        "before_count": 23,
+        "after_start": 66,
+        "after_count": 6
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-f8cef4143bc462db0dfbfa30cc5ea131ac3b5ceaa6a53782b2ab951d6a77b12c",
+      "evidence_refs": [
+        "E3",
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f7193214054bedb69c4103b9b5c574f33ba2db3082acaea5f135fdbf49605f56",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 3,
+      "part": 1,
+      "change_range": {
+        "before_start": 218,
+        "before_count": 7,
+        "after_start": 200,
+        "after_count": 7
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-5e231769d453bc8276ac951f6ba767158bc5a56febf424da847c705ad122567f",
+      "evidence_refs": [
+        "E5",
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dc2917afa7ea13d2b83366faa00ef49c640ef4c458ddc0a8ccd645c9c9b55a8c",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 4,
+      "part": 1,
+      "change_range": {
+        "before_start": 240,
+        "before_count": 7,
+        "after_start": 222,
+        "after_count": 7
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-8a612362f928675af5f74a023fea268a9698272b33736f3d839f60df77f50bce",
+      "evidence_refs": [
+        "E7",
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fc17309d83701d49965ee0fa4ca0d37e2f1ab26adace0ac821b237be12dcd7b4",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 5,
+      "part": 1,
+      "change_range": {
+        "before_start": 250,
+        "before_count": 7,
+        "after_start": 232,
+        "after_count": 7
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-aa85be8d4d827d0d306770ed9a78710e98f1a1ebbae49e906a7eb42f157cf41e",
+      "evidence_refs": [
+        "E9",
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6f6aad17dc5412a12966905d7417ca0a626dfc14dc280cc3473cb940e2f7b5b0",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 6,
+      "part": 1,
+      "change_range": {
+        "before_start": 271,
+        "before_count": 7,
+        "after_start": 253,
+        "after_count": 13
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-3f08389de36d63c7574fc20675cb6d8fb9d743748b6bd7ef8f646ec93670ea6e",
+      "evidence_refs": [
+        "E11",
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-71d9da5dbcc658a02fceedc215e2f00af6796c2ece00c1cadaf6ff88abd7c4cc",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 7,
+      "part": 1,
+      "change_range": {
+        "before_start": 279,
+        "before_count": 11,
+        "after_start": 267,
+        "after_count": 11
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-d0deec727bdcf35612bbda8c6720e2b4100cbbacfc895699c1bd6de67dfd2f09",
+      "evidence_refs": [
+        "E13",
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8100ae54a59650eb73b40ca29d67e1f54c0697070e54dc78957a02c042030af5",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 8,
+      "part": 1,
+      "change_range": {
+        "before_start": 338,
+        "before_count": 20,
+        "after_start": 326,
+        "after_count": 18
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-fd845574fe9d03d51485fa751917c492c482781de412c9700f34d596cfb6349a",
+      "evidence_refs": [
+        "E15",
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6aaef1cbbeeaa3aa3410ce28c62d7c99d2af84ce434122bcc23b193d4820031b",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 9,
+      "part": 1,
+      "change_range": {
+        "before_start": 383,
+        "before_count": 25,
+        "after_start": 369,
+        "after_count": 15
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-92896885d5e78bac250a4e7580bfa616051f7b66cc42bbe670d1f055ced751d3",
+      "evidence_refs": [
+        "E17",
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f26c6ff7d7142ec51d8413044d9dc8e7ef8fe251cf3d95955ca3427fef1e9a21",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 10,
+      "part": 1,
+      "change_range": {
+        "before_start": 409,
+        "before_count": 19,
+        "after_start": 385,
+        "after_count": 14
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-7d0386f9152355738eab947e69d1dba789ddc6bef9717ae9f3fcfa422678c7ea",
+      "evidence_refs": [
+        "E19",
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b73251552591ed4f48d821aee12f9203ce0cd4e66ffe0290d8a9fcb16ada63f",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 11,
+      "part": 1,
+      "change_range": {
+        "before_start": 479,
+        "before_count": 16,
+        "after_start": 450,
+        "after_count": 8
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-9c672c48dfb45172de6e6acde13a4f37367c0ff86841e0148c07e3f9f255cfee",
+      "evidence_refs": [
+        "E21",
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-435dccfb96e355bb6f5a6e34851939cb39a1e36358f6f34b0e34bff39ade9be8",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 12,
+      "part": 1,
+      "change_range": {
+        "before_start": 516,
+        "before_count": 14,
+        "after_start": 479,
+        "after_count": 25
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-022652b8920458672f31a37119630e17004498bf0de450eee2bfd5be817dc977",
+      "evidence_refs": [
+        "E23",
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/quote.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b3092d9be786a9def58409e98dda4a6bebaae43c8041bdca39039685a7fd1f77",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 13,
+      "part": 1,
+      "change_range": {
+        "before_start": 536,
+        "before_count": 190,
+        "after_start": 510,
+        "after_count": 148
+      },
+      "diff_digest": "25db961aaa2bbf9f36bd5d584b0b7c1a05f4df4e70eda4d08123dc1a2ebb6f94",
+      "task_id": "T-583c70f60bf919053bfcda494762e6034f017ac1a94f377844f651a4f4565594",
+      "evidence_refs": [
+        "E25",
+        "E26"
+      ]
+    }
+  ],
+  "task_id": "T-d7648445bbfd7bd7e911471f449b20d5b04e1600c30a9f2c24649fd2ed2811f3"
+}

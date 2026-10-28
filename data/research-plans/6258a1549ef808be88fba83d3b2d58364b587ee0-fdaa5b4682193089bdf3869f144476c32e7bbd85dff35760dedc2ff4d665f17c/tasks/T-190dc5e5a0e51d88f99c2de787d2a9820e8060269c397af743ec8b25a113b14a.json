@@ -1,0 +1,651 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/utils/gpu.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-b425502aebc0986a67f23ce96529a9d6c43b62cfe042c1eb2287a8018915eb97",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/utils/gpu.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 295,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport ctypes\nimport logging\nimport os\nimport re\nimport subprocess\nfrom ctypes import byref, c_int, c_size_t\nfrom enum import Enum\nfrom functools import cache\n\nfrom xrex.utils import cluster\n\nlogger = logging.getLogger(__name__)\nrank_logger = logging.getLogger(\"rank\")\n\n\nclass GpuArch(Enum):\n    UNKNOWN = 0\n    CPU = 1\n    A100 = 2\n    H100 = 3\n    H200 = 4\n    GB200 = 5\n    GB300 = 6\n\n\ndef string_to_gpu_arch(arch_str: str) -> GpuArch:\n    arch_str = arch_str.upper()\n    if \"H100\" in arch_str or not arch_str:\n        return GpuArch.H100\n    if \"H200\" in arch_str:\n        return GpuArch.H200\n    if \"A100\" in arch_str:\n        return GpuArch.A100\n    if \"GB200\" in arch_str:\n        return GpuArch.GB200\n    if \"GB300\" in arch_str:\n        return GpuArch.GB300\n    if \"CPU\" in arch_str:\n        return GpuArch.CPU\n    raise ValueError(f\"Unknown GPU architecture: {arch_str}\")\n\n\ndef _check_cuda_errors(status):\n    if status != 0:\n        raise RuntimeError(f\"CUDA error: {status}\")\n\n\n\u0040cache\ndef gpu_arch():\n    arch_env = os.getenv(\"MACHINE_TYPE\", \"\").strip()\n    if arch_env:\n        return string_to_gpu_arch(arch_env)\n\n    try:\n        cuda_lib = None\n        legal_driver_paths = [\n            \"/usr/lib/aarch64-linux-gnu/libcuda.so\",\n            \"/usr/lib/x86_64-linux-gnu/libcuda.so\",\n        ]\n\n        for path in legal_driver_paths:\n            if os.path.exists(path):\n                cuda_lib = ctypes.CDLL(path)\n                break\n\n        if cuda_lib is None:\n            try:\n                cuda_lib = ctypes.CDLL(\"libcuda.so.1\")\n            except OSError:\n                pass\n\n        if cuda_lib is None:\n            raise ValueError(\"No CUDA driver library found.\")\n\n        status = cuda_lib.cuInit(0)\n        _check_cuda_errors(status)\n\n        device_count = c_int()\n        status = cuda_lib.cuDeviceGetCount(byref(device_count))\n        _check_cuda_errors(status)\n\n        if device_count.value == 0:\n            raise ValueError(\"No GPU devices found.\")\n\n        device = c_int()\n        device_name = ctypes.create_string_buffer(256)\n\n        status = cuda_lib.cuDeviceGet(byref(device), 0)\n        _check_cuda_errors(status)\n\n        status = cuda_lib.cuDeviceGetName(device_name, c_size_t(256), device)\n        _check_cuda_errors(status)\n\n        device_name = device_name.value.decode(\"utf-8\")\n        rank_logger.info(f\"Detected GPU architecture: {device_name}\")\n    except Exception as e:\n        rank_logger.error(\n            f\"Failed to get GPU architecture from CUDA driver: {e}\\nFalling back to CPU.\"\n        )\n        return GpuArch.CPU\n\n    if \"H100\" in device_name:\n        return GpuArch.H100\n    if \"H200\" in device_name:\n        return GpuArch.H200\n    if \"A100\" in device_name:\n        return GpuArch.A100\n    if \"GB200\" in device_name:\n        return GpuArch.GB200\n    if \"GB300\" in device_name:\n        return GpuArch.GB300\n    raise ValueError(f\"Unknown GPU architecture: {device_name}\")\n\n\n_GPU_ARCH_TO_PEAK_TFLOPS: dict[GpuArch, float] = {\n    GpuArch.H100: 989.5,\n    GpuArch.H200: 989.5,\n    GpuArch.GB200: 2500,\n    GpuArch.GB300: 2500,\n}\n\n\n\u0040cache\ndef peak_tflops() -> float:\n    gpu = gpu_arch()\n    assert gpu in _GPU_ARCH_TO_PEAK_TFLOPS, f\"Unknown GPU architecture: {gpu}!\"\n    return _GPU_ARCH_TO_PEAK_TFLOPS[gpu]\n\n\n_NUM_PHYSICAL_DEVICES_PER_NODE = {\n    GpuArch.CPU: 1,\n    GpuArch.H100: 8,\n    GpuArch.H200: 8,\n    GpuArch.A100: 8,\n    GpuArch.GB200: 4,\n    GpuArch.GB300: 4,\n}\n\n\n\u0040cache\ndef num_physical_devices_per_node() -> int:\n    if os.getenv(\"NUM_PHYSICAL_DEVICES_PER_NODE\") is not None:\n        return int(os.getenv(\"NUM_PHYSICAL_DEVICES_PER_NODE\"))\n\n    arch = GpuArch.H100\n    try:\n        arch = gpu_arch()\n    except Exception as e:\n        rank_logger.error(f\"Failed to get GPU architecture: {e}\")\n        rank_logger.error(\"Default to H100.\")\n    return _NUM_PHYSICAL_DEVICES_PER_NODE[arch]\n\n\nNUM_PHYSICAL_DEVICES_PER_NODE = num_physical_devices_per_node()\n\n\ndef _read_sysfs(path: str) -> str:\n    with open(path) as f:\n        return f.read()\n\n\ndef _parse_cpulist(text: str) -> set[int]:\n    cpus: set[int] = set()\n    for part in filter(None, text.strip().split(\",\")):\n        lo, _, hi = part.partition(\"-\")\n        cpus.update(range(int(lo), int(hi or lo) + 1))\n    return cpus\n\n\ndef schedulable_cpus(*nodes: int) -> set[int]:\n    cpus: set[int] = set()\n    for node in nodes:\n        cpus |= _parse_cpulist(_read_sysfs(f\"/sys/devices/system/node/node{node}/cpulist\"))\n    try:\n        isolated = _parse_cpulist(_read_sysfs(\"/sys/devices/system/cpu/isolated\"))\n    except FileNotFoundError:\n        isolated = set()\n    return cpus - isolated\n\n\n\u0040cache\ndef _gpu_index_to_local_numa_node() -> dict[int, int]:\n    mapping: dict[int, int] = {}\n    probe_env = {k: v for k, v in os.environ.items() if k != \"CUDA_VISIBLE_DEVICES\"}\n    try:\n        out = subprocess.check_output(\n            [\"nvidia-smi\", \"--query-gpu=index,pci.bus_id\", \"--format=csv,noheader\"],\n            stderr=subprocess.STDOUT,\n            text=True,\n            timeout=60,\n            env=probe_env,\n        )\n    except (OSError, subprocess.SubprocessError) as e:\n        rank_logger.warning(f\"NUMA pin: could not query GPU PCI ids ({e}); skipping\")\n        return mapping\n\n    for line in out.splitlines():\n        line = line.strip()\n        if not line:\n            continue\n        idx_str, _, bus_id = line.partition(\",\")\n        idx_str = idx_str.strip()\n        bus_id = bus_id.strip().lower()\n        if not idx_str or not bus_id:\n            continue\n        if len(bus_id.split(\":\", 1)[0]) == 8:\n            bus_id = bus_id[4:]\n        try:\n            node = int(_read_sysfs(f\"/sys/bus/pci/devices/{bus_id}/numa_node\").strip())\n        except (OSError, ValueError):\n            continue\n        if node < 0:\n            continue\n        try:\n            cpulist = _read_sysfs(f\"/sys/devices/system/node/node{node}/cpulist\").strip()\n        except OSError:\n            cpulist = \"\"\n        if not cpulist:\n            continue\n        try:\n            mapping[int(idx_str)] = node\n        except ValueError:\n            continue\n\n    if len(set(mapping.values())) < 2:\n        return {}\n    return mapping\n\n\ndef _running_in_ci() -> bool:\n    return cluster.get_user() == \"ci\"\n\n\ndef _running_on_a_devbox() -> bool:\n    return \"HOST_NODE_ADDR\" not in os.environ\n\n\ndef _get_max_clocks() -> tuple[int, int]:\n    out = subprocess.check_output(\n        \"nvidia-smi -q -d SUPPORTED_CLOCKS\".split(), stderr=subprocess.STDOUT, text=True\n    )\n    pattern = re.compile(r\"Memory.+?(?P<memory>\\d+).+?Graphics.+?(?P<graphics>\\d+)\", re.DOTALL)\n    match = pattern.search(out)\n    if not match:\n        raise RuntimeError(\"Could not determine max GPU clocks\")\n    num_physically_attached_gpus = len(\n        [line for line in out.splitlines() if line.startswith(\"GPU\")]\n    )\n    assert num_physically_attached_gpus >= NUM_PHYSICAL_DEVICES_PER_NODE, (\n        f\"Expected {NUM_PHYSICAL_DEVICES_PER_NODE} GPUs but found {num_physically_attached_gpus}\"\n    )\n    return int(match[\"memory\"]), int(match[\"graphics\"])\n\n\ndef set_gpu_clocks_to_max() -> None:\n    if os.getenv(\"NO_CUDA\") or _running_in_ci() or _running_on_a_devbox():\n        return\n    try:\n        memory, graphics = _get_max_clocks()\n        subprocess.check_output(\n            [\"nvidia-smi\", \"-ac\", f\"{memory},{graphics}\"], stderr=subprocess.STDOUT, text=True\n        )\n    except subprocess.CalledProcessError as e:\n        rank_logger.info(e.stdout)\n        raise\n\n\ndef pin_process_to_local_numa(gpu_index: int | str) -> None:\n    try:\n        gpu_index = int(gpu_index)\n    except (TypeError, ValueError):\n        return\n    node = _gpu_index_to_local_numa_node().get(gpu_index)\n    if node is None:\n        return\n    try:\n        import numa\n\n        numa.memory.set_membind_nodes(node)\n    except Exception as e:\n        rank_logger.warning(f\"NUMA pin: failed to membind gpu {gpu_index} to node {node} ({e})\")\n        return\n    try:\n        cpus = schedulable_cpus(node)\n        if not cpus:\n            rank_logger.warning(f\"NUMA pin: node {node} has no non-isolated CPUs; membind only\")\n            return\n        os.sched_setaffinity(0, cpus)\n        rank_logger.info(f\"NUMA pin: gpu {gpu_index} -> node {node} ({len(cpus)} cpus + membind)\")\n    except Exception as e:\n        rank_logger.warning(\n            f\"NUMA pin: gpu {gpu_index} membind to node {node} ok, CPU affinity failed ({e})\"\n        )\n",
+      "source_digest": "9305391c2a14b2ec7808debba8ab81f56a789eba60749805b6d8a1fa0dacae74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/utils/gpu.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 310,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport ctypes\nimport logging\nimport os\nimport re\nimport subprocess\nfrom ctypes import byref, c_int, c_size_t\nfrom enum import Enum\nfrom functools import cache\nfrom typing import TYPE_CHECKING\n\nfrom xrex.utils import cluster\n\nif TYPE_CHECKING:\n    import jax\n\nlogger = logging.getLogger(__name__)\nrank_logger = logging.getLogger(\"rank\")\n\n\nclass GpuArch(Enum):\n    UNKNOWN = 0\n    CPU = 1\n    A100 = 2\n    H100 = 3\n    H200 = 4\n    GB200 = 5\n    GB300 = 6\n\n\ndef string_to_gpu_arch(arch_str: str) -> GpuArch:\n    arch_str = arch_str.upper()\n    if \"H100\" in arch_str or not arch_str:\n        return GpuArch.H100\n    if \"H200\" in arch_str:\n        return GpuArch.H200\n    if \"A100\" in arch_str:\n        return GpuArch.A100\n    if \"GB200\" in arch_str:\n        return GpuArch.GB200\n    if \"GB300\" in arch_str:\n        return GpuArch.GB300\n    if \"CPU\" in arch_str:\n        return GpuArch.CPU\n    raise ValueError(f\"Unknown GPU architecture: {arch_str}\")\n\n\ndef _check_cuda_errors(status):\n    if status != 0:\n        raise RuntimeError(f\"CUDA error: {status}\")\n\n\n\u0040cache\ndef gpu_arch():\n    arch_env = os.getenv(\"MACHINE_TYPE\", \"\").strip()\n    if arch_env:\n        return string_to_gpu_arch(arch_env)\n\n    try:\n        cuda_lib = None\n        legal_driver_paths = [\n            \"/usr/lib/aarch64-linux-gnu/libcuda.so\",\n            \"/usr/lib/x86_64-linux-gnu/libcuda.so\",\n        ]\n\n        for path in legal_driver_paths:\n            if os.path.exists(path):\n                cuda_lib = ctypes.CDLL(path)\n                break\n\n        if cuda_lib is None:\n            try:\n                cuda_lib = ctypes.CDLL(\"libcuda.so.1\")\n            except OSError:\n                pass\n\n        if cuda_lib is None:\n            raise ValueError(\"No CUDA driver library found.\")\n\n        status = cuda_lib.cuInit(0)\n        _check_cuda_errors(status)\n\n        device_count = c_int()\n        status = cuda_lib.cuDeviceGetCount(byref(device_count))\n        _check_cuda_errors(status)\n\n        if device_count.value == 0:\n            raise ValueError(\"No GPU devices found.\")\n\n        device = c_int()\n        device_name = ctypes.create_string_buffer(256)\n\n        status = cuda_lib.cuDeviceGet(byref(device), 0)\n        _check_cuda_errors(status)\n\n        status = cuda_lib.cuDeviceGetName(device_name, c_size_t(256), device)\n        _check_cuda_errors(status)\n\n        device_name = device_name.value.decode(\"utf-8\")\n        rank_logger.info(f\"Detected GPU architecture: {device_name}\")\n    except Exception as e:\n        rank_logger.error(\n            f\"Failed to get GPU architecture from CUDA driver: {e}\\nFalling back to CPU.\"\n        )\n        return GpuArch.CPU\n\n    if \"H100\" in device_name:\n        return GpuArch.H100\n    if \"H200\" in device_name:\n        return GpuArch.H200\n    if \"A100\" in device_name:\n        return GpuArch.A100\n    if \"GB200\" in device_name:\n        return GpuArch.GB200\n    if \"GB300\" in device_name:\n        return GpuArch.GB300\n    raise ValueError(f\"Unknown GPU architecture: {device_name}\")\n\n\n_GPU_ARCH_TO_PEAK_TFLOPS: dict[GpuArch, float] = {\n    GpuArch.H100: 989.5,\n    GpuArch.H200: 989.5,\n    GpuArch.GB200: 2500,\n    GpuArch.GB300: 2500,\n}\n\n\n\u0040cache\ndef peak_tflops() -> float:\n    gpu = gpu_arch()\n    assert gpu in _GPU_ARCH_TO_PEAK_TFLOPS, f\"Unknown GPU architecture: {gpu}!\"\n    return _GPU_ARCH_TO_PEAK_TFLOPS[gpu]\n\n\ndef cuda_compute_capability(device: \"jax.Device\") -> tuple[int, int] | None:\n    if device.platform != \"gpu\":\n        return None\n    major, minor = device.compute_capability.split(\".\")\n    return int(major), int(minor)\n\n\ndef bf16_arithmetic_is_native(device: \"jax.Device\") -> bool:\n    return (cuda_compute_capability(device) or (0, 0)) >= (9, 0)\n\n\n_NUM_PHYSICAL_DEVICES_PER_NODE = {\n    GpuArch.CPU: 1,\n    GpuArch.H100: 8,\n    GpuArch.H200: 8,\n    GpuArch.A100: 8,\n    GpuArch.GB200: 4,\n    GpuArch.GB300: 4,\n}\n\n\n\u0040cache\ndef num_physical_devices_per_node() -> int:\n    if os.getenv(\"NUM_PHYSICAL_DEVICES_PER_NODE\") is not None:\n        return int(os.getenv(\"NUM_PHYSICAL_DEVICES_PER_NODE\"))\n\n    arch = GpuArch.H100\n    try:\n        arch = gpu_arch()\n    except Exception as e:\n        rank_logger.error(f\"Failed to get GPU architecture: {e}\")\n        rank_logger.error(\"Default to H100.\")\n    return _NUM_PHYSICAL_DEVICES_PER_NODE[arch]\n\n\nNUM_PHYSICAL_DEVICES_PER_NODE = num_physical_devices_per_node()\n\n\ndef _read_sysfs(path: str) -> str:\n    with open(path) as f:\n        return f.read()\n\n\ndef _parse_cpulist(text: str) -> set[int]:\n    cpus: set[int] = set()\n    for part in filter(None, text.strip().split(\",\")):\n        lo, _, hi = part.partition(\"-\")\n        cpus.update(range(int(lo), int(hi or lo) + 1))\n    return cpus\n\n\ndef schedulable_cpus(*nodes: int) -> set[int]:\n    cpus: set[int] = set()\n    for node in nodes:\n        cpus |= _parse_cpulist(_read_sysfs(f\"/sys/devices/system/node/node{node}/cpulist\"))\n    try:\n        isolated = _parse_cpulist(_read_sysfs(\"/sys/devices/system/cpu/isolated\"))\n    except FileNotFoundError:\n        isolated = set()\n    return cpus - isolated\n\n\n\u0040cache\ndef _gpu_index_to_local_numa_node() -> dict[int, int]:\n    mapping: dict[int, int] = {}\n    probe_env = {k: v for k, v in os.environ.items() if k != \"CUDA_VISIBLE_DEVICES\"}\n    try:\n        out = subprocess.check_output(\n            [\"nvidia-smi\", \"--query-gpu=index,pci.bus_id\", \"--format=csv,noheader\"],\n            stderr=subprocess.STDOUT,\n            text=True,\n            timeout=60,\n            env=probe_env,\n        )\n    except (OSError, subprocess.SubprocessError) as e:\n        rank_logger.warning(f\"NUMA pin: could not query GPU PCI ids ({e}); skipping\")\n        return mapping\n\n    for line in out.splitlines():\n        line = line.strip()\n        if not line:\n            continue\n        idx_str, _, bus_id = line.partition(\",\")\n        idx_str = idx_str.strip()\n        bus_id = bus_id.strip().lower()\n        if not idx_str or not bus_id:\n            continue\n        if len(bus_id.split(\":\", 1)[0]) == 8:\n            bus_id = bus_id[4:]\n        try:\n            node = int(_read_sysfs(f\"/sys/bus/pci/devices/{bus_id}/numa_node\").strip())\n        except (OSError, ValueError):\n            continue\n        if node < 0:\n            continue\n        try:\n            cpulist = _read_sysfs(f\"/sys/devices/system/node/node{node}/cpulist\").strip()\n        except OSError:\n            cpulist = \"\"\n        if not cpulist:\n            continue\n        try:\n            mapping[int(idx_str)] = node\n        except ValueError:\n            continue\n\n    if len(set(mapping.values())) < 2:\n        return {}\n    return mapping\n\n\ndef _running_in_ci() -> bool:\n    return cluster.get_user() == \"ci\"\n\n\ndef _running_on_a_devbox() -> bool:\n    return \"HOST_NODE_ADDR\" not in os.environ\n\n\ndef _get_max_clocks() -> tuple[int, int]:\n    out = subprocess.check_output(\n        \"nvidia-smi -q -d SUPPORTED_CLOCKS\".split(), stderr=subprocess.STDOUT, text=True\n    )\n    pattern = re.compile(r\"Memory.+?(?P<memory>\\d+).+?Graphics.+?(?P<graphics>\\d+)\", re.DOTALL)\n    match = pattern.search(out)\n    if not match:\n        raise RuntimeError(\"Could not determine max GPU clocks\")\n    num_physically_attached_gpus = len(\n        [line for line in out.splitlines() if line.startswith(\"GPU\")]\n    )\n    assert num_physically_attached_gpus >= NUM_PHYSICAL_DEVICES_PER_NODE, (\n        f\"Expected {NUM_PHYSICAL_DEVICES_PER_NODE} GPUs but found {num_physically_attached_gpus}\"\n    )\n    return int(match[\"memory\"]), int(match[\"graphics\"])\n\n\ndef set_gpu_clocks_to_max() -> None:\n    if os.getenv(\"NO_CUDA\") or _running_in_ci() or _running_on_a_devbox():\n        return\n    try:\n        memory, graphics = _get_max_clocks()\n        subprocess.check_output(\n            [\"nvidia-smi\", \"-ac\", f\"{memory},{graphics}\"], stderr=subprocess.STDOUT, text=True\n        )\n    except subprocess.CalledProcessError as e:\n        rank_logger.info(e.stdout)\n        raise\n\n\ndef pin_process_to_local_numa(gpu_index: int | str) -> None:\n    try:\n        gpu_index = int(gpu_index)\n    except (TypeError, ValueError):\n        return\n    node = _gpu_index_to_local_numa_node().get(gpu_index)\n    if node is None:\n        return\n    try:\n        import numa\n\n        numa.memory.set_membind_nodes(node)\n    except Exception as e:\n        rank_logger.warning(f\"NUMA pin: failed to membind gpu {gpu_index} to node {node} ({e})\")\n        return\n    try:\n        cpus = schedulable_cpus(node)\n        if not cpus:\n            rank_logger.warning(f\"NUMA pin: node {node} has no non-isolated CPUs; membind only\")\n            return\n        os.sched_setaffinity(0, cpus)\n        rank_logger.info(f\"NUMA pin: gpu {gpu_index} -> node {node} ({len(cpus)} cpus + membind)\")\n    except Exception as e:\n        rank_logger.warning(\n            f\"NUMA pin: gpu {gpu_index} membind to node {node} ok, CPU affinity failed ({e})\"\n        )\n",
+      "source_digest": "05876c1541dc6fd83c7b47c8a467837dca9d36f6a4dad8b96cbb46b82bba867b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    Linear,\n    MultiHeadAttention,\n    MultiHeadAttentionOutput,\n)\nfrom xrex.models.normalization import RMSNorm\nfrom xrex.models.remat import (\n    RematType,\n    custom_remat_policy,\n)\nfrom xrex.models.scaling import ScaleConfig\nfrom xrex.models.sharding_context import NamedShape, ShardingContext\nfrom xrex.utils import layer_stack\nfrom xrex.utils.gpu import peak_tflops\nfrom xrex.utils.sharding import with_sharding_constraint_unless_manual\nfrom xrex.utils.utils import (\n    dump_block_outputs,\n    ffn_size,\n    gelu_fn,\n    remat_less,\n    summarize,\n    unroll_layer_dumps,\n)\n\nDecoderInput: TypeAlias = jax.Array\n\n",
+      "source_digest": "3cdf6993c7c9a67e9a78080b4dde79f060aa4de583e6aa73e399ff4245821acc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 125,
+      "end_line": 149,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        attn = attn_flops()\n        ffn = ((z1 + z2) * m.num_layers + o) * num_seq_per_sec\n\n        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n",
+      "source_digest": "5d51fb9fa43aa969c7d8564bac440f6c13ac58669de3d0ecccd21d3debe8323e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 127,
+      "end_line": 151,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ffn = ((z1 + z2) * m.num_layers + o) * num_seq_per_sec\n\n        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n\u0040dataclass\nclass MHABlock(hk.Module):\n",
+      "source_digest": "c8ce98b55c69fafb447ff13a50e99c1a919854e814bccd423c98785f2f53e80c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 128,
+      "end_line": 152,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n\u0040dataclass\nclass MHABlock(hk.Module):\n    config: AttentionConfig\n",
+      "source_digest": "5885bce37b01a484b73b7f69b1afd8aea1f425005e0058f0a42e67a990a03013",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 129,
+      "end_line": 153,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n\u0040dataclass\nclass MHABlock(hk.Module):\n    config: AttentionConfig\n    scale_config: ScaleConfig\n",
+      "source_digest": "317fdc0cf721a4d50d2facb6d218087fcf9f4f95ef030f8cf1eef590f07f5a8c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 95,
+      "end_line": 119,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    CheckpointConfig,\n    PostEmbeddings,\n    RecsysTrainingState,\n)\nfrom xrex.train.trainer import (\n    RecsysTwoTowerModelConfig,\n    Trainer,\n    TrainerContext,\n)\nfrom xrex.utils import recsys_async_emb\nfrom xrex.utils.aot import JittedOrCompiled\nfrom xrex.utils.checkpointing import wait_until_finished\nfrom xrex.utils.gpu import peak_tflops\nfrom xrex.utils.metrics import norm_metrics\nfrom xrex.utils.utils import (\n    cast_bfloat16,\n)\n\nlogger = logging.getLogger(__name__)\nrank_logger = logging.getLogger(\"rank\")\n\n\nOUT_PATH = \"/dev/shm\"\n\n_DATA_POSITION_FILENAME = \"data_position.json\"\n",
+      "source_digest": "049da7e319fd6b8d1b8ed3ac290d30c4026983194538ddfc331f92a6a41071fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1079,
+      "end_line": 1103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self, soft_step: int, metrics: dict[str, float | int]\n    ) -> dict[str, float | int]:\n        metrics = super().handle_metrics(soft_step, metrics)\n\n        if self.forward_only:\n            assert isinstance(\n                self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n            )\n            num_seq_per_sec_per_device = (\n                self.batch_size / float(metrics[\"step_time\"]) / self.num_devices\n            )\n            metrics[\"tflops\"] = self.model_config.compute_forward_tflops(num_seq_per_sec_per_device)\n            metrics[\"mfu\"] = metrics[\"tflops\"] / peak_tflops()\n\n        if self.empty_history_user_dropout_rate > 0.0 and self._last_history_user_dropout_bsz > 0:\n            metrics[\"train/empty_history_user_dropout_frac\"] = (\n                self._last_history_user_dropout_count / self._last_history_user_dropout_bsz\n            )\n\n        self._report_save_timing(metrics)\n\n        if isinstance(self.dataset, PhoenixKafkaDataset) and self.dataset.export_metrics:\n            report_training_metrics(\n                training_name=self.dataset.name,\n                metrics_dict=metrics,\n",
+      "source_digest": "82928cc086bcb9cb58b6f0399a87e89b975748bbd7f33db1df7c024cde9f525c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 16,
+      "end_line": 40,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "_NUM_ROW_SUMS = 4\n\n\ndef qk_norm_rope_backward_supported(\n    num_tokens: int,\n    num_q_heads: int,\n    num_kv_heads: int,\n    head_dim: int,\n    dtype: DTypeLike,\n    device: jax.Device,\n) -> bool:\n    return (\n        gpu.cuda_compute_capability(device) == (9, 0)\n        and dtype == jnp.bfloat16\n        and _shape_fits_kernel(num_tokens, num_q_heads, num_kv_heads, head_dim)\n    )\n\n\ndef _shape_fits_kernel(num_tokens: int, num_q_heads: int, num_kv_heads: int, head_dim: int) -> bool:\n    return (\n        num_q_heads % num_kv_heads == 0\n        and head_dim % (2 * _VEC_WIDTH) == 0\n        and _num_threads(num_q_heads, num_kv_heads, head_dim) <= _MAX_THREADS_PER_CTA\n        and num_tokens * (num_q_heads + 2 * num_kv_heads) * head_dim < 2**31\n    )\n",
+      "source_digest": "7427510c4d002abcb4c7d72d76959517e85471f04b82ab304ce65d202c0b0886",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "phoenix/xrex/models/fp8.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 85,
+      "end_line": 109,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    num_rows = math.prod(x_shape[:-1])\n    x_2d_shape, g_2d_shape = (num_rows, x_shape[-1]), (num_rows, output_size)\n    mesh = jax.sharding.get_abstract_mesh()\n    per_device_operands = jax.device_count() == 1 or (\n        not mesh.empty\n        and all(\n            kind == AxisType.Manual or size == 1\n            for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True)\n        )\n    )\n    return (\n        gemms == Fp8Gemms.ALL\n        and gpu.cuda_compute_capability(jax.devices()[0]) == (9, 0)\n        and dtype == jnp.bfloat16\n        and fp8_transpose.transpose_supported(x_2d_shape)\n        and fp8_transpose.quantize_transposed_supported(x_2d_shape)\n        and fp8_transpose.quantize_transposed_supported(g_2d_shape)\n        and per_device_operands\n    )\n\n\ndef _scale(x: jax.Array, dtype: DTypeLike) -> jax.Array:\n    amax = jnp.max(jnp.abs(x)).astype(jnp.float32)\n    largest_mantissa, largest_exponent = math.frexp(float(jnp.finfo(dtype).max))\n    mantissa, exponent = jnp.frexp(amax)\n",
+      "source_digest": "a1c902931cfbea03253428855aa8ceea09a945e45af1131bb13db1ecd9be5227",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from xrex.models.remat import (\n    ATTN_FP8_T,\n    DENSE_GELU_FP8_T,\n    NORM_STATS,\n    POST_ATTN_RESIDUAL,\n    RematType,\n    checkpoint_as_bits,\n    custom_remat_policy,\n)\nfrom xrex.models.scaling import ScaleConfig\nfrom xrex.models.sharding_context import NamedShape, ShardingContext\nfrom xrex.utils import gpu, layer_stack\nfrom xrex.utils.gpu import peak_tflops\nfrom xrex.utils.sharding import with_sharding_constraint_unless_manual\nfrom xrex.utils.utils import (\n    dump_block_outputs,\n    ffn_size,\n    gelu_fn,\n    remat_less,\n    summarize,\n    unroll_layer_dumps,\n)\n\nDecoderInput: TypeAlias = jax.Array\n\n",
+      "source_digest": "710bbd67a4251146a09b6fc90a0000ae1fb57f1b73c42df13cefece0cf612112",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 133,
+      "end_line": 157,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        attn = attn_flops()\n        ffn = ((z1 + z2) * m.num_layers + o) * num_seq_per_sec\n\n        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n",
+      "source_digest": "5d51fb9fa43aa969c7d8564bac440f6c13ac58669de3d0ecccd21d3debe8323e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 135,
+      "end_line": 159,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ffn = ((z1 + z2) * m.num_layers + o) * num_seq_per_sec\n\n        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n\u0040dataclass\nclass MHABlock(hk.Module):\n",
+      "source_digest": "c8ce98b55c69fafb447ff13a50e99c1a919854e814bccd423c98785f2f53e80c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 136,
+      "end_line": 160,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n\u0040dataclass\nclass MHABlock(hk.Module):\n    config: AttentionConfig\n",
+      "source_digest": "5885bce37b01a484b73b7f69b1afd8aea1f425005e0058f0a42e67a990a03013",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 137,
+      "end_line": 161,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        return attn, ffn\n\n    def compute_tflops(self, num_seq_per_sec: float, S: int) -> float:\n        attn, ffn = self.compute_forward_flops_per_sec(num_seq_per_sec, S)\n        total_flops_per_second = (attn + ffn) * 3\n        return round(total_flops_per_second, 2)\n\n    def compute_mfu(\n        self, num_seq_per_sec: float, S: int, peak_tflops_override: Optional[float] = None\n    ) -> float:\n        if peak_tflops_override is None:\n            peak_tflops_override = peak_tflops()\n        return self.compute_tflops(num_seq_per_sec, S) / peak_tflops_override\n\n    def make(self, sharding_context: ShardingContext) -> hk.Module:\n        return Transformer(\n            config=self,\n            sharding_context=sharding_context,\n        )\n\n\n\u0040dataclass\nclass MHABlock(hk.Module):\n    config: AttentionConfig\n    scale_config: ScaleConfig\n",
+      "source_digest": "317fdc0cf721a4d50d2facb6d218087fcf9f4f95ef030f8cf1eef590f07f5a8c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "phoenix/xrex/models/transformer.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 523,
+      "end_line": 547,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n            if self.primer_norm:\n                h_attn = with_sharding_constraint_unless_manual(h_attn, activation_pspec)\n                h_attn = layer_norm(name=\"post_attn_norm\")(h_attn)\n\n            return h_attn, attn_input, attn_outputs, attn_loss\n\n        h_attn, attn_input, attn_outputs, attn_loss = remat_fn(run_attn_layer)(\n            h_attn_in, history_states\n        )\n\n        residual = residual + h_attn\n        if self.fp8_remat_saves and gpu.bf16_arithmetic_is_native(jax.devices()[0]):\n            residual = checkpoint_as_bits(residual, POST_ATTN_RESIDUAL, barrier=False)\n        residual = with_sharding_constraint_unless_manual(residual, activation_pspec)\n\n        attn_post_ln_output = residual\n\n        h_ffn_in = residual\n        residual = with_sharding_constraint_unless_manual(residual, activation_pspec)\n\n        def run_ffn_layer(h_ffn_in: jax.Array):\n            if self.pre_norm:\n                h_ln = layer_norm(name=self.pre_ffn_norm_name)(h_ffn_in, stats_name=norm_stats_name)\n            else:\n",
+      "source_digest": "89c08824dcb81e18d948f9c9dbd2825f731a62d8e6b83354e812f121eb753694",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 98,
+      "end_line": 122,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    PostEmbeddings,\n    RecsysTrainingState,\n)\nfrom xrex.train.trainer import (\n    RecsysTwoTowerModelConfig,\n    Trainer,\n    TrainerContext,\n)\nfrom xrex.utils import recsys_async_emb\nfrom xrex.utils.aot import JittedOrCompiled\nfrom xrex.utils.checkpointing import wait_until_finished\nfrom xrex.utils.coalesced_device_put import device_put_coalesced, precompile_device_put_coalesced\nfrom xrex.utils.gpu import peak_tflops\nfrom xrex.utils.metrics import norm_metrics\nfrom xrex.utils.utils import (\n    cast_bfloat16,\n)\n\nlogger = logging.getLogger(__name__)\nrank_logger = logging.getLogger(\"rank\")\n\n\nOUT_PATH = \"/dev/shm\"\n\n_DATA_POSITION_FILENAME = \"data_position.json\"\n",
+      "source_digest": "a87d4a7abf10f0df4958947b9111e30cc5862e8d66a1186931915d72cf4ee7b9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1179,
+      "end_line": 1203,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self, soft_step: int, metrics: dict[str, float | int]\n    ) -> dict[str, float | int]:\n        metrics = super().handle_metrics(soft_step, metrics)\n\n        if self.forward_only:\n            assert isinstance(\n                self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n            )\n            num_seq_per_sec_per_device = (\n                self.batch_size / float(metrics[\"step_time\"]) / self.num_devices\n            )\n            metrics[\"tflops\"] = self.model_config.compute_forward_tflops(num_seq_per_sec_per_device)\n            metrics[\"mfu\"] = metrics[\"tflops\"] / peak_tflops()\n\n        if self.empty_history_user_dropout_rate > 0.0 and self._last_history_user_dropout_bsz > 0:\n            metrics[\"train/empty_history_user_dropout_frac\"] = (\n                self._last_history_user_dropout_count / self._last_history_user_dropout_bsz\n            )\n\n        self._report_save_timing(metrics)\n\n        if isinstance(self.dataset, PhoenixKafkaDataset) and self.dataset.export_metrics:\n            report_training_metrics(\n                training_name=self.dataset.name,\n                metrics_dict=metrics,\n",
+      "source_digest": "82928cc086bcb9cb58b6f0399a87e89b975748bbd7f33db1df7c024cde9f525c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b425502aebc0986a67f23ce96529a9d6c43b62cfe042c1eb2287a8018915eb97",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "31232b0c014f8152103355d717c52e46c765f38745cf24f0b0f88316f3ab03a2",
+      "context_complete": true,
+      "task_id": "T-56e48282aa5433fa39ca0224013e46cbc563fe0a3ad2132dc36e1c5a78f229c9",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-629e3cbbcb98a2ee2e1f04cccf1bb4e29bc98988f9e5bb6bc396d751ac08cceb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-bc2db98d89140b06cd391770bdd383a73c0011a7763a2175a1db37e6c40de3cc",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-521c5f6ff3fc0c656df4397f42edfc6295dab7ddba6fc9c482c68bf5489c95f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-54b93ad686d599ec628a2a259fbc83c9a33ba6f46c9ba465e9bcd3eeba4b856e",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-55e7f1361bd2e4628399b818835905ddf9af27b78be8675061aa0fa01ab020b7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-70a1db13dbc37d6c0e9f379488f60131b46b5bd1f7289f9b6bb691cdc2d39c7f",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-200d4b2c3ff1fe8c8aa8a72b3f4927e59f7f44d2801aaaf769573b91df2853c9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-7282cda8e19bf7a9b8e8afd7642145b749821fdf4c1e02e30e3905c23e5041b6",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-58391442d7f3a779bf2f1e4e1e17bde65caad789387a39e142d97d90a574b3a7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-801df5357ffcce013139d2819c936a78531a5a0f7ea6056c833d8e75e9d8f25d",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c6bf39883c88ddf767a368b410aded70305298d677f43a80f7b5d8334596f33b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-cb19ba33ae9051eb7e95f844022a5b6f2c976046b8fc1d822f20136e25ae2a18",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-43b559b8be73017f44807c65f9a8e08263e04a1eda81fb79d2fd74fde1713331",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-80e56c9f5f3e1c6390ee30bf638e49479e2c3556cda469eaa124fdb61fb5ec02",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4477aa94eb84d1e98f7c526880cb92c4a79499091f090d3f3cc634b84b7b5f29",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-bb30a1a10d521b7f993e42d1ce6d8b40a334da0115d08dac626a8693ae6fc2c9",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-fe123f7d851e8cdf5d6ee26964258f55012399e820312b8bbad701727e74deb9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-6e1292a780692093325de3d6525a56d0698dbe06248ebac18d7053c1a2a63a21",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-fdbe53745bed6b225d63aa07d48ace49c508c6696323f9a1d6944c3c7618acf1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-977edfde25e6e94bf21216882f75fdb2bcd76b5f6dd4f0bb3142387ed1c2b2d1",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b2477b2db21ec38ff05039e270e4b17ba0d194e204bf72d104025cec20625d79",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-508b553c9eac1b6712fc245708b92ae9fbca8ed86836ab9d07c9733b6361c3e4",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-909ff1a6f992994cedc625a65e79f81e77e5ba57a887d1d4e127384d417b3b94",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-1e4f82706789153010702f46bf8d62c15770d6b877ef6dd56200199d436e0c19",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-acf92f876e420049472f57cc3613b7311684f3052f05fe29bb9f44383b88b3b4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-ebdabd9d916ba61ab506d4c5cefb1798e8ccd896437e4b1c66b6d3e7edf367f1",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-aad30919f67d3052fef649056ec918f21f619ba97743a2600e2217f8b1a8bbfc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-54648f238db86ce9544f84c96d7a8b354a1943c2844469cce1698134418f57d3",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-218427523343e503a2978a620d04e84906b3a2fcc59d96e50705f07d0ad744ed",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-336c7671bcd80f7f150c7013fd1c018efe248a915e5995eec66ac37df6f37d91",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-dbe43e27fb2cb9ac194a5eddebe5cb0f249cb34057af39be44aef88d180493bd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-917759521f5520b95fb4b4733e46b9c8e17a6f28901e63a5c57408d732a05352",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/utils/gpu.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f8878ba76401ba0fd3ebd5924bf8f7e110b4f8c902beabafd1e44f71b9a8531a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "peak_tflops",
+        "cuda_compute_capability",
+        "bf16_arithmetic_is_native"
+      ],
+      "context_complete": false,
+      "task_id": "T-d57424626c377ada35815d7af1e271c3d6c81d6d073226ed95c45bee14db72bd",
+      "evidence_refs": [
+        "E19"
+      ]
+    }
+  ],
+  "task_id": "T-190dc5e5a0e51d88f99c2de787d2a9820e8060269c397af743ec8b25a113b14a"
+}

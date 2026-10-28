@@ -1,0 +1,1933 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-8401f959d14db6834bdd10be04048406b848848bf50976ac4d2945cc7754835d",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 171,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport functools\n\nimport jax\nimport jax.numpy as jnp\nfrom jax.typing import DTypeLike\n\n_ROWS = 16\n_LANES_M = 4\n_WARPS = 8\n_WARP_SIZE = 32\n_LANES_N = _WARP_SIZE // _LANES_M\n_QUANTIZE_COLS = 8\n_TRANSPOSE_COLS = 16\n_PTX_CVT_TYPE = {\"float8_e4m3fn\": \"e4m3x2\", \"float8_e5m2\": \"e5m2x2\"}\n\n\ndef quantize_transposed_supported(shape: tuple[int, ...]) -> bool:\n    return _supported(shape, _QUANTIZE_COLS)\n\n\ndef transpose_supported(shape: tuple[int, ...]) -> bool:\n    return _supported(shape, _TRANSPOSE_COLS)\n\n\ndef _supported(shape: tuple[int, ...], cols: int) -> bool:\n    return (\n        len(shape) == 2\n        and 0 < shape[0] * shape[1] < 2**31\n        and shape[0] % (_ROWS * _LANES_M) == 0\n        and shape[0] <= 65535 * _ROWS * _LANES_M * _WARPS\n        and shape[1] % (cols * _LANES_N) == 0\n    )\n\n\ndef quantize_transposed(\n    x: jax.Array, inv_scale: jax.Array, dtype: DTypeLike, *, with_untransposed: bool = True\n) -> tuple[jax.Array | None, jax.Array]:\n    m, n = x.shape\n    assert x.dtype == jnp.bfloat16 and quantize_transposed_supported(x.shape), (x.dtype, x.shape)\n    call = _compiled_kernel(m, n, _PTX_CVT_TYPE[jnp.dtype(dtype).name], with_untransposed)\n    x_words = jax.lax.bitcast_convert_type(x.reshape(m, n // 2, 2), jnp.int32)\n    outputs = call(x_words, inv_scale.astype(jnp.float32).reshape(1))\n    q_t = jax.lax.bitcast_convert_type(outputs[-1], dtype).reshape(n, m)\n    q = jax.lax.bitcast_convert_type(outputs[0], dtype).reshape(m, n) if with_untransposed else None\n    return q, q_t\n\n\ndef transpose(q: jax.Array) -> jax.Array:\n    m, n = q.shape\n    assert q.dtype.itemsize == 1 and transpose_supported(q.shape), (q.dtype, q.shape)\n    call = _compiled_kernel(m, n, ptx_cvt_type=None, with_untransposed=False)\n    (q_t,) = call(jax.lax.bitcast_convert_type(q.reshape(m, n // 4, 4), jnp.int32))\n    return jax.lax.bitcast_convert_type(q_t, q.dtype).reshape(n, m)\n\n\ndef _store_transposed(words, num_words, m_q_t, col, row0):\n    import cutlass.cute as cute\n    from cutlass import Int32\n\n    for word in range(num_words):\n        outs = [cute.make_rmem_tensor((1, _ROWS // 4), Int32) for _ in range(4)]\n        for block in range(_ROWS // 4):\n            a0, a1, a2, a3 = (words[4 * block + i][0, word] for i in range(4))\n            b0, b1 = cute.arch.prmt(a0, a1, 0x5140), cute.arch.prmt(a0, a1, 0x7362)\n            b2, b3 = cute.arch.prmt(a2, a3, 0x5140), cute.arch.prmt(a2, a3, 0x7362)\n            outs[0][0, block] = cute.arch.prmt(b0, b2, 0x5410)\n            outs[1][0, block] = cute.arch.prmt(b0, b2, 0x7632)\n            outs[2][0, block] = cute.arch.prmt(b1, b3, 0x5410)\n            outs[3][0, block] = cute.arch.prmt(b1, b3, 0x7632)\n        for j in range(4):\n            cute.autovec_copy(\n                outs[j],\n                cute.local_tile(m_q_t, (1, _ROWS // 4), (col + 4 * word + j, row0 // _ROWS)),\n            )\n\n\n\u0040functools.cache\ndef _compiled_kernel(m: int, n: int, ptx_cvt_type: str | None, with_untransposed: bool):\n    import cuda.bindings.driver as cuda_driver\n    import cutlass\n    import cutlass.cute as cute\n    from cutlass import Float32, Int32, const_expr\n    from cutlass._mlir.dialects import llvm\n    from cutlass.cutlass_dsl import T, dsl_user_op\n    from cutlass.jax import cutlass_call\n\n    quantize = ptx_cvt_type is not None\n    cols = _QUANTIZE_COLS if quantize else _TRANSPOSE_COLS\n    num_warp_rows = m // (_ROWS * _LANES_M)\n    grid = [n // (cols * _LANES_N), -(-num_warp_rows // _WARPS), 1]\n    block = [_WARP_SIZE * _WARPS, 1, 1]\n\n    \u0040dsl_user_op\n    def quantize4(lo: Int32, hi: Int32, inv: Float32, *, loc=None, ip=None) -> Int32:\n        return Int32(\n            llvm.inline_asm(\n                T.i32(),\n                [arg.ir_value(loc=loc, ip=ip) for arg in (Int32(lo), Int32(hi), Float32(inv))],\n                \"{\\n\"\n                \".reg .b32 a0, a1, a2, a3;\\n\"\n                \".reg .b16 l, h;\\n\"\n                \"shl.b32 a0, $1, 16;\\n\"\n                \"and.b32 a1, $1, 0xFFFF0000;\\n\"\n                \"shl.b32 a2, $2, 16;\\n\"\n                \"and.b32 a3, $2, 0xFFFF0000;\\n\"\n                \"mul.rn.f32 a0, a0, $3;\\n\"\n                \"mul.rn.f32 a1, a1, $3;\\n\"\n                \"mul.rn.f32 a2, a2, $3;\\n\"\n                \"mul.rn.f32 a3, a3, $3;\\n\"\n                f\"cvt.rn.satfinite.{ptx_cvt_type}.f32 l, a1, a0;\\n\"\n                f\"cvt.rn.satfinite.{ptx_cvt_type}.f32 h, a3, a2;\\n\"\n                \"mov.b32 $0, {l, h};\\n\"\n                \"}\",\n                \"=r,r,r,f\",\n                has_side_effects=False,\n                is_align_stack=False,\n                asm_dialect=llvm.AsmDialect.AD_ATT,\n            )\n        )\n\n    \u0040cute.kernel\n    def kernel(mIn, mInv, mQ, mQT):\n        tidx, _, _ = cute.arch.thread_idx()\n        bx, by, _ = cute.arch.block_idx()\n        warp, lane = tidx // _WARP_SIZE, tidx % _WARP_SIZE\n        warp_row = by * _WARPS + warp\n        if warp_row < num_warp_rows:\n            col = (bx * _LANES_N + lane % _LANES_N) * cols\n            row0 = (warp_row * _LANES_M + lane // _LANES_N) * _ROWS\n            if const_expr(quantize):\n                inv = mInv[0]\n            words = [cute.make_rmem_tensor((1, 4), Int32) for _ in range(_ROWS)]\n            for r in cutlass.range_constexpr(_ROWS):\n                cute.autovec_copy(cute.local_tile(mIn, (1, 4), (row0 + r, col // cols)), words[r])\n            if const_expr(quantize):\n                q = [cute.make_rmem_tensor((1, 2), Int32) for _ in range(_ROWS)]\n                for r in cutlass.range_constexpr(_ROWS):\n                    q[r][0, 0] = quantize4(words[r][0, 0], words[r][0, 1], inv)\n                    q[r][0, 1] = quantize4(words[r][0, 2], words[r][0, 3], inv)\n                    if const_expr(mQ is not None):\n                        cute.autovec_copy(\n                            q[r], cute.local_tile(mQ, (1, 2), (row0 + r, col // cols))\n                        )\n                words = q\n            _store_transposed(words, cols // 4, mQT, col, row0)\n\n    \u0040cute.jit\n    def launch(stream: cuda_driver.CUstream, mIn, mInv, mQ, mQT):\n        kernel(mIn, mInv, mQ, mQT).launch(grid=grid, block=block, stream=stream)\n\n    \u0040cute.jit\n    def launch_quantize_transposed_only(stream: cuda_driver.CUstream, mIn, mInv, mQT):\n        launch(stream, mIn, mInv, None, mQT)\n\n    \u0040cute.jit\n    def launch_transpose(stream: cuda_driver.CUstream, mIn, mQT):\n        launch(stream, mIn, None, None, mQT)\n\n    q_t_spec = jax.ShapeDtypeStruct((n, m // 4), jnp.int32)\n    if not quantize:\n        return cutlass_call(\n            launch_transpose, output_shape_dtype=[q_t_spec], use_static_tensors=True\n        )\n    if not with_untransposed:\n        return cutlass_call(\n            launch_quantize_transposed_only, output_shape_dtype=[q_t_spec], use_static_tensors=True\n        )\n    q_spec = jax.ShapeDtypeStruct((m, n // 4), jnp.int32)\n    return cutlass_call(launch, output_shape_dtype=[q_spec, q_t_spec], use_static_tensors=True)\n",
+      "source_digest": "0f0ab3e610121c015abcce6598d3dedf9e734ccbce0069646668392cb63072fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1199,
+      "end_line": 1223,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                prior: w.prior.clone(),\n            })\n            .chain(scope_write.as_ref().map(|rec| Change {\n                lkey: scope_lkey.clone(),\n                after: Some(rec.clone()),\n                before: scope_before.clone(),\n                prior: scope_prior.clone(),\n            }))\n            .chain(removals)\n            .collect();\n        let values = changes\n            .iter()\n            .map(|c| c.after.as_ref().map(serde_json::to_vec).transpose())\n            .collect::<Result<Vec<_>, _>>()\n            .map_err(|e| SetError::Store(e.to_string()))?;\n        if Instant::now() + self.scan_timeout * (2 * changes.len()) as u32 > deadline {\n            return Err(SetError::Store(\n                \"the save took longer than its hold on the head; nothing was written, reload and save again\"\n                    .into(),\n            ));\n        }\n        for (i, (c, value)) in changes.iter().zip(values).enumerate() {\n            if let Err(e) = self.write_raw(&c.lkey, value, deadline).await {\n                return Err(self.put_back(&changes[..=i], e, deadline).await);\n            }\n",
+      "source_digest": "d8401f06048a73c61381609fb5b9199d6673f49ba14c2b91fcbce9aa8737efa6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "clip/utils/data_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    image = tf.image.convert_image_dtype(image, tf.float32)\n\n    resize_side = tf.random.uniform(\n        [],\n        minval=vgg_preprocessing._RESIZE_SIDE_MIN,\n        maxval=vgg_preprocessing._RESIZE_SIDE_MAX + 1,\n        dtype=tf.int32,\n    )\n    image = aspect_preserving_resize(image, resize_side)\n    image = vgg_preprocessing._random_crop([image], output_height, output_width)[0]\n    image = tf.squeeze((image - means) / stdevs)\n    tf.transpose(image, [2, 0, 1])\n    image.set_shape(output_image_shape)\n    return image\n\n\ndef clip_preproc_val(\n    image,\n    output_image_shape,\n    means=TWITTER_MEANS,\n    stdevs=TWITTER_STDEVS,\n    drop_frames=True,\n):\n    if drop_frames:\n",
+      "source_digest": "96304bba1657cc5b96023bf02c6b7875c804d82e1fee1b9718e9b00bb6406df4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "clip/utils/data_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 91,
+      "end_line": 115,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if drop_frames:\n        image = _drop_frames(image)\n\n    image = tf.image.convert_image_dtype(image, tf.float32)\n\n    _, output_height, output_width = output_image_shape\n    smallest_side = tf.math.minimum(output_height, output_width)\n    image = aspect_preserving_resize(image, smallest_side)\n    image = vgg_preprocessing._central_crop([image], output_height, output_width)[0]\n    image = (image - means) / stdevs\n\n    image = tf.squeeze(image)\n    image = tf.transpose(image, [2, 0, 1])\n    image.set_shape(output_image_shape)\n    return image\n\n\ndef get_clip_decode_and_proc_fn(\n    encoded_image_field=\"image_byte_string\",\n    image_field=\"image\",\n    data_augmentation=True,\n    encoder_input_resolution=224,\n    channels=3,\n):\n    preprocessed_image_shape = (\n",
+      "source_digest": "9327677a964adbed55890db071500e0da48289df3f2013f1fd0be692a6f73aaf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "grox/libs/video_tools/video_frames.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 224,
+      "end_line": 246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    \u0040classmethod\n    def get_video_bytes(cls, frames: list[bytes]) -> bytes | None:\n        num_frames = len(frames)\n        if num_frames == 0:\n            logger.warning(\"No video frames to combine\")\n            return None\n        combined_array = None\n        for i, frame in enumerate(frames):\n            with io.BytesIO(frame) as buffer:\n                with Image.open(buffer) as image:\n                    with image.convert(\"RGB\") as converted_image:\n                        np_arr = np.array(converted_image)\n                        np_frame = np_arr.transpose(2, 0, 1)\n                        del np_arr\n                        if i == 0:\n                            combined_array = np.empty(\n                                (num_frames,) + np_frame.shape, dtype=np.uint8\n                            )\n                        combined_array[i] = np_frame\n        with io.BytesIO() as buffer:\n            np.save(buffer, combined_array)\n            del combined_array\n            return buffer.getvalue()\n",
+      "source_digest": "56614300a81d9879366b5d06d21219a98f731c5a0415e0b21ff3a446f19731df",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "home-mixer/clients/popular_authors_store_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 91,
+      "end_line": 115,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(Self {\n            client: build_client(dc).await?,\n        })\n    }\n}\n\n#[async_trait]\nimpl PopularAuthorsStore for ManhattanPopularAuthorsStore {\n    async fn load(&self) -> Result<Option<StoredPopularAuthors>, String> {\n        get_bytes(&self.client, POPULAR_AUTHORS_VERSION)\n            .await?\n            .map(|bytes| decode_stored(&bytes))\n            .transpose()\n    }\n\n    async fn save(&self, stored: &StoredPopularAuthors) -> Result<(), String> {\n        put_bytes(&self.client, POPULAR_AUTHORS_VERSION, encode_stored(stored)).await\n    }\n}\n\npub struct ManhattanPopularPostsStore {\n    client: NativeManhattanClient,\n}\n\nimpl ManhattanPopularPostsStore {\n",
+      "source_digest": "57a6803b07941302adf0957fb8fcf227bb90b41f1ca717f1ae6889159619c738",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "home-mixer/clients/popular_authors_store_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 117,
+      "end_line": 140,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(Self {\n            client: build_client(dc).await?,\n        })\n    }\n}\n\n#[async_trait]\nimpl PopularPostsStore for ManhattanPopularPostsStore {\n    async fn load(&self) -> Result<Option<StoredPopularPosts>, String> {\n        get_bytes(&self.client, POPULAR_POSTS_VERSION)\n            .await?\n            .map(|bytes| popular_posts::decode_stored(&bytes))\n            .transpose()\n    }\n\n    async fn save(&self, stored: &StoredPopularPosts) -> Result<(), String> {\n        put_bytes(\n            &self.client,\n            POPULAR_POSTS_VERSION,\n            popular_posts::encode_stored(stored),\n        )\n        .await\n    }\n}\n",
+      "source_digest": "d8b9cb8e99314d46730727fd8885683c173eab08145e696b73ec2c0c31533fbb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "home-mixer/clients/recent_search_queries_store_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[async_trait]\nimpl RecentSearchQueriesStoreClient for ProdRecentSearchQueriesStoreClient {\n    async fn fetch(&self, user_id: u64) -> Result<Option<RecentSearchQueries>, String> {\n        let pkey: Vec<Vec<u8>> = vec![user_id.to_be_bytes().to_vec()];\n        let lkey: Vec<Vec<u8>> = vec![];\n        let item = self\n            .mh\n            .get(tenant(), pkey, lkey)\n            .await\n            .map_err(|e| e.to_string())?;\n        item.map(|item| RecentSearchQueries::decode(item.value().as_bytes()))\n            .transpose()\n            .map_err(|e| format!(\"decoding RecentSearchQueries: {e}\"))\n    }\n}\n\npub struct MockRecentSearchQueriesStoreClient;\n\n#[async_trait]\nimpl RecentSearchQueriesStoreClient for MockRecentSearchQueriesStoreClient {\n    async fn fetch(&self, _user_id: u64) -> Result<Option<RecentSearchQueries>, String> {\n        Ok(None)\n    }\n}\n",
+      "source_digest": "e2c88dc33d52edfea2deb60affc988d3653ba30d0b054430cf03a0ee2f7ee06d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1629,
+      "end_line": 1653,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let history_actions_slice = history_actions.as_slice_mut()?;\n        let history_continuous_actions_slice = history_continuous_actions.as_slice_mut()?;\n        let candidate_post_hashes_slice = candidate_post_hashes.as_slice_mut()?;\n        let candidate_auth_hashes_slice = candidate_auth_hashes.as_slice_mut()?;\n        let candidate_product_surfaces_slice = candidate_product_surfaces.as_slice_mut()?;\n        let mut hist_sid_rw = self\n            .history_post_sids\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_sid_slice = hist_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_sid_rw = self\n            .candidate_post_sids\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_sid_slice = cand_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut candidate_embeddings_slices: Vec<&mut [f16]> = Vec::new();\n        for arr in candidate_embeddings_arrays.iter_mut() {\n            candidate_embeddings_slices.push(arr.as_slice_mut()?);\n        }\n",
+      "source_digest": "28726f7571d315abf5ccbd5f4408d50a3bf73b7125e1a1700e01e6b6a21cfbe3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1637,
+      "end_line": 1661,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut hist_sid_slice = hist_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_sid_rw = self\n            .candidate_post_sids\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_sid_slice = cand_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut candidate_embeddings_slices: Vec<&mut [f16]> = Vec::new();\n        for arr in candidate_embeddings_arrays.iter_mut() {\n            candidate_embeddings_slices.push(arr.as_slice_mut()?);\n        }\n        let candidate_search_query_embeddings_slice = candidate_search_query_embeddings_arr\n            .as_mut()\n            .map(|arr| arr.as_slice_mut())\n            .transpose()?;\n        let mut user_categorical_features_arr = self\n            .user_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "815470068549f3fde45c070b34dc7ab6d3e891b632dd588e8fc1f74063f41f7e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1645,
+      "end_line": 1669,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut cand_sid_slice = cand_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut candidate_embeddings_slices: Vec<&mut [f16]> = Vec::new();\n        for arr in candidate_embeddings_arrays.iter_mut() {\n            candidate_embeddings_slices.push(arr.as_slice_mut()?);\n        }\n        let candidate_search_query_embeddings_slice = candidate_search_query_embeddings_arr\n            .as_mut()\n            .map(|arr| arr.as_slice_mut())\n            .transpose()?;\n        let mut user_categorical_features_arr = self\n            .user_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut user_bool_features_arr = self\n            .user_bool_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut user_float_features_arr = self\n            .user_float_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "10f887f50508e4880fe63579476cbb3a1f12e48a693d0a98d72d4d96c8139992",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1669,
+      "end_line": 1693,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut user_int64_features_arr = self\n            .user_int64_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut user_installed_apps_arr = self\n            .user_installed_apps\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let user_categorical_slice = user_categorical_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "0f5d8781ee49652a485b842206794257866aefd64219d3ed0d372db1e4997468",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1673,
+      "end_line": 1697,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut user_installed_apps_arr = self\n            .user_installed_apps\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let user_categorical_slice = user_categorical_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "3a1001698a05840856622fa9849ddbe4494bfa5c4f96df8a4b777a1192fe4f59",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1677,
+      "end_line": 1701,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let user_categorical_slice = user_categorical_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let mut hist_cat_arr = self\n            .history_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "11be2edede66564f9ab5199e9cef898a1e55a6540b2025640d0597eb74469af1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1681,
+      "end_line": 1705,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let mut hist_cat_arr = self\n            .history_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_bool_arr = self\n            .history_bool_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "e2c843f2427d090ea61f2c4234803ab49070d87a4887acedb46f92f14ac0f9ee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1685,
+      "end_line": 1709,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let mut hist_cat_arr = self\n            .history_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_bool_arr = self\n            .history_bool_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_float_arr = self\n            .history_float_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "a6ea47b52319120d52795758519613154ad634935a071fed38681eefc39fe3fb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1721,
+      "end_line": 1745,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut cand_float_arr = self\n            .candidate_float_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_int64_arr = self\n            .candidate_int64_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let hist_cat_slice = hist_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "d449368cbb4b4ba14af98f39a149c58d58bd37535730eab3528a5dd250e87c42",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1725,
+      "end_line": 1749,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut cand_int64_arr = self\n            .candidate_int64_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let hist_cat_slice = hist_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "7164022ce4acb8aa93adb6a45d93bb9290ffe9a50a50ecb52147a0d0fb01efc5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1729,
+      "end_line": 1753,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let hist_cat_slice = hist_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "d389de7b3e46746610d07edf739e4b6c41a9b8785ad60f806556a793cb5dd158",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1733,
+      "end_line": 1757,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "5341dd9121afd777986c0592a78cf70cab173aa8ae8ae71f203b904fcdddb22d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1737,
+      "end_line": 1761,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "638700579d96f91c1865467ddde37bb49b4e359f5a3e97ece7b5968d51f11c65",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1741,
+      "end_line": 1765,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n\n        let mut hist_impr_ts_rw = self\n            .history_impr_ts\n            .as_ref()\n",
+      "source_digest": "092fcd9bae881b679c899ebd9df7d96add43ac8ee97a0fc8b608d9f7f6ade5f0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1745,
+      "end_line": 1769,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n\n        let mut hist_impr_ts_rw = self\n            .history_impr_ts\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_post_creation_ts_sec_rw = self\n            .history_post_creation_ts_sec\n            .as_ref()\n",
+      "source_digest": "edb1f6b99ebfd100364b7cfd43a1bf70e4dc52a9e1073df674ddc784915c706a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1749,
+      "end_line": 1773,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n\n        let mut hist_impr_ts_rw = self\n            .history_impr_ts\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_post_creation_ts_sec_rw = self\n            .history_post_creation_ts_sec\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_impr_ts_rw = self\n            .candidate_impr_ts\n            .as_ref()\n",
+      "source_digest": "cb19c5465ca95f4eba49496ff919a380a0befae0c21698e8eadb91f6084c23c8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1771,
+      "end_line": 1795,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut cand_impr_ts_rw = self\n            .candidate_impr_ts\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_post_creation_ts_sec_rw = self\n            .candidate_post_creation_ts_sec\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n\n        let mut hist_impr_ts_slice = hist_impr_ts_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut hist_post_creation_ts_sec_slice = hist_post_creation_ts_sec_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_impr_ts_slice = cand_impr_ts_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_post_creation_ts_sec_slice = cand_post_creation_ts_sec_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "07241e7ab6b2820790abb02384659ecdad25503705873eefa71a6f5fe8e3a258",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1203,
+      "end_line": 1227,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                prior: w.prior.clone(),\n            })\n            .chain(scope_write.as_ref().map(|rec| Change {\n                lkey: scope_lkey.clone(),\n                after: Some(rec.clone()),\n                before: scope_before.clone(),\n                prior: scope_prior.clone(),\n            }))\n            .chain(removals)\n            .collect();\n        let values = changes\n            .iter()\n            .map(|c| c.after.as_ref().map(serde_json::to_vec).transpose())\n            .collect::<Result<Vec<_>, _>>()\n            .map_err(|e| SetError::Store(e.to_string()))?;\n        if Instant::now() + self.scan_timeout * (2 * changes.len()) as u32 > deadline {\n            return Err(SetError::Store(\n                \"the save took longer than its hold on the head; nothing was written, reload and save again\"\n                    .into(),\n            ));\n        }\n        for (i, (c, value)) in changes.iter().zip(values).enumerate() {\n            if let Err(e) = self.write_raw(&c.lkey, value, deadline).await {\n                return Err(self.put_back(&changes[..=i], e, deadline).await);\n            }\n",
+      "source_digest": "d8401f06048a73c61381609fb5b9199d6673f49ba14c2b91fcbce9aa8737efa6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "clip/utils/data_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    image = tf.image.convert_image_dtype(image, tf.float32)\n\n    resize_side = tf.random.uniform(\n        [],\n        minval=vgg_preprocessing._RESIZE_SIDE_MIN,\n        maxval=vgg_preprocessing._RESIZE_SIDE_MAX + 1,\n        dtype=tf.int32,\n    )\n    image = aspect_preserving_resize(image, resize_side)\n    image = vgg_preprocessing._random_crop([image], output_height, output_width)[0]\n    image = tf.squeeze((image - means) / stdevs)\n    tf.transpose(image, [2, 0, 1])\n    image.set_shape(output_image_shape)\n    return image\n\n\ndef clip_preproc_val(\n    image,\n    output_image_shape,\n    means=TWITTER_MEANS,\n    stdevs=TWITTER_STDEVS,\n    drop_frames=True,\n):\n    if drop_frames:\n",
+      "source_digest": "96304bba1657cc5b96023bf02c6b7875c804d82e1fee1b9718e9b00bb6406df4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "clip/utils/data_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 91,
+      "end_line": 115,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if drop_frames:\n        image = _drop_frames(image)\n\n    image = tf.image.convert_image_dtype(image, tf.float32)\n\n    _, output_height, output_width = output_image_shape\n    smallest_side = tf.math.minimum(output_height, output_width)\n    image = aspect_preserving_resize(image, smallest_side)\n    image = vgg_preprocessing._central_crop([image], output_height, output_width)[0]\n    image = (image - means) / stdevs\n\n    image = tf.squeeze(image)\n    image = tf.transpose(image, [2, 0, 1])\n    image.set_shape(output_image_shape)\n    return image\n\n\ndef get_clip_decode_and_proc_fn(\n    encoded_image_field=\"image_byte_string\",\n    image_field=\"image\",\n    data_augmentation=True,\n    encoder_input_resolution=224,\n    channels=3,\n):\n    preprocessed_image_shape = (\n",
+      "source_digest": "9327677a964adbed55890db071500e0da48289df3f2013f1fd0be692a6f73aaf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "grox/libs/video_tools/video_frames.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 224,
+      "end_line": 246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    \u0040classmethod\n    def get_video_bytes(cls, frames: list[bytes]) -> bytes | None:\n        num_frames = len(frames)\n        if num_frames == 0:\n            logger.warning(\"No video frames to combine\")\n            return None\n        combined_array = None\n        for i, frame in enumerate(frames):\n            with io.BytesIO(frame) as buffer:\n                with Image.open(buffer) as image:\n                    with image.convert(\"RGB\") as converted_image:\n                        np_arr = np.array(converted_image)\n                        np_frame = np_arr.transpose(2, 0, 1)\n                        del np_arr\n                        if i == 0:\n                            combined_array = np.empty(\n                                (num_frames,) + np_frame.shape, dtype=np.uint8\n                            )\n                        combined_array[i] = np_frame\n        with io.BytesIO() as buffer:\n            np.save(buffer, combined_array)\n            del combined_array\n            return buffer.getvalue()\n",
+      "source_digest": "56614300a81d9879366b5d06d21219a98f731c5a0415e0b21ff3a446f19731df",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "home-mixer/clients/popular_authors_store_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 91,
+      "end_line": 115,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(Self {\n            client: build_client(dc).await?,\n        })\n    }\n}\n\n#[async_trait]\nimpl PopularAuthorsStore for ManhattanPopularAuthorsStore {\n    async fn load(&self) -> Result<Option<StoredPopularAuthors>, String> {\n        get_bytes(&self.client, POPULAR_AUTHORS_VERSION)\n            .await?\n            .map(|bytes| decode_stored(&bytes))\n            .transpose()\n    }\n\n    async fn save(&self, stored: &StoredPopularAuthors) -> Result<(), String> {\n        put_bytes(&self.client, POPULAR_AUTHORS_VERSION, encode_stored(stored)).await\n    }\n}\n\npub struct ManhattanPopularPostsStore {\n    client: NativeManhattanClient,\n}\n\nimpl ManhattanPopularPostsStore {\n",
+      "source_digest": "57a6803b07941302adf0957fb8fcf227bb90b41f1ca717f1ae6889159619c738",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "home-mixer/clients/popular_authors_store_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 117,
+      "end_line": 140,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Ok(Self {\n            client: build_client(dc).await?,\n        })\n    }\n}\n\n#[async_trait]\nimpl PopularPostsStore for ManhattanPopularPostsStore {\n    async fn load(&self) -> Result<Option<StoredPopularPosts>, String> {\n        get_bytes(&self.client, POPULAR_POSTS_VERSION)\n            .await?\n            .map(|bytes| popular_posts::decode_stored(&bytes))\n            .transpose()\n    }\n\n    async fn save(&self, stored: &StoredPopularPosts) -> Result<(), String> {\n        put_bytes(\n            &self.client,\n            POPULAR_POSTS_VERSION,\n            popular_posts::encode_stored(stored),\n        )\n        .await\n    }\n}\n",
+      "source_digest": "d8b9cb8e99314d46730727fd8885683c173eab08145e696b73ec2c0c31533fbb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "home-mixer/clients/recent_search_queries_store_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[async_trait]\nimpl RecentSearchQueriesStoreClient for ProdRecentSearchQueriesStoreClient {\n    async fn fetch(&self, user_id: u64) -> Result<Option<RecentSearchQueries>, String> {\n        let pkey: Vec<Vec<u8>> = vec![user_id.to_be_bytes().to_vec()];\n        let lkey: Vec<Vec<u8>> = vec![];\n        let item = self\n            .mh\n            .get(tenant(), pkey, lkey)\n            .await\n            .map_err(|e| e.to_string())?;\n        item.map(|item| RecentSearchQueries::decode(item.value().as_bytes()))\n            .transpose()\n            .map_err(|e| format!(\"decoding RecentSearchQueries: {e}\"))\n    }\n}\n\npub struct MockRecentSearchQueriesStoreClient;\n\n#[async_trait]\nimpl RecentSearchQueriesStoreClient for MockRecentSearchQueriesStoreClient {\n    async fn fetch(&self, _user_id: u64) -> Result<Option<RecentSearchQueries>, String> {\n        Ok(None)\n    }\n}\n",
+      "source_digest": "e2c88dc33d52edfea2deb60affc988d3653ba30d0b054430cf03a0ee2f7ee06d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1629,
+      "end_line": 1653,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let history_actions_slice = history_actions.as_slice_mut()?;\n        let history_continuous_actions_slice = history_continuous_actions.as_slice_mut()?;\n        let candidate_post_hashes_slice = candidate_post_hashes.as_slice_mut()?;\n        let candidate_auth_hashes_slice = candidate_auth_hashes.as_slice_mut()?;\n        let candidate_product_surfaces_slice = candidate_product_surfaces.as_slice_mut()?;\n        let mut hist_sid_rw = self\n            .history_post_sids\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_sid_slice = hist_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_sid_rw = self\n            .candidate_post_sids\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_sid_slice = cand_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut candidate_embeddings_slices: Vec<&mut [f16]> = Vec::new();\n        for arr in candidate_embeddings_arrays.iter_mut() {\n            candidate_embeddings_slices.push(arr.as_slice_mut()?);\n        }\n",
+      "source_digest": "28726f7571d315abf5ccbd5f4408d50a3bf73b7125e1a1700e01e6b6a21cfbe3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1637,
+      "end_line": 1661,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut hist_sid_slice = hist_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_sid_rw = self\n            .candidate_post_sids\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_sid_slice = cand_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut candidate_embeddings_slices: Vec<&mut [f16]> = Vec::new();\n        for arr in candidate_embeddings_arrays.iter_mut() {\n            candidate_embeddings_slices.push(arr.as_slice_mut()?);\n        }\n        let candidate_search_query_embeddings_slice = candidate_search_query_embeddings_arr\n            .as_mut()\n            .map(|arr| arr.as_slice_mut())\n            .transpose()?;\n        let mut user_categorical_features_arr = self\n            .user_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "815470068549f3fde45c070b34dc7ab6d3e891b632dd588e8fc1f74063f41f7e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1645,
+      "end_line": 1669,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut cand_sid_slice = cand_sid_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut candidate_embeddings_slices: Vec<&mut [f16]> = Vec::new();\n        for arr in candidate_embeddings_arrays.iter_mut() {\n            candidate_embeddings_slices.push(arr.as_slice_mut()?);\n        }\n        let candidate_search_query_embeddings_slice = candidate_search_query_embeddings_arr\n            .as_mut()\n            .map(|arr| arr.as_slice_mut())\n            .transpose()?;\n        let mut user_categorical_features_arr = self\n            .user_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut user_bool_features_arr = self\n            .user_bool_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut user_float_features_arr = self\n            .user_float_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "10f887f50508e4880fe63579476cbb3a1f12e48a693d0a98d72d4d96c8139992",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1669,
+      "end_line": 1693,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut user_int64_features_arr = self\n            .user_int64_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut user_installed_apps_arr = self\n            .user_installed_apps\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let user_categorical_slice = user_categorical_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "0f5d8781ee49652a485b842206794257866aefd64219d3ed0d372db1e4997468",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1673,
+      "end_line": 1697,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut user_installed_apps_arr = self\n            .user_installed_apps\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let user_categorical_slice = user_categorical_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "3a1001698a05840856622fa9849ddbe4494bfa5c4f96df8a4b777a1192fe4f59",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1677,
+      "end_line": 1701,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let user_categorical_slice = user_categorical_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let mut hist_cat_arr = self\n            .history_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "11be2edede66564f9ab5199e9cef898a1e55a6540b2025640d0597eb74469af1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1681,
+      "end_line": 1705,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let user_bool_slice = user_bool_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let mut hist_cat_arr = self\n            .history_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_bool_arr = self\n            .history_bool_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "e2c843f2427d090ea61f2c4234803ab49070d87a4887acedb46f92f14ac0f9ee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1685,
+      "end_line": 1709,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let user_float_slice = user_float_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_int64_slice = user_int64_features_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let user_installed_apps_slice = user_installed_apps_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let mut hist_cat_arr = self\n            .history_categorical_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_bool_arr = self\n            .history_bool_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_float_arr = self\n            .history_float_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n",
+      "source_digest": "a6ea47b52319120d52795758519613154ad634935a071fed38681eefc39fe3fb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1721,
+      "end_line": 1745,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut cand_float_arr = self\n            .candidate_float_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_int64_arr = self\n            .candidate_int64_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let hist_cat_slice = hist_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "d449368cbb4b4ba14af98f39a149c58d58bd37535730eab3528a5dd250e87c42",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1725,
+      "end_line": 1749,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let mut cand_int64_arr = self\n            .candidate_int64_features\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let hist_cat_slice = hist_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "7164022ce4acb8aa93adb6a45d93bb9290ffe9a50a50ecb52147a0d0fb01efc5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1729,
+      "end_line": 1753,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|a| a.bind(py).readwrite());\n        let hist_cat_slice = hist_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "d389de7b3e46746610d07edf739e4b6c41a9b8785ad60f806556a793cb5dd158",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1733,
+      "end_line": 1757,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let hist_bool_slice = hist_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "5341dd9121afd777986c0592a78cf70cab173aa8ae8ae71f203b904fcdddb22d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1737,
+      "end_line": 1761,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let hist_float_slice = hist_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "638700579d96f91c1865467ddde37bb49b4e359f5a3e97ece7b5968d51f11c65",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1741,
+      "end_line": 1765,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let hist_int64_slice = hist_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n\n        let mut hist_impr_ts_rw = self\n            .history_impr_ts\n            .as_ref()\n",
+      "source_digest": "092fcd9bae881b679c899ebd9df7d96add43ac8ee97a0fc8b608d9f7f6ade5f0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1745,
+      "end_line": 1769,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let cand_cat_slice = cand_cat_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n\n        let mut hist_impr_ts_rw = self\n            .history_impr_ts\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_post_creation_ts_sec_rw = self\n            .history_post_creation_ts_sec\n            .as_ref()\n",
+      "source_digest": "edb1f6b99ebfd100364b7cfd43a1bf70e4dc52a9e1073df674ddc784915c706a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1749,
+      "end_line": 1773,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .transpose()?;\n        let cand_bool_slice = cand_bool_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_float_slice = cand_float_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n        let cand_int64_slice = cand_int64_arr\n            .as_mut()\n            .map(|a| a.as_slice_mut())\n            .transpose()?;\n\n        let mut hist_impr_ts_rw = self\n            .history_impr_ts\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut hist_post_creation_ts_sec_rw = self\n            .history_post_creation_ts_sec\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_impr_ts_rw = self\n            .candidate_impr_ts\n            .as_ref()\n",
+      "source_digest": "cb19c5465ca95f4eba49496ff919a380a0befae0c21698e8eadb91f6084c23c8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/python.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1771,
+      "end_line": 1795,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut cand_impr_ts_rw = self\n            .candidate_impr_ts\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n        let mut cand_post_creation_ts_sec_rw = self\n            .candidate_post_creation_ts_sec\n            .as_ref()\n            .map(|a| a.bind(py).readwrite());\n\n        let mut hist_impr_ts_slice = hist_impr_ts_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut hist_post_creation_ts_sec_slice = hist_post_creation_ts_sec_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_impr_ts_slice = cand_impr_ts_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n        let mut cand_post_creation_ts_sec_slice = cand_post_creation_ts_sec_rw\n            .as_mut()\n            .map(|rw| rw.as_slice_mut())\n            .transpose()?;\n",
+      "source_digest": "07241e7ab6b2820790abb02384659ecdad25503705873eefa71a6f5fe8e3a258",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8401f959d14db6834bdd10be04048406b848848bf50976ac4d2945cc7754835d",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "2c6789709ef2118342a01a0d58ce840f624b8cecb05ab1491a288da5972d53e3",
+      "context_complete": true,
+      "task_id": "T-ced570332e44b8fe6e8c27d4830d62ab6d9540f458ff203e89967cde9b82ed3f",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-34a8ab8bc85899283345927b911b2bd6f29996b4be3ffae840675006351718fd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-c621631aac44f4627490fc9f0d05f9870aabd0d6b2d42702076aea483afa3e4e",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-25d2b5a4cdc135e8dc2f892e858477d6ee4b19c1725de16b0e359da918bc6659",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-bd14811e20a2455fb6a494baf279c993cfb9cf6ba996f257d88ab389b31f6b45",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-6c9304ee7345418df1d05cc5f672620686e265655911cbd8104a2b9358b1c7bb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-d19f26cd20393ae244a962dc1ca59a77dd3118edf8cf8aa8df2fc66eca75af28",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f5d95b34f41ffff2f0c8f671a17e943f7f8f3ef1027b44963084a05f805959ce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-66ceb4ad727decb227c920725f0c46b87188757909daa27bd62a6f3717e33115",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-6af86e5d6dd1f38aa72aea6d1cd7501311f85b5afaa756a73acc44735db9039a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-75ebf6557b9d004f080e11e51d5824b64357a0fcae8cf65b8235ff2c98e2ca39",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b16bc3624c11959f592cac86a797cdd0b444d6d19fcedc6a0363048880983f40",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-f29a5deae073e5b43c08171d0ae73fd3de0ac0597d3ed5fe4b2567db3db9e65e",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f1201cea684743e6aef9294a114b1c9998f6732f8f02ca5193b34bd579b81fef",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-f6c2fd4df2e566e225f44577af3accb990a5db8d7864ee999840661741a2909c",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-6b51f5425f9ca924994ad6634ebe2643ad90f0ef70b3b206af012a3f0b6d3d8a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-d0a53da65f4a5d4c9f0001945bf2e42ab0304f8e45a10c031198e6a63757d1ac",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9165ec1b2b22262018fb3d434502642de14de71480f55aa0dbd6dffa1967b7d2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-f0304132a1096733c64680368bcb498231c690bbd786c9544139db91cbe36701",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-726f798fb8e83bed2d5aef66982b9c1eaa8ff408f17d8c0be2c53de7c5414ded",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-45800e69b64f87f698e7a3e4ccc292e2a59050c28ed6c81389c98c74b278169f",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a791186948bd5e19b1b4f93765585af38f4a578b4a791730d240f784d310b0d2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-a53d84112bbad803559fc518c5cd1039e6888261dd8eac055255a827c3cb16ae",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-44b8fa2feb91c96a0826dfd606903b9ffe8e039ceee445c86095cf7cd436887c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-57a121357dded73a48e1338bc4c428f41e94c96f1dafbdbe4db569998b4a661b",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4d1e9afde099d1d9d9692e19c0a7fcd80e983e50968781bae5de1d2a77dcb2d4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-3fb3023d19798d2d3637afe6995c8eea375a4c33e0ade4a82a7c8cada9877cdc",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5d10b08624e881b5eaefebb8ee0a22e4282d21b51248729b0ba006ad10db49ab",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-e4be9d1ff20418bb8c6c007857f106c3307e1f07a7e1efc6e9f55658d06205cb",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-6a23cde9f60e17248cd270681c7b6d6395ad48e1eebfa95618cb7be5a4d1aea7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-039b02b9694f9192da3095aaafca33db7b74307d4b78c0d65356cebf2c32e360",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-072ea22da8775e001348873a6f7c27f924188cb43e25f65baf2f73e7d5a2481f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-4d68b671f43ab56f01909657bac38aa67117fb9de28c629693f22ecd862bf041",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b123f260655430520bb1b03e374641071e559e21e07b5a83f9f4fefd03f76d2a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-90de532ffb77a5918892dda12ea0f93d9a4b2ff1f4a4deaae0c3f70745bc89a3",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-26c98be399f073a5a131994b1015f88f35f1ae0d4b8ed1a0e846b072b8dbfcea",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-79bd0f78cc12ba5066fcf42ab998468238cdd4ea60d9d7f6d6c5874ddcdc6fd8",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-2fed50476c4df3ac04cb7a8a4145f5a6ecea69d49a1dfe0b51d7c6411c8ad412",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-05ebdd18e59432009c07402e93ffef23d4dbf9583389977d14c8b68d791609db",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a400e0bae68354f0fb13c0908d1322daa7bafcf296f8343cb2065132ad79b300",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-684d5de9db567a34491f946fd72ef88069d5f64f936c6cb097a4a67232ca61aa",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-de6d4aa3d50490b2bc2e996f8e1b5634417770717e57b9bd7d3d670fc34392a4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-2e6f484b452017a8e719814fe819cfc7bb7bbf8592b13f5ae5e26b8c0c8ae29f",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-1a57bf02cd31772d3628a22ab7c3ef1bdd09ad7e9d1b6aeba12c18ff064b8f11",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-0e11fda654cbaac8a869e9bf7960479dc9e3f3bc31e0f459ea2dcd1f96e6ec9f",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-635b0c2dc0501e482a8dc58d5d8488e454639e59ba01141bad277edacb9315d9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-9e09ad88580fe8f8afda70e0324842392451e61845c7dca6950765908f738ae7",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b7d9055ed380e1e257ed5d3d316176e774cf84447a0266bbb088e6b6e0e7841b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-19ae6eb8318538887d5ad62c802f4912c2347e5f8d37d3e02e9416bd28dc3b59",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d0aa098ab4b771637902f788221d3dccb16ac86ccb9202ec9ea393396c7e34f3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-f0ffd39329d0038479ef2d0dfa1fa4eee42a211fe2f596c53b535ed194e43e31",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a5c23ef92ae4b7d69c389f4ae13b9fbf12053f5a323f1374058dcff060f095ef",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-c3b672945d4b6c8055f8f156207fe61f30eeb9dfac6e0fefa4c9f4bbaae4cf9b",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9f8b5d99942e48c0e464a6f7edd42bd321833b04a465e09ce4fbd7d0ee4dfd06",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c2032a7e086c7777051c749ec687fc1074c86a4ff4c459076337f03874e15c7",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-2f72744002e9e376eba51c29c5d6ad00afe84942a91e8a4db26ad016bfcd2a4d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a4034f480dc6690f0ebd50d0de4bf842c061ae2d212de470c7c31c68738821e",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-26b3afe9feb738f3887f445942b59e05b03bdfdaed87e19875cd2ceb82a87a2e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-df6805bb4357989b81863327f2228bc8c1f3908629c0b9dc81c3d128cb15cfb9",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-cabf2df3faf431d51f3538349519982715248bae357432c746ce9cd6a3d9e685",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-e5559fc8437dba2632951294079763f76c4e40884ee6fb2e9ed2a9407602bf3f",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-da5502ff0c80f0b1c6fb6853efda8e7e2ae84cc275a84f533701e6e00611bc3c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-557b0117a1ba8bc6722564fc80b20402e0062dea8af6133e4b4ce254159e45b9",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-eac598b48ae46dbe517925758e2c40ccdd2b419f04d413a75691a177a10d3241",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-7fcfcf5e7e42efca2267ce8d645fa46346a6b5b24b36d4cb4d062e7a238b9943",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-3e5b1fbd2a5437464845da156733aee3ca00733b77b2bab20517e86bb1d076af",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-b427e0e3b780c342503e9aeb35f6f3c45833b93209e1880a089e8d2c573b734a",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b55536cbb36bbf575f28fb572a3b8776e0fa493efa05fce992e167f9e76c5df1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-ae15c2301073124591fe094701fa06d7184f122a1723630ae2321eafdf0770bf",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-eec5e7b43e47f38c94a51494791ca9865d9199134662fe169c7e2c86864bb509",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-b66360739437fea2bb6a3fd42fa66e1ad1a46b20a7b55d2a542c582256d4025e",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-31b5d255497e804be7a3589d797b9b792c61f88c0c4040c4b709be425612f82b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-bceb185c2711a1af21897818c242b703eb32a781a1f14401649141a731ef1b92",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b0ef62f30d41d6e177052c56190f9a8e0476834548fe026c99e294d06f423cd3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-c4c7289a99c4cf54e0f7198109a4bf269b5466931d2fa8c2bb2f696a717a32c4",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-50b75ee582fd13292b5fd9d750331554aa93681afe9d40f578a33d577a044262",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-45449fa7a4322ba4408823ad0cbe6f76261190bcd2b3b24c1abe62d544dc07ac",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-322601f4bf7112aa3de150464606947e5503d8e0030f025ccae499d703ce5451",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-b8dd654cfd94818556d46da2fc2d49af8753188953f7612148e8dc7559179015",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c4b50bad19a9c5673cad175966f67a834eebdb744bb0a2eada8d598b7c1f1561",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-eec8f715065d641d8a6a30814b8c570f295bf72113ea7b949768d8327c2dda05",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-cf028388ee3d536f1133c5ac8f9b86e40e035475fe19547f69883bccc8a69f29",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-57c3aab9c15dd3cc6569e35399a623f5deb6bac1dc0bf4eeaa6f80664d9e015f",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b3e1b5d0e58569d85e9c3ec0e55a39b4546c588e56ce4d5632c57f7ebbf46846",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-ca3a918b69bdcc3714cdf25386d5dd00e68fa9c31a813d8610cf4f8bc5aa6956",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-efd70e2fa35308ce4f47f6b146c47fa42036bb12bb88c00405ed65c62440a880",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-2e36aa7653e0add25ce3be0be08aad0eb4cc3b3e92c27ee61a270d3044c854ea",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7e4a75269f63f0592aa682eba0447440a9f52834aed10da9299c7ada455ca6c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-97f77f59a68f8d9d2d6f75ca8c847f4e8a467986ce57ae01b5b38672dbdec8dc",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-37173ba7941f224edd6e3e1799ff035499fac492de29329a0507cb54ed334c12",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-526965a2cd98653c96dde16f211b52e4aa3e5240243e8b16a033440b7f6c878a",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-dcfcc0c60a78bf6a2f24da10fcb935a2e607ce68765fd4c7ade6ad609b527ae3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-f94c5c68a2697b9811f451a42de5a5c2148e1b74040c372a0789017153fea76a",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8119899deb620f1a154a2681463ba78dc79a05dfcbf347e0620bde53b2b931bb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-3d65bda38cbd93daaab817e23201446615ad424103baba69c776fc7d05cb2fed",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-eb42aa5d0d6bad5c6f0b682bb39dc529460826490ab05b6515de16e5724faa9a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "quantize_transposed_supported",
+        "transpose_supported",
+        "_supported",
+        "quantize_transposed",
+        "transpose",
+        "_store_transposed",
+        "_compiled_kernel",
+        "quantize4"
+      ],
+      "context_complete": false,
+      "task_id": "T-9882d2b222532e42bfdb8c4f2d706501674bd6e8341ad71a637638b49d29a7de",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-3ae69ac5fd4d356b27e3aa50fdc19c2252604f725a321c0fa6d88e08d7c47be7"
+}

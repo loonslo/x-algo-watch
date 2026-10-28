@@ -1,0 +1,1937 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-64b03d70618c1668c9238970aaff57e938188769e8b19ce79603bdd9c3cf18cc",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 300,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport collections\nimport dataclasses\nimport logging\nimport os\nimport threading\nimport time\nfrom collections.abc import Callable, Sequence\nfrom typing import Protocol, final\n\nimport numpy as np\nfrom numpy import typing as npt\n\nfrom xrex.data import rust_ext\n\nrank_logger = logging.getLogger(\"rank\")\n\nURL_EMBEDDING_DIM = 1024\n_AVAILABLE_AT_BYTES = 8\nURL_EMBEDDING_VALUE_BYTES = _AVAILABLE_AT_BYTES + 2 * URL_EMBEDDING_DIM\n_ERROR_BACKOFF_S = 10.0\n_LOG_INTERVAL_S = 300.0\n_NOT_FOUND_MS = np.iinfo(np.int64).max\n_XDS_BOOTSTRAP_ENVS = (\"GRPC_XDS_BOOTSTRAP\", \"GRPC_XDS_BOOTSTRAP_CONFIG\")\n\n\ndef url_embedding_key(url_id: int) -> str:\n    return f\"url_{url_id}_v8_2_emb\"\n\n\ndef parse_url_embedding_value(\n    value: bytes | None,\n) -> tuple[int, npt.NDArray[np.float16]] | None:\n    if value is None or len(value) != URL_EMBEDDING_VALUE_BYTES:\n        return None\n    available_at_ms = int.from_bytes(value[:_AVAILABLE_AT_BYTES], \"little\", signed=True)\n    vector = np.frombuffer(value, dtype=\"<f2\", offset=_AVAILABLE_AT_BYTES).astype(np.float16)\n    return available_at_ms, vector\n\n\nclass MGetClient(Protocol):\n    def mget(self, keys: list[str]) -> tuple[Sequence[bytes | None], Sequence[int]]: ...\n\n\n\u0040dataclasses.dataclass\nclass UrlEmbeddingLookupStats:\n    rows: int = 0\n    sampled_out_rows: int = 0\n    positions: int = 0\n    filled_positions: int = 0\n    not_yet_available_positions: int = 0\n    unique_ids: int = 0\n    cache_hits: int = 0\n    negative_cache_hits: int = 0\n    redis_hits: int = 0\n    redis_misses: int = 0\n    redis_unanswered: int = 0\n    mget_calls: int = 0\n    mget_errors: int = 0\n    mget_skipped: int = 0\n    mget_seconds: float = 0.0\n\n    def add(self, other: UrlEmbeddingLookupStats) -> None:\n        for field in dataclasses.fields(self):\n            setattr(self, field.name, getattr(self, field.name) + getattr(other, field.name))\n\n\n\u0040final\nclass HistoryUrlEmbeddingLookup:\n    def __init__(\n        self,\n        client: MGetClient,\n        cache_entries: int,\n        sample_rate: float,\n        rng: np.random.Generator,\n        clock: Callable[[], float],\n        negative_ttl_s: float = 0.0,\n    ) -> None:\n        if cache_entries < 0:\n            raise ValueError(f\"cache_entries must be >= 0, got {cache_entries}\")\n        if not 0.0 <= sample_rate <= 1.0:\n            raise ValueError(f\"sample_rate must be in [0, 1], got {sample_rate}\")\n        if negative_ttl_s < 0:\n            raise ValueError(f\"negative_ttl_s must be >= 0, got {negative_ttl_s}\")\n        self._client = client\n        self._cache_entries = cache_entries\n        self._sample_rate = sample_rate\n        self._rng = rng\n        self._clock = clock\n        self._slots: collections.OrderedDict[int, int] = collections.OrderedDict()\n        self._vectors = np.zeros((cache_entries, URL_EMBEDDING_DIM), np.float16)\n        self._available_at_ms = np.zeros(cache_entries, np.int64)\n        self._negative_ttl_s = negative_ttl_s\n        self._absent: collections.OrderedDict[int, float] = collections.OrderedDict()\n        self._mget_paused_until = float(\"-inf\")\n        self._pending = UrlEmbeddingLookupStats()\n        self._totals = UrlEmbeddingLookupStats()\n        self._last_log = clock()\n        self._lock = threading.Lock()\n\n    \u0040classmethod\n    def from_cache(\n        cls,\n        cache: str,\n        dc: str,\n        timeout_s: float,\n        cache_entries: int,\n        sample_rate: float,\n        negative_ttl_s: float,\n    ) -> HistoryUrlEmbeddingLookup:\n        source = next((name for name in _XDS_BOOTSTRAP_ENVS if os.environ.get(name)), \"no\")\n        client = rust_ext.load(\"xai_recsys_kafka_reader\").XdsRedisMget(cache, dc, timeout_s)\n        endpoints = client.endpoint_count()\n        if endpoints == 0:\n            raise RuntimeError(\n                f\"xDS discovery found no endpoints for Dragonfly {cache!r} in {dc!r} with the \"\n                f\"{source} bootstrap; check its discovery server\"\n            )\n        rank_logger.info(\n            \"History URL embedding cache %s (%s, bootstrap %s): %d endpoints\",\n            cache,\n            dc,\n            source,\n            endpoints,\n        )\n        return cls(\n            client,\n            cache_entries,\n            sample_rate,\n            np.random.default_rng(),\n            time.monotonic,\n            negative_ttl_s,\n        )\n\n    def __call__(\n        self,\n        url_ids: npt.NDArray[np.int64],\n        valid: npt.NDArray[np.bool_],\n        serve_time_ms: npt.NDArray[np.int64],\n        out: npt.NDArray[np.float16],\n    ) -> None:\n        batch_size, history_len = url_ids.shape\n        assert out.shape == (batch_size, history_len, URL_EMBEDDING_DIM), out.shape\n        stats = UrlEmbeddingLookupStats(rows=batch_size)\n        with self._lock:\n            sampled = self._rng.random(batch_size) < self._sample_rate\n        stats.sampled_out_rows = batch_size - int(sampled.sum())\n        rows, cols = np.nonzero(valid & sampled[:, None])\n        stats.positions = len(rows)\n        if len(rows) > 0:\n            unique_ids, inverse = np.unique(url_ids[rows, cols], return_inverse=True)\n            available_at_ms, vectors = self._lookup(unique_ids, stats)\n            position_available_at_ms = available_at_ms[inverse]\n            usable = position_available_at_ms <= serve_time_ms[rows]\n            out[rows[usable], cols[usable]] = vectors[inverse[usable]]\n            stats.filled_positions = int(usable.sum())\n            stats.not_yet_available_positions = int(\n                ((position_available_at_ms != _NOT_FOUND_MS) & ~usable).sum()\n            )\n        with self._lock:\n            self._pending.add(stats)\n            self._totals.add(stats)\n            self._maybe_log()\n\n    def take_stats(self) -> UrlEmbeddingLookupStats:\n        with self._lock:\n            stats, self._pending = self._pending, UrlEmbeddingLookupStats()\n        return stats\n\n    def _lookup(\n        self, unique_ids: npt.NDArray[np.int64], stats: UrlEmbeddingLookupStats\n    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float16]]:\n        available_at_ms = np.full(len(unique_ids), _NOT_FOUND_MS, np.int64)\n        vectors = np.zeros((len(unique_ids), URL_EMBEDDING_DIM), np.float16)\n        misses: list[int] = []\n        hit_indices: list[int] = []\n        hit_slots: list[int] = []\n        with self._lock:\n            now = self._clock()\n            for index, url_id in enumerate(unique_ids.tolist()):\n                slot = self._slots.get(url_id)\n                if slot is not None:\n                    self._slots.move_to_end(url_id)\n                    hit_indices.append(index)\n                    hit_slots.append(slot)\n                    continue\n                absent_until = self._absent.get(url_id)\n                if absent_until is not None:\n                    if now < absent_until:\n                        stats.negative_cache_hits += 1\n                        continue\n                    del self._absent[url_id]\n                misses.append(index)\n            available_at_ms[hit_indices] = self._available_at_ms[hit_slots]\n            vectors[hit_indices] = self._vectors[hit_slots]\n            paused = now < self._mget_paused_until\n        stats.unique_ids = len(unique_ids)\n        stats.cache_hits = len(unique_ids) - len(misses) - stats.negative_cache_hits\n        if not misses:\n            return available_at_ms, vectors\n        if paused:\n            stats.mget_skipped = 1\n            return available_at_ms, vectors\n        miss_ids = unique_ids[misses].tolist()\n        start = self._clock()\n        stats.mget_calls = 1\n        try:\n            values, failed = self._client.mget([url_embedding_key(url_id) for url_id in miss_ids])\n        except OSError as error:\n            self._pause_mgets(stats, f\"no shard answered: {error!r}\")\n            return available_at_ms, vectors\n        finally:\n            stats.mget_seconds = self._clock() - start\n        unanswered = set(failed)\n        stats.redis_unanswered = len(unanswered)\n        if unanswered:\n            self._pause_mgets(stats, f\"{len(unanswered)}/{len(miss_ids)} keys unanswered\")\n        found: list[tuple[int, tuple[int, npt.NDArray[np.float16]]]] = []\n        absent: list[int] = []\n        for position, (index, url_id, value) in enumerate(\n            zip(misses, miss_ids, values, strict=True)\n        ):\n            if position in unanswered:\n                continue\n            entry = parse_url_embedding_value(value if isinstance(value, bytes) else None)\n            if entry is None:\n                stats.redis_misses += 1\n                absent.append(url_id)\n                continue\n            stats.redis_hits += 1\n            available_at_ms[index], vectors[index] = entry\n            found.append((url_id, entry))\n        if self._cache_entries > 0 and (found or absent):\n            with self._lock:\n                for url_id, (entry_available_at_ms, vector) in found:\n                    self._absent.pop(url_id, None)\n                    slot = self._slots.get(url_id)\n                    if slot is not None:\n                        self._slots.move_to_end(url_id)\n                    else:\n                        if len(self._slots) < self._cache_entries:\n                            slot = len(self._slots)\n                        else:\n                            _, slot = self._slots.popitem(last=False)\n                        self._slots[url_id] = slot\n                    self._vectors[slot] = vector\n                    self._available_at_ms[slot] = entry_available_at_ms\n                if self._negative_ttl_s > 0 and absent:\n                    absent_until = self._clock() + self._negative_ttl_s\n                    for url_id in absent:\n                        self._absent.pop(url_id, None)\n                        self._absent[url_id] = absent_until\n                    while len(self._absent) > self._cache_entries:\n                        self._absent.popitem(last=False)\n        return available_at_ms, vectors\n\n    def _pause_mgets(self, stats: UrlEmbeddingLookupStats, reason: str) -> None:\n        stats.mget_errors = 1\n        with self._lock:\n            self._mget_paused_until = self._clock() + _ERROR_BACKOFF_S\n            first_error = self._totals.mget_errors == 0\n        if first_error:\n            rank_logger.warning(\n                \"History URL embedding MGET failed (%s); misses read zeros for %.0fs\",\n                reason,\n                _ERROR_BACKOFF_S,\n            )\n\n    def _maybe_log(self) -> None:\n        now = self._clock()\n        if now - self._last_log < _LOG_INTERVAL_S:\n            return\n        self._last_log = now\n        totals = self._totals\n        rank_logger.info(\n            \"History URL embeddings: rows=%d sampled_out=%d positions=%d filled=%d \"\n            \"not_yet_available=%d unique_ids=%d cache_hits=%d negative_cache_hits=%d \"\n            \"redis_hits=%d redis_misses=%d redis_unanswered=%d mget_calls=%d mget_errors=%d \"\n            \"mget_skipped=%d mget_mean_ms=%.1f cache_size=%d negative_cache_size=%d\",\n            totals.rows,\n            totals.sampled_out_rows,\n            totals.positions,\n            totals.filled_positions,\n            totals.not_yet_available_positions,\n            totals.unique_ids,\n            totals.cache_hits,\n            totals.negative_cache_hits,\n            totals.redis_hits,\n            totals.redis_misses,\n            totals.redis_unanswered,\n            totals.mget_calls,\n            totals.mget_errors,\n            totals.mget_skipped,\n            1000.0 * totals.mget_seconds / max(totals.mget_calls, 1),\n            len(self._slots),\n            len(self._absent),\n        )\n",
+      "source_digest": "ea0753648bcf61557079f3a107f9000d09483950b892f7bc8dbf387aeb204001",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 708,
+      "end_line": 732,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        format!(\"{pkey}:{lkey}\")\n    }\n}\n\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n        PageAction::SpamHighRecall { lifetime }\n        | PageAction::PhoenixSkip { lifetime }\n        | PageAction::PostSpamHighRecall { lifetime } => {\n            Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))\n        }\n        _ => None,\n    }\n}\n",
+      "source_digest": "6d5a51ba5e530d90e2c76e870133e071cfefb968adb143e3c76503e6fd767c8c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 754,
+      "end_line": 778,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    \"hands the scope back to the GrowthBook rules, whose actions may be harsher\"\n                        .to_owned(),\n                ),\n            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n",
+      "source_digest": "5e8700065dad055c36be1d2dd94604eabfd187ee76736347e77f98e0a23b1bed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 756,
+      "end_line": 780,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ),\n            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n",
+      "source_digest": "36d03b47ce1efdb55aa8fd15bd7bd7eddbfca4b7da4b8b4ead77633ea89dd341",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 757,
+      "end_line": 781,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        }\n        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n",
+      "source_digest": "a60553d49e133a635fdb73a0d93167561068731dade9cbc6b19fc8375a45f6c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2245,
+      "end_line": 2269,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub fail_get: AtomicBool,\n        pub scans: AtomicUsize,\n                        pub clobber_with: Mutex<Option<Vec<u8>>>,\n                pub record_writes: AtomicUsize,\n                                pub fail_record_writes: Mutex<HashMap<usize, bool>>,\n    }\n\n    impl MemControlStore {\n                fn record_write_fails(&self, pkey: &str) -> Option<bool> {\n            if pkey != MH_PKEY {\n                return None;\n            }\n            let n = self.record_writes.fetch_add(1, Ordering::SeqCst);\n            self.fail_record_writes.lock().unwrap().get(&n).copied()\n        }\n\n        pub(crate) fn put_record(&self, rec: &ActionControlRecord) {\n            self.rows.lock().unwrap().insert(\n                (MH_PKEY.into(), record_lkey(rec)),\n                serde_json::to_vec(rec).unwrap(),\n            );\n        }\n\n        pub(crate) fn put_raw(&self, lkey: &str, value: &[u8]) {\n            self.rows\n",
+      "source_digest": "3131be9f92b7a86101a2df25d19101c5f650fc54916e52f4dced3b4554ed0d37",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2280,
+      "end_line": 2304,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .iter()\n                .filter(|((p, _), _)| p == pkey)\n                .map(|((_, l), v)| (l.clone(), v.clone()))\n                .collect();\n            rows.sort();\n            rows\n        }\n    }\n\n    #[async_trait]\n    impl ControlStore for MemControlStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.scans.fetch_add(1, Ordering::Relaxed);\n            if self.fail_scan.load(Ordering::Relaxed) {\n                anyhow::bail!(\"scan failed (test)\");\n            }\n            Ok(self.pkey_rows(pkey))\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            if self.fail_get.load(Ordering::Relaxed) {\n                anyhow::bail!(\"get failed (test)\");\n            }\n            Ok(self\n                .rows\n",
+      "source_digest": "3d47206f4574aa0a2fe844ae64d7330d18873ebae2adaf1289d659c8c9e7458a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3583,
+      "end_line": 3607,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            h(None, &r(ControlMode::Recording, vec![])),\n            Vec::<String>::new()\n        );\n        assert!(!h(None, &r(ControlMode::Live, vec![LIVENESS])).is_empty());\n        let rec = r(ControlMode::Recording, vec![]);\n        assert!(\n            !h(Some(&rec), &r(ControlMode::Rules, vec![])).is_empty(),\n            \"recording → rules acts\"\n        );\n        let l = r(ControlMode::Live, vec![SHR7]);\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, SUSPEND]))\n                .contains(&\"adds suspend\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, LIVENESS]))\n                .contains(&\"adds liveness check\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR30]))\n                .contains(&\"makes the label last longer\".to_owned())\n        );\n        let shorter = h(\n            Some(&r(ControlMode::Live, vec![SHR30])),\n            &r(ControlMode::Live, vec![SHR7]),\n",
+      "source_digest": "ba3de1daed88c24049d9a2ed4768d7d2843eee7271921a1c2117f0b0743e4e47",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3587,
+      "end_line": 3611,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let rec = r(ControlMode::Recording, vec![]);\n        assert!(\n            !h(Some(&rec), &r(ControlMode::Rules, vec![])).is_empty(),\n            \"recording → rules acts\"\n        );\n        let l = r(ControlMode::Live, vec![SHR7]);\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, SUSPEND]))\n                .contains(&\"adds suspend\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, LIVENESS]))\n                .contains(&\"adds liveness check\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR30]))\n                .contains(&\"makes the label last longer\".to_owned())\n        );\n        let shorter = h(\n            Some(&r(ControlMode::Live, vec![SHR30])),\n            &r(ControlMode::Live, vec![SHR7]),\n        );\n        assert!(shorter.is_empty(), \"{shorter:?}\");\n        assert!(\n            h(Some(&l), &r(ControlMode::Recording, vec![SHR7])).is_empty(),\n",
+      "source_digest": "670ad4f2c14b6f743fbcd3e6e2bbb10d6c6f22bc40ccaa69c4883246272ed3cb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4352,
+      "end_line": 4376,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            struct HoldingStore {\n        inner: MemControlStore,\n        marker_scans: AtomicUsize,\n        first_checked: tokio::sync::Notify,\n        second_done: tokio::sync::Notify,\n    }\n\n    #[async_trait]\n    impl ControlStore for HoldingStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            let rows = self.inner.scan(pkey).await?;\n            if pkey.starts_with(SAVE_PKEY_PREFIX)\n                && self.marker_scans.fetch_add(1, Ordering::SeqCst) == 0\n            {\n                self.first_checked.notify_one();\n                self.second_done.notified().await;\n            }\n            Ok(rows)\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            self.inner.get(pkey, lkey).await\n        }\n\n        async fn put(\n",
+      "source_digest": "3354fe6938b3fc1fc0f04d918fbdc7162b3a642ed88199808c37c455995806ae",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 604,
+      "end_line": 628,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"invalid_evidence\",\n            \"evidence belongs on a low, mid or high row\".into(),\n        ),\n        None if req.evidence_override.is_some() => bad(\n            \"invalid_override\",\n            \"an evidence override belongs on a live low, mid or high row\".into(),\n        ),\n        None => Ok(()),\n    }\n}\n\npub(super) fn record_problem(rec: &ActionControlRecord, now_ms: i64) -> Option<&'static str> {\n    let ahead = now_ms.saturating_add(confidence::CLOCK_SKEW_MS);\n    if rec.updated_at_ms > ahead {\n        return Some(\"written later than this pod's clock\");\n    }\n    if rec\n        .evidence\n        .as_ref()\n        .is_some_and(|ev| ev.read_at_ms > ahead)\n    {\n        return Some(\"evidence read later than this pod's clock\");\n    }\n    if let Some(ov) = &rec.evidence_override {\n        if ov.by.trim().is_empty() || ov.reason.trim().is_empty() {\n",
+      "source_digest": "23c3ce40473f7ebca8f7157c152068d4cc800a148d70bf204b11b8ea2df7b564",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 625,
+      "end_line": 649,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        return Some(\"evidence read later than this pod's clock\");\n    }\n    if let Some(ov) = &rec.evidence_override {\n        if ov.by.trim().is_empty() || ov.reason.trim().is_empty() {\n            return Some(\"an evidence override must name a person and a reason\");\n        }\n        if ov.expires_at_ms <= rec.updated_at_ms {\n            return Some(\"an evidence override can't expire before its own write\");\n        }\n        if ov.expires_at_ms\n            > rec\n                .updated_at_ms\n                .saturating_add(confidence::EVIDENCE_OVERRIDE_MAX_MS)\n        {\n            return Some(\"an evidence override can't last past 7 days from its write\");\n        }\n    }\n    if rec.confidence.is_some() && rec.band.is_some() {\n        return Some(\"a record can't be keyed by both band and row\");\n    }\n    if rec.mode == ControlMode::Rows\n        && (rec.band.is_some() || rec.confidence.is_some() || !rec.actions.is_empty())\n    {\n        return Some(\"mode rows is set on a head or head + classifier, with no actions\");\n    }\n",
+      "source_digest": "f4d7ad4fb9db75a4f9975427f91379c04a1b9c3820c1e79e367ecc47d3372b4e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 222,
+      "end_line": 246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let b = bed(\n        vec![\n            live(BB1.0, None, vec![SHR7, LIVENESS]),\n            live(crate::replay_tests::SWITCHED_OFF_HEAD, None, vec![LIVENESS]),\n        ],\n        false,\n    )\n    .await;\n    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(\n        ais_names(&t),\n        vec![\"addLabelsV2\", \"bounceViaTemplate\"],\n        \"label, then liveness check\"\n    );\n    assert_eq!(t.tickets, 1);\n    assert_eq!(\n        t.dedup_calls,\n        vec![\"try_insert(class=2)=new\", \"update(class=2,own_claim=true)\"]\n    );\n    let i = info(&t);\n    assert_eq!(i[\"matched_rule_id\"], \"page\");\n    assert_eq!(i[\"rules_would_rule_id\"], \"anchor_campaign_suspend\");\n    assert_eq!(i[\"action_control_mode\"], \"live\");\n    assert_eq!(i[\"action_control_scope\"], \"head\");\n",
+      "source_digest": "5934521da020ff924fab223a296d24a04d8dd7e8b18be10dc53780edbcc3c4d7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 294,
+      "end_line": 318,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"already_spam_high_recall_labeled\");\n    assert!(t.ais.is_empty());\n    let b = bed(vec![live(BB1.0, None, vec![SHR7, LIVENESS])], false).await;\n    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(\n        ais_names(&t),\n        vec![\"addLabelsV2\", \"bounceViaTemplate\"],\n        \"a composite is never split\"\n    );\n}\n\n#[tokio::test]\nasync fn phoenix_skip_page_label_writes_label_118_once() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let phoenix = PageAction::PhoenixSkip {\n        lifetime: Lifetime::Days30,\n    };\n    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;\n",
+      "source_digest": "c6c8691589b69bd700186c107b951cb4c5d651ad24a713b5ccbd1fead7b686de",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 309,
+      "end_line": 333,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[tokio::test]\nasync fn phoenix_skip_page_label_writes_label_118_once() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let phoenix = PageAction::PhoenixSkip {\n        lifetime: Lifetime::Days30,\n    };\n    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;\n    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(ais_names(&t), vec![\"addLabelsV2\"]);\n    let label_id = t.ais[0].1.pointer(\n        \"/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels\",\n    );\n    assert_eq!(label_id, Some(&serde_json::json!(\"ClientEventPhoenixSkip\")));\n\n    let t = b.run_fresh(&bb1(&[&label], Account::HasPhoenixSkip)).await;\n    assert_eq!(t.status, \"already_phoenix_skip_labeled\");\n    assert!(t.ais.is_empty());\n    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"success\", \"another label does not count\");\n",
+      "source_digest": "1d5db12990b2296af47deccb3fae4ceb7ba0791524b47e14feabad929389d447",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 311,
+      "end_line": 335,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[tokio::test]\nasync fn phoenix_skip_page_label_writes_label_118_once() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let phoenix = PageAction::PhoenixSkip {\n        lifetime: Lifetime::Days30,\n    };\n    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;\n    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(ais_names(&t), vec![\"addLabelsV2\"]);\n    let label_id = t.ais[0].1.pointer(\n        \"/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels\",\n    );\n    assert_eq!(label_id, Some(&serde_json::json!(\"ClientEventPhoenixSkip\")));\n\n    let t = b.run_fresh(&bb1(&[&label], Account::HasPhoenixSkip)).await;\n    assert_eq!(t.status, \"already_phoenix_skip_labeled\");\n    assert!(t.ais.is_empty());\n    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"success\", \"another label does not count\");\n}\n\n",
+      "source_digest": "4d79384b9a41c9ccf4fb57d5a5404af01b3fd3d8f1106b21dd121c9ea66e3ac8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 626,
+      "end_line": 650,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert!(\n            t.dedup_calls.iter().all(|c| c.starts_with(\"peek\")),\n            \"{}: {:?}\",\n            sc.id,\n            t.dedup_calls\n        );\n        n += 1;\n    }\n    n\n}\n\n#[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]\nasync fn no_failure_state_adds_an_ais_call() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let mut killed = on_config(false, None);\n    killed[\"action_control\"] = serde_json::json!({\"enabled\": false});\n    let mut malformed = on_config(false, None);\n    malformed[\"action_control\"] = serde_json::json!({\"enabled\": \"off\"});\n    let missing_ceiling = BAKED_USER_RULES.replacen(\n        \"cred.follower_count >= \",\n        \"false && cred.follower_count >= \",\n        1,\n    );\n    assert_ne!(missing_ceiling, BAKED_USER_RULES);\n    let cases: Vec<(&str, serde_json::Value, &str, Option<Duration>)> = vec![\n",
+      "source_digest": "cdec3f8c6b0b06b0c11e0bf86ad8e43a8695508506f14250e4bcab0c535ada6c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 207,
+      "end_line": 231,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    async fn call_method(\n        &self,\n        meta: &MethodMeta,\n        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n",
+      "source_digest": "2fba006f21632b19a186993a9a4e991dfc8b29de0aba0d72ce9d06c30782d4f3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 486,
+      "end_line": 510,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction\");\n        let body = json!({\n            \"actorHeader\": {\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}},\n            \"action\": {\n                \"suspendUser\": {\n                    \"userId\": 42,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": [\"note\"]\n                }\n            },\n            \"tool\": \"RtpPlugin\",\n            \"auditHeader\": {\"note\": \"test\"}\n        });\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n",
+      "source_digest": "bd9ea81245a97df9eaea01a19e3a68c06b933047930528f9be9e406ad333c5c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 523,
+      "end_line": 547,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n            json!({\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}}),\n            vec![\n                json!({\"suspendUser\": {\n                    \"userId\": 1,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": []\n                }}),\n                json!({\"bounceViaSelection\": {\n                    \"target\": {\"user\": {\"userId\": 1}},\n                    \"tags\": [],\n                    \"uncheckedTags\": [\"FAKE\"],\n                    \"bounceActor\": {\"simpleService\": {\"serviceName\": \"xai-abuse-enforcement-service\"}}\n                }}),\n            ],\n            \"RtpPlugin\",\n            Some(\"audit\"),\n        );\n        let bytes = t\n",
+      "source_digest": "26495ffbdae92b15acc3285d5eaf74eb83b995b11be89fdb9a994846bd0a7035",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 576,
+      "end_line": 600,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .any(|e| e.field_id == 4 && e.name == \"aisException\"),\n            \"schema must declare aisException as result field 4: {:?}\",\n            method\n                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n",
+      "source_digest": "626e27dd1c67571c93fd741c953a769803a4d1a7969f0cdfca90af8d4dfc6780",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 604,
+      "end_line": 628,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        assert!(\n            decoded.get(\"aisException\").is_some(),\n            \"expected {{aisException: …}}, got {decoded}\"\n        );\n        assert_eq!(\n            decoded\n                .pointer(\"/aisException/underlyingDetails/exceptionClass\")\n                .and_then(|v| v.as_str()),\n            Some(\"com.twitter.gizmoduck.thriftscala.ValidationFailed\")\n        );\n\n        let err = classify_ais_response(1672364227921682433, \"addLabelsV2\", decoded)\n            .expect_err(\"ValidationFailed must not be Ok\");\n        let permanent = err\n            .downcast_ref::<PermanentAisFailure>()\n            .expect(\"must be PermanentAisFailure so Kafka path does not retry\");\n        assert!(\n            permanent.0.contains(\"ValidationFailed\"),\n            \"permanent message should name the class: {}\",\n            permanent.0\n        );\n    }\n\n    #[test]\n",
+      "source_digest": "6cd5d2557a2c21081873b7e067dc79945727d5291b19239cbbcba62762196dc6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    fn entity_lkey(entity_type: EntityType, entity_id: i64) -> String {\n        match entity_type {\n            EntityType::User => entity_id.to_string(),\n            other => format!(\"{}:{}\", other.as_str(), entity_id),\n        }\n    }\n\n    pub async fn get(&self, user_id: i64) -> Option<AllowlistRecord> {\n        let (entry, ttl_secs) = self.get_entity(EntityType::User, user_id).await?;\n        Some(AllowlistRecord {\n            user_id,\n            added_by: entry.added_by,\n            reason: entry.reason,\n            added_at: entry.added_at,\n            ttl_secs,\n        })\n    }\n\n    pub async fn add(\n        &self,\n        user_id: i64,\n        ttl_secs: u64,\n        entry: &AllowlistEntry,\n    ) -> Result<(), Box<dyn std::error::Error>> {\n",
+      "source_digest": "759f89e8090c29cad72863176f786f1a1452797c9c6ed0ff4419f19837010e48",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 26,
+      "end_line": 50,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        match entity_type {\n            EntityType::User => entity_id.to_string(),\n            other => format!(\"{}:{}\", other.as_str(), entity_id),\n        }\n    }\n\n    pub async fn get(&self, user_id: i64) -> Option<AllowlistRecord> {\n        let (entry, ttl_secs) = self.get_entity(EntityType::User, user_id).await?;\n        Some(AllowlistRecord {\n            user_id,\n            added_by: entry.added_by,\n            reason: entry.reason,\n            added_at: entry.added_at,\n            ttl_secs,\n        })\n    }\n\n    pub async fn add(\n        &self,\n        user_id: i64,\n        ttl_secs: u64,\n        entry: &AllowlistEntry,\n    ) -> Result<(), Box<dyn std::error::Error>> {\n        self.add_entity(EntityType::User, user_id, ttl_secs, entry)\n            .await\n",
+      "source_digest": "5157ebd9b2e42efd5f5ac1e10f5d54b09737a8e748c32d7508dadcd22c3fc3c1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 31,
+      "end_line": 55,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub async fn get(&self, user_id: i64) -> Option<AllowlistRecord> {\n        let (entry, ttl_secs) = self.get_entity(EntityType::User, user_id).await?;\n        Some(AllowlistRecord {\n            user_id,\n            added_by: entry.added_by,\n            reason: entry.reason,\n            added_at: entry.added_at,\n            ttl_secs,\n        })\n    }\n\n    pub async fn add(\n        &self,\n        user_id: i64,\n        ttl_secs: u64,\n        entry: &AllowlistEntry,\n    ) -> Result<(), Box<dyn std::error::Error>> {\n        self.add_entity(EntityType::User, user_id, ttl_secs, entry)\n            .await\n    }\n\n    pub async fn remove(&self, user_id: i64) -> Result<bool, Box<dyn std::error::Error>> {\n        self.remove_entity(EntityType::User, user_id).await\n    }\n",
+      "source_digest": "3253365f8bd418bcec3fa4f1e45836d37217fc6971dcc24d3c39048e0c5d533a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 733,
+      "end_line": 757,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        format!(\"{pkey}:{lkey}\")\n    }\n}\n\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n        PageAction::SpamHighRecall { lifetime }\n        | PageAction::PhoenixSkip { lifetime }\n        | PageAction::PostSpamHighRecall { lifetime }\n        | PageAction::HideReply { lifetime } => {\n            Some(lifetime.ttl_msec().map_or(i64::MAX, |t| t / 86_400_000))\n        }\n        _ => None,\n    }\n",
+      "source_digest": "e5f12f0142ed6fe91d4653d9576812769bee310919e131a5289292f11869e3e7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 797,
+      "end_line": 821,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (was, now) = (share(before), share(Some(after)));\n        if now > was {\n            why.push(format!(\n                \"acts on more accounts (rollout {} to {})\",\n                rollout_percent(was),\n                rollout_percent(now)\n            ));\n        }\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n",
+      "source_digest": "ea042b56faa76046af9d822bb286cb74cf4d431d21a7493261b45f46a06c3a98",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 799,
+      "end_line": 823,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            why.push(format!(\n                \"acts on more accounts (rollout {} to {})\",\n                rollout_percent(was),\n                rollout_percent(now)\n            ));\n        }\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n",
+      "source_digest": "74632811eddd439c7e3a60377ab7b1e8b641c73244ced44e8bb565a046ad003d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 800,
+      "end_line": 824,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"acts on more accounts (rollout {} to {})\",\n                rollout_percent(was),\n                rollout_percent(now)\n            ));\n        }\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n",
+      "source_digest": "ca500f0b8119d29c1f33a9982dcabb573e39db1c67f924f9fd7434750ecd7f6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2363,
+      "end_line": 2387,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub fail_get: AtomicBool,\n        pub scans: AtomicUsize,\n                                pub clobber_with: Mutex<Option<Vec<u8>>>,\n                pub record_writes: AtomicUsize,\n                                pub fail_record_writes: Mutex<HashMap<usize, bool>>,\n    }\n\n    impl MemControlStore {\n                fn record_write_fails(&self, pkey: &str) -> Option<bool> {\n            if pkey != MH_PKEY {\n                return None;\n            }\n            let n = self.record_writes.fetch_add(1, Ordering::SeqCst);\n            self.fail_record_writes.lock().unwrap().get(&n).copied()\n        }\n\n        pub(crate) fn put_record(&self, rec: &ActionControlRecord) {\n            self.rows.lock().unwrap().insert(\n                (MH_PKEY.into(), record_lkey(rec)),\n                serde_json::to_vec(rec).unwrap(),\n            );\n        }\n\n        pub(crate) fn put_raw(&self, lkey: &str, value: &[u8]) {\n            self.rows\n",
+      "source_digest": "76d6c0453c39eb029e0d600aac61470c58b929dce5da0059bbd7428175e41a2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2398,
+      "end_line": 2422,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .iter()\n                .filter(|((p, _), _)| p == pkey)\n                .map(|((_, l), v)| (l.clone(), v.clone()))\n                .collect();\n            rows.sort();\n            rows\n        }\n    }\n\n    #[async_trait]\n    impl ControlStore for MemControlStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.scans.fetch_add(1, Ordering::Relaxed);\n            if self.fail_scan.load(Ordering::Relaxed) {\n                anyhow::bail!(\"scan failed (test)\");\n            }\n            Ok(self.pkey_rows(pkey))\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            if self.fail_get.load(Ordering::Relaxed) {\n                anyhow::bail!(\"get failed (test)\");\n            }\n            Ok(self\n                .rows\n",
+      "source_digest": "3d47206f4574aa0a2fe844ae64d7330d18873ebae2adaf1289d659c8c9e7458a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4181,
+      "end_line": 4205,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            h(None, &r(ControlMode::Recording, vec![])),\n            Vec::<String>::new()\n        );\n        assert!(!h(None, &r(ControlMode::Live, vec![LIVENESS])).is_empty());\n        let rec = r(ControlMode::Recording, vec![]);\n        assert!(\n            !h(Some(&rec), &r(ControlMode::Rules, vec![])).is_empty(),\n            \"recording → rules acts\"\n        );\n        let l = r(ControlMode::Live, vec![SHR7]);\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, SUSPEND]))\n                .contains(&\"adds suspend\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, LIVENESS]))\n                .contains(&\"adds liveness check\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR30]))\n                .contains(&\"makes the label last longer\".to_owned())\n        );\n        let shorter = h(\n            Some(&r(ControlMode::Live, vec![SHR30])),\n            &r(ControlMode::Live, vec![SHR7]),\n",
+      "source_digest": "ba3de1daed88c24049d9a2ed4768d7d2843eee7271921a1c2117f0b0743e4e47",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4185,
+      "end_line": 4209,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let rec = r(ControlMode::Recording, vec![]);\n        assert!(\n            !h(Some(&rec), &r(ControlMode::Rules, vec![])).is_empty(),\n            \"recording → rules acts\"\n        );\n        let l = r(ControlMode::Live, vec![SHR7]);\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, SUSPEND]))\n                .contains(&\"adds suspend\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR7, LIVENESS]))\n                .contains(&\"adds liveness check\".to_owned())\n        );\n        assert!(\n            h(Some(&l), &r(ControlMode::Live, vec![SHR30]))\n                .contains(&\"makes the label last longer\".to_owned())\n        );\n        let shorter = h(\n            Some(&r(ControlMode::Live, vec![SHR30])),\n            &r(ControlMode::Live, vec![SHR7]),\n        );\n        assert!(shorter.is_empty(), \"{shorter:?}\");\n        assert!(\n            h(Some(&l), &r(ControlMode::Recording, vec![SHR7])).is_empty(),\n",
+      "source_digest": "670ad4f2c14b6f743fbcd3e6e2bbb10d6c6f22bc40ccaa69c4883246272ed3cb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4652,
+      "end_line": 4676,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                vec![SUSPEND, LIVENESS],\n            ),\n        )\n        .await\n        .unwrap();\n        let got = set(&ac, unconfirmed(LevelRow::Mid, vec![SUSPEND], Some(1))).await;\n        assert!(got.is_ok(), \"dropping an action: {got:?}\");\n        let got = set(\n            &ac,\n            unconfirmed(LevelRow::Mid, vec![SUSPEND, SHR7], Some(2)),\n        )\n        .await;\n        assert_eq!(code(got), \"confirm_required\", \"adding an action\");\n        let unreadable = ControlConfig {\n            confidence: crate::confidence::ConfidenceConfig::from_value(Some(\n                &serde_json::json!({\"label_map\": {}}),\n            )),\n            ..on()\n        };\n        let got = put_with(\n            &ac,\n            &unreadable,\n            unconfirmed(LevelRow::Mid, vec![SUSPEND], Some(2)),\n        )\n        .await;\n",
+      "source_digest": "668541c2524e9c748b9e74fc60019c3ec5aeff147752a827b97a8f295e7c99fc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5155,
+      "end_line": 5179,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            struct HoldingStore {\n        inner: MemControlStore,\n        marker_scans: AtomicUsize,\n        first_checked: tokio::sync::Notify,\n        second_done: tokio::sync::Notify,\n    }\n\n    #[async_trait]\n    impl ControlStore for HoldingStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            let rows = self.inner.scan(pkey).await?;\n            if pkey.starts_with(SAVE_PKEY_PREFIX)\n                && self.marker_scans.fetch_add(1, Ordering::SeqCst) == 0\n            {\n                self.first_checked.notify_one();\n                self.second_done.notified().await;\n            }\n            Ok(rows)\n        }\n\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            self.inner.get(pkey, lkey).await\n        }\n\n        async fn put(\n",
+      "source_digest": "3354fe6938b3fc1fc0f04d918fbdc7162b3a642ed88199808c37c455995806ae",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 780,
+      "end_line": 804,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"invalid_evidence\",\n            \"evidence belongs on a low, mid or high row\".into(),\n        ),\n        None if req.evidence_override.is_some() => bad(\n            \"invalid_override\",\n            \"an evidence override belongs on a live low, mid or high row\".into(),\n        ),\n        None => Ok(()),\n    }\n}\n\npub(super) fn record_problem(rec: &ActionControlRecord, now_ms: i64) -> Option<&'static str> {\n    let ahead = now_ms.saturating_add(confidence::CLOCK_SKEW_MS);\n    if rec.updated_at_ms > ahead {\n        return Some(\"written later than this pod's clock\");\n    }\n    if rec\n        .evidence\n        .as_ref()\n        .is_some_and(|ev| ev.read_at_ms > ahead)\n    {\n        return Some(\"evidence read later than this pod's clock\");\n    }\n    if let Some(ov) = &rec.evidence_override {\n        if ov.by.trim().is_empty() || ov.reason.trim().is_empty() {\n",
+      "source_digest": "23c3ce40473f7ebca8f7157c152068d4cc800a148d70bf204b11b8ea2df7b564",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 801,
+      "end_line": 825,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        return Some(\"evidence read later than this pod's clock\");\n    }\n    if let Some(ov) = &rec.evidence_override {\n        if ov.by.trim().is_empty() || ov.reason.trim().is_empty() {\n            return Some(\"an evidence override must name a person and a reason\");\n        }\n        if ov.expires_at_ms <= rec.updated_at_ms {\n            return Some(\"an evidence override can't expire before its own write\");\n        }\n        if ov.expires_at_ms\n            > rec\n                .updated_at_ms\n                .saturating_add(confidence::EVIDENCE_OVERRIDE_MAX_MS)\n        {\n            return Some(\"an evidence override can't last past 7 days from its write\");\n        }\n    }\n    if rec.confidence.is_some() && rec.band.is_some() {\n        return Some(\"a record can't be keyed by both band and row\");\n    }\n    if rec.mode == ControlMode::Rows\n        && (rec.band.is_some() || rec.confidence.is_some() || !rec.actions.is_empty())\n    {\n        return Some(\"mode rows is set on a head or head + classifier, with no actions\");\n    }\n",
+      "source_digest": "f4d7ad4fb9db75a4f9975427f91379c04a1b9c3820c1e79e367ecc47d3372b4e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 498,
+      "end_line": 522,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let b = bed(\n        vec![\n            live(BB1.0, None, vec![SHR7, LIVENESS]),\n            live(crate::replay_tests::SWITCHED_OFF_HEAD, None, vec![LIVENESS]),\n        ],\n        false,\n    )\n    .await;\n    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(\n        ais_names(&t),\n        vec![\"addLabelsV2\", \"bounceViaTemplate\"],\n        \"label, then liveness check\"\n    );\n    assert_eq!(t.tickets, 1);\n    assert_eq!(\n        t.dedup_calls,\n        vec![\"try_insert(class=2)=new\", \"update(class=2,own_claim=true)\"]\n    );\n    let i = info(&t);\n    assert_eq!(i[\"matched_rule_id\"], \"page\");\n    assert_eq!(i[\"rules_would_rule_id\"], \"anchor_campaign_suspend\");\n    assert_eq!(i[\"action_control_mode\"], \"live\");\n    assert_eq!(i[\"action_control_scope\"], \"head\");\n",
+      "source_digest": "5934521da020ff924fab223a296d24a04d8dd7e8b18be10dc53780edbcc3c4d7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 570,
+      "end_line": 594,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"already_spam_high_recall_labeled\");\n    assert!(t.ais.is_empty());\n    let b = bed(vec![live(BB1.0, None, vec![SHR7, LIVENESS])], false).await;\n    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(\n        ais_names(&t),\n        vec![\"addLabelsV2\", \"bounceViaTemplate\"],\n        \"a composite is never split\"\n    );\n}\n\n#[tokio::test]\nasync fn phoenix_skip_page_label_writes_label_118_once() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let phoenix = PageAction::PhoenixSkip {\n        lifetime: Lifetime::Days30,\n    };\n    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;\n",
+      "source_digest": "c6c8691589b69bd700186c107b951cb4c5d651ad24a713b5ccbd1fead7b686de",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 585,
+      "end_line": 609,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[tokio::test]\nasync fn phoenix_skip_page_label_writes_label_118_once() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let phoenix = PageAction::PhoenixSkip {\n        lifetime: Lifetime::Days30,\n    };\n    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;\n    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(ais_names(&t), vec![\"addLabelsV2\"]);\n    let label_id = t.ais[0].1.pointer(\n        \"/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels\",\n    );\n    assert_eq!(label_id, Some(&serde_json::json!(\"ClientEventPhoenixSkip\")));\n\n    let t = b.run_fresh(&bb1(&[&label], Account::HasPhoenixSkip)).await;\n    assert_eq!(t.status, \"already_phoenix_skip_labeled\");\n    assert!(t.ais.is_empty());\n    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"success\", \"another label does not count\");\n",
+      "source_digest": "1d5db12990b2296af47deccb3fae4ceb7ba0791524b47e14feabad929389d447",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 587,
+      "end_line": 611,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[tokio::test]\nasync fn phoenix_skip_page_label_writes_label_118_once() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let phoenix = PageAction::PhoenixSkip {\n        lifetime: Lifetime::Days30,\n    };\n    let b = bed(vec![live(BB1.0, None, vec![phoenix])], false).await;\n    let t = b.run_fresh(&bb1(&[&label], Account::Clean)).await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(ais_names(&t), vec![\"addLabelsV2\"]);\n    let label_id = t.ais[0].1.pointer(\n        \"/action/addLabelsV2/labels/0/nonPolicyBasedLabel/label/labelReferenceWithSafetyLabel/labelReference/labelIdType/nativeUserLabels\",\n    );\n    assert_eq!(label_id, Some(&serde_json::json!(\"ClientEventPhoenixSkip\")));\n\n    let t = b.run_fresh(&bb1(&[&label], Account::HasPhoenixSkip)).await;\n    assert_eq!(t.status, \"already_phoenix_skip_labeled\");\n    assert!(t.ais.is_empty());\n    let t = b\n        .run_fresh(&bb1(&[&label], Account::HasSpamHighRecall))\n        .await;\n    assert_eq!(t.status, \"success\", \"another label does not count\");\n}\n\n",
+      "source_digest": "4d79384b9a41c9ccf4fb57d5a5404af01b3fd3d8f1106b21dd121c9ea66e3ac8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 902,
+      "end_line": 926,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert!(\n            t.dedup_calls.iter().all(|c| c.starts_with(\"peek\")),\n            \"{}: {:?}\",\n            sc.id,\n            t.dedup_calls\n        );\n        n += 1;\n    }\n    n\n}\n\n#[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]\nasync fn no_failure_state_adds_an_ais_call() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let mut killed = on_config(false, None);\n    killed[\"action_control\"] = serde_json::json!({\"enabled\": false});\n    let mut malformed = on_config(false, None);\n    malformed[\"action_control\"] = serde_json::json!({\"enabled\": \"off\"});\n    let missing_ceiling = BAKED_USER_RULES.replacen(\n        \"cred.follower_count >= \",\n        \"false && cred.follower_count >= \",\n        1,\n    );\n    assert_ne!(missing_ceiling, BAKED_USER_RULES);\n    let cases: Vec<(&str, serde_json::Value, &str, Option<Duration>)> = vec![\n",
+      "source_digest": "cdec3f8c6b0b06b0c11e0bf86ad8e43a8695508506f14250e4bcab0c535ada6c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1570,
+      "end_line": 1594,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let b = bed(\n        vec![\n            admitting(live(REPLY_HEAD, None, vec![SHR7])),\n            admitting(record(FACTORY_HEAD, None, None, ControlMode::Rows, vec![])),\n        ],\n        false,\n    )\n    .await;\n    let t = b\n        .run_admitted(&user_topic(&b), &reply_bot(EntityType::User))\n        .await;\n    assert_eq!(t.status, \"success\");\n    assert_eq!(ais_names(&t), vec![\"addLabelsV2\"]);\n    assert!(!info(&t).keys().any(|k| k.starts_with(\"rules_would\")));\n    let t = b\n        .run_admitted(&post_topic(&b), &reply_bot(EntityType::Post))\n        .await;\n    assert_dropped(&t, \"no_match\");\n\n    b.set_records(&[admitting(record(\n        REPLY_HEAD,\n        None,\n        None,\n        ControlMode::Recording,\n        vec![],\n",
+      "source_digest": "d92e05461ad9f7319743b9252f6661629f6a94150a0f82faecac26be65c3f74f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 207,
+      "end_line": 231,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    async fn call_method(\n        &self,\n        meta: &MethodMeta,\n        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n",
+      "source_digest": "2fba006f21632b19a186993a9a4e991dfc8b29de0aba0d72ce9d06c30782d4f3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 486,
+      "end_line": 510,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction\");\n        let body = json!({\n            \"actorHeader\": {\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}},\n            \"action\": {\n                \"suspendUser\": {\n                    \"userId\": 42,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": [\"note\"]\n                }\n            },\n            \"tool\": \"RtpPlugin\",\n            \"auditHeader\": {\"note\": \"test\"}\n        });\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n",
+      "source_digest": "bd9ea81245a97df9eaea01a19e3a68c06b933047930528f9be9e406ad333c5c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 523,
+      "end_line": 547,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n            json!({\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}}),\n            vec![\n                json!({\"suspendUser\": {\n                    \"userId\": 1,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": []\n                }}),\n                json!({\"bounceViaSelection\": {\n                    \"target\": {\"user\": {\"userId\": 1}},\n                    \"tags\": [],\n                    \"uncheckedTags\": [\"FAKE\"],\n                    \"bounceActor\": {\"simpleService\": {\"serviceName\": \"xai-abuse-enforcement-service\"}}\n                }}),\n            ],\n            \"RtpPlugin\",\n            Some(\"audit\"),\n        );\n        let bytes = t\n",
+      "source_digest": "26495ffbdae92b15acc3285d5eaf74eb83b995b11be89fdb9a994846bd0a7035",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 576,
+      "end_line": 600,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .any(|e| e.field_id == 4 && e.name == \"aisException\"),\n            \"schema must declare aisException as result field 4: {:?}\",\n            method\n                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n",
+      "source_digest": "626e27dd1c67571c93fd741c953a769803a4d1a7969f0cdfca90af8d4dfc6780",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 604,
+      "end_line": 628,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        assert!(\n            decoded.get(\"aisException\").is_some(),\n            \"expected {{aisException: …}}, got {decoded}\"\n        );\n        assert_eq!(\n            decoded\n                .pointer(\"/aisException/underlyingDetails/exceptionClass\")\n                .and_then(|v| v.as_str()),\n            Some(\"com.twitter.gizmoduck.thriftscala.ValidationFailed\")\n        );\n\n        let err = classify_ais_response(1672364227921682433, \"addLabelsV2\", decoded)\n            .expect_err(\"ValidationFailed must not be Ok\");\n        let permanent = err\n            .downcast_ref::<PermanentAisFailure>()\n            .expect(\"must be PermanentAisFailure so Kafka path does not retry\");\n        assert!(\n            permanent.0.contains(\"ValidationFailed\"),\n            \"permanent message should name the class: {}\",\n            permanent.0\n        );\n    }\n\n    #[test]\n",
+      "source_digest": "6cd5d2557a2c21081873b7e067dc79945727d5291b19239cbbcba62762196dc6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 24,
+      "end_line": 48,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    fn entity_lkey(entity_type: EntityType, entity_id: i64) -> String {\n        match entity_type {\n            EntityType::User => entity_id.to_string(),\n            other => format!(\"{}:{}\", other.as_str(), entity_id),\n        }\n    }\n\n    pub async fn get(&self, user_id: i64) -> Option<AllowlistRecord> {\n        let (entry, ttl_secs) = self.get_entity(EntityType::User, user_id).await?;\n        Some(AllowlistRecord {\n            user_id,\n            added_by: entry.added_by,\n            reason: entry.reason,\n            added_at: entry.added_at,\n            ttl_secs,\n        })\n    }\n\n    pub async fn add(\n        &self,\n        user_id: i64,\n        ttl_secs: u64,\n        entry: &AllowlistEntry,\n    ) -> Result<(), Box<dyn std::error::Error>> {\n",
+      "source_digest": "759f89e8090c29cad72863176f786f1a1452797c9c6ed0ff4419f19837010e48",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-64b03d70618c1668c9238970aaff57e938188769e8b19ce79603bdd9c3cf18cc",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "03553061f4d27279bdd218a581187b6d6f75ea62344b8939225f88cb51840f09",
+      "context_complete": true,
+      "task_id": "T-0bf7a32183156561f3a9c04127bb6d18525f88f263060cf30ab97b06ecfdef57",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-274e348d98e35674c00621c31c81b87975e989a0a3b5007950d1566f5915282c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-7966d923e2ff6bebf783b5f5f145a69487f7c782b9f10ae22df666600ce34a58",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2befed91eee03f4ea311b52e838b356be99254d299031438f9d39a00f612eb41",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-f5eadd524cee538b262af93c39eb0e577cc2bd42c44b90a1e49da22c62b4d282",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-086cacea1b101e0d7cab183a6ac54d256af5dd23eebb7f5530382a95720a80e1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-7ded381fedf81e305ef43e505d1792d64ccad1fe6d876eabc4ae7337012eba29",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5cc9fd40d899be631bea3d83f9095ba54fae7695b4f5d2beb7211989b8bd7473",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-2bd4f1c3cddc4211686492a9d71babc92d5265c9e326f27b1a5eecc92ece1d38",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-eb3c6762956234433cd829fec6376ecba1730da9fcbdf8fc4cc833c429df4aa8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-3eb2ca3e91777558c20fc0a5bb531a7285dcc12771669955267539606869571a",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b48ea513088a7c446dca1e25f95e72fb5893071b9c29b8163940b928a833be6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-fe7789e4f68765239cbc7bf84a368773cdbbc290be3be245e2d02b9edfa2fc19",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f83b53366fa4187e0ef1ad14296c4173e2dab980c1df1f54cf537e83a12795fd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-83d7bfa4c1a24a18eba7180199f586b4789cbdb139364de641f5c704789ae268",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-df2871503e1a9cb22b195d657b5e9b2d1c13b7e2bd5d3fa7b55de9172cdd01f4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-93e4bab0c4a1b66ea55f6bb1de8d50eab83d704ff86083b8a9282f092db77502",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b54bfb82c090a970c8ea56e174b6e688bf77fde6159db6cbeba7b5f49bc958ce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-0d3cda97f0b81ed159d4620503b494d5f438d79d097c71173b760dcf7c64a151",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6ec111590001014d8c75e23aa518b50d41a150e8a8b31722522fc19a4ea24efb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-92f034b132d50f3a4443fb8f89979b9c438cb3528600d2d2b79d0fa86edde780",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-caae4d20f7f8b091a1008a690951e503c0b4027b57ad2ccd814303289b74490b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-4173faf3790b01a264592ceb8d8d0ae3d5c05cce31d874d03ed0924a70146765",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ebdc632a36d6d5fdb42b82399090c38dbe5174472eed65e1914ee9dd836c85c4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-cfd468d2c01f4e64a5bdcfcb93e25d6703084016bca839b57476d616f9152d16",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bf6ef8e7c81e81ed26efef2a01b15b9fc68ec9d6f2b4c507608e96d8f777fbe0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-05fa6d69fdbf0d8bb02563a80dcc1612019c1480ef825206cd9b967b49b5dc75",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-541eae368405cf157ada0c64d9536ac21275cc8fc7a079f8a3a602d522639842",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d1db7c683bf2463c0fdafb58d3e7a3388897cdf10d58230b03b961a39699e39c",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39a799e26efe6821799acc109c91c16cdd0402a2af29686c5996cb7ef44e2e55",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ca6ee518bc6192b35fe634e26a53068827e273a87bd1565ddf32840ba5498f7e",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f175779c9880ac469f69382273250280d6411ecb7e6ff385b2602ea3ac79bddb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-370e48966b3574f956ae983dc87ae4bc7ccb46bf3a7d5eba0d9874806cf75dfc",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1c2b9929f5472050c84475e4f6420d420570262829a1854bb57290f9569abc90",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-854505ed268706b9887a7f5263a2770630a9aaa267f2d0f445b12b0f41db7fdf",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c5c3331bebf36fed9a034d8318f5cc06fcf19b1d2d746c7b818d2e78252a9410",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-3ef972867955f7654cd032b8a428ad067b66dad13856842a4d8e97bbe7e4827d",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aebf2d28f12aaa3cd9125c5abb34ecf457bcd19d4ed5131557cd8f6bbac85f61",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d554a59eee1ec7039c3d8c6804c2edb06a4746bdb1ea77b675c9cf202ba634c6",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fe44724057bb6372a7d88a2358fce6833c6ced50f0d5e7a9acd5e2c3c84489a6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-a5b3c4ddfc396f510c095c9fcd5ebf6e4955fb8124d6c0f0357c62dbae7009ec",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a67933754df49627c42f7143e20915fe8a59b7090e253a4b45c53a2f840a0fd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-f34732e20cc436b10809518d9bb72a47c6caad53e14e06cde934135de949cdf3",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e70dc2eb42294e1ed1e39f22f3af43e63c140a9dd3660e680746415445c3ab2a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-3b39641faac8cf2b124080f3231747d76756d47a3e7cc4506701ba386879cd58",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4872bc8b7cfca332305bc1dfd3f8408300261816bfb23c0512ef6d58d9ea62c3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-8ac284916c5f88e6908dbbcac393ee2ba091cfef54bd3b22e81f70fdcc67f922",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-04ddae964f0397e501d465a2162db704eba95bf70a003bff39a274e0493ee851",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-f91af01a5fe778cce841d836293875d4acbb2236098bfd19041f6890c6129d58",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a388040faf187dd6c37a5213a5aec954cdac3c351754687abc7987ca30410723",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-bbfb71c1921b6c82f18b720eac8e56707602c70d2fa82ef4dbb923bc3d828a73",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1a21fc6a6d5288b7ce8559c5f6c1397e3a9761f1b824b0dcc85ca452721d6c34",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-7147b906626b652858277c61f974a171b5ca0714eef2ed18fd6065408cc6b0d2",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-152d43c44abe0d3fae54236f77874a4af3f9c2ecee4f48596ddf3aa1201b1ee5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-4727896a3ac04f7a8e947231922104ee3884d33e9d1aa5681ecce77c7923d9f9",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-25c745ea316c0e23ca9e1e009f3dea16e935e8ffefc258355650e9db2fb14d08",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ff3babc2f6cb9c3a4654c4e7c84de5fcb516d8342fc1cf104b490f4eb597186c",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-951c201ff5b158c00900c717e0f21dcfc5366ae58df87e4fcd601a07553a4764",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-e59511ce36b06977d2204bf1032f9275e656729c4702dab8503d237280dfc1db",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b283eed91cbd1dc971cac203d28bd0bbf8d9c35cf228e13ab4409d6482470817",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-98efac916abd01899529485829d8e15a7b0760d67419d5b894add417649f2407",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d7fc7716653c929bda7329ab06d1bb5f94ccb3543b9f98c8f177d09a569293ff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-f13ede0ce6a9e69461851d1a8a650cf9ae0485c22e072c35652145bf168ac86c",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4a1e486c1291197d2054aad6320cc23a2b599810ad28a8dd6e6daa7ed82b4bb1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-08b4e148998159c55f4a25d4ba898b7bea009b2c1382cc1b21bf97afa26c08a3",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8bf4549a0e0e2c8201bdfb3ed71a9d6865752643e81db0e5922eb23cc596432c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ce47b03d5eda15a68124469e7346f7d1a7fe73833b583c482ce580360e4227c9",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d8fd86f317142e58b15c365772b9119ec5bcb9b0a4da9f4521df3a39b630e413",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d20e8d91919e3844ab4be418ff11a9d19df043b09d60c6f0ba948ef17efe8c5d",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-37dc2547b24185132edf0cc960952465da080d337f838214fe120ece070c7d41",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-c3ae4d421193efa76a9e35cb8dc07a977de3855d3c45212a98ca6a5918e80415",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b5b5c5158b6e5b6e45b9213e925355e052d1c45b0d13091853e637d75e9fdf5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d95e963e588130651c96b9bd5c27a4eef6424d8c939249a49934d0dd8d018aff",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9286bc7285cc24a4e686a5992dbcfedf2d415dbbd3a36f01d111579c2570d042",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-beb777afc3be2555427c47f9446bc58a8cd206e1ac3e2e8a5a35d9b9766eef7d",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1bce6e08b9ec61fbb5648e63b1ac4d7fbb5e7d24511ba7cde01dbde7af463004",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-6f2d7de726240d785b049c1dd76d0600f8c8021b9b1fb8975b3de57aadf01171",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0461066909c16de60069f3ecf80115c48bb69af6ce6463d0d27c77f312ba1e74",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-e94773e9c996b911c75d021a4da3159f7439d57c5eb756b9a808d05e43e8a62e",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d6a5b8b05ca420841dd35312e046af77e0a7b66db05581681485c5fc332d59fd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-5e0bb0679e0197838014570b316d7c4e72da3c5712f149f52a39963e978a2161",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1a10da066e3d45335bad55857c57ff74101cc414690e9bfe722e1fb7d7a7f0d9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-c155452670298f74e02b3b2f6cd8aac8484db473a18c4549326bea335a17e2ec",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-06e3c03d8f7c529845056490162b7e291dc436b0ef5a60c1fda11add472f8fff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-2a9a29277c62b1e1ca5f4eecc704654441528ee30118d4df77f2d22915b416b6",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3b129ec42dce429df32cadfa3c6bdc8edb041fbebef672b24686e174b1a4db34",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-bb1f3d1cc41c3a140b759abc9088d8f1d805332154d487bb46d88488f5c04ea5",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f8cda21238ff8ad79752407554f59a717078b121600da79b036dc70ffefa1951",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-2bcae720752db8d490aa3c83ac483d099eef600d8e1d34c60946033025f1dece",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6b0529500a043684cc7db0bc90b60cdd8516a123506d5db29a0c405ef386ca3a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ee582dc6cd8d206e72fdda58fe34e0eb96c805b07621c02fa7bae58de52a8ad4",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-74ffa35a57ed90f60f391ee23b823b39598d52ad9fe26bc35c25b7ff598915db",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-de83fbf8722d862c0242221895bb44602d6a0793255be073878159c7d6cab155",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-938063b6b25911291ffc51a73e14ca65023a1a90cd7b42eae87511948e8415c7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-aaa1b64df27cf90c284f09b656a090039e38be59bd889ffc25c4d68bf78a2f0f",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/streaming/history_url_embedding.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ccf508d38a3fc6501b01d8122be4f0a3bdbead452095e917624bcf50bb602a6a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "url_embedding_key",
+        "parse_url_embedding_value",
+        "MGetClient",
+        "mget",
+        "UrlEmbeddingLookupStats",
+        "add",
+        "HistoryUrlEmbeddingLookup",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-e04593dd7ab265b0baf5c6660c150a5469852054d713067659bbc7c3168b9aa5",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-5cbd28baf4ead5e5acd3ad0fc8c07760bffc50e8c36d862c60391058718626eb"
+}

@@ -1,0 +1,1953 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/staging/recording/replay.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-2817515a747d3743e5c5b2968ae99f17afa687733670ae031d14a9773f56980a",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/staging",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 350,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use super::*;\nuse crate::clients::socialgraph_client::EdgeQuery;\nuse crate::hydration::batch::{HydrationBatch, HydrationError, RawHydrationBatch};\nuse crate::hydration::community_source::CommunityPost;\nuse crate::hydration::sources::{\n    author_batch, core_batch, country_batch, exchange, label_batch, lifecycle_batch, tweet_batch,\n    viewer_batch, Answered, Bytes, DecodedAuthor, DecodedViewer, EdgeKey, Observed, PairEdgeKey,\n    Sources,\n};\nuse crate::models::{ArticleLifecycle, PureCore, TweetFeatures};\nuse crate::post_card::PostCard;\nuse prost::Message;\nuse std::collections::HashMap;\nuse std::hash::Hash;\nuse xai_core_entities::entities::{ConversationControl, QuotedTweet};\nuse xai_visibility_filtering_proto as vf_pb;\n\npub(crate) struct Replay {\n    recording: Recording,\n    misses: Mutex<Vec<String>>,\n}\n\nfn result<V>(answer: Hydrated<V>) -> Result<Option<V>, HydrationError> {\n    match answer {\n        Hydrated::Found(value) | Hydrated::Partial(value) => Ok(Some(value)),\n        Hydrated::NotFound => Ok(None),\n        Hydrated::Failed(error) => Err(error),\n    }\n}\n\nimpl Replay {\n    fn answer<X: Exchange>(&self, key: &X::Key) -> Hydrated<X::Wire> {\n        let name = X::NAME;\n        let recorded = self.recording.answers.get(name);\n        let wire = |json: &serde_json::Value| {\n            X::Wire::deserialize(json).unwrap_or_else(|e| panic!(\"{name}/{key}: {e}\"))\n        };\n        match recorded.and_then(|answers| answers.get(&key.to_string())) {\n            Some(Answer::Found(json)) => Hydrated::Found(wire(json)),\n            Some(Answer::Partial(json)) if X::KEEPS_PARTIAL => Hydrated::Partial(wire(json)),\n            Some(Answer::Partial(_)) => {\n                panic!(\"{name}/{key}: a partial answer, which capture never keeps\")\n            }\n            Some(Answer::NotFound) => Hydrated::NotFound,\n            Some(Answer::Failed) => Hydrated::Failed(HydrationError::Error),\n            None => {\n                self.misses.lock().unwrap().push(format!(\"{name}/{key}\"));\n                Hydrated::NotFound\n            }\n        }\n    }\n\n    fn batch<X: Exchange>(\n        &self,\n        keys: impl Iterator<Item = X::Key>,\n    ) -> Observed<X, HydrationBatch<X::Key, X::Wire>>\n    where\n        X::Key: Eq + Hash,\n    {\n        Observed::quiet(HydrationBatch::from_hydrated(\n            keys.map(|key| {\n                let answer = self.answer::<X>(&key);\n                (key, answer)\n            })\n            .collect(),\n        ))\n    }\n\n    fn found<X: Exchange<Key = u64>>(&self, keys: &[u64]) -> HashMap<u64, anyhow::Result<X::Wire>> {\n        keys.iter()\n            .map(|&key| {\n                let wire = self.answer::<X>(&key).into_value();\n                (\n                    key,\n                    wire.ok_or_else(|| anyhow!(\"{}/{key}: no answer\", X::NAME)),\n                )\n            })\n            .collect()\n    }\n\n    fn asked<X: Exchange>(&self, fields: &[QueryFields]) {\n        let Some(name) = X::FIELDS else {\n            return;\n        };\n        let recorded = self.recording.fields.get(name);\n        let mut missing: Vec<&QueryFields> = fields\n            .iter()\n            .filter(|field| !recorded.is_some_and(|recorded| recorded.contains(field)))\n            .collect();\n        missing.dedup();\n        if !missing.is_empty() {\n            self.misses\n                .lock()\n                .unwrap()\n                .push(format!(\"{name} {missing:?}\"));\n        }\n    }\n\n    pub(crate) fn misses(&self) -> Vec<String> {\n        let mut misses = self.misses.lock().unwrap().clone();\n        misses.sort();\n        misses.dedup();\n        misses\n    }\n}\n\n#[tonic::async_trait]\nimpl Sources for Replay {\n    async fn pure_cores(&self, tweet_ids: &[u64]) -> Answered<exchange::TesPureCoreData, PureCore> {\n        self.batch::<exchange::TesPureCoreData>(tweet_ids.iter().copied())\n            .map(core_batch)\n    }\n\n    async fn tweets(&self, tweet_ids: &[u64]) -> Answered<exchange::TesTweet, TweetFeatures> {\n        let tweets = self.found::<exchange::TesTweet>(tweet_ids);\n        Observed::quiet(tweet_batch(tweet_ids, tweets))\n    }\n\n    async fn conversation_controls(\n        &self,\n        tweet_ids: &[u64],\n    ) -> Answered<exchange::TesConversationControl, ConversationControl> {\n        self.batch::<exchange::TesConversationControl>(tweet_ids.iter().copied())\n    }\n\n    async fn quoted_tweets(\n        &self,\n        outer_ids: &[u64],\n    ) -> Answered<exchange::TesQuotedTweet, QuotedTweet> {\n        self.batch::<exchange::TesQuotedTweet>(outer_ids.iter().copied())\n    }\n\n    async fn safety_labels(\n        &self,\n        tweet_ids: &[u64],\n    ) -> Answered<exchange::SafetyLabels, Arc<vf_pb::SafetyLabelMap>> {\n        let labels = self\n            .found::<exchange::SafetyLabels>(tweet_ids)\n            .into_iter()\n            .map(|(id, bytes)| {\n                let labels = bytes.and_then(|Bytes(bytes)| {\n                    Ok(Arc::new(vf_pb::SafetyLabelMap::decode(bytes.as_slice())?))\n                });\n                (id, labels)\n            })\n            .collect();\n        Observed::quiet(label_batch(tweet_ids, labels))\n    }\n\n    async fn viewer(\n        &self,\n        viewer_id: u64,\n        fields: &[QueryFields],\n    ) -> Answered<exchange::GizmoduckViewer, DecodedViewer> {\n        self.asked::<exchange::GizmoduckViewer>(fields);\n        let viewer = result(self.answer::<exchange::GizmoduckViewer>(&viewer_id));\n        Observed::quiet(viewer_batch(viewer_id, viewer, fields))\n    }\n\n    async fn users(\n        &self,\n        user_ids: &[u64],\n        fields: &[QueryFields],\n    ) -> Answered<exchange::GizmoduckAuthor, DecodedAuthor> {\n        self.asked::<exchange::GizmoduckAuthor>(fields);\n        self.batch::<exchange::GizmoduckAuthor>(user_ids.iter().copied())\n            .map(author_batch)\n    }\n\n    async fn select_edges(\n        &self,\n        _viewer_id: u64,\n        queries: &[EdgeQuery],\n    ) -> Observed<exchange::Flock, Vec<RawHydrationBatch<bool>>> {\n        let batches = queries.iter().map(|query| {\n            let answers = query.destination_ids.iter().map(|&destination| {\n                let key = EdgeKey::of(query, destination);\n                (destination, self.answer::<exchange::Flock>(&key))\n            });\n            HydrationBatch::from_hydrated(answers.collect())\n        });\n        Observed::quiet(batches.collect())\n    }\n\n    async fn select_pair_edges(\n        &self,\n        queries: &[EdgeQuery],\n    ) -> Observed<exchange::FlockUserPair, Vec<RawHydrationBatch<bool>>> {\n        let batches = queries.iter().map(|query| {\n            let answers = query.destination_ids.iter().map(|&destination| {\n                let answer = PairEdgeKey::of(query, destination)\n                    .map_or(Hydrated::Failed(HydrationError::Error), |key| {\n                        self.answer::<exchange::FlockUserPair>(&key)\n                    });\n                (destination, answer)\n            });\n            HydrationBatch::from_hydrated(answers.collect())\n        });\n        Observed::quiet(batches.collect())\n    }\n\n    async fn viewer_country(&self, viewer_id: u64) -> Answered<exchange::ViewerCountry, Arc<str>> {\n        let country = result(self.answer::<exchange::ViewerCountry>(&viewer_id));\n        Observed::quiet(country_batch(viewer_id, country))\n    }\n\n    async fn second_degree(\n        &self,\n        _viewer_id: u64,\n        root_author_ids: &[u64],\n    ) -> Answered<exchange::Wingman, bool> {\n        self.batch::<exchange::Wingman>(root_author_ids.iter().copied())\n    }\n\n    async fn community_moderations(\n        &self,\n        posts: &[CommunityPost],\n    ) -> Answered<exchange::CommunityModeration, CommunityModeration> {\n        self.batch::<exchange::CommunityModeration>(posts.iter().map(|post| post.tweet_id))\n    }\n\n    async fn community_moderators(\n        &self,\n        _viewer_id: u64,\n        community_ids: &[u64],\n    ) -> Answered<exchange::CommunityModerator, bool> {\n        self.batch::<exchange::CommunityModerator>(community_ids.iter().copied())\n    }\n\n    async fn community_viewer_removals(\n        &self,\n        _viewer_id: u64,\n        community_ids: &[u64],\n    ) -> Answered<exchange::CommunityViewerRemoved, bool> {\n        self.batch::<exchange::CommunityViewerRemoved>(community_ids.iter().copied())\n    }\n\n    async fn article_media_entities(\n        &self,\n        _viewer_id: Option<u64>,\n        article_ids: &[u64],\n    ) -> Answered<exchange::ArticleMediaEntities, bool> {\n        self.batch::<exchange::ArticleMediaEntities>(article_ids.iter().copied())\n    }\n\n    async fn article_cover_media(\n        &self,\n        _viewer_id: Option<u64>,\n        article_ids: &[u64],\n    ) -> Answered<exchange::ArticleCoverMedia, bool> {\n        self.batch::<exchange::ArticleCoverMedia>(article_ids.iter().copied())\n    }\n\n    async fn article_lifecycles(\n        &self,\n        article_ids: &[u64],\n    ) -> Answered<exchange::ArticleLifecycle, ArticleLifecycle> {\n        self.batch::<exchange::ArticleLifecycle>(article_ids.iter().copied())\n            .map(lifecycle_batch)\n    }\n\n    async fn trusted_friends(\n        &self,\n        _viewer_id: u64,\n        list_ids: &[u64],\n    ) -> Answered<exchange::TrustedFriends, bool> {\n        self.batch::<exchange::TrustedFriends>(list_ids.iter().copied())\n    }\n\n    async fn outside_places(\n        &self,\n        _viewer_id: u64,\n        place_ids: &[u64],\n    ) -> Answered<exchange::UserLocation, bool> {\n        self.batch::<exchange::UserLocation>(place_ids.iter().copied())\n    }\n\n    async fn post_card(&self, _tweet_id: u64) -> Option<PostCard> {\n        None\n    }\n}\n\nstruct ViewerKeyed<'a> {\n    recording: &'a Recording,\n    names: Vec<&'static str>,\n}\n\nimpl Visit for ViewerKeyed<'_> {\n    fn exchange<X: Exchange>(&mut self) {\n        if X::SCOPE == Scope::Viewer {\n            let recording = self.recording;\n            self.names.extend(owned_names::<X>().filter(|name| {\n                recording.answers.contains_key(*name) || recording.fields.contains_key(*name)\n            }));\n        }\n    }\n}\n\nimpl Recording {\n    fn viewer_keyed(&self) -> Vec<&'static str> {\n        visit_all(ViewerKeyed {\n            recording: self,\n            names: vec![],\n        })\n        .names\n    }\n\n    pub(crate) fn into_replay(self, viewer_id: Option<u64>) -> anyhow::Result<Replay> {\n        if viewer_id.is_none() {\n            let keyed = self.viewer_keyed();\n            anyhow::ensure!(\n                keyed.is_empty(),\n                \"a logged-out recording holds viewer-keyed {keyed:?}\"\n            );\n        }\n        Ok(Replay {\n            recording: self,\n            misses: Mutex::default(),\n        })\n    }\n\n    pub(crate) fn names(&self) -> Vec<&str> {\n        let mut names: Vec<&str> = self\n            .answers\n            .keys()\n            .chain(self.fields.keys())\n            .map(String::as_str)\n            .collect();\n        names.sort_unstable();\n        names\n    }\n\n    pub(crate) fn with_shared(mut self, shared: &Self) -> Self {\n        for (name, answers) in &shared.answers {\n            let own = self.answers.entry(name.clone()).or_default();\n            for (key, answer) in answers {\n                own.entry(key.clone()).or_insert_with(|| answer.clone());\n            }\n        }\n        for (name, fields) in &shared.fields {\n            let own = self.fields.entry(name.clone()).or_default();\n            for field in fields {\n                if !own.contains(field) {\n                    own.push(*field);\n                }\n            }\n        }\n        self\n    }\n}\n",
+      "source_digest": "99e4abc5a43dc678c76a8f86f598a39cbfe7aed43b829fc21d44497eaee1b097",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1369,
+      "end_line": 1393,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        pub fn spawn_seen_writer(self: &Arc<Self>) -> Option<JoinHandle<()>> {\n        let mut rx = self\n            .seen_rx\n            .lock()\n            .unwrap_or_else(|p| p.into_inner())\n            .take()?;\n        let this = self.clone();\n        Some(tokio::spawn(async move {\n            let mut failures: u64 = 0;\n            while let Some((pkey, lkey, value)) = rx.recv().await {\n                let key = seen_guard_key(pkey, &lkey);\n                let result = match tokio::time::timeout(\n                    this.scan_timeout,\n                    this.store.put(pkey, &lkey, value, SEEN_TTL_SECS),\n                )\n                .await\n                {\n                    Ok(r) => r,\n                    Err(_) => Err(anyhow::anyhow!(\"seen write timed out\")),\n                };\n                match result {\n                    Ok(()) => {\n                        failures = 0;\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n",
+      "source_digest": "e9b23b194acfee721ba8e4a2a092777e5d3b0e58012db38c3ff6cc2c3411efa7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1378,
+      "end_line": 1402,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let mut failures: u64 = 0;\n            while let Some((pkey, lkey, value)) = rx.recv().await {\n                let key = seen_guard_key(pkey, &lkey);\n                let result = match tokio::time::timeout(\n                    this.scan_timeout,\n                    this.store.put(pkey, &lkey, value, SEEN_TTL_SECS),\n                )\n                .await\n                {\n                    Ok(r) => r,\n                    Err(_) => Err(anyhow::anyhow!(\"seen write timed out\")),\n                };\n                match result {\n                    Ok(()) => {\n                        failures = 0;\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"written\"])\n                            .inc();\n                    }\n                    Err(e) => {\n                        failures += 1;\n                        metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"error\"])\n                            .inc();\n",
+      "source_digest": "06cf9b0eaf044834008a61c6baa10d62b9d75e9a3f68d2c7af54883360036070",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3434,
+      "end_line": 3458,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(\n            code(set_cfg(renamed(\"NewName\", None)).await),\n            \"confirm_required\"\n        );\n        assert!(\n            set_cfg(renamed(\"NewName\", Some(CONFIRM_WORD)))\n                .await\n                .is_ok()\n        );\n    }\n\n    #[tokio::test]\n    async fn put_answer_shows_this_pods_effective_mode() {\n        let (ac, _) = loaded(&[]).await;\n        let killed = ControlConfig {\n            enabled: false,\n            ..Default::default()\n        };\n        let out = ac\n            .set(\n                put(\"H\", ControlMode::Live, vec![SUSPEND]),\n                \"w\",\n                \"k\",\n                1,\n                &killed,\n",
+      "source_digest": "de8e939a7a18f9194ccd5c523d7ec71666ecd36db86ffaf2a1a7458d8a1a35ff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 192,
+      "end_line": 216,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "async fn admission_strips_the_prefix_and_an_old_image_drops_it() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let b = bed(vec![], false).await;\n    let mut p = b.processor();\n    p.labels = HashSet::from([label.clone()]);\n    let prefixed = format!(\"dry_run__{label}\");\n    let msg = |labels: &[&str]| xai_kafka::KafkaMessage {\n        topic: p.topic.clone(),\n        payload: Some(bb1(labels, Account::Clean).encode_to_vec()),\n        ..Default::default()\n    };\n    p.process_batch(&[msg(&[&prefixed])]).await.unwrap();\n    let outcomes = std::mem::take(&mut *b.outcomes.lock().unwrap());\n    assert_eq!(outcomes.len(), 1, \"admitted\");\n    assert_eq!(outcomes[0].status, \"dry_run\");\n    assert_eq!(outcomes[0].info[\"dry_run_source\"], \"producer\");\n    assert!(b.ais.take().is_empty());\n    assert!(!p.labels.contains(&prefixed));\n    p.process_batch(&[msg(&[\"unsubscribed\"])]).await.unwrap();\n    assert!(\n        b.outcomes.lock().unwrap().is_empty(),\n        \"unsubscribed labels are still dropped\"\n    );\n}\n",
+      "source_digest": "156ed4b9aa22fea523077128ac9708a64c3103bc142aa81f717190fc5eae903f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 199,
+      "end_line": 223,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let msg = |labels: &[&str]| xai_kafka::KafkaMessage {\n        topic: p.topic.clone(),\n        payload: Some(bb1(labels, Account::Clean).encode_to_vec()),\n        ..Default::default()\n    };\n    p.process_batch(&[msg(&[&prefixed])]).await.unwrap();\n    let outcomes = std::mem::take(&mut *b.outcomes.lock().unwrap());\n    assert_eq!(outcomes.len(), 1, \"admitted\");\n    assert_eq!(outcomes[0].status, \"dry_run\");\n    assert_eq!(outcomes[0].info[\"dry_run_source\"], \"producer\");\n    assert!(b.ais.take().is_empty());\n    assert!(!p.labels.contains(&prefixed));\n    p.process_batch(&[msg(&[\"unsubscribed\"])]).await.unwrap();\n    assert!(\n        b.outcomes.lock().unwrap().is_empty(),\n        \"unsubscribed labels are still dropped\"\n    );\n}\n\n#[tokio::test]\nasync fn live_page_actions_replace_the_rules_and_pass_every_gate() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let b = bed(\n        vec![\n",
+      "source_digest": "822c3e9ecffd517367901a2ad118d6e5f76867bd4b572bf3461bf8d0b7cea2e4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 241,
+      "end_line": 265,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    );\n    let i = info(&t);\n    assert_eq!(i[\"matched_rule_id\"], \"page\");\n    assert_eq!(i[\"rules_would_rule_id\"], \"anchor_campaign_suspend\");\n    assert_eq!(i[\"action_control_mode\"], \"live\");\n    assert_eq!(i[\"action_control_scope\"], \"head\");\n    assert!(!i.contains_key(\"dry_run_source\"));\n\n    for (account, reason) in [\n        (Account::Followers5k, \"high_follower_count\"),\n        (Account::Followers200k, \"very_high_follower_count\"),\n        (Account::HighCred, \"pagerank_skipped\"),\n        (Account::NotFound, \"user_not_found\"),\n    ] {\n        let t = b.run_fresh(&bb1(&[&label], account)).await;\n        assert_eq!(t.status, reason, \"{account:?}\");\n        assert_eq!(info(&t)[\"matched_rule_id\"], reason);\n        assert!(t.ais.is_empty());\n        assert_eq!(t.tickets, 0);\n    }\n    let off = message(\n        EntityType::User,\n        crate::replay_tests::SWITCHED_OFF_HEAD,\n        \"clf_v1\",\n        &[&label],\n",
+      "source_digest": "f0090e27ee82708b42fecfe136f86019f6c8ea4395791a9d71243b6f1dba5797",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 391,
+      "end_line": 415,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(t.tickets, 0);\n        assert_eq!(info(&t)[\"would_dedup_skip\"], \"true\");\n        assert_eq!(info(&t)[\"would_dedup_held_class\"], \"3\");\n    }\n}\n\nconst RULES_WITH_A_CSE_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_in_allowlist\n    when: user_allowlist.is_allowlisted\n    then: { kind: skip, reason: user_in_allowlist }\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: very_high_follower_count\n    when: cred.follower_count >= 12345.67\n    then: { kind: skip, reason: very_high_follower_count }\n  - id: high_follower_count\n    when: cred.follower_count >= 12.34\n    then: { kind: skip, reason: high_follower_count }\n  - id: pagerank_skipped\n    when: cred.is_high || cred.score >= 50.0\n    then: { kind: skip, reason: pagerank_skipped }\n  - id: act_cse_label\n",
+      "source_digest": "5fdb96a27259e365669852d62e59792465fc2c62c29b70459ac590eb2a9f38ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 393,
+      "end_line": 417,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(info(&t)[\"would_dedup_held_class\"], \"3\");\n    }\n}\n\nconst RULES_WITH_A_CSE_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_in_allowlist\n    when: user_allowlist.is_allowlisted\n    then: { kind: skip, reason: user_in_allowlist }\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: very_high_follower_count\n    when: cred.follower_count >= 12345.67\n    then: { kind: skip, reason: very_high_follower_count }\n  - id: high_follower_count\n    when: cred.follower_count >= 12.34\n    then: { kind: skip, reason: high_follower_count }\n  - id: pagerank_skipped\n    when: cred.is_high || cred.score >= 50.0\n    then: { kind: skip, reason: pagerank_skipped }\n  - id: act_cse_label\n    when: '\"cse_label\" in score.labels'\n    then: { kind: act_suspend_user, perm: true, policy: \"Cse\" }\n",
+      "source_digest": "8bb9a00489767187f45a84d7922f3f15cb7de07dc9ac1e1891740895aeba02e6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 743,
+      "end_line": 767,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    lifetime: lifetime()?,\n                }\n            }\n            _ => return None,\n        });\n    }\n    (!out.is_empty()).then_some(out)\n}\n\nconst SAFETY_REASONS: &[&str] = &[\n    \"user_in_allowlist\",\n    \"post_in_allowlist\",\n    \"user_not_found\",\n    \"very_high_follower_count\",\n    \"high_follower_count\",\n    \"pagerank_skipped\",\n];\n\nasync fn move_to_page(\n    user_rules: &str,\n    post_rules: &str,\n) -> BTreeMap<String, (usize, Vec<String>)> {\n    let all = scenarios(user_rules, post_rules);\n    let mut base: HashMap<String, Trace> = HashMap::new();\n    let mut beds: HashMap<(bool, Option<u64>), TestBed> = HashMap::new();\n",
+      "source_digest": "95932371c3ff2539787ae9ecb697422de677fceffc5d8cb00b97904245090422",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1004,
+      "end_line": 1028,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let live = run_enforcement(ctx, &score, \"t\", &DecisionContext::default())\n        .await\n        .unwrap();\n    assert_eq!(\n        live.status, \"success\",\n        \"the same message acts when not pinned\"\n    );\n}\n\nconst RULES_FACT_GATED_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: act_suspend_if_labeled\n    when: '\"fact_gated_suspend\" in score.labels && \"SpamHighRecall\" in user.labels'\n    then: { kind: act_suspend_user, perm: false, policy: \"PlatformManipulation\" }\n  - id: act_liveness_fallback\n    when: '\"fact_gated_suspend\" in score.labels'\n    then: { kind: act_spam_liveness_check }\n  - id: terminal\n    when: \"true\"\n    then: { kind: skip, reason: no_match }\n\"#;\n",
+      "source_digest": "598b0f232daccb85f9d6439723dcde06bf9f956b3a692e1a814088a439e608ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1006,
+      "end_line": 1030,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .unwrap();\n    assert_eq!(\n        live.status, \"success\",\n        \"the same message acts when not pinned\"\n    );\n}\n\nconst RULES_FACT_GATED_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: act_suspend_if_labeled\n    when: '\"fact_gated_suspend\" in score.labels && \"SpamHighRecall\" in user.labels'\n    then: { kind: act_suspend_user, perm: false, policy: \"PlatformManipulation\" }\n  - id: act_liveness_fallback\n    when: '\"fact_gated_suspend\" in score.labels'\n    then: { kind: act_spam_liveness_check }\n  - id: terminal\n    when: \"true\"\n    then: { kind: skip, reason: no_match }\n\"#;\n\nasync fn fact_gated_bed() -> TestBed {\n",
+      "source_digest": "43eb9f1393bbace7bfc1092a56edaa4aa085ed7de865acef5d8eec84cb520f28",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 89,
+      "end_line": 113,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[cfg(test)]\n#[derive(Default)]\npub(crate) struct AisRecorder {\n    pub calls: std::sync::Mutex<Vec<(String, Value)>>,\n}\n\n#[cfg(test)]\nimpl AisRecorder {\n    pub(crate) fn take(&self) -> Vec<(String, Value)> {\n        std::mem::take(&mut *self.calls.lock().unwrap())\n    }\n\n    fn answer(&self, method: &str, request: Value) -> Value {\n        let n = request\n            .get(\"actions\")\n            .and_then(Value::as_array)\n            .map_or(0, Vec::len);\n        self.calls\n            .lock()\n            .unwrap()\n            .push((method.to_owned(), request));\n        if n > 0 {\n            let ok: serde_json::Map<String, Value> =\n                (0..n).map(|i| (i.to_string(), json!({}))).collect();\n            json!({ \"successesfulActions\": ok, \"failedActions\": {} })\n",
+      "source_digest": "2490566b75349863c310f444897f0dc13fd99c7ff5897c109190203c024d8606",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 204,
+      "end_line": 228,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) -> Result<Value> {\n        self.call_method(&self.multi, request, labels).await\n    }\n\n    async fn call_method(\n        &self,\n        meta: &MethodMeta,\n        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n",
+      "source_digest": "1146994b9020b70e4b54beed05011d945aff105f9d9bf4e7f1424e94e6218d0e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 565,
+      "end_line": 589,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn thrift_ais_exception_validation_failed_is_permanent() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction in schema\");\n\n        assert!(\n            method\n                .exceptions\n                .iter()\n                .any(|e| e.field_id == 4 && e.name == \"aisException\"),\n            \"schema must declare aisException as result field 4: {:?}\",\n            method\n                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n",
+      "source_digest": "459ab6f5e6e623a5cdc324ddd349c4c0689d80c494adac4960bdc6013766ee36",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1815,
+      "end_line": 1839,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn backfill_topics_are_recognised() {\n        assert!(is_backfill_topic(BACKFILL_TOPIC));\n        assert!(is_backfill_topic(\"abuse.enforcement.backfill.staging.v1\"));\n        assert!(!is_backfill_topic(\"abuse.enforcement.decisions.v1\"));\n        assert!(!is_backfill_topic(\"abuse.embeddings.user_decisions\"));\n    }\n\n    #[test]\n    fn gate_cfg_for_runs_fails_closed_and_covers_every_topic() {\n        let mut live = HoldGateConfig::default();\n        assert_eq!(run_gate_cfg(&live), None, \"off: a run can't be checked\");\n        live.mode = GateMode::Shadow;\n        live.topics = vec![\"abuse.v3.score_results\".into()];\n        let run = run_gate_cfg(&live).unwrap();\n        assert_eq!(run.mode, GateMode::Enforce);\n        assert_eq!(run.on_probe_error, OnProbeError::Skip);\n        assert!(run.covers_topic(BACKFILL_TOPIC));\n        assert_eq!(\n            live.on_probe_error,\n            OnProbeError::Allow,\n            \"live config untouched\"\n        );\n    }\n\n    #[tokio::test]\n",
+      "source_digest": "b67aeac538d5b179d79c5e66cb086ac44e2376d8a3c3fa091443be4f6f13c9b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n            \"the record list came from a pod's copy ({}), not the store; retry when the store answers\",\n            list.error.unwrap_or_default()\n        );\n    }\n    let planned = plan(&list, &args.updated_by);\n    println!(\"{} off switch(es) to turn on ({REASON}):\", planned.len());\n    for s in &planned {\n        println!(\"  {}\", switch_lkey(s));\n    }\n    if !args.apply {\n        println!(\"plan only; rerun with --apply to write the switches\");\n        return Ok(());\n    }\n",
+      "source_digest": "407192d801c89660bfbad0f68361221ee4217a7bef43d5f2f036335130854902",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/entities.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 12,
+      "end_line": 36,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub user_cred_score: Option<f64>,\n    #[serde(deserialize_with = \"deserialize_string_or_i64\")]\n    pub follower_count: Option<i64>,\n}\n\n#[derive(Serialize)]\npub struct DedupEntry<'a> {\n    pub status: &'a str,\n    pub acted_class: u8,\n    pub topic: &'a str,\n    pub dry_run: bool,\n    pub additional_info_map: &'a std::collections::BTreeMap<String, String>,\n    pub score_result: xai_abuse_proto::enforcement::ScoreResult,\n}\n\n#[derive(Debug, Serialize, Deserialize)]\n#[allow(dead_code)]\npub struct DedupEntryOwned {\n    pub status: String,\n    #[serde(default)]\n    pub acted_class: u8,\n    #[serde(default)]\n    pub topic: String,\n    #[serde(default)]\n    pub dry_run: bool,\n",
+      "source_digest": "ccd119eac66dc06a35f8a7e97e00a7b67a944f8c7bb73c80bcd7d788c18d5146",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/entities.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 27,
+      "end_line": 51,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[derive(Debug, Serialize, Deserialize)]\n#[allow(dead_code)]\npub struct DedupEntryOwned {\n    pub status: String,\n    #[serde(default)]\n    pub acted_class: u8,\n    #[serde(default)]\n    pub topic: String,\n    #[serde(default)]\n    pub dry_run: bool,\n    #[serde(default)]\n    pub additional_info_map: std::collections::BTreeMap<String, String>,\n    pub score_result: xai_abuse_proto::enforcement::ScoreResult,\n}\n\nfn deserialize_string_or_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{\n    use serde::de::Error;\n    let v = Option::<serde_json::Value>::deserialize(deserializer)?;\n    match v {\n        None | Some(serde_json::Value::Null) => Ok(None),\n        Some(serde_json::Value::Number(n)) => n\n            .as_i64()\n",
+      "source_digest": "9bfb726959ff2ad2a6bb80f0fe4fcb774d75891f0c237dcb938e2eec1a054262",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 738,
+      "end_line": 762,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        legacy.insert(\"gizmoduck_is_affiliate\".into(), \"false\".into());\n\n        let parsed = Facts::from_additional_info_map(&legacy, &score, \"t\")\n            .expect(\"legacy map (no gizmoduck_labels) should still reconstruct\");\n        assert_eq!(parsed.user().labels, vec![\"SpamHighRecall\".to_owned()]);\n\n        legacy.insert(\"gizmoduck_has_spam_high_recall\".into(), \"false\".into());\n        let parsed = Facts::from_additional_info_map(&legacy, &score, \"t\").unwrap();\n        assert!(parsed.user().labels.is_empty());\n    }\n\n    #[test]\n    fn from_additional_info_map_reconstructs_user_not_found_skip() {\n        let score = ScoreResult {\n            user_id: 99,\n            ..Default::default()\n        };\n        let original = Facts {\n            entity_type: EntityType::User,\n            entity_id: 99,\n            user_id: 99,\n            topic: \"t\".into(),\n            score: ScoreFacts::from_score(&score),\n            entity: EntityFacts::User(UserFacts {\n                allowlist: AllowlistFacts::default(),\n",
+      "source_digest": "355ed50ba27539dd341557f2d22016ec33fcde2b426c5f0af128ee315bbca0ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 761,
+      "end_line": 785,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            entity: EntityFacts::User(UserFacts {\n                allowlist: AllowlistFacts::default(),\n                user: GizmoduckFacts::default(),\n                cred: CredFacts {\n                    is_high: Some(false),\n                    ..Default::default()\n                },\n            }),\n            uas: None,\n        };\n        let map = original.to_additional_info_map();\n        let parsed = Facts::from_additional_info_map(&map, &score, \"t\")\n            .expect(\"user_not_found skip-path map should reconstruct\");\n\n        assert!(!parsed.user_allowlist().is_allowlisted);\n        assert!(!parsed.user().present);\n        assert_eq!(parsed.cred().is_high, Some(false));\n    }\n\n    #[test]\n    fn audit_map_round_trips_through_from_additional_info_map() {\n        let score = ScoreResult {\n            user_id: 12345,\n            model_version: \"v_test\".into(),\n            enforcement_note: \"note\".into(),\n",
+      "source_digest": "d3314616d9a49f40c91f0011ceb310e755131ae235cf185552e89ca88df482a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 32,
+      "end_line": 56,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[cfg(test)]\n    pub(crate) fn from_client(inner: Arc<dyn GizmoduckClient + Send + Sync>) -> Self {\n        Self { inner }\n    }\n\n    pub async fn connect(cfg: &GizmoduckCoreClientConfig) -> Result<Self> {\n        let service_url = format!(\"gizmoduck.gizmoduck.prod.{}.s2s.twttr.net\", cfg.zone);\n        let strato_cfg = StratoGrpcConfig {\n            ca_cert_path: cfg.ca_cert_path.clone(),\n            client_cert_path: cfg.client_cert_path.clone(),\n            client_key_path: cfg.client_key_path.clone(),\n            num_endpoints: Some(GizmoduckRpcConstants::num_endpoints()),\n            max_batch_size: GizmoduckRpcConstants::max_batch_size(),\n            connect_timeout_ms: GizmoduckRpcConstants::connect_timeout_msec(),\n            request_timeout_ms: GizmoduckRpcConstants::request_timeout_msec(),\n            client_id: Some(cfg.client_id.clone()),\n            wily_ns_path: \"/s/gizmoduck/gizmoduck:fed-grpc\".to_string(),\n            service_url,\n            dns_probe_interval_ms: GizmoduckRpcConstants::dns_probe_interval_msec(),\n            zone: cfg.zone.clone(),\n            readiness_probe_port: Some(8081),\n            filter_to_k8s_only: true,\n            ..Default::default()\n        };\n        let grpc = StratoGrpc::new(strato_cfg)\n",
+      "source_digest": "d3dd4b42c9a77a8575c3da585f128eb6e9972cd4ffce55783f8d55b8698d0339",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 62,
+      "end_line": 86,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"gizmoduck core client initialised (get-V2 fed-grpc)\"\n        );\n        Ok(Self {\n            inner: Arc::new(ProdGizmoduckClient {\n                grpc_client: Arc::new(grpc),\n            }),\n        })\n    }\n\n    #[tracing::instrument(skip(self), fields(present, suspended, deactivated, label_count))]\n    pub async fn fetch_user(&self, user_id: i64) -> Result<GizmoduckFacts> {\n        let start = Instant::now();\n        let mut results = self\n            .inner\n            .get_users_with_context(vec![user_id], None, QUERY_FIELDS)\n            .await;\n        let item = results\n            .remove(&user_id)\n            .ok_or_else(|| anyhow!(\"gizmoduck core: empty batch for user_id={user_id}\"))?;\n\n        let facts = match item {\n            Ok(None) => GizmoduckFacts::default(),\n            Ok(Some(result)) => match result.user {\n                None => GizmoduckFacts::default(),\n                Some(user) => {\n",
+      "source_digest": "580c01cb9b1b89c9aaeab759103fc02fa882f13bf48f2ba4159b2ecffe094265",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 66,
+      "end_line": 90,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                grpc_client: Arc::new(grpc),\n            }),\n        })\n    }\n\n    #[tracing::instrument(skip(self), fields(present, suspended, deactivated, label_count))]\n    pub async fn fetch_user(&self, user_id: i64) -> Result<GizmoduckFacts> {\n        let start = Instant::now();\n        let mut results = self\n            .inner\n            .get_users_with_context(vec![user_id], None, QUERY_FIELDS)\n            .await;\n        let item = results\n            .remove(&user_id)\n            .ok_or_else(|| anyhow!(\"gizmoduck core: empty batch for user_id={user_id}\"))?;\n\n        let facts = match item {\n            Ok(None) => GizmoduckFacts::default(),\n            Ok(Some(result)) => match result.user {\n                None => GizmoduckFacts::default(),\n                Some(user) => {\n                    let labels: Vec<String> = user\n                        .labels\n                        .labels\n                        .iter()\n",
+      "source_digest": "c3a78b343d293f20d502f3c5b7d879c6f069ec0d76bb289a8868680ce6fc5147",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 68,
+      "end_line": 92,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        })\n    }\n\n    #[tracing::instrument(skip(self), fields(present, suspended, deactivated, label_count))]\n    pub async fn fetch_user(&self, user_id: i64) -> Result<GizmoduckFacts> {\n        let start = Instant::now();\n        let mut results = self\n            .inner\n            .get_users_with_context(vec![user_id], None, QUERY_FIELDS)\n            .await;\n        let item = results\n            .remove(&user_id)\n            .ok_or_else(|| anyhow!(\"gizmoduck core: empty batch for user_id={user_id}\"))?;\n\n        let facts = match item {\n            Ok(None) => GizmoduckFacts::default(),\n            Ok(Some(result)) => match result.user {\n                None => GizmoduckFacts::default(),\n                Some(user) => {\n                    let labels: Vec<String> = user\n                        .labels\n                        .labels\n                        .iter()\n                        .map(|l| label_ordinal_to_name(l.label_value))\n                        .collect();\n",
+      "source_digest": "fff9f45bc9fd4c15ea852c5fffeb19b2023e07e3d986853eece53033bfeb6a9b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1453,
+      "end_line": 1477,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        pub fn spawn_seen_writer(self: &Arc<Self>) -> Option<JoinHandle<()>> {\n        let mut rx = self\n            .seen_rx\n            .lock()\n            .unwrap_or_else(|p| p.into_inner())\n            .take()?;\n        let this = self.clone();\n        Some(tokio::spawn(async move {\n            let mut failures: u64 = 0;\n            while let Some((pkey, lkey, value)) = rx.recv().await {\n                let key = seen_guard_key(pkey, &lkey);\n                let result = match tokio::time::timeout(\n                    this.scan_timeout,\n                    this.store.put(pkey, &lkey, value, SEEN_TTL_SECS),\n                )\n                .await\n                {\n                    Ok(r) => r,\n                    Err(_) => Err(anyhow::anyhow!(\"seen write timed out\")),\n                };\n                match result {\n                    Ok(()) => {\n                        failures = 0;\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n",
+      "source_digest": "e9b23b194acfee721ba8e4a2a092777e5d3b0e58012db38c3ff6cc2c3411efa7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1462,
+      "end_line": 1486,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let mut failures: u64 = 0;\n            while let Some((pkey, lkey, value)) = rx.recv().await {\n                let key = seen_guard_key(pkey, &lkey);\n                let result = match tokio::time::timeout(\n                    this.scan_timeout,\n                    this.store.put(pkey, &lkey, value, SEEN_TTL_SECS),\n                )\n                .await\n                {\n                    Ok(r) => r,\n                    Err(_) => Err(anyhow::anyhow!(\"seen write timed out\")),\n                };\n                match result {\n                    Ok(()) => {\n                        failures = 0;\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"written\"])\n                            .inc();\n                    }\n                    Err(e) => {\n                        failures += 1;\n                        metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                        metrics::ACTION_CONTROL_SEEN_TOTAL\n                            .with_label_values(&[\"error\"])\n                            .inc();\n",
+      "source_digest": "06cf9b0eaf044834008a61c6baa10d62b9d75e9a3f68d2c7af54883360036070",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2804,
+      "end_line": 2828,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            action_specs: serde_json::json!([]),\n        };\n        store.rows.lock().unwrap().insert(\n            (SEEN_PKEY.into(), seen_lkey(&seen)),\n            serde_json::to_vec(&seen).unwrap(),\n        );\n    }\n\n        fn claims_without_the_rules(r: &Resolved) {\n        let want = page_class(&r.page_actions);\n        assert_eq!(r.dedup_class, Some(want));\n        assert_eq!(\n            r.incoming_dedup_class(|| panic!(\"rules asked for a factory decision\")),\n            want\n        );\n    }\n\n                    #[tokio::test]\n    async fn a_factory_head_records_only_until_its_row_is_set() {\n        let (empty, _) = loaded(&[]).await;\n        let r = empty.resolve(&factory_input(\"F\", \"c\", None), &on(), |_| true);\n        assert_eq!(r.mode, ControlMode::Recording);\n        assert_eq!((r.forced, r.matched.is_none()), (None, true));\n        assert!(r.factory && r.by_row && r.page_driven());\n        assert_eq!(r.row.as_ref().map(|o| o.row), Some(LevelRow::Missing));\n",
+      "source_digest": "86f5ceb21f484ba8d5a0a7f6c7337b5b6e7dacf669454376e7bf04d9ab33a2c8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3898,
+      "end_line": 3922,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            record(\"RulesRow\", None, None, ControlMode::Rows, vec![]),\n            row_rec(\"RulesRow\", LevelRow::Missing, ControlMode::Rules, vec![]),\n        ])\n        .await;\n        for head in [\"Moved\", \"Recording\", \"Live\"] {\n            let r = resolve(&ac, head, \"c\", &[]);\n            let page = r.page_actions.clone();\n            let r = r\n                .admit_unlisted()\n                .unwrap_or_else(|| panic!(\"{head} admitted\"));\n            assert!(r.unlisted && r.page_driven() && r.rules_unread(), \"{head}\");\n            assert_eq!(\n                r.incoming_dedup_class(|| panic!(\"rules asked for {head}\")),\n                page_class(&page)\n            );\n        }\n        let moved = resolve(&ac, \"Moved\", \"c\", &[]).admit_unlisted().unwrap();\n        assert_eq!(moved.mode, ControlMode::Recording);\n        assert!(moved.page_actions.is_empty());\n        assert_eq!(logged_because(&moved).as_deref(), Some(\"no_selection\"));\n        for head in [\"None\", \"OnRules\", \"RulesRow\"] {\n            assert!(\n                resolve(&ac, head, \"c\", &[]).admit_unlisted().is_none(),\n                \"{head}\"\n            );\n",
+      "source_digest": "296a51b785b6ea24e9df20a9333c5d8f7f32518e225eac6da79e6b886c240ce1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4032,
+      "end_line": 4056,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(\n            code(set_cfg(renamed(\"NewName\", None)).await),\n            \"confirm_required\"\n        );\n        assert!(\n            set_cfg(renamed(\"NewName\", Some(CONFIRM_WORD)))\n                .await\n                .is_ok()\n        );\n    }\n\n    #[tokio::test]\n    async fn put_answer_shows_this_pods_effective_mode() {\n        let (ac, _) = loaded(&[]).await;\n        let killed = ControlConfig {\n            enabled: false,\n            ..Default::default()\n        };\n        let out = ac\n            .set(\n                put(\"H\", ControlMode::Live, vec![SUSPEND]),\n                \"w\",\n                \"k\",\n                1,\n                &killed,\n",
+      "source_digest": "de8e939a7a18f9194ccd5c523d7ec71666ecd36db86ffaf2a1a7458d8a1a35ff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 468,
+      "end_line": 492,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "async fn admission_strips_the_prefix_and_an_old_image_drops_it() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let b = bed(vec![], false).await;\n    let mut p = b.processor();\n    p.labels = HashSet::from([label.clone()]);\n    let prefixed = format!(\"dry_run__{label}\");\n    let msg = |labels: &[&str]| xai_kafka::KafkaMessage {\n        topic: p.topic.clone(),\n        payload: Some(bb1(labels, Account::Clean).encode_to_vec()),\n        ..Default::default()\n    };\n    p.process_batch(&[msg(&[&prefixed])]).await.unwrap();\n    let outcomes = std::mem::take(&mut *b.outcomes.lock().unwrap());\n    assert_eq!(outcomes.len(), 1, \"admitted\");\n    assert_eq!(outcomes[0].status, \"dry_run\");\n    assert_eq!(outcomes[0].info[\"dry_run_source\"], \"producer\");\n    assert!(b.ais.take().is_empty());\n    assert!(!p.labels.contains(&prefixed));\n    p.process_batch(&[msg(&[\"unsubscribed\"])]).await.unwrap();\n    assert!(\n        b.outcomes.lock().unwrap().is_empty(),\n        \"unsubscribed labels are still dropped\"\n    );\n}\n",
+      "source_digest": "156ed4b9aa22fea523077128ac9708a64c3103bc142aa81f717190fc5eae903f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 475,
+      "end_line": 499,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let msg = |labels: &[&str]| xai_kafka::KafkaMessage {\n        topic: p.topic.clone(),\n        payload: Some(bb1(labels, Account::Clean).encode_to_vec()),\n        ..Default::default()\n    };\n    p.process_batch(&[msg(&[&prefixed])]).await.unwrap();\n    let outcomes = std::mem::take(&mut *b.outcomes.lock().unwrap());\n    assert_eq!(outcomes.len(), 1, \"admitted\");\n    assert_eq!(outcomes[0].status, \"dry_run\");\n    assert_eq!(outcomes[0].info[\"dry_run_source\"], \"producer\");\n    assert!(b.ais.take().is_empty());\n    assert!(!p.labels.contains(&prefixed));\n    p.process_batch(&[msg(&[\"unsubscribed\"])]).await.unwrap();\n    assert!(\n        b.outcomes.lock().unwrap().is_empty(),\n        \"unsubscribed labels are still dropped\"\n    );\n}\n\n#[tokio::test]\nasync fn live_page_actions_replace_the_rules_and_pass_every_gate() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let b = bed(\n        vec![\n",
+      "source_digest": "822c3e9ecffd517367901a2ad118d6e5f76867bd4b572bf3461bf8d0b7cea2e4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 517,
+      "end_line": 541,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    );\n    let i = info(&t);\n    assert_eq!(i[\"matched_rule_id\"], \"page\");\n    assert_eq!(i[\"rules_would_rule_id\"], \"anchor_campaign_suspend\");\n    assert_eq!(i[\"action_control_mode\"], \"live\");\n    assert_eq!(i[\"action_control_scope\"], \"head\");\n    assert!(!i.contains_key(\"dry_run_source\"));\n\n    for (account, reason) in [\n        (Account::Followers5k, \"high_follower_count\"),\n        (Account::Followers200k, \"very_high_follower_count\"),\n        (Account::HighCred, \"pagerank_skipped\"),\n        (Account::NotFound, \"user_not_found\"),\n    ] {\n        let t = b.run_fresh(&bb1(&[&label], account)).await;\n        assert_eq!(t.status, reason, \"{account:?}\");\n        assert_eq!(info(&t)[\"matched_rule_id\"], reason);\n        assert!(t.ais.is_empty());\n        assert_eq!(t.tickets, 0);\n    }\n    let off = message(\n        EntityType::User,\n        crate::replay_tests::SWITCHED_OFF_HEAD,\n        \"clf_v1\",\n        &[&label],\n",
+      "source_digest": "f0090e27ee82708b42fecfe136f86019f6c8ea4395791a9d71243b6f1dba5797",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 667,
+      "end_line": 691,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(t.tickets, 0);\n        assert_eq!(info(&t)[\"would_dedup_skip\"], \"true\");\n        assert_eq!(info(&t)[\"would_dedup_held_class\"], \"3\");\n    }\n}\n\nconst RULES_WITH_A_CSE_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_in_allowlist\n    when: user_allowlist.is_allowlisted\n    then: { kind: skip, reason: user_in_allowlist }\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: very_high_follower_count\n    when: cred.follower_count >= 12345.67\n    then: { kind: skip, reason: very_high_follower_count }\n  - id: high_follower_count\n    when: cred.follower_count >= 12.34\n    then: { kind: skip, reason: high_follower_count }\n  - id: pagerank_skipped\n    when: cred.is_high || cred.score >= 50.0\n    then: { kind: skip, reason: pagerank_skipped }\n  - id: act_cse_label\n",
+      "source_digest": "5fdb96a27259e365669852d62e59792465fc2c62c29b70459ac590eb2a9f38ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 669,
+      "end_line": 693,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(info(&t)[\"would_dedup_held_class\"], \"3\");\n    }\n}\n\nconst RULES_WITH_A_CSE_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_in_allowlist\n    when: user_allowlist.is_allowlisted\n    then: { kind: skip, reason: user_in_allowlist }\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: very_high_follower_count\n    when: cred.follower_count >= 12345.67\n    then: { kind: skip, reason: very_high_follower_count }\n  - id: high_follower_count\n    when: cred.follower_count >= 12.34\n    then: { kind: skip, reason: high_follower_count }\n  - id: pagerank_skipped\n    when: cred.is_high || cred.score >= 50.0\n    then: { kind: skip, reason: pagerank_skipped }\n  - id: act_cse_label\n    when: '\"cse_label\" in score.labels'\n    then: { kind: act_suspend_user, perm: true, policy: \"Cse\" }\n",
+      "source_digest": "8bb9a00489767187f45a84d7922f3f15cb7de07dc9ac1e1891740895aeba02e6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1019,
+      "end_line": 1043,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    lifetime: lifetime()?,\n                }\n            }\n            _ => return None,\n        });\n    }\n    (!out.is_empty()).then_some(out)\n}\n\nconst SAFETY_REASONS: &[&str] = &[\n    \"user_in_allowlist\",\n    \"post_in_allowlist\",\n    \"user_not_found\",\n    \"very_high_follower_count\",\n    \"high_follower_count\",\n    \"pagerank_skipped\",\n];\n\nasync fn move_to_page(\n    user_rules: &str,\n    post_rules: &str,\n) -> BTreeMap<String, (usize, Vec<String>)> {\n    let all = scenarios(user_rules, post_rules);\n    let mut base: HashMap<String, Trace> = HashMap::new();\n    let mut beds: HashMap<(bool, Option<u64>), TestBed> = HashMap::new();\n",
+      "source_digest": "95932371c3ff2539787ae9ecb697422de677fceffc5d8cb00b97904245090422",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1273,
+      "end_line": 1297,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let live = run_enforcement(ctx, &score, \"t\", &DecisionContext::default())\n        .await\n        .unwrap();\n    assert_eq!(\n        live.status, \"success\",\n        \"the same message acts when not pinned\"\n    );\n}\n\nconst RULES_FACT_GATED_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: act_suspend_if_labeled\n    when: '\"fact_gated_suspend\" in score.labels && \"SpamHighRecall\" in user.labels'\n    then: { kind: act_suspend_user, perm: false, policy: \"PlatformManipulation\" }\n  - id: act_liveness_fallback\n    when: '\"fact_gated_suspend\" in score.labels'\n    then: { kind: act_spam_liveness_check }\n  - id: terminal\n    when: \"true\"\n    then: { kind: skip, reason: no_match }\n\"#;\n",
+      "source_digest": "598b0f232daccb85f9d6439723dcde06bf9f956b3a692e1a814088a439e608ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1275,
+      "end_line": 1299,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .unwrap();\n    assert_eq!(\n        live.status, \"success\",\n        \"the same message acts when not pinned\"\n    );\n}\n\nconst RULES_FACT_GATED_SUSPEND: &str = r#\"\nfor_entity: user\nrules:\n  - id: user_not_found\n    when: \"!user.present\"\n    then: { kind: skip, reason: user_not_found }\n  - id: act_suspend_if_labeled\n    when: '\"fact_gated_suspend\" in score.labels && \"SpamHighRecall\" in user.labels'\n    then: { kind: act_suspend_user, perm: false, policy: \"PlatformManipulation\" }\n  - id: act_liveness_fallback\n    when: '\"fact_gated_suspend\" in score.labels'\n    then: { kind: act_spam_liveness_check }\n  - id: terminal\n    when: \"true\"\n    then: { kind: skip, reason: no_match }\n\"#;\n\nasync fn fact_gated_bed() -> TestBed {\n",
+      "source_digest": "43eb9f1393bbace7bfc1092a56edaa4aa085ed7de865acef5d8eec84cb520f28",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 89,
+      "end_line": 113,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[cfg(test)]\n#[derive(Default)]\npub(crate) struct AisRecorder {\n    pub calls: std::sync::Mutex<Vec<(String, Value)>>,\n}\n\n#[cfg(test)]\nimpl AisRecorder {\n    pub(crate) fn take(&self) -> Vec<(String, Value)> {\n        std::mem::take(&mut *self.calls.lock().unwrap())\n    }\n\n    fn answer(&self, method: &str, request: Value) -> Value {\n        let n = request\n            .get(\"actions\")\n            .and_then(Value::as_array)\n            .map_or(0, Vec::len);\n        self.calls\n            .lock()\n            .unwrap()\n            .push((method.to_owned(), request));\n        if n > 0 {\n            let ok: serde_json::Map<String, Value> =\n                (0..n).map(|i| (i.to_string(), json!({}))).collect();\n            json!({ \"successesfulActions\": ok, \"failedActions\": {} })\n",
+      "source_digest": "2490566b75349863c310f444897f0dc13fd99c7ff5897c109190203c024d8606",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 204,
+      "end_line": 228,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) -> Result<Value> {\n        self.call_method(&self.multi, request, labels).await\n    }\n\n    async fn call_method(\n        &self,\n        meta: &MethodMeta,\n        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n",
+      "source_digest": "1146994b9020b70e4b54beed05011d945aff105f9d9bf4e7f1424e94e6218d0e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 565,
+      "end_line": 589,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn thrift_ais_exception_validation_failed_is_permanent() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction in schema\");\n\n        assert!(\n            method\n                .exceptions\n                .iter()\n                .any(|e| e.field_id == 4 && e.name == \"aisException\"),\n            \"schema must declare aisException as result field 4: {:?}\",\n            method\n                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n",
+      "source_digest": "459ab6f5e6e623a5cdc324ddd349c4c0689d80c494adac4960bdc6013766ee36",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1831,
+      "end_line": 1855,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn backfill_topics_are_recognised() {\n        assert!(is_backfill_topic(BACKFILL_TOPIC));\n        assert!(is_backfill_topic(\"abuse.enforcement.backfill.staging.v1\"));\n        assert!(!is_backfill_topic(\"abuse.enforcement.decisions.v1\"));\n        assert!(!is_backfill_topic(\"abuse.embeddings.user_decisions\"));\n    }\n\n    #[test]\n    fn gate_cfg_for_runs_fails_closed_and_covers_every_topic() {\n        let mut live = HoldGateConfig::default();\n        assert_eq!(run_gate_cfg(&live), None, \"off: a run can't be checked\");\n        live.mode = GateMode::Shadow;\n        live.topics = vec![\"abuse.v3.score_results\".into()];\n        let run = run_gate_cfg(&live).unwrap();\n        assert_eq!(run.mode, GateMode::Enforce);\n        assert_eq!(run.on_probe_error, OnProbeError::Skip);\n        assert!(run.covers_topic(BACKFILL_TOPIC));\n        assert_eq!(\n            live.on_probe_error,\n            OnProbeError::Allow,\n            \"live config untouched\"\n        );\n    }\n\n    #[tokio::test]\n",
+      "source_digest": "b67aeac538d5b179d79c5e66cb086ac44e2376d8a3c3fa091443be4f6f13c9b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n            \"the record list came from a pod's copy ({}), not the store; retry when the store answers\",\n            list.error.unwrap_or_default()\n        );\n    }\n    let planned = plan(&list, &args.updated_by);\n    println!(\"{} off switch(es) to turn on ({REASON}):\", planned.len());\n    for s in &planned {\n        println!(\"  {}\", switch_lkey(s));\n    }\n    if !args.apply {\n        println!(\"plan only; rerun with --apply to write the switches\");\n        return Ok(());\n    }\n",
+      "source_digest": "407192d801c89660bfbad0f68361221ee4217a7bef43d5f2f036335130854902",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/entities.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 12,
+      "end_line": 36,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub user_cred_score: Option<f64>,\n    #[serde(deserialize_with = \"deserialize_string_or_i64\")]\n    pub follower_count: Option<i64>,\n}\n\n#[derive(Serialize)]\npub struct DedupEntry<'a> {\n    pub status: &'a str,\n    pub acted_class: u8,\n    pub topic: &'a str,\n    pub dry_run: bool,\n    pub additional_info_map: &'a std::collections::BTreeMap<String, String>,\n    pub score_result: xai_abuse_proto::enforcement::ScoreResult,\n}\n\n#[derive(Debug, Serialize, Deserialize)]\n#[allow(dead_code)]\npub struct DedupEntryOwned {\n    pub status: String,\n    #[serde(default)]\n    pub acted_class: u8,\n    #[serde(default)]\n    pub topic: String,\n    #[serde(default)]\n    pub dry_run: bool,\n",
+      "source_digest": "ccd119eac66dc06a35f8a7e97e00a7b67a944f8c7bb73c80bcd7d788c18d5146",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/entities.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 27,
+      "end_line": 51,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[derive(Debug, Serialize, Deserialize)]\n#[allow(dead_code)]\npub struct DedupEntryOwned {\n    pub status: String,\n    #[serde(default)]\n    pub acted_class: u8,\n    #[serde(default)]\n    pub topic: String,\n    #[serde(default)]\n    pub dry_run: bool,\n    #[serde(default)]\n    pub additional_info_map: std::collections::BTreeMap<String, String>,\n    pub score_result: xai_abuse_proto::enforcement::ScoreResult,\n}\n\nfn deserialize_string_or_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>\nwhere\n    D: serde::Deserializer<'de>,\n{\n    use serde::de::Error;\n    let v = Option::<serde_json::Value>::deserialize(deserializer)?;\n    match v {\n        None | Some(serde_json::Value::Null) => Ok(None),\n        Some(serde_json::Value::Number(n)) => n\n            .as_i64()\n",
+      "source_digest": "9bfb726959ff2ad2a6bb80f0fe4fcb774d75891f0c237dcb938e2eec1a054262",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 638,
+      "end_line": 662,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        legacy.insert(\"gizmoduck_is_affiliate\".into(), \"false\".into());\n\n        let parsed = Facts::from_additional_info_map(&legacy, &score, \"t\")\n            .expect(\"legacy map (no gizmoduck_labels) should still reconstruct\");\n        assert_eq!(parsed.user().labels, vec![\"SpamHighRecall\".to_owned()]);\n\n        legacy.insert(\"gizmoduck_has_spam_high_recall\".into(), \"false\".into());\n        let parsed = Facts::from_additional_info_map(&legacy, &score, \"t\").unwrap();\n        assert!(parsed.user().labels.is_empty());\n    }\n\n    #[test]\n    fn from_additional_info_map_reconstructs_user_not_found_skip() {\n        let score = ScoreResult {\n            user_id: 99,\n            ..Default::default()\n        };\n        let original = Facts {\n            entity_type: EntityType::User,\n            entity_id: 99,\n            user_id: 99,\n            topic: \"t\".into(),\n            score: ScoreFacts::from_score(&score),\n            entity: EntityFacts::User(UserFacts {\n                allowlist: AllowlistFacts::default(),\n",
+      "source_digest": "355ed50ba27539dd341557f2d22016ec33fcde2b426c5f0af128ee315bbca0ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 661,
+      "end_line": 685,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            entity: EntityFacts::User(UserFacts {\n                allowlist: AllowlistFacts::default(),\n                user: GizmoduckFacts::default(),\n                cred: CredFacts {\n                    is_high: Some(false),\n                    ..Default::default()\n                },\n            }),\n            uas: None,\n        };\n        let map = original.to_additional_info_map();\n        let parsed = Facts::from_additional_info_map(&map, &score, \"t\")\n            .expect(\"user_not_found skip-path map should reconstruct\");\n\n        assert!(!parsed.user_allowlist().is_allowlisted);\n        assert!(!parsed.user().present);\n        assert_eq!(parsed.cred().is_high, Some(false));\n    }\n\n    #[test]\n    fn audit_map_round_trips_through_from_additional_info_map() {\n        let score = ScoreResult {\n            user_id: 12345,\n            model_version: \"v_test\".into(),\n            enforcement_note: \"note\".into(),\n",
+      "source_digest": "d3314616d9a49f40c91f0011ceb310e755131ae235cf185552e89ca88df482a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 32,
+      "end_line": 56,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[cfg(test)]\n    pub(crate) fn from_client(inner: Arc<dyn GizmoduckClient + Send + Sync>) -> Self {\n        Self { inner }\n    }\n\n    pub async fn connect(cfg: &GizmoduckCoreClientConfig) -> Result<Self> {\n        let service_url = format!(\"gizmoduck.gizmoduck.prod.{}.s2s.twttr.net\", cfg.zone);\n        let strato_cfg = StratoGrpcConfig {\n            ca_cert_path: cfg.ca_cert_path.clone(),\n            client_cert_path: cfg.client_cert_path.clone(),\n            client_key_path: cfg.client_key_path.clone(),\n            num_endpoints: Some(GizmoduckRpcConstants::num_endpoints()),\n            max_batch_size: GizmoduckRpcConstants::max_batch_size(),\n            connect_timeout_ms: GizmoduckRpcConstants::connect_timeout_msec(),\n            request_timeout_ms: GizmoduckRpcConstants::request_timeout_msec(),\n            client_id: Some(cfg.client_id.clone()),\n            wily_ns_path: \"/s/gizmoduck/gizmoduck:fed-grpc\".to_string(),\n            service_url,\n            dns_probe_interval_ms: GizmoduckRpcConstants::dns_probe_interval_msec(),\n            zone: cfg.zone.clone(),\n            readiness_probe_port: Some(8081),\n            filter_to_k8s_only: true,\n            ..Default::default()\n        };\n        let grpc = StratoGrpc::new(strato_cfg)\n",
+      "source_digest": "d3dd4b42c9a77a8575c3da585f128eb6e9972cd4ffce55783f8d55b8698d0339",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 62,
+      "end_line": 86,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"gizmoduck core client initialised (get-V2 fed-grpc)\"\n        );\n        Ok(Self {\n            inner: Arc::new(ProdGizmoduckClient {\n                grpc_client: Arc::new(grpc),\n            }),\n        })\n    }\n\n    #[tracing::instrument(skip(self), fields(present, suspended, deactivated, label_count))]\n    pub async fn fetch_user(&self, user_id: i64) -> Result<GizmoduckFacts> {\n        let start = Instant::now();\n        let mut results = self\n            .inner\n            .get_users_with_context(vec![user_id], None, QUERY_FIELDS)\n            .await;\n        let item = results\n            .remove(&user_id)\n            .ok_or_else(|| anyhow!(\"gizmoduck core: empty batch for user_id={user_id}\"))?;\n\n        let facts = match item {\n            Ok(None) => GizmoduckFacts::default(),\n            Ok(Some(result)) => match result.user {\n                None => GizmoduckFacts::default(),\n                Some(user) => {\n",
+      "source_digest": "580c01cb9b1b89c9aaeab759103fc02fa882f13bf48f2ba4159b2ecffe094265",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": false
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2817515a747d3743e5c5b2968ae99f17afa687733670ae031d14a9773f56980a",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/staging",
+      "presence": {
+        "before_exists": true,
+        "after_exists": false
+      },
+      "diff_digest": "3acb7f1e62d53f521094d517b29c6cb2828948b58a83cdf764d0ce62f7c79ba8",
+      "context_complete": true,
+      "task_id": "T-5214db43c299d5cc26cb34b0f1103e88a89f96c4996de65c8c07f2773bb8cf3d",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-75c0a7d6cd6962c2f53acd9f9afea34ad205c12a2a44cd7fc3fb2f941c8a3fe1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa9513e4c29ec5b4bd6d377e5c44d239b4bb10325644990d81356418a2859dc4",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-107a3b9c88ec5b5475030031c6dbf26edffe2a3bb213c296b4f3d122e45e9f1f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-29f976c72bb8fc2a73641559991c302aa0855ef64a1894949266f8c6b111a1f5",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7ed93b45db4a7b7c309d578f9bd758c4f09e5d2399ca2af8d33ee164eaf0f471",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-0c0e77de029da3e57c55fee26c773e28b00b3799455ecd78bd36fa4a0e53fef3",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4686ae417083c315c9e789be136c890fba1e151531aee19f8fb366e7d9f2f3db",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-866c239bba7a4a01c2c889c84b01b981392c59cf358315d3f4965978d9962253",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-db8b254132b5af1959358fdcc2164ad035d8834d160c4656ef83ef26895af2f7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-27bd35b672ae5d164292dc7a872a838830a897341951e0cd750532ada09f612e",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2fb756469938ebcad39e56a1025c49b616a3cb2802df0e553214864c500ed17a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-404d87911fe6c8a93397af1243b0aadef9815dc6a5e8f7ccb268c05d77dfe32d",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e31aba4469d413900b7a3358c02b99a22761dd91f969db4500ab849d4101c818",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-eba25df1de8e0b6debcba7e8d7b747cd284caec921fd699167adf7f4255adf91",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-13f1134f05b14519d7a1e482799acbc4972e17ef00f983d09b62927bb314f961",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-6867f5df5dfba5b84433b56cc67ce82f26db23c204b0a888324d9016d42192ed",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-003eff82dd99dd0087bfc27a5fb50e633ea7f94e45fd9837f4e005cd88d23d64",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-bd509c0464035a4de52e065e41d0091820df998929577c951f542dd89cb7d475",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-31d83d3b935b881fc410b953437b8a2af103af38d36949d3ef8a73c4ea1f4bb3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-da0901301bcb4280401a029d8608d982e71deaba8ec00a09f61a58b028c3ac67",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0f63788311d19da40c0146392d61407e5424682dd78dc054fa46862f0691d698",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-521713e2da7157eb237e52c6e4a3bde91d9f42050bfc69a0b2ae736c2650f906",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b17cf569b3f543253ec66f08e524435cc4e2965f6d5bf4b81d7b0387caf71fe9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-7b44374e8a60fd44e9eb6cf1f8bfaae4159ed80290ff39498f4df5e5b0f6ea1f",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7390b53d38da3763d0fa23fc8d8afab936e49f94b91e36ff525aefec0fd33a37",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-5404ce5cb83b22e7d6e1f6afd4482bfe07f5d1aac6cb2eec359a832abb390bdb",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-778c710962a1c373028f45670c4818143c2217008b696d4b13728db695f07289",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-022980000297eee59f5fc9931ec0e51db888c2efbe86f479f0f2d79b5a1858fe",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab36a0d9e2c0239c1de6997a90129954f6e81c3f11908360bf7d1a1534b96b4a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-fd3445cf5ef4085e95bdd39e4175351be238e267dda6c18d5c5dcbcee766bdd1",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7c44e45e54a651b078483809b8d0d4e377f5cbe2f1033ee5d64ec0e1c1d67ebd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-82c47b261ab25e85846dc0f6d7be676acf44d8cd23993e8027c2199bd22040d4",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bc88b2911a5e2412d64f8012de4c8c508c4fa99131dfa4653ad16667cd34b5de",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-d143d98e4ac470873da6f18f581ed1c6781d0470ae1984611b92955a191580aa",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-90c80df3fc86db5d4fea0f602dfbbc4143fa546a36f220aad1b3a998153a89ca",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-91b4506df163b98da451751cd369cf77dc341d0ce93e4fe4aafeec4d76162ac1",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-094d4e1eb573256996c69951fde0a751edb7e6a78d021b270a0fac6891de486d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-7e10900d86b957fa40b928590f75e12c21d77e3dc7540f229e7cb817c6d04613",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-efc66ba7db034746706bca6133ef716b873711ae37aff4cfa9a1cd12137f55f7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-6b5d05c1a43e8df223145d962c4461cce59e4af12d3a416e19cc0774d948d03c",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3b45a2973aeedcd2ffd885ef7aa334a43f90d0f51a90117268103259b39fa1c7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-d20ac9b58eb576ea05f1c388483d62dd9bc37a6e7a532b49631ba2d7e0df8379",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-73bc3d6e11300068f5ed459cca3120cd43e8342b397d3501b3e6e912844f204d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa421e6a6ae5a0526f8d46e04843f3f7678bbaa5e8be2d590e4d40d7d7a3f7be",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2e24443dd678eec904980db1290f2f8b0ef8a01f06270a7c140be88a905fb9f4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-2e9a640a6b5b36b57b1f2f795cb45f02f7a155ce53b1da0e684fcc9ad9fcadd7",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5d5d8f6bd1bb5074d37b46650876bf4f23126d75f43d5e3b2b25411be133e8cb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-055b6d5308f65b46842f5b0da074c1b3585eb2afc5e548402e9702e6c6fc28a5",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-19767eef6f6f4ecaf798783255d1422c88206001c9824434ab8cbaab5947b6d9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-98902fdb1a71c70e20c6e5b7b9dfd1c98f53c912cefe5358faeb449b27655ad7",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-313b28578495b61f4476a31914d7e6e79b4bdae8ac94663c68660372eaebaecf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-b301a5381bbf4fe90217e57c1119d4cea945e9b17f067142459cba534d090c5a",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5edf6b86f101897a724a8f0b7f742153353e1c1024ecd66146fbb6f1d6504681",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-cd170b6f947a34596af1b945dd4b9d89d02be19f6f7bd509d20429a2f1558233",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-332bc83d492671edc778793366ea1cdcfbba917c6a4ac846a1a046cbc513aa2e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-6c03f7fe00e1c553207376c0b287e45c1a4f003b6381715eaf89a792252ec683",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-24bebfe1d9ec6dd0ab395f537368621c793cd88eef80569e24c31b43f01852de",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-dd35c9033ddaafb23c2ab631520017ec8e5099c6e083ff36dd3d028b1522350a",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-04678cc4d585a8d257e3fe17069c39932a40753994bd78f557c2d23c09c0b220",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-c9ffb892c0d0062e98c27b0daabd7255db2c027055c24b8ab96c81babd5c5709",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dc85028bf6d7bd4b3bebef9249d365714b4c44ba10200c28708975da32a6b0dc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-93d0ff1f9973c8519b43e0a43c8278d8b4d2cd115e36fcee9a5e6cc3f4a85df6",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0fb92b3d631490ec634c1cf244d07e7d25673d0386cfd40ba48ba15be49ad86c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-f8713b926274f15edac62112d2530bd68e50a9e985478b746a1b4a6c9e9b9658",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-739fad17450bba8acca37c1bf3073957b99fe27df37ff82f2845d87384cdc866",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-b6a0963452ead29ba5549a4bd9811c2555cf162484aff7ce9927581645709deb",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ede97f62c69e033a56650c09974a663cf41483e8f46a3db09431835573b91c3e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-51586c4b4f5c7338995cc162ca8c9e1e77ad397de8ea03ac3324132b2ba6d431",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-23621d7173a5da72106c8b508febec1ad3a0acd271a8787ad58f30fe5dab3728",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-aed1dbda6f9d967ef947bf02876eea814763837ce27aa7efee28b9755fe67244",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4472a81d052324d7d4babd62b4972a2397c6281f8c0880e4975b9f75be3f233f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-9e097911881a93af835da711c28f2b818bc14c8a5d256558772fa4c99d6d7241",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a2903e38e508ad13bcf3d9d3f38d1421096a436bce3e902d5ab2791c68505fea",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-33c7686e51d1ea236abd3eac83d3c6c653be4356d298fcf9af60961c01740639",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4bd045bb3aa1db1332bdeedfd7b656ddf614ca57490a70ceced66dda2954ca2c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-34a3221adba18217f4b9041bebff0a097fb540b54a48e7452f375d0683d2912c",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e633dd7031b1c7399abf139f06f80c876eef8449debdff345b4011c4244ecab2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-046ef97fc9035a23fe87e61a588c384de21cee568c5d0e185990b6f3f8c02b35",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b356263fae3554bc5287f5421e2c0e4c8f6226f082a59477979c942859975e64",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-0486a0cc46f42862d0e7a7ff0ec0ec1ba9c314d551dbaf4f729760aaab27849a",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dee6829054eccbfd291d95604b9c1756ed454698e96661a798eb73987bb70c21",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-07894e7c7dd7d6899a2550b6fa0c20cf7cce919f042d7f3e8b78aac87be38533",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c8658c5ae908bd12b73062a943392c39c5fed8c7342ab235a9912b0a1037024c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-fec5eb12ca86bcc6c22c1bce225461df25ce4cf920d128f452fae656e700b74f",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fa61c82955de84863f5e8288cbc799a63378bfa5fd6a7ab43f18e4b210fd3668",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-69471e51721f0a43f7268c023f78035a67592f0d007d65559d0286afed072a4b",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bf58b7eaaac0c4652067201816ee104144c35c611ef5a5b5bc897fe0ee1fbf90",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-1f9d8025d0679c11ac628a60e5d283a340be16c5f4ccf157a26647dba9db4bc9",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2efc3aef27e2c2fe3b43582f1f11b82cd7ae98a2b7366db0d49a59246f942eb4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-e850232eed2fbd63bca03c5fbd9b9121b52e47322a8d7a877c53f9a01b378d13",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9a42311280858f5193477abf348d83007f1019166129dfabffbbc136df9ba0f5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-5602efc7392b288430ea0cae8c0f24307a40705382a139f93721b9cfb158700c",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-accb7990f6f2cd8ba6112c12fd4d0e56222941ffb283d7a20e2dd54b31352e5b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-b7745dac85e8b643668eb1eb8f8bceb98c8881a3434dfc1a039498020383e363",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/recording/replay.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-da702bb90307a18e721c7381d83e77458071c6a247ca18fb1026f0d077066108",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "Replay",
+        "result",
+        "answer",
+        "batch",
+        "found",
+        "asked",
+        "misses",
+        "pure_cores"
+      ],
+      "context_complete": false,
+      "task_id": "T-655aafdb73ececb0c87598e6dcb98bcbc37d680dc5af0e148951b16582a1cd01",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-ca6ad158dab6afb149eacf1eba7346d4bf8ae1dedbe1fece7dcd37d5d6906f79"
+}

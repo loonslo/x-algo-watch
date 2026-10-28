@@ -1,0 +1,661 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/train/trainer_recsys.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-5d71c9c0dec3d0a0ab55aa619e3c372ab15ae05ce88951eba68fbe3a902dc207",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2016,
+      "end_line": 2073,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:\n                    self._reserve_small_buffer_region()\n                state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(\n                    state, self._lookup_hash_fields(data)\n                )\n\n            step_jit = self._async_emb_step_jits[self._candidate_region_len(data)]\n            state, metrics, extras, self._async_emb_lookup_pin = step_jit(\n                state,\n                data,\n                lr,\n                self._lookup_hash_fields(self._batch_pipeline.reserve.batch),\n                self._async_emb_lookup_pin,\n            )\n        except Exception:\n            assert self._async_emb_context is not None\n            recsys_async_emb.kernel_api(self._async_emb_context).abort(\n                self._async_emb_context.context_id\n            )\n            raise\n\n        return state, metrics, extras\n\n    def _reserve_small_buffer_region(self) -> None:\n        region_bytes, anchor_bytes = 256 << 20, 64 << 20\n        data_axis = (\"stage\", *self.model_config.model_config.data_axis)\n        sharding = NamedSharding(self.mesh, P(data_axis))\n        num_devices = math.prod(self.mesh.shape[a] for a in data_axis)\n        zeros = jax.jit(\n            lambda n: jnp.zeros((n,), jnp.uint8), static_argnums=0, out_shardings=sharding\n        )\n        region = zeros(region_bytes * num_devices)\n        region.block_until_ready()\n        self._small_buffer_anchor = zeros(anchor_bytes * num_devices).block_until_ready()\n        del region\n\n    def _lookup_hash_fields(\n        self, data: tuple[RecsysFeaturesBatch, ...]\n    ) -> tuple[RecsysFeaturesBatch, ...]:\n        def pad_history(x: jax.Array, users_per_device: int) -> jax.Array:\n            length = self._history_lookup_len(x.shape[-1])\n            if length is None or x.shape[1] * x.shape[-1] == users_per_device * length:\n                return x\n            per_user = _pad_axis(x.reshape(x.shape[0], users_per_device, -1), 2, length)\n            return per_user.reshape(x.shape[0], -1, x.shape[-1])\n\n        return tuple(\n            typing.cast(\n                RecsysFeaturesBatch,\n                {\n                    \"user_hashes\": batch[\"user_hashes\"],\n                    \"user_ip_hashes\": batch.get(\"user_ip_hashes\"),\n                    \"history_seq\": {\n                        k: pad_history(batch[\"history_seq\"][k], batch[\"user_hashes\"].shape[1])\n                        for k in (\"post_hashes\", \"auth_hashes\")\n                    },\n                    \"candidate_seq\": {\n                        k: batch[\"candidate_seq\"][k] for k in (\"post_hashes\", \"auth_hashes\")\n",
+      "source_digest": "5902b1ff73d4f1e2c24eb7726e56482d014ee0672c472756a3a115695e60f78a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2122,
+      "end_line": 2218,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        try:\n            if self._async_emb_lookup_pin is None:\n                state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(\n                    state, self._lookup_hash_fields(data)\n                )\n\n            step_jit = self._async_emb_step_jits[self._candidate_region_len(data)]\n            state, metrics, extras, self._async_emb_lookup_pin = step_jit(\n                state,\n                data,\n                lr,\n                self._lookup_hash_fields(self._batch_pipeline.reserve.batch),\n                self._async_emb_lookup_pin,\n            )\n        except Exception:\n            assert self._async_emb_context is not None\n            recsys_async_emb.kernel_api(self._async_emb_context).abort(\n                self._async_emb_context.context_id\n            )\n            raise\n\n        return state, metrics, extras\n\n    def _pin_step_scratch(self) -> bool:\n        if jax.default_backend() != \"gpu\" or not self.enable_aot:\n            return False\n        scratch_sizes = [\n            step_jit.jitted.memory_analysis().temp_size_in_bytes\n            for step_jit in self._async_emb_step_jits.values()\n        ]\n        block_bytes, smallest_scratch_bytes = max(scratch_sizes), min(scratch_sizes)\n        if block_bytes - smallest_scratch_bytes >= min(\n            smallest_scratch_bytes, _ALLOCATOR_SPLIT_BYTES\n        ):\n            rank_logger.warning(\n                \"Step scratch not pinned: its sizes %s differ enough for a smaller scratch to \"\n                \"split the block\",\n                scratch_sizes,\n            )\n            return False\n        anchors = []\n        for device in self.mesh.local_devices:\n            low, block, high = (\n                _device_zeros(num_bytes, device)\n                for num_bytes in (_ANCHOR_BYTES, block_bytes, _ANCHOR_BYTES)\n            )\n            low_ptr, block_ptr, high_ptr = (\n                buffer.unsafe_buffer_pointer() for buffer in (low, block, high)\n            )\n            rounded_block_bytes = block_bytes + -block_bytes % _ALLOCATOR_ROUNDING_BYTES\n            if (block_ptr, block_ptr + rounded_block_bytes) != (low_ptr + _ANCHOR_BYTES, high_ptr):\n                rank_logger.warning(\n                    \"Step scratch not pinned: its block is not between its anchors on %s \"\n                    \"(low %#x, block %#x, high %#x)\",\n                    device,\n                    low_ptr,\n                    block_ptr,\n                    high_ptr,\n                )\n                return False\n            anchors.extend((low, high))\n            del block\n        self._allocator_anchors = anchors\n        rank_logger.info(\"Pinned a free %d-byte block for the step scratch\", block_bytes)\n        return True\n\n    def _reserve_small_buffer_region(self) -> None:\n        for device in self.mesh.local_devices:\n            region = _device_zeros(_SMALL_BUFFER_REGION_BYTES, device)\n            self._allocator_anchors.append(_device_zeros(_ANCHOR_BYTES, device))\n            del region\n        rank_logger.info(\n            \"Reserved a free %d-byte region for small buffers\", _SMALL_BUFFER_REGION_BYTES\n        )\n\n    def _lookup_hash_fields(\n        self, data: tuple[RecsysFeaturesBatch, ...]\n    ) -> tuple[RecsysFeaturesBatch, ...]:\n        def pad_history(x: jax.Array, users_per_device: int) -> jax.Array:\n            length = self._history_lookup_len(x.shape[-1])\n            if length is None or x.shape[1] * x.shape[-1] == users_per_device * length:\n                return x\n            per_user = _pad_axis(x.reshape(x.shape[0], users_per_device, -1), 2, length)\n            return per_user.reshape(x.shape[0], -1, x.shape[-1])\n\n        return tuple(\n            typing.cast(\n                RecsysFeaturesBatch,\n                {\n                    \"user_hashes\": batch[\"user_hashes\"],\n                    \"user_ip_hashes\": batch.get(\"user_ip_hashes\"),\n                    \"history_seq\": {\n                        k: pad_history(batch[\"history_seq\"][k], batch[\"user_hashes\"].shape[1])\n                        for k in (\"post_hashes\", \"auth_hashes\")\n                    },\n                    \"candidate_seq\": {\n                        k: batch[\"candidate_seq\"][k] for k in (\"post_hashes\", \"auth_hashes\")\n",
+      "source_digest": "d3190861bf5c36ed99395906e0e585a90a7db223bd57cacf192e3f8fdbb212ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2320,
+      "end_line": 2365,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                    ),\n                    out_shardings=(self.state_sharding, metrics_sharding, None, row_sharding),\n                    donate_argnums=(0, 4),\n                ),\n                name=(\n                    None\n                    if candidate_tokens_per_user is None\n                    else f\"async_emb_step_{candidate_tokens_per_user}\"\n                ),\n            )\n            self.register_jit_function(\n                step_jit,\n                self.state_shape,\n                step_data,\n                lr_shape,\n                lookup_data,\n                lookup_pin_shape,\n                compiler_options=compiler_options,\n            )\n            self._async_emb_step_jits[self._candidate_region_len(step_data)] = step_jit\n\n        self.update_jit = self.async_emb_update\n\n    def create_executable(self) -> None:\n        if self.num_microbatch < 1 or self.bs_per_device % self.num_microbatch:\n            raise ValueError(\n                f\"num_microbatch={self.num_microbatch} must divide \"\n                f\"bs_per_device={self.bs_per_device}\"\n            )\n        if self.num_microbatch > 1:\n            if not self.use_async_emb:\n                raise ValueError(\"num_microbatch > 1 requires use_async_emb=True\")\n            if isinstance(self.model_config, RecsysTwoTowerModelConfig):\n                if self.model_config.apply_u2u_and_i2i_loss:\n                    raise ValueError(\"num_microbatch > 1 does not support apply_u2u_and_i2i_loss\")\n            elif type(self.model_config) is not RecsysAggregatedModelConfig:\n                raise ValueError(\"num_microbatch > 1 supports only the ranker and the two-tower\")\n            if self.empty_history_augmentation_rate > 0:\n                raise ValueError(\n                    \"num_microbatch > 1 does not support empty_history_augmentation_rate\"\n                )\n        if self.seqpack_candidate_packing:\n            if not isinstance(self.model_config, RecsysAggregatedModelConfig):\n                raise ValueError(\"seqpack_candidate_packing supports only the ranker\")\n            if not self.using_seqpack:\n                raise ValueError(\"seqpack_candidate_packing requires use_seqpack=True\")\n",
+      "source_digest": "88bc83b3ed1e92ff6dc76721fcbb056494b7c70d2f7326e626718ba8610963e1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2465,
+      "end_line": 2519,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                    ),\n                    out_shardings=(self.state_sharding, metrics_sharding, None, row_sharding),\n                    donate_argnums=(0, 4),\n                ),\n                name=(\n                    None\n                    if candidate_tokens_per_user is None\n                    else f\"async_emb_step_{candidate_tokens_per_user}\"\n                ),\n            )\n            self.register_jit_function(\n                step_jit,\n                self.state_shape,\n                step_data,\n                lr_shape,\n                lookup_data,\n                lookup_pin_shape,\n                compiler_options=compiler_options,\n            )\n            self._async_emb_step_jits[self._candidate_region_len(step_data)] = step_jit\n\n        self.update_jit = self.async_emb_update\n\n    def compile_or_load(self, phases: set[str] | None = None) -> None:\n        super().compile_or_load(phases)\n        if phases is not None or not self._async_emb_step_jits or jax.default_backend() != \"gpu\":\n            return\n        gemms = self.model_config.model_config.fp8_gemms\n        if gemms != Fp8Gemms.OFF:\n            for step in self._async_emb_step_jits.values():\n                check_compiled_fp8_gemms(step.name(), step.jitted.as_text(), gemms)\n\n    def create_executable(self) -> None:\n        if self.num_microbatch < 1 or self.bs_per_device % self.num_microbatch:\n            raise ValueError(\n                f\"num_microbatch={self.num_microbatch} must divide \"\n                f\"bs_per_device={self.bs_per_device}\"\n            )\n        if self.num_microbatch > 1:\n            if not self.use_async_emb:\n                raise ValueError(\"num_microbatch > 1 requires use_async_emb=True\")\n            if isinstance(self.model_config, RecsysTwoTowerModelConfig):\n                if self.model_config.apply_u2u_and_i2i_loss:\n                    raise ValueError(\"num_microbatch > 1 does not support apply_u2u_and_i2i_loss\")\n            elif type(self.model_config) is not RecsysAggregatedModelConfig:\n                raise ValueError(\"num_microbatch > 1 supports only the ranker and the two-tower\")\n            if self.empty_history_augmentation_rate > 0:\n                raise ValueError(\n                    \"num_microbatch > 1 does not support empty_history_augmentation_rate\"\n                )\n        if self.seqpack_candidate_packing:\n            if not isinstance(self.model_config, RecsysAggregatedModelConfig):\n                raise ValueError(\"seqpack_candidate_packing supports only the ranker\")\n            if not self.using_seqpack:\n                raise ValueError(\"seqpack_candidate_packing requires use_seqpack=True\")\n",
+      "source_digest": "25550a8a5517980ad96fc521ec9d9ccf0a9ebaac24016ee09d85bd96d55b28fc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2387,
+      "end_line": 2432,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                users_per_microbatch * size % PACK_BLOCK_SIZE\n                for size in self.seqpack_candidate_count\n            ):\n                raise ValueError(\n                    f\"every seqpack_candidate_count times the {users_per_microbatch} \"\n                    f\"users per device and microbatch must be a multiple of {PACK_BLOCK_SIZE}: \"\n                    f\"{self.seqpack_candidate_count}\"\n                )\n            shortest_mean_history = self._history_mean_len(self.seqpack_candidate_count[-1])\n            if shortest_mean_history < self.seqpack_distribution.min_len:\n                raise ValueError(\n                    f\"the largest candidate size leaves a mean history of {shortest_mean_history} \"\n                    f\"tokens, below seqpack_distribution.min_len=\"\n                    f\"{self.seqpack_distribution.min_len}\"\n                )\n        if (\n            isinstance(self.model_config, RecsysAggregatedModelConfig)\n            and self.model_config.page_rl.enabled\n        ):\n            if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):\n                raise ValueError(\"page_rl needs a dataset with page_records=True\")\n            if self.seqpack_candidate_packing:\n                raise ValueError(\"page_rl does not support seqpack_candidate_packing\")\n\n        self._init_shmem_write_pool()\n        self._free_ports()\n        self._init_incremental_state()\n\n        assert isinstance(\n            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n        )\n        assert isinstance(self.dataset, PhoenixDataset)\n\n        if self.use_row_emb:\n            if not self.use_async_emb:\n                raise ValueError(\"use_row_emb requires use_async_emb=True\")\n            if self.emb_optim_config._active() != \"rowwise_adagrad\":\n                raise ValueError(\"use_row_emb requires the rowwise_adagrad embedding optimizer\")\n\n        if isinstance(self.model_config, RecsysAggregatedModelConfig):\n            ctx = self.model_config.context_features\n        elif isinstance(self.model_config, RecsysTwoTowerModelConfig):\n            ctx = self.model_config.user_tower_config.context_features\n        else:\n            ctx = None\n        if ctx is not None and ctx.enabled:\n",
+      "source_digest": "7e64b887676689290097dcd2de00436ce29687448882483cc3ed362832c063ff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2541,
+      "end_line": 2591,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                users_per_microbatch * size % PACK_BLOCK_SIZE\n                for size in self.seqpack_candidate_count\n            ):\n                raise ValueError(\n                    f\"every seqpack_candidate_count times the {users_per_microbatch} \"\n                    f\"users per device and microbatch must be a multiple of {PACK_BLOCK_SIZE}: \"\n                    f\"{self.seqpack_candidate_count}\"\n                )\n            shortest_mean_history = self._history_mean_len(self.seqpack_candidate_count[-1])\n            if shortest_mean_history < self.seqpack_distribution.min_len:\n                raise ValueError(\n                    f\"the largest candidate size leaves a mean history of {shortest_mean_history} \"\n                    f\"tokens, below seqpack_distribution.min_len=\"\n                    f\"{self.seqpack_distribution.min_len}\"\n                )\n        if (\n            isinstance(self.model_config, RecsysAggregatedModelConfig)\n            and self.model_config.page_rl.enabled\n        ):\n            if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):\n                raise ValueError(\"page_rl needs a dataset with page_records=True\")\n            if self.seqpack_candidate_packing:\n                raise ValueError(\"page_rl does not support seqpack_candidate_packing\")\n        if self.model_config.model_config.fp8_gemms != Fp8Gemms.OFF and not self.forward_only:\n            if not self.use_async_emb:\n                raise ValueError(\"fp8_gemms requires use_async_emb=True\")\n            if not self.enable_aot:\n                raise ValueError(\"fp8_gemms requires enable_aot=True\")\n\n        self._init_shmem_write_pool()\n        self._free_ports()\n        self._init_incremental_state()\n\n        assert isinstance(\n            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n        )\n        assert isinstance(self.dataset, PhoenixDataset)\n\n        if self.use_row_emb:\n            if not self.use_async_emb:\n                raise ValueError(\"use_row_emb requires use_async_emb=True\")\n            if self.emb_optim_config._active() != \"rowwise_adagrad\":\n                raise ValueError(\"use_row_emb requires the rowwise_adagrad embedding optimizer\")\n\n        if isinstance(self.model_config, RecsysAggregatedModelConfig):\n            ctx = self.model_config.context_features\n        elif isinstance(self.model_config, RecsysTwoTowerModelConfig):\n            ctx = self.model_config.user_tower_config.context_features\n        else:\n            ctx = None\n        if ctx is not None and ctx.enabled:\n",
+      "source_digest": "1f781ee6162e5be23232b4154c7725724dc0c46eb196a154a623b140d44d96d4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2997,
+      "end_line": 3043,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            on_replaced,\n            logical_rows=self.dataset.input_vocab_size,\n            row_sharded=self.use_row_emb,\n            verify_checksums=self.checkpoint_config.verify_checksums,\n        )\n\n    def maybe_load_checkpoint(self, ctx: TrainerContext, tag=None):\n        assert isinstance(\n            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n        )\n        assert isinstance(self.dataset, PhoenixDataset)\n\n        if self.store_load:\n            raise ValueError(\n                f\"store_load={self.store_load!r} is not supported by the trainer; \"\n                \"restore from a filesystem checkpoint with load=.\"\n            )\n\n        res = super().maybe_load_checkpoint(ctx, tag)\n        return self._finalize_checkpoint_load(ctx, res)\n\n    def next_data_batch(self):\n        if self._shmem_write_future is not None and self._shmem_write_future.done():\n            self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()\n            self._shmem_write_future = None\n\n        if not self.use_async_emb:\n            return super().next_data_batch()\n\n        if self._batch_pipeline.exhausted:\n            raise StopIteration\n\n        assert isinstance(self.dataset, PhoenixDataset)\n        dataset, load = self.dataset, super().next_data_batch\n\n        def fetch() -> FetchedBatch:\n            batch = load()\n            return FetchedBatch(batch, dict(self.offsets_to_commit), dataset.get_data_position())\n\n        if self._batch_pipeline.reserve is None:\n            self._batch_pipeline.reserve = fetch()\n\n        self._batch_pipeline.current = self._batch_pipeline.reserve\n\n        try:\n            self._batch_pipeline.reserve = fetch()\n        except StopIteration:\n",
+      "source_digest": "2374706b50e67183951ee251ea9c75bf2b2c730bf59d192099557f0e04b354a0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3156,
+      "end_line": 3204,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            on_replaced,\n            logical_rows=self.dataset.input_vocab_size,\n            row_sharded=self.use_row_emb,\n            verify_checksums=self.checkpoint_config.verify_checksums,\n        )\n\n    def maybe_load_checkpoint(self, ctx: TrainerContext, tag=None):\n        assert isinstance(\n            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n        )\n        assert isinstance(self.dataset, PhoenixDataset)\n\n        if self.store_load:\n            raise ValueError(\n                f\"store_load={self.store_load!r} is not supported by the trainer; \"\n                \"restore from a filesystem checkpoint with load=.\"\n            )\n\n        res = super().maybe_load_checkpoint(ctx, tag)\n        return self._finalize_checkpoint_load(ctx, res)\n\n    def next_data_batch(self):\n        if self._shmem_write_future is not None and self._shmem_write_future.done():\n            self._pending_shmem_ckpt_write_s, self._pending_checksum_s = (\n                self._shmem_write_future.result()\n            )\n            self._shmem_write_future = None\n\n        if not self.use_async_emb:\n            return super().next_data_batch()\n\n        if self._batch_pipeline.exhausted:\n            raise StopIteration\n\n        assert isinstance(self.dataset, PhoenixDataset)\n        dataset, load = self.dataset, super().next_data_batch\n\n        def fetch() -> FetchedBatch:\n            batch = load()\n            return FetchedBatch(batch, dict(self.offsets_to_commit), dataset.get_data_position())\n\n        if self._batch_pipeline.reserve is None:\n            if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:\n                if not self._pin_step_scratch():\n                    self._reserve_small_buffer_region()\n            self._batch_pipeline.reserve = fetch()\n\n        self._batch_pipeline.current = self._batch_pipeline.reserve\n\n",
+      "source_digest": "6901ff6972003f27eace23c8fd667b59272746cf2ae4bf32e5843cbf2b26adba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3014,
+      "end_line": 3059,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "\n        res = super().maybe_load_checkpoint(ctx, tag)\n        return self._finalize_checkpoint_load(ctx, res)\n\n    def next_data_batch(self):\n        if self._shmem_write_future is not None and self._shmem_write_future.done():\n            self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()\n            self._shmem_write_future = None\n\n        if not self.use_async_emb:\n            return super().next_data_batch()\n\n        if self._batch_pipeline.exhausted:\n            raise StopIteration\n\n        assert isinstance(self.dataset, PhoenixDataset)\n        dataset, load = self.dataset, super().next_data_batch\n\n        def fetch() -> FetchedBatch:\n            batch = load()\n            return FetchedBatch(batch, dict(self.offsets_to_commit), dataset.get_data_position())\n\n        if self._batch_pipeline.reserve is None:\n            self._batch_pipeline.reserve = fetch()\n\n        self._batch_pipeline.current = self._batch_pipeline.reserve\n\n        try:\n            self._batch_pipeline.reserve = fetch()\n        except StopIteration:\n            self._batch_pipeline.exhausted = True\n\n        self.offsets_to_commit = self._batch_pipeline.current.offsets\n\n        assert self._async_emb_context is not None\n        ready_step = recsys_async_emb.kernel_api(self._async_emb_context).wait_step_ready(\n            self._async_emb_context.context_id\n        )\n        assert ready_step != 0 or self._async_emb_lookup_pin is None\n        return self._batch_pipeline.current.batch\n\n    def _checkpoint_data_position(self) -> DataPosition | None:\n        assert isinstance(self.dataset, PhoenixDataset)\n        if not self.use_async_emb or self._batch_pipeline.current is None:\n            return self.dataset.get_data_position()\n        return self._batch_pipeline.current.data_position\n",
+      "source_digest": "7ddc9785c7da2061e7db7746477a366ae0685486325565cbf23c18d3631afaec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3175,
+      "end_line": 3223,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "        return self._finalize_checkpoint_load(ctx, res)\n\n    def next_data_batch(self):\n        if self._shmem_write_future is not None and self._shmem_write_future.done():\n            self._pending_shmem_ckpt_write_s, self._pending_checksum_s = (\n                self._shmem_write_future.result()\n            )\n            self._shmem_write_future = None\n\n        if not self.use_async_emb:\n            return super().next_data_batch()\n\n        if self._batch_pipeline.exhausted:\n            raise StopIteration\n\n        assert isinstance(self.dataset, PhoenixDataset)\n        dataset, load = self.dataset, super().next_data_batch\n\n        def fetch() -> FetchedBatch:\n            batch = load()\n            return FetchedBatch(batch, dict(self.offsets_to_commit), dataset.get_data_position())\n\n        if self._batch_pipeline.reserve is None:\n            if self.seqpack_candidate_packing and len(self.seqpack_candidate_count) > 1:\n                if not self._pin_step_scratch():\n                    self._reserve_small_buffer_region()\n            self._batch_pipeline.reserve = fetch()\n\n        self._batch_pipeline.current = self._batch_pipeline.reserve\n\n        try:\n            self._batch_pipeline.reserve = fetch()\n        except StopIteration:\n            self._batch_pipeline.exhausted = True\n\n        self.offsets_to_commit = self._batch_pipeline.current.offsets\n\n        assert self._async_emb_context is not None\n        ready_step = recsys_async_emb.kernel_api(self._async_emb_context).wait_step_ready(\n            self._async_emb_context.context_id\n        )\n        assert ready_step != 0 or self._async_emb_lookup_pin is None\n        return self._batch_pipeline.current.batch\n\n    def _checkpoint_data_position(self) -> DataPosition | None:\n        assert isinstance(self.dataset, PhoenixDataset)\n        if not self.use_async_emb or self._batch_pipeline.current is None:\n            return self.dataset.get_data_position()\n        return self._batch_pipeline.current.data_position\n",
+      "source_digest": "c62e211991f97f32bd869d15acddb97ee4520c514b80155cc725f05f63ab0417",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3086,
+      "end_line": 3137,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "    def _write_stablehlo_bundle_files(self, prefix: str, bundle_files: list | None) -> None:\n        from xrex.train.recsys_bundle_export import MANIFEST_NAME, restamp_manifest\n\n        try:\n            for bundle_file in bundle_files or ():\n                data = bundle_file.data\n                if bundle_file.name == MANIFEST_NAME:\n                    data = restamp_manifest(data)\n                bundle_path = f\"{OUT_PATH}/.{prefix}/{bundle_file.name}\"\n                os.makedirs(os.path.dirname(bundle_path), exist_ok=True)\n                _write_all_bytes(bundle_path, memoryview(data))\n        except OSError:\n            rank_logger.exception(\n                \"StableHLO bundle write failed; disabling for the rest of this run \"\n                \"(this publish continues without export/)\"\n            )\n            self._stablehlo_bundle_files = []\n            for subdir in {f.name.split(\"/\", 1)[0] for f in bundle_files or ()}:\n                shutil.rmtree(f\"{OUT_PATH}/.{prefix}/{subdir}\", ignore_errors=True)\n\n    def _write_shmem_checkpoint(\n        self,\n        write_items: list[tuple[str, typing.Any, npt.NDArray]],\n        checksums: dict,\n        data_pos: typing.Any,\n        prefix: str,\n        stub: typing.Any,\n        bundle_files: list | None = None,\n    ) -> float:\n        start = time.perf_counter()\n        proc_idx = jax.process_index()\n        proc_count = jax.process_count()\n        has_engine = self._engine is not None\n        devices_per_node = self.parallel_config.num_devices_per_node\n        use_rdma = os.environ.get(\"XAI_RECSYS_RDMA\") == \"1\"\n\n        for key, value, arr in write_items:\n            shard = value.addressable_shards[0]\n            sharded = [(x.start, x.stop, x.step) != (None,) * 3 for x in shard.index]\n            path = f\"{OUT_PATH}/.{prefix}/{key}/c\"\n            if any(sharded):\n                err = NotImplementedError(f\"unsupported sharding in tensor {key}: {shard.index}\")\n                if sharded not in ([False, True], [True, False]):\n                    raise err\n                i = sharded.index(True)\n                if shard.index[i].step is not None:\n                    raise err\n                delta = shard.index[i].stop - shard.index[i].start\n                if shard.index[i].start % delta != 0 or value.shape[i] % delta != 0:\n                    raise err\n                shard_idx = shard.index[i].start // delta\n                num_shards = value.shape[i] // delta\n",
+      "source_digest": "a564312229795b1646232906e0d9d6ed884486b65bdf57565bd79d72ffd042e8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3250,
+      "end_line": 3300,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "    def _write_stablehlo_bundle_files(self, prefix: str, bundle_files: list | None) -> None:\n        from xrex.train.recsys_bundle_export import MANIFEST_NAME, restamp_manifest\n\n        try:\n            for bundle_file in bundle_files or ():\n                data = bundle_file.data\n                if bundle_file.name == MANIFEST_NAME:\n                    data = restamp_manifest(data)\n                bundle_path = f\"{OUT_PATH}/.{prefix}/{bundle_file.name}\"\n                os.makedirs(os.path.dirname(bundle_path), exist_ok=True)\n                _write_all_bytes(bundle_path, memoryview(data))\n        except OSError:\n            rank_logger.exception(\n                \"StableHLO bundle write failed; disabling for the rest of this run \"\n                \"(this publish continues without export/)\"\n            )\n            self._stablehlo_bundle_files = []\n            for subdir in {f.name.split(\"/\", 1)[0] for f in bundle_files or ()}:\n                shutil.rmtree(f\"{OUT_PATH}/.{prefix}/{subdir}\", ignore_errors=True)\n\n    def _write_shmem_checkpoint(\n        self,\n        write_items: list[tuple[str, typing.Any, npt.NDArray]],\n        data_pos: typing.Any,\n        prefix: str,\n        stub: typing.Any,\n        bundle_files: list | None = None,\n    ) -> tuple[float, float]:\n        start = time.perf_counter()\n        proc_idx = jax.process_index()\n        proc_count = jax.process_count()\n        has_engine = self._engine is not None\n        devices_per_node = self.parallel_config.num_devices_per_node\n        use_rdma = os.environ.get(\"XAI_RECSYS_RDMA\") == \"1\"\n\n        for key, value, arr in write_items:\n            shard = value.addressable_shards[0]\n            sharded = [(x.start, x.stop, x.step) != (None,) * 3 for x in shard.index]\n            path = f\"{OUT_PATH}/.{prefix}/{key}/c\"\n            if any(sharded):\n                err = NotImplementedError(f\"unsupported sharding in tensor {key}: {shard.index}\")\n                if sharded not in ([False, True], [True, False]):\n                    raise err\n                i = sharded.index(True)\n                if shard.index[i].step is not None:\n                    raise err\n                delta = shard.index[i].stop - shard.index[i].start\n                if shard.index[i].start % delta != 0 or value.shape[i] % delta != 0:\n                    raise err\n                shard_idx = shard.index[i].start // delta\n                num_shards = value.shape[i] // delta\n",
+      "source_digest": "500a3e421236ccbc466ae05f9b7ac9d9f29d0022601ad93665e21ceb5de8c09f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3147,
+      "end_line": 3196,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                os.makedirs(path[: path.rindex(\"/\")], exist_ok=True)\n                mv = memoryview(np.ndarray(shape=arr.nbytes, dtype=np.uint8, buffer=arr))\n                _write_all_bytes(path, mv)\n                actual_size = os.path.getsize(path)\n                if actual_size != arr.nbytes:\n                    raise RuntimeError(\n                        f\"bad checkpoint shard size for {key} at {path}: \"\n                        f\"wanted {arr.nbytes}, got {actual_size}\"\n                    )\n                if use_rdma and any(sharded) and not key.startswith(\"emb_table_state\"):\n                    d = proc_idx * devices_per_node // proc_count\n                    request = copy_pb2.RegisterRequest(\n                        path=f\"{OUT_PATH}/.\",\n                        name=path[len(OUT_PATH) + 2 :],\n                        rdma_device_indexes=bytes([d]),\n                    )\n                    try:\n                        stub.Register(request)\n                    except Exception as e:\n                        raise RuntimeError(repr(e))\n\n        from jax._src.distributed import global_state as _jax_dist\n\n        assert _jax_dist.client is not None, \"JAX distributed not initialized\"\n        _jax_dist.client.wait_at_barrier(f\"recsys-save-checkpoint2-{prefix}\", timeout_in_ms=300_000)\n\n        if has_engine:\n            with open(f\"{OUT_PATH}/.{prefix}/checksums.0.json\", \"w\") as f:\n                json.dump(\n                    {\n                        \"global_checksums\": checksums,\n                        \"created_timestamp\": time.time(),\n                    },\n                    f,\n                )\n            self._write_stablehlo_bundle_files(prefix, bundle_files)\n            if data_pos is not None:\n                with open(f\"{OUT_PATH}/.{prefix}/{_DATA_POSITION_FILENAME}\", \"w\") as f:\n                    json.dump(data_pos, f)\n                rank_logger.info(\n                    \"Saved data position (engine) to %s/.%s: %s\", OUT_PATH, prefix, data_pos\n                )\n            name = prefix[: prefix.index(\"/\")]\n            all_names = os.listdir(OUT_PATH)\n            old_entries = sorted(\n                x for x in all_names if x.startswith(\"elapsed_samples\") and x < name\n            )\n            keep_old = max(self.checkpoint_config.shm_max_entries - 1, 0)\n            expired = old_entries if keep_old == 0 else old_entries[:-keep_old]\n            for x in expired + [\n",
+      "source_digest": "ddfc16fca6dd60a491fb7186c0d6072a42cfa4f49fd3d78d3b25ff8fdd9e5f59",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3310,
+      "end_line": 3377,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                os.makedirs(path[: path.rindex(\"/\")], exist_ok=True)\n                mv = memoryview(np.ndarray(shape=arr.nbytes, dtype=np.uint8, buffer=arr))\n                _write_all_bytes(path, mv)\n                actual_size = os.path.getsize(path)\n                if actual_size != arr.nbytes:\n                    raise RuntimeError(\n                        f\"bad checkpoint shard size for {key} at {path}: \"\n                        f\"wanted {arr.nbytes}, got {actual_size}\"\n                    )\n                if use_rdma and any(sharded) and not key.startswith(\"emb_table_state\"):\n                    d = proc_idx * devices_per_node // proc_count\n                    request = copy_pb2.RegisterRequest(\n                        path=f\"{OUT_PATH}/.\",\n                        name=path[len(OUT_PATH) + 2 :],\n                        rdma_device_indexes=bytes([d]),\n                    )\n                    try:\n                        stub.Register(request)\n                    except Exception as e:\n                        raise RuntimeError(repr(e))\n\n        from jax._src.distributed import global_state as _jax_dist\n\n        client = _jax_dist.client\n        assert client is not None, \"JAX distributed not initialized\"\n        checksum_start = time.perf_counter()\n        checksums, local_parts = _local_checksums(write_items, checksum_replicated=has_engine)\n        checksum_s = time.perf_counter() - checksum_start\n        client.key_value_set(\n            f\"{_CHECKSUM_PARTS_KV_DIR}/{proc_idx}\",\n            json.dumps([prefix, local_parts]),\n            allow_overwrite=True,\n        )\n        client.wait_at_barrier(f\"recsys-save-checkpoint2-{prefix}\", timeout_in_ms=300_000)\n\n        if has_engine:\n            published = dict(client.key_value_dir_get(f\"{_CHECKSUM_PARTS_KV_DIR}/\"))\n            parts_by_process = []\n            for process in range(proc_count):\n                published_prefix, process_parts = json.loads(\n                    published[f\"{_CHECKSUM_PARTS_KV_DIR}/{process}\"]\n                )\n                assert published_prefix == prefix, f\"stale checksum parts of process {process}\"\n                parts_by_process.append(process_parts)\n            checksums = _combine_checksums(write_items, checksums, parts_by_process)\n            with open(f\"{OUT_PATH}/.{prefix}/checksums.0.json\", \"w\") as f:\n                json.dump(\n                    {\n                        \"global_checksums\": checksums,\n                        \"created_timestamp\": time.time(),\n                    },\n                    f,\n                )\n            self._write_stablehlo_bundle_files(prefix, bundle_files)\n            if data_pos is not None:\n                with open(f\"{OUT_PATH}/.{prefix}/{_DATA_POSITION_FILENAME}\", \"w\") as f:\n                    json.dump(data_pos, f)\n                rank_logger.info(\n                    \"Saved data position (engine) to %s/.%s: %s\", OUT_PATH, prefix, data_pos\n                )\n            name = prefix[: prefix.index(\"/\")]\n            all_names = os.listdir(OUT_PATH)\n            old_entries = sorted(\n                x for x in all_names if x.startswith(\"elapsed_samples\") and x < name\n            )\n            keep_old = max(self.checkpoint_config.shm_max_entries - 1, 0)\n            expired = old_entries if keep_old == 0 else old_entries[:-keep_old]\n            for x in expired + [\n",
+      "source_digest": "e7217c3a9a2781d6d80f820cead40bfeb35e225eeed12598e6de0df546785ca4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3186,
+      "end_line": 3232,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                rank_logger.info(\n                    \"Saved data position (engine) to %s/.%s: %s\", OUT_PATH, prefix, data_pos\n                )\n            name = prefix[: prefix.index(\"/\")]\n            all_names = os.listdir(OUT_PATH)\n            old_entries = sorted(\n                x for x in all_names if x.startswith(\"elapsed_samples\") and x < name\n            )\n            keep_old = max(self.checkpoint_config.shm_max_entries - 1, 0)\n            expired = old_entries if keep_old == 0 else old_entries[:-keep_old]\n            for x in expired + [\n                x\n                for x in all_names\n                if (x.startswith(\"elapsed_samples\") and x >= name)\n                or (x.startswith(\".elapsed_samples\") and x != f\".{name}\")\n            ]:\n                shutil.rmtree(f\"{OUT_PATH}/{x}\", ignore_errors=True)\n            suffix = prefix[prefix.index(\"/\") + 1 :]\n            for x in os.listdir(f\"{OUT_PATH}/.{name}\"):\n                if x != suffix:\n                    shutil.rmtree(f\"{OUT_PATH}/.{name}/{x}\", ignore_errors=True)\n            os.rename(f\"{OUT_PATH}/.{name}\", f\"{OUT_PATH}/{name}\")\n\n        return time.perf_counter() - start\n\n    def save_checkpoint(self, *args, **kwargs):\n        if self.forward_only:\n            return None\n        if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        live_params = self.state.params\n        self.state = self.state._replace(\n            params=self._dense_params_ema_as_params_jit(self._dense_params_ema, live_params)\n        )\n        try:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        finally:\n            self.state = self.state._replace(params=live_params)\n\n    def _save_checkpoint_current_params(self, *args, **kwargs):\n        dataset = self.dataset\n        assert isinstance(dataset, PhoenixDataset), f\"Got {type(dataset)}\"\n        assert isinstance(self.state, RecsysTrainingState), f\"Got {type(self.state)}\"\n\n        if self.offsets_to_commit or (\n            isinstance(dataset, RustKafkaDataset)\n            and dataset.redistribution_reader_count(jax.process_count())\n",
+      "source_digest": "30aa74e93481579d005f1ecd798961ccd80d2e7be13db72942113a6408bd8277",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3367,
+      "end_line": 3413,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                rank_logger.info(\n                    \"Saved data position (engine) to %s/.%s: %s\", OUT_PATH, prefix, data_pos\n                )\n            name = prefix[: prefix.index(\"/\")]\n            all_names = os.listdir(OUT_PATH)\n            old_entries = sorted(\n                x for x in all_names if x.startswith(\"elapsed_samples\") and x < name\n            )\n            keep_old = max(self.checkpoint_config.shm_max_entries - 1, 0)\n            expired = old_entries if keep_old == 0 else old_entries[:-keep_old]\n            for x in expired + [\n                x\n                for x in all_names\n                if (x.startswith(\"elapsed_samples\") and x >= name)\n                or (x.startswith(\".elapsed_samples\") and x != f\".{name}\")\n            ]:\n                shutil.rmtree(f\"{OUT_PATH}/{x}\", ignore_errors=True)\n            suffix = prefix[prefix.index(\"/\") + 1 :]\n            for x in os.listdir(f\"{OUT_PATH}/.{name}\"):\n                if x != suffix:\n                    shutil.rmtree(f\"{OUT_PATH}/.{name}/{x}\", ignore_errors=True)\n            os.rename(f\"{OUT_PATH}/.{name}\", f\"{OUT_PATH}/{name}\")\n\n        return time.perf_counter() - start, checksum_s\n\n    def save_checkpoint(self, *args, **kwargs):\n        if self.forward_only:\n            return None\n        if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        live_params = self.state.params\n        self.state = self.state._replace(\n            params=self._dense_params_ema_as_params_jit(self._dense_params_ema, live_params)\n        )\n        try:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        finally:\n            self.state = self.state._replace(params=live_params)\n\n    def _save_checkpoint_current_params(self, *args, **kwargs):\n        if not gc.get_freeze_count():\n            gc.collect()\n            gc.freeze()\n            rank_logger.info(\"Froze %d objects for cyclic GC\", gc.get_freeze_count())\n\n        dataset = self.dataset\n        assert isinstance(dataset, PhoenixDataset), f\"Got {type(dataset)}\"\n",
+      "source_digest": "3914da6d52c08c3a0e419b8d79c7b13e614b1bf19e9ba82eade29deca0a41df4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3203,
+      "end_line": 3248,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "            suffix = prefix[prefix.index(\"/\") + 1 :]\n            for x in os.listdir(f\"{OUT_PATH}/.{name}\"):\n                if x != suffix:\n                    shutil.rmtree(f\"{OUT_PATH}/.{name}/{x}\", ignore_errors=True)\n            os.rename(f\"{OUT_PATH}/.{name}\", f\"{OUT_PATH}/{name}\")\n\n        return time.perf_counter() - start\n\n    def save_checkpoint(self, *args, **kwargs):\n        if self.forward_only:\n            return None\n        if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        live_params = self.state.params\n        self.state = self.state._replace(\n            params=self._dense_params_ema_as_params_jit(self._dense_params_ema, live_params)\n        )\n        try:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        finally:\n            self.state = self.state._replace(params=live_params)\n\n    def _save_checkpoint_current_params(self, *args, **kwargs):\n        dataset = self.dataset\n        assert isinstance(dataset, PhoenixDataset), f\"Got {type(dataset)}\"\n        assert isinstance(self.state, RecsysTrainingState), f\"Got {type(self.state)}\"\n\n        if self.offsets_to_commit or (\n            isinstance(dataset, RustKafkaDataset)\n            and dataset.redistribution_reader_count(jax.process_count())\n        ):\n            items_list = list(self.offsets_to_commit.items())\n\n            n_partitions = dataset.num_kafka_partitions\n            assert n_partitions is not None, \"num_kafka_partitions must be set for Kafka offsets\"\n            max_size = (n_partitions + jax.process_count() - 1) // jax.process_count()\n            if isinstance(dataset, RustKafkaDataset) and dataset.redistribution_reader_count(\n                jax.process_count()\n            ):\n                max_size = n_partitions\n\n            items_padded = items_list + [(-1, 0)] * (max_size - len(items_list))\n\n            items_array = np.array(items_padded, dtype=np.int64)\n\n            all_offsets = multihost_utils.process_allgather(items_array, tiled=True)\n",
+      "source_digest": "8be083a24fec50e384ffc7ec3a7d99093d2858b7d5dff3caa9454ede8cce565b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3384,
+      "end_line": 3434,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "            suffix = prefix[prefix.index(\"/\") + 1 :]\n            for x in os.listdir(f\"{OUT_PATH}/.{name}\"):\n                if x != suffix:\n                    shutil.rmtree(f\"{OUT_PATH}/.{name}/{x}\", ignore_errors=True)\n            os.rename(f\"{OUT_PATH}/.{name}\", f\"{OUT_PATH}/{name}\")\n\n        return time.perf_counter() - start, checksum_s\n\n    def save_checkpoint(self, *args, **kwargs):\n        if self.forward_only:\n            return None\n        if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        live_params = self.state.params\n        self.state = self.state._replace(\n            params=self._dense_params_ema_as_params_jit(self._dense_params_ema, live_params)\n        )\n        try:\n            return self._save_checkpoint_current_params(*args, **kwargs)\n        finally:\n            self.state = self.state._replace(params=live_params)\n\n    def _save_checkpoint_current_params(self, *args, **kwargs):\n        if not gc.get_freeze_count():\n            gc.collect()\n            gc.freeze()\n            rank_logger.info(\"Froze %d objects for cyclic GC\", gc.get_freeze_count())\n\n        dataset = self.dataset\n        assert isinstance(dataset, PhoenixDataset), f\"Got {type(dataset)}\"\n        assert isinstance(self.state, RecsysTrainingState), f\"Got {type(self.state)}\"\n\n        if self.offsets_to_commit or (\n            isinstance(dataset, RustKafkaDataset)\n            and dataset.redistribution_reader_count(jax.process_count())\n        ):\n            items_list = list(self.offsets_to_commit.items())\n\n            n_partitions = dataset.num_kafka_partitions\n            assert n_partitions is not None, \"num_kafka_partitions must be set for Kafka offsets\"\n            max_size = (n_partitions + jax.process_count() - 1) // jax.process_count()\n            if isinstance(dataset, RustKafkaDataset) and dataset.redistribution_reader_count(\n                jax.process_count()\n            ):\n                max_size = n_partitions\n\n            items_padded = items_list + [(-1, 0)] * (max_size - len(items_list))\n\n            items_array = np.array(items_padded, dtype=np.int64)\n\n            all_offsets = multihost_utils.process_allgather(items_array, tiled=True)\n",
+      "source_digest": "7c40f539148a07291916665906be24c3cc2f042697b654c4395cb777c0128e98",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3303,
+      "end_line": 3363,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                    disk_every_s,\n                    elapsed_since_disk_ckpt,\n                )\n\n        if port:\n            if self._engine is None and self._is_copy_port_binder():\n                cc = self.checkpoint_config\n                self._engine = xai_recsys_engine.RecsysPredictorServer(\n                    port,\n                    port + 1,\n                    1,\n                    0,\n                    copy_max_entries=cc.shm_max_entries,\n                    tls_cert_path=cc.copy_port_tls_cert or None,\n                    tls_key_path=cc.copy_port_tls_key or None,\n                    tls_client_ca_path=cc.copy_port_tls_client_ca or None,\n                )\n            multihost_utils.sync_global_devices(\"recsys-copy-port-bind\")\n\n            checkpoint_path = self.get_checkpoint_path(self.ctx)\n            prefix = \"/\".join(checkpoint_path.split(\"/\")[-2:])\n            wait_until_finished()\n            if self._shmem_write_future is not None:\n                self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()\n                self._shmem_write_future = None\n            multihost_utils.sync_global_devices(\"recsys-save-checkpoint1\")\n            stub = copy_pb2_grpc.CopyStub(self._copy_port_channel(port))\n\n            if not hasattr(self, \"host_state\") or self.host_state is None:\n                self.host_state = jax.device_put(self.state, self.host_sharding)\n            else:\n                self.state, self.host_state = self.offload_state(self.state, self.host_state)\n            jax.block_until_ready(self.host_state)\n\n            assert isinstance(self.state, RecsysTrainingState)\n            host_state = unwrap_tree(self.host_state)\n            host_state = host_state.purge_opt_state()\n            host_state = tree_to_dict(host_state)\n\n            ep = self.mesh.shape[\"expert\"]\n\n            if self._copy_port_emb_host_spec() is not None:\n                pass\n            else:\n                emb = _pad_vocab_for_ep(self.state.emb_table.x, ep, \"emb_table\")\n                sharding = NamedSharding(self.mesh, P(\"expert\", None))\n                emb_table = jax.lax.with_sharding_constraint(emb, sharding.spec)\n                host_state[\"emb_table\"] = jax.device_put(\n                    emb_table,\n                    sharding.with_memory_kind(\"pinned_host\"),\n                )\n\n            pe_key = \"post_embeddings.embeddings\"\n            if (\n                isinstance(self.model_config, RecsysTwoTowerModelConfig)\n                and pe_key in host_state\n                and host_state[pe_key] is not None\n            ):\n                pe_padded = _pad_vocab_for_ep(host_state[pe_key], ep, pe_key)\n                if pe_padded is not host_state[pe_key]:\n                    host_state[pe_key] = jax.device_put(\n",
+      "source_digest": "c2239b9b596ad4bc07e245c62accd12209db477c730e9c29ec85c718b6b59723",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3489,
+      "end_line": 3552,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                    disk_every_s,\n                    elapsed_since_disk_ckpt,\n                )\n\n        if port:\n            if self._engine is None and self._is_copy_port_binder():\n                cc = self.checkpoint_config\n                self._engine = xai_recsys_engine.RecsysPredictorServer(\n                    port,\n                    port + 1,\n                    1,\n                    0,\n                    copy_max_entries=cc.shm_max_entries,\n                    tls_cert_path=cc.copy_port_tls_cert or None,\n                    tls_key_path=cc.copy_port_tls_key or None,\n                    tls_client_ca_path=cc.copy_port_tls_client_ca or None,\n                )\n            multihost_utils.sync_global_devices(\"recsys-copy-port-bind\")\n\n            checkpoint_path = self.get_checkpoint_path(self.ctx)\n            prefix = \"/\".join(checkpoint_path.split(\"/\")[-2:])\n            wait_until_finished()\n            if self._shmem_write_future is not None:\n                self._pending_shmem_ckpt_write_s, self._pending_checksum_s = (\n                    self._shmem_write_future.result()\n                )\n                self._shmem_write_future = None\n            multihost_utils.sync_global_devices(\"recsys-save-checkpoint1\")\n            stub = copy_pb2_grpc.CopyStub(self._copy_port_channel(port))\n\n            serving_state = self.state.purge_opt_state()\n            if not hasattr(self, \"host_state\") or self.host_state is None:\n                self.host_state = jax.device_put(\n                    serving_state, self.host_sharding.purge_opt_state()\n                )\n            else:\n                self.host_state = self.offload_state(serving_state, self.host_state)\n            jax.block_until_ready(self.host_state)\n\n            assert isinstance(self.state, RecsysTrainingState)\n            host_state = tree_to_dict(unwrap_tree(self.host_state))\n\n            ep = self.mesh.shape[\"expert\"]\n\n            if self._copy_port_emb_host_spec() is not None:\n                pass\n            else:\n                emb = _pad_vocab_for_ep(self.state.emb_table.x, ep, \"emb_table\")\n                sharding = NamedSharding(self.mesh, P(\"expert\", None))\n                emb_table = jax.lax.with_sharding_constraint(emb, sharding.spec)\n                host_state[\"emb_table\"] = jax.device_put(\n                    emb_table,\n                    sharding.with_memory_kind(\"pinned_host\"),\n                )\n\n            pe_key = \"post_embeddings.embeddings\"\n            if (\n                isinstance(self.model_config, RecsysTwoTowerModelConfig)\n                and pe_key in host_state\n                and host_state[pe_key] is not None\n            ):\n                pe_padded = _pad_vocab_for_ep(host_state[pe_key], ep, pe_key)\n                if pe_padded is not host_state[pe_key]:\n                    host_state[pe_key] = jax.device_put(\n",
+      "source_digest": "24549913b4de69638bda7e7b5e418bd70577cdfc43ff07064e472df60b4ebe4a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3345,
+      "end_line": 3486,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "                pass\n            else:\n                emb = _pad_vocab_for_ep(self.state.emb_table.x, ep, \"emb_table\")\n                sharding = NamedSharding(self.mesh, P(\"expert\", None))\n                emb_table = jax.lax.with_sharding_constraint(emb, sharding.spec)\n                host_state[\"emb_table\"] = jax.device_put(\n                    emb_table,\n                    sharding.with_memory_kind(\"pinned_host\"),\n                )\n\n            pe_key = \"post_embeddings.embeddings\"\n            if (\n                isinstance(self.model_config, RecsysTwoTowerModelConfig)\n                and pe_key in host_state\n                and host_state[pe_key] is not None\n            ):\n                pe_padded = _pad_vocab_for_ep(host_state[pe_key], ep, pe_key)\n                if pe_padded is not host_state[pe_key]:\n                    host_state[pe_key] = jax.device_put(\n                        pe_padded,\n                        pe_padded.sharding.with_memory_kind(\"pinned_host\"),\n                    )\n\n            start_checksum = time.perf_counter()\n            checksums = {}\n\n            for key in host_state:\n                value = host_state[key]\n                if value is None:\n                    continue\n                shards = value.addressable_shards\n                if len(shards) != 1:\n                    continue\n                shard = shards[0]\n                sharded = [(x.start, x.stop, x.step) != (None,) * 3 for x in shard.index]\n                shard_data = _unsafe_jax2np(shard.data)\n                shard_bytes = np.ndarray(shape=shard_data.nbytes, dtype=np.uint8, buffer=shard_data)\n\n                if not any(sharded):\n                    checksums[key] = xai_recsys_engine.adler32_parallel(\n                        np.ascontiguousarray(shard_bytes)\n                    )\n                elif key in (\"emb_table\", \"post_embeddings.embeddings\"):\n                    local_checksum = xai_recsys_engine.adler32_parallel(\n                        np.ascontiguousarray(shard_bytes)\n                    )\n                    local_len = shard_bytes.nbytes\n\n                    all_checksums = multihost_utils.process_allgather(\n                        np.array([local_checksum], dtype=np.uint32), tiled=True\n                    )\n                    local_len_parts = np.array([local_len], dtype=np.uint64).view(np.uint32)\n                    all_lens_split = multihost_utils.process_allgather(\n                        local_len_parts.reshape(1, 2), tiled=True\n                    )\n\n                    i = sharded.index(True)\n                    delta = shard.index[i].stop - shard.index[i].start\n                    num_shards = value.shape[i] // delta\n                    n = jax.process_count()\n                    processes_per_shard = n // num_shards\n\n                    shard_info = []\n                    for proc_idx in range(n):\n                        proc_shard_idx = proc_idx // processes_per_shard\n                        if proc_idx % processes_per_shard == 0:\n                            ck = int(all_checksums[proc_idx])\n                            len_lo = int(all_lens_split[proc_idx, 0])\n                            len_hi = int(all_lens_split[proc_idx, 1])\n                            length = len_lo | (len_hi << 32)\n                            shard_info.append((proc_shard_idx, ck, length))\n                    shard_info.sort(key=lambda x: x[0])\n\n                    combined = shard_info[0][1]\n                    for _, ck, length in shard_info[1:]:\n                        combined = xai_recsys_engine.adler32_combine_py(combined, ck, length)\n                    checksums[key] = combined\n                else:\n                    i = sharded.index(True)\n                    delta = shard.index[i].stop - shard.index[i].start\n                    shard_idx = shard.index[i].start // delta\n                    num_shards = value.shape[i] // delta\n                    total_cols = value.shape[1]\n                    shard_width = delta\n                    num_rows = value.shape[0]\n\n                    local_partial = xai_recsys_engine.adler32_shard_partial(\n                        np.ascontiguousarray(shard_bytes),\n                        shard_width * shard_data.dtype.itemsize,\n                        shard_idx,\n                        total_cols * shard_data.dtype.itemsize,\n                        128,\n                    )\n\n                    all_partials_flat = multihost_utils.process_allgather(\n                        local_partial.astype(np.uint32), tiled=True\n                    )\n                    all_partials_2d = all_partials_flat.reshape(-1, 2)\n\n                    n = jax.process_count()\n                    processes_per_shard = n // num_shards\n                    unique_partials = []\n                    for proc_idx in range(n):\n                        if proc_idx % processes_per_shard == 0:\n                            proc_shard_idx = proc_idx // processes_per_shard\n                            unique_partials.append((proc_shard_idx, all_partials_2d[proc_idx]))\n\n                    unique_partials.sort(key=lambda x: x[0])\n                    partials_array = np.stack([p[1] for p in unique_partials], axis=0).astype(\n                        np.uint32\n                    )\n\n                    total_len = num_rows * total_cols * shard_data.dtype.itemsize\n                    checksums[key] = xai_recsys_engine.adler32_combine_partials(\n                        partials_array, total_len\n                    )\n\n            self._pending_checksum_s = time.perf_counter() - start_checksum\n\n            write_items: list[tuple[str, typing.Any, npt.NDArray]] = []\n            for key in host_state:\n                value = host_state[key]\n                if value is None:\n                    continue\n                shards = value.addressable_shards\n                if len(shards) != 1:\n                    continue\n                write_items.append((key, value, _unsafe_jax2np(shards[0].data)))\n\n            data_pos = self._checkpoint_data_position() if self._engine is not None else None\n\n            bundle_files = self._maybe_build_stablehlo_bundle()\n\n            self._shmem_write_future = self._shmem_write_pool.submit(\n                self._write_shmem_checkpoint,\n                write_items,\n                checksums,\n                data_pos,\n                prefix,\n                stub,\n                bundle_files,\n            )\n",
+      "source_digest": "b8d5a7ec449bc550f7b14aaf2a52d511ad340ce8c499a86c5ac83e834d6825fe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 3534,
+      "end_line": 3579,
+      "kind": "after_implementation",
+      "scope": "change_window",
+      "text": "                pass\n            else:\n                emb = _pad_vocab_for_ep(self.state.emb_table.x, ep, \"emb_table\")\n                sharding = NamedSharding(self.mesh, P(\"expert\", None))\n                emb_table = jax.lax.with_sharding_constraint(emb, sharding.spec)\n                host_state[\"emb_table\"] = jax.device_put(\n                    emb_table,\n                    sharding.with_memory_kind(\"pinned_host\"),\n                )\n\n            pe_key = \"post_embeddings.embeddings\"\n            if (\n                isinstance(self.model_config, RecsysTwoTowerModelConfig)\n                and pe_key in host_state\n                and host_state[pe_key] is not None\n            ):\n                pe_padded = _pad_vocab_for_ep(host_state[pe_key], ep, pe_key)\n                if pe_padded is not host_state[pe_key]:\n                    host_state[pe_key] = jax.device_put(\n                        pe_padded,\n                        pe_padded.sharding.with_memory_kind(\"pinned_host\"),\n                    )\n\n            write_items: list[tuple[str, typing.Any, npt.NDArray]] = []\n            for key in host_state:\n                value = host_state[key]\n                if value is None:\n                    continue\n                shards = value.addressable_shards\n                if len(shards) != 1:\n                    continue\n                write_items.append((key, value, _unsafe_jax2np(shards[0].data)))\n\n            data_pos = self._checkpoint_data_position() if self._engine is not None else None\n\n            bundle_files = self._maybe_build_stablehlo_bundle()\n\n            self._shmem_write_future = self._shmem_write_pool.submit(\n                self._write_shmem_checkpoint,\n                write_items,\n                data_pos,\n                prefix,\n                stub,\n                bundle_files,\n            )\n\n",
+      "source_digest": "53cef6d2fe73ba6e8f9b5e68e4e1e89c0e971606edb6952ba5d23a0741822d73",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5d71c9c0dec3d0a0ab55aa619e3c372ab15ae05ce88951eba68fbe3a902dc207",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 14,
+      "part": 1,
+      "change_range": {
+        "before_start": 2036,
+        "before_count": 18,
+        "after_start": 2142,
+        "after_count": 57
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-46a8102db6bf5f1013b1f0d28c9fa75fb25aae3517ecdebdf7a5e95a59e68523",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8ddfa6c5a39869e097e9d8e296a88bd72f4aceab55ca6162e794118b22c7b068",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 15,
+      "part": 1,
+      "change_range": {
+        "before_start": 2340,
+        "before_count": 6,
+        "after_start": 2485,
+        "after_count": 15
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-712eb2521b027c64c198f45c87976a72ec367e94a5f9f56ee09e825cab9284ce",
+      "evidence_refs": [
+        "E3",
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-061a4616c6d1c095b8001d5c6f34da49127f9d6bd5b8e41dd62ec5b8e75176a1",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 16,
+      "part": 1,
+      "change_range": {
+        "before_start": 2407,
+        "before_count": 6,
+        "after_start": 2561,
+        "after_count": 11
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-f9606d84f566ecfeb7e7db70dc48c37bd52ad4e87d44457bb052253dfe73021b",
+      "evidence_refs": [
+        "E5",
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-311a79b3c097fe1d56eee3b877c1c6394529ca61d4fe639386365b8f90b78806",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 17,
+      "part": 1,
+      "change_range": {
+        "before_start": 3017,
+        "before_count": 7,
+        "after_start": 3176,
+        "after_count": 9
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-a93877a3c6f1e818e4f0c4415870066c37bb40fd0ce91f0eb42f69f8f305eece",
+      "evidence_refs": [
+        "E7",
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7ef04b63f4333eb3ba619cc2781b869976c7a3ee4da15967bc120f88c22f120e",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 18,
+      "part": 1,
+      "change_range": {
+        "before_start": 3034,
+        "before_count": 6,
+        "after_start": 3195,
+        "after_count": 9
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-ebfc7227d071c41a3a0ca32fabd7dd97be7b1f7eb814d76fc772d8f62dd6a33a",
+      "evidence_refs": [
+        "E9",
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c3630023d87441e58ed3979a453cd974c027205a3b1b8b43a57b0b63c1be30e9",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 19,
+      "part": 1,
+      "change_range": {
+        "before_start": 3106,
+        "before_count": 12,
+        "after_start": 3270,
+        "after_count": 11
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-e4270ad8f4da60c66239938480a7373193c765cdca07f11e14726f4ec8f0400f",
+      "evidence_refs": [
+        "E11",
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7072c0891dbe708a6c00bce72525ec860d96826d0dab9bd2c5564344c30cef18",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 20,
+      "part": 1,
+      "change_range": {
+        "before_start": 3167,
+        "before_count": 10,
+        "after_start": 3330,
+        "after_count": 28
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-de612d7965a35b7483cc563da1dc9fe29df07a120060bc36587ebee197c50284",
+      "evidence_refs": [
+        "E13",
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-aaed2576c309b4e97fe6eb6e438e57f3b7e1575354e51acc405f1cc80966bb87",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 21,
+      "part": 1,
+      "change_range": {
+        "before_start": 3206,
+        "before_count": 7,
+        "after_start": 3387,
+        "after_count": 7
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-c732c45d5bea1cb48543a1cea256c871797b5e92461c2e46e55f1889cdd6ca38",
+      "evidence_refs": [
+        "E15",
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ddde883dfa070f6244661e02babb8f1f18c3e55fe81cd3c10ef21a0dcef9d330",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 22,
+      "part": 1,
+      "change_range": {
+        "before_start": 3223,
+        "before_count": 6,
+        "after_start": 3404,
+        "after_count": 11
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-47acebba628a3e84657f70002eebe22338ce67c189ac328bcd3b6ab0e6643cdb",
+      "evidence_refs": [
+        "E17",
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-45e69d1f88b4b5322fddcb1d2af6a382dc0ef9ec75ca1a9e8860fe298747b947",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 23,
+      "part": 1,
+      "change_range": {
+        "before_start": 3323,
+        "before_count": 21,
+        "after_start": 3509,
+        "after_count": 24
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-5d921cf0edd32ce6d2702ceeca658a940c1b27e644a90f17efbf9bdaafb3f982",
+      "evidence_refs": [
+        "E19",
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c8f277f68e7040b20c9a07fb1c03367bf14ecdd081fd3b3e4cc9773ae76c247c",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 24,
+      "part": 1,
+      "change_range": {
+        "before_start": 3365,
+        "before_count": 102,
+        "after_start": 3554,
+        "after_count": 6
+      },
+      "diff_digest": "488180cb25b1660042906b7db06fa6577991725484559c41c9852445bdd1b16e",
+      "task_id": "T-6c0ec2d609f6b230067732629801a6b4c425698f81a85c6afbaf95ef7022da7f",
+      "evidence_refs": [
+        "E21",
+        "E22"
+      ]
+    }
+  ],
+  "task_id": "T-da384a34d01f03b6ec9fd215140eb30f62890a42409c48bd04e8d12802aff98d"
+}

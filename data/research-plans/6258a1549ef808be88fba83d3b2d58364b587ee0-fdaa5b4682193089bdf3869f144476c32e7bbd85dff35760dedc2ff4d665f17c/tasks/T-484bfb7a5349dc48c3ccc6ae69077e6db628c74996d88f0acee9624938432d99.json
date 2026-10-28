@@ -1,0 +1,1757 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/train/checkpoint_write.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-9ec0a0e967da2999a12500b1aa3ec0f2f0e0cc04a332a077ed1266e3abd70836",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 167,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport json\nimport logging\nimport os\nfrom collections import namedtuple\nfrom typing import Callable\n\nimport jax\nfrom jax.experimental import multihost_utils\nfrom opentelemetry.trace import Tracer\n\nfrom xrex.models.model_utils import unwrap_tree\nfrom xrex.utils import checkpointing\nfrom xrex.utils import metrics as metrics_utils\nfrom xrex.utils.aot import JittedOrCompiled\nfrom xrex.utils.tracer import MockTracer\n\nrank_logger = logging.getLogger(\"rank\")\n\n\ndef install_offload_state(trainer) -> None:\n    def d2h_copy(src, dst):\n        dst = jax.device_put(src, trainer.host_sharding)\n        return src, dst\n\n    trainer.offload_state = JittedOrCompiled(\n        jax.jit(\n            d2h_copy,\n            in_shardings=(trainer.state_sharding, trainer.host_sharding),\n            out_shardings=(trainer.state_sharding, trainer.host_sharding),\n            donate_argnums=(0, 1),\n            keep_unused=True,\n        )\n    )\n\n\ndef register_offload_state(trainer) -> None:\n    trainer.register_jit_function(\n        trainer.offload_state, trainer.state_shape, trainer.state_shape, phase=\"early\"\n    )\n\n\ndef barrier(self, name: str) -> None:\n    multihost_utils.sync_global_devices(name)\n\n\ndef get_checkpoint_path(self, ctx) -> str:\n    return ctx.run.checkpoint_path(self.checkpoint_config.checkpoint_dir, self.elapsed_samples)\n\n\ndef save_checkpoint(\n    self,\n    tag: str | None = None,\n    blocking: bool = False,\n    callback: Callable[[int, str], None] | None = None,\n    tracer: Tracer | None = None,\n    checkpoint_index: int | None = None,\n    checksum_dict: dict | None = None,\n):\n    if not tracer:\n        tracer = MockTracer()\n    if not hasattr(jax._src.config, \"enable_memories\"):\n        _FakeState = namedtuple(\"_FakeState\", [\"value\"])\n        jax._src.config.enable_memories = _FakeState(value=True)\n\n    path = self.get_checkpoint_path(self.ctx)\n\n    encrypt_checkpoint = self.checkpoint_config.encrypt\n    if getattr(self, \"_restored_encrypted\", False) and not encrypt_checkpoint:\n        raise ValueError(\n            \"restored from an ENCRYPTED checkpoint but checkpoint_config.encrypt is \"\n            \"false — refusing to downgrade to plaintext saves; set \"\n            \"checkpoint_config.encrypt=true with encryption_key_id/encryption_context\"\n        )\n    kms_client = None\n    if encrypt_checkpoint:\n        if self.checkpoint_config.encryption_key_id is None:\n            raise ValueError(\n                \"checkpoint_config.encrypt requires checkpoint_config.encryption_key_id\"\n            )\n        missing_context = {\"domain\", \"run\"} - self.checkpoint_config.encryption_context.keys()\n        if missing_context:\n            raise ValueError(\n                \"encrypted checkpoint context is missing \" + \", \".join(sorted(missing_context))\n            )\n        import hashlib\n\n        import xai_kms\n\n        encryption_context = dict(self.checkpoint_config.encryption_context)\n        encryption_context[\"mint_nonce\"] = hashlib.sha256(os.fsencode(path)).hexdigest()\n        kms_client = xai_kms.KmsClient.from_cluster_env(\n            key_id=self.checkpoint_config.encryption_key_id,\n            encryption_context=encryption_context,\n        )\n\n    with tracer.start_as_current_span(\"write_checksum\"):\n        if self.checkpoint_config.write_checksums:\n            if checksum_dict is None:\n                rank_logger.info(\"Computing checksums for state\")\n                checksum_dict = self.checksum_dict()\n            if jax.process_index() == 0:\n                os.makedirs(path, exist_ok=True)\n                with open(f\"{path}/checksums.{jax.process_index()}.json\", \"w\") as f:\n                    json.dump(checksum_dict, f)\n                    rank_logger.info(\n                        \"Wrote %i checksums to %s\",\n                        len(checksum_dict[\"shard_checksums\"]),\n                        f.name,\n                    )\n\n    def _callback(\n        elapsed_samples: int = self.elapsed_samples,\n        elapsed_tokens: int = self.elapsed_tokens,\n        trainer_step: int = self.step,\n    ) -> None:\n        if checkpoint_index is not None:\n            self.current_ckpt_index = checkpoint_index\n        else:\n            self.current_ckpt_index += 1\n        metrics_utils.addto(\"checkpoints_done\", ((elapsed_samples, self.current_ckpt_index),), ())\n\n        self.ctx.meta.record_completed_checkpoint(\n            self.checkpoint_config.checkpoint_dir,\n            elapsed_samples,\n            self.current_ckpt_index,\n            elapsed_tokens,\n            trainer_step,\n            self.checkpoint_config.checkpoint_ttl,\n        )\n\n        if callback is not None:\n            callback(self.elapsed_samples, path)\n\n    if self.checkpoint_config.save_method != \"orbax\":\n        raise ValueError(\n            f\"save_method={self.checkpoint_config.save_method!r} is retired: the \"\n            '\"tensorstore\" save arm (xai_checkpointing background_save_ts plus its '\n            \"d2h offload staging) was removed because no fork configuration ever \"\n            \"selected it — orbax is the only writer whose output the serving \"\n            \"loader and repack tooling accept. Leave save_method unset (it \"\n            'defaults to \"orbax\"); the field survives only because stored '\n            \"run-configs serialize it and strict from_dict would reject a \"\n            \"deleted key.\"\n        )\n    checkpointing.save_checkpoint(\n        unwrap_tree(self.state),\n        path=path,\n        callback=_callback,\n        tag=tag,\n        blocking=blocking,\n        timeout_secs=self.checkpoint_config.timeout_secs,\n        chunked=self.checkpoint_config.checkpoint_chunked,\n        compressed=self.checkpoint_config.checkpoint_compressed,\n        chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,\n        tracer=tracer,\n        save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,\n        kms_client=kms_client,\n        encryption_chunk_size=self.checkpoint_config.encryption_chunk_size_bytes,\n    )\n\n\ndef install(trainer_cls) -> None:\n    trainer_cls.barrier = barrier\n    trainer_cls.get_checkpoint_path = get_checkpoint_path\n    trainer_cls.save_checkpoint = save_checkpoint\n",
+      "source_digest": "8423c4107ae38027fbeb671d86f1ff8a351f74131c6d8da2b2699f2c7bd89e9b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 169,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport json\nimport logging\nimport os\nfrom collections import namedtuple\nfrom typing import Callable\n\nimport jax\nfrom jax.experimental import multihost_utils\nfrom opentelemetry.trace import Tracer\n\nfrom xrex.models.model_utils import unwrap_tree\nfrom xrex.utils import checkpointing\nfrom xrex.utils import metrics as metrics_utils\nfrom xrex.utils.aot import JittedOrCompiled\nfrom xrex.utils.tracer import MockTracer\n\nrank_logger = logging.getLogger(\"rank\")\n\n\ndef install_offload_state(trainer) -> None:\n    state_sharding = trainer.state_sharding.purge_opt_state()\n    host_sharding = trainer.host_sharding.purge_opt_state()\n\n    def d2h_copy(src, dst):\n        del dst\n        return jax.device_put(src, host_sharding)\n\n    trainer.offload_state = JittedOrCompiled(\n        jax.jit(\n            d2h_copy,\n            in_shardings=(state_sharding, host_sharding),\n            out_shardings=host_sharding,\n            donate_argnums=1,\n            keep_unused=True,\n        )\n    )\n\n\ndef register_offload_state(trainer) -> None:\n    state_shape = trainer.state_shape.purge_opt_state()\n    trainer.register_jit_function(trainer.offload_state, state_shape, state_shape, phase=\"early\")\n\n\ndef barrier(self, name: str) -> None:\n    multihost_utils.sync_global_devices(name)\n\n\ndef get_checkpoint_path(self, ctx) -> str:\n    return ctx.run.checkpoint_path(self.checkpoint_config.checkpoint_dir, self.elapsed_samples)\n\n\ndef save_checkpoint(\n    self,\n    tag: str | None = None,\n    blocking: bool = False,\n    callback: Callable[[int, str], None] | None = None,\n    tracer: Tracer | None = None,\n    checkpoint_index: int | None = None,\n    checksum_dict: dict | None = None,\n):\n    if not tracer:\n        tracer = MockTracer()\n    if not hasattr(jax._src.config, \"enable_memories\"):\n        _FakeState = namedtuple(\"_FakeState\", [\"value\"])\n        jax._src.config.enable_memories = _FakeState(value=True)\n\n    path = self.get_checkpoint_path(self.ctx)\n\n    encrypt_checkpoint = self.checkpoint_config.encrypt\n    if getattr(self, \"_restored_encrypted\", False) and not encrypt_checkpoint:\n        raise ValueError(\n            \"restored from an ENCRYPTED checkpoint but checkpoint_config.encrypt is \"\n            \"false — refusing to downgrade to plaintext saves; set \"\n            \"checkpoint_config.encrypt=true with encryption_key_id/encryption_context\"\n        )\n    kms_client = None\n    if encrypt_checkpoint:\n        if self.checkpoint_config.encryption_key_id is None:\n            raise ValueError(\n                \"checkpoint_config.encrypt requires checkpoint_config.encryption_key_id\"\n            )\n        missing_context = {\"domain\", \"run\"} - self.checkpoint_config.encryption_context.keys()\n        if missing_context:\n            raise ValueError(\n                \"encrypted checkpoint context is missing \" + \", \".join(sorted(missing_context))\n            )\n        import hashlib\n\n        import xai_kms\n\n        encryption_context = dict(self.checkpoint_config.encryption_context)\n        encryption_context[\"mint_nonce\"] = hashlib.sha256(os.fsencode(path)).hexdigest()\n        kms_client = xai_kms.KmsClient.from_cluster_env(\n            key_id=self.checkpoint_config.encryption_key_id,\n            encryption_context=encryption_context,\n        )\n\n    with tracer.start_as_current_span(\"write_checksum\"):\n        if self.checkpoint_config.write_checksums:\n            if checksum_dict is None:\n                rank_logger.info(\"Computing checksums for state\")\n                checksum_dict = self.checksum_dict()\n            if jax.process_index() == 0:\n                os.makedirs(path, exist_ok=True)\n                with open(f\"{path}/checksums.{jax.process_index()}.json\", \"w\") as f:\n                    json.dump(checksum_dict, f)\n                    rank_logger.info(\n                        \"Wrote %i checksums to %s\",\n                        len(checksum_dict[\"shard_checksums\"]),\n                        f.name,\n                    )\n\n    def _callback(\n        elapsed_samples: int = self.elapsed_samples,\n        elapsed_tokens: int = self.elapsed_tokens,\n        trainer_step: int = self.step,\n    ) -> None:\n        if checkpoint_index is not None:\n            self.current_ckpt_index = checkpoint_index\n        else:\n            self.current_ckpt_index += 1\n        metrics_utils.addto(\"checkpoints_done\", ((elapsed_samples, self.current_ckpt_index),), ())\n\n        self.ctx.meta.record_completed_checkpoint(\n            self.checkpoint_config.checkpoint_dir,\n            elapsed_samples,\n            self.current_ckpt_index,\n            elapsed_tokens,\n            trainer_step,\n            self.checkpoint_config.checkpoint_ttl,\n        )\n\n        if callback is not None:\n            callback(self.elapsed_samples, path)\n\n    if self.checkpoint_config.save_method != \"orbax\":\n        raise ValueError(\n            f\"save_method={self.checkpoint_config.save_method!r} is retired: the \"\n            '\"tensorstore\" save arm (xai_checkpointing background_save_ts plus its '\n            \"d2h offload staging) was removed because no fork configuration ever \"\n            \"selected it — orbax is the only writer whose output the serving \"\n            \"loader and repack tooling accept. Leave save_method unset (it \"\n            'defaults to \"orbax\"); the field survives only because stored '\n            \"run-configs serialize it and strict from_dict would reject a \"\n            \"deleted key.\"\n        )\n    checkpointing.save_checkpoint(\n        unwrap_tree(self.state),\n        path=path,\n        callback=_callback,\n        tag=tag,\n        blocking=blocking,\n        timeout_secs=self.checkpoint_config.timeout_secs,\n        chunked=self.checkpoint_config.checkpoint_chunked,\n        compressed=self.checkpoint_config.checkpoint_compressed,\n        chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,\n        tracer=tracer,\n        save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,\n        kms_client=kms_client,\n        encryption_chunk_size=self.checkpoint_config.encryption_chunk_size_bytes,\n    )\n\n\ndef install(trainer_cls) -> None:\n    trainer_cls.barrier = barrier\n    trainer_cls.get_checkpoint_path = get_checkpoint_path\n    trainer_cls.save_checkpoint = save_checkpoint\n",
+      "source_digest": "52e14ad4a2e1d0e57c1f991e845243d83342c26074887b56496377219b4b1596",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2179,
+      "end_line": 2203,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n        let now = bf.run(\"run-00000001\").await.unwrap().unwrap();\n        assert_eq!(now.state, RunState::Stopped);\n        assert_eq!(gate(&now, NOW), Err(STATUS_RUN_STOPPED));\n        assert!(matches!(\n            start(&bf, &ac, &sw, req, \"page\", Some(\"[已隐去源码联系地址]\")).await,\n            Err(RunError::Conflict(\"start_failed\", ..))\n        ));\n    }\n\n                struct BothWrittenStore {\n        inner: Arc<MemControlStore>,\n        barrier: Arc<tokio::sync::Barrier>,\n        waited: std::sync::atomic::AtomicBool,\n    }\n\n    #[async_trait::async_trait]\n    impl ControlStore for BothWrittenStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.inner.scan(pkey).await\n        }\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            self.inner.get(pkey, lkey).await\n        }\n        async fn put(\n",
+      "source_digest": "cd07740dc1112b5896755b1d89bbdb00c957c5a4c6ed301d5cf427eb5b119a10",
+      "redacted_contacts": 1,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2201,
+      "end_line": 2225,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.inner.get(pkey, lkey).await\n        }\n        async fn put(\n            &self,\n            pkey: &str,\n            lkey: &str,\n            value: Vec<u8>,\n            ttl: u64,\n        ) -> anyhow::Result<()> {\n            let first =\n                pkey == RUN_PKEY && !self.waited.swap(true, std::sync::atomic::Ordering::SeqCst);\n            if first {\n                self.barrier.wait().await;\n            }\n            self.inner.put(pkey, lkey, value, ttl).await?;\n            if first {\n                self.barrier.wait().await;\n            }\n            Ok(())\n        }\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n",
+      "source_digest": "c3c04a993aa3c8353f7459881234761ba7cbcf90d848f1447b61abae2d8e0429",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2205,
+      "end_line": 2229,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pkey: &str,\n            lkey: &str,\n            value: Vec<u8>,\n            ttl: u64,\n        ) -> anyhow::Result<()> {\n            let first =\n                pkey == RUN_PKEY && !self.waited.swap(true, std::sync::atomic::Ordering::SeqCst);\n            if first {\n                self.barrier.wait().await;\n            }\n            self.inner.put(pkey, lkey, value, ttl).await?;\n            if first {\n                self.barrier.wait().await;\n            }\n            Ok(())\n        }\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n    #[tokio::test]\n    async fn two_fresh_starts_at_once_leave_exactly_one_running() {\n        let inner = Arc::new(MemControlStore::default());\n        let barrier = Arc::new(tokio::sync::Barrier::new(2));\n",
+      "source_digest": "8bcd40941163820aec8c45aae6cc325a1b8043a87a4cc153988a847395516048",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2217,
+      "end_line": 2241,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                self.barrier.wait().await;\n            }\n            Ok(())\n        }\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n    #[tokio::test]\n    async fn two_fresh_starts_at_once_leave_exactly_one_running() {\n        let inner = Arc::new(MemControlStore::default());\n        let barrier = Arc::new(tokio::sync::Barrier::new(2));\n        let pod = |name: &str| {\n            Backfill::new(\n                Arc::new(BothWrittenStore {\n                    inner: inner.clone(),\n                    barrier: barrier.clone(),\n                    waited: Default::default(),\n                }),\n                None,\n                name.into(),\n            )\n        };\n        let (a, b) = (pod(\"pod-a\"), pod(\"pod-b\"));\n",
+      "source_digest": "01b65ebf91a811e0f2a9459651776f39d718f39ecffb3656797321650681a854",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2222,
+      "end_line": 2246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n    #[tokio::test]\n    async fn two_fresh_starts_at_once_leave_exactly_one_running() {\n        let inner = Arc::new(MemControlStore::default());\n        let barrier = Arc::new(tokio::sync::Barrier::new(2));\n        let pod = |name: &str| {\n            Backfill::new(\n                Arc::new(BothWrittenStore {\n                    inner: inner.clone(),\n                    barrier: barrier.clone(),\n                    waited: Default::default(),\n                }),\n                None,\n                name.into(),\n            )\n        };\n        let (a, b) = (pod(\"pod-a\"), pod(\"pod-b\"));\n        let (_, _, ac, sw) = parts();\n        let (got_a, got_b) = tokio::join!(\n            start(\n                &a,\n                &ac,\n",
+      "source_digest": "e983b231eb723696f99fa74e08e46db5929048cae2f0afbe0cc6a249ecab7f76",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 265,
+      "end_line": 289,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    struct Row {\n        state: Option<&'static str>,\n        nonce: i64,\n        at: std::time::Instant,\n        status: Option<String>,\n    }\n\n    #[derive(Default)]\n    pub(crate) struct MemClaimStore {\n        rows: Mutex<HashMap<ClaimKey, Row>>,\n        pub all_listed: bool,\n        pub tickets: Mutex<HashMap<&'static str, u64>>,\n        pub state_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,\n        pub fail_reads: std::sync::atomic::AtomicBool,\n    }\n\n    impl MemClaimStore {\n        pub(crate) fn listing_all() -> Self {\n            Self {\n                all_listed: true,\n                ..Default::default()\n            }\n        }\n\n        pub(crate) fn add(&self, key: ClaimKey) {\n",
+      "source_digest": "41c9b3938fc2b324fd350da31667a9a749278f9983715dbafa70041710fe2967",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 347,
+      "end_line": 371,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    #[async_trait]\n    impl ClaimStore for MemClaimStore {\n        async fn state(&self, key: &ClaimKey) -> anyhow::Result<ItemClaim> {\n            if self.fail_reads.load(std::sync::atomic::Ordering::Relaxed) {\n                anyhow::bail!(\"claim store unreachable (test)\");\n            }\n            let claim = {\n                let rows = self.rows.lock().unwrap();\n                self.claim_of(&rows, key)\n            };\n            let barrier = self.state_barrier.lock().unwrap().clone();\n            if let Some(b) = barrier {\n                b.wait().await;\n            }\n            Ok(claim)\n        }\n\n        async fn take(\n            &self,\n            key: &ClaimKey,\n            nonce: i64,\n            budget: u64,\n            _pod: &str,\n",
+      "source_digest": "e49498d001b7265afd4a59c4ad3d9e2115c5cd6d69979585e264c40a3131fbf2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 348,
+      "end_line": 372,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    #[async_trait]\n    impl ClaimStore for MemClaimStore {\n        async fn state(&self, key: &ClaimKey) -> anyhow::Result<ItemClaim> {\n            if self.fail_reads.load(std::sync::atomic::Ordering::Relaxed) {\n                anyhow::bail!(\"claim store unreachable (test)\");\n            }\n            let claim = {\n                let rows = self.rows.lock().unwrap();\n                self.claim_of(&rows, key)\n            };\n            let barrier = self.state_barrier.lock().unwrap().clone();\n            if let Some(b) = barrier {\n                b.wait().await;\n            }\n            Ok(claim)\n        }\n\n        async fn take(\n            &self,\n            key: &ClaimKey,\n            nonce: i64,\n            budget: u64,\n            _pod: &str,\n        ) -> anyhow::Result<Take> {\n",
+      "source_digest": "8fa2bb734deeb2271398cc66a96c2c7c9b4bab0611a0cdf6f4558978f61b773a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 866,
+      "end_line": 890,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let b = bed(run_config(false, 10), vec![]).await;\n    let rec = put_running(\n        &b.backfill_store,\n        RUN,\n        BB1.0,\n        vec![SUSPEND],\n        vec![LevelRow::Missing],\n    );\n    let score = bb1(Account::Clean);\n    let mut pod2 = b.ctx.clone();\n    pod2.backfill = pod_backfill(&b, b.claims.clone(), \"pod-2\").await;\n    *b.claims.state_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));\n    let decision = |nonce: i64| DecisionContext {\n        control: resolve_run_control(&b.ctx, &score, EntityType::User, &rec),\n        run: Some(Arc::new(rec.clone())),\n        run_nonce: nonce,\n        ..Default::default()\n    };\n    let (d1, d2) = (decision(1), decision(2));\n    let (a, c) = tokio::join!(\n        run_enforcement(&b.ctx, &score, backfill::BACKFILL_TOPIC, &d1),\n        run_enforcement(&pod2, &score, backfill::BACKFILL_TOPIC, &d2),\n    );\n    *b.claims.state_barrier.lock().unwrap() = None;\n",
+      "source_digest": "5cdca1e00fa9eea6c29c9a26446a1c9e35b3da3c2a5c3d0920a4cb19816c735c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 878,
+      "end_line": 902,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    *b.claims.state_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));\n    let decision = |nonce: i64| DecisionContext {\n        control: resolve_run_control(&b.ctx, &score, EntityType::User, &rec),\n        run: Some(Arc::new(rec.clone())),\n        run_nonce: nonce,\n        ..Default::default()\n    };\n    let (d1, d2) = (decision(1), decision(2));\n    let (a, c) = tokio::join!(\n        run_enforcement(&b.ctx, &score, backfill::BACKFILL_TOPIC, &d1),\n        run_enforcement(&pod2, &score, backfill::BACKFILL_TOPIC, &d2),\n    );\n    *b.claims.state_barrier.lock().unwrap() = None;\n    let mut statuses = vec![a.unwrap().status, c.unwrap().status];\n    statuses.sort();\n    assert_eq!(\n        statuses,\n        vec![\n            backfill::STATUS_CLAIM_TAKEN.to_owned(),\n            \"success\".to_owned()\n        ]\n    );\n    assert_eq!(\n        ais_names(&Trace {\n            status: String::new(),\n",
+      "source_digest": "d17de63d0df9a9bd82373107af87ac5cdee0c4835964161dcfc6270a473e965c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2197,
+      "end_line": 2221,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    use std::sync::atomic::{AtomicUsize, Ordering};\n    use std::sync::{Arc, Mutex};\n    use tonic::codegen::{Service, http};\n    use tonic::{Status, body};\n\n    const PREFIX: &str = \"elapsed_samples_000000000000000042/trainer/\";\n    type Files = BTreeMap<String, Vec<u8>>;\n\n    #[derive(Default)]\n    struct Traffic {\n        active: AtomicUsize,\n        peak: AtomicUsize,\n        barrier: Option<tokio::sync::Barrier>,\n        fault: AtomicUsize,\n    }\n\n    #[derive(Clone)]\n    struct Trainer {\n        files: Arc<Files>,\n        traffic: Arc<Traffic>,\n        sockets: Arc<Mutex<HashSet<SocketAddr>>>,\n        primary: Arc<Mutex<Option<SocketAddr>>>,\n    }\n\n    impl tonic::server::NamedService for Trainer {\n",
+      "source_digest": "d231caa5b8b0a675ee3f07224f5fe1b3a806a45c74b95aa27565c0d15d3d479c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2306,
+      "end_line": 2330,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        let file = self\n                            .files\n                            .get(&name)\n                            .ok_or_else(|| Status::not_found(&name))?;\n                        data.extend_from_slice(\n                            file.get(offset..offset + size)\n                                .ok_or_else(|| Status::out_of_range(&name))?,\n                        );\n                    }\n                    self.sockets.lock().unwrap().insert(remote);\n                    let active = self.traffic.active.fetch_add(1, Ordering::SeqCst) + 1;\n                    self.traffic.peak.fetch_max(active, Ordering::SeqCst);\n                    if sharded && let Some(barrier) = &self.traffic.barrier {\n                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())\n                            .await\n                            .unwrap();\n                    }\n                    self.traffic.active.fetch_sub(1, Ordering::SeqCst);\n                    if fault == 2 && first_stripe {\n                        data.pop();\n                    }\n                    out.put_string(1, &data);\n                }\n                _ => return Err(Status::unimplemented(\"unexpected copy_port method\")),\n            }\n",
+      "source_digest": "076dc29bd5e3e7c48f01050dde38b332db851618f4a1c67074ec1d90f79bf3d8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2307,
+      "end_line": 2331,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                            .files\n                            .get(&name)\n                            .ok_or_else(|| Status::not_found(&name))?;\n                        data.extend_from_slice(\n                            file.get(offset..offset + size)\n                                .ok_or_else(|| Status::out_of_range(&name))?,\n                        );\n                    }\n                    self.sockets.lock().unwrap().insert(remote);\n                    let active = self.traffic.active.fetch_add(1, Ordering::SeqCst) + 1;\n                    self.traffic.peak.fetch_max(active, Ordering::SeqCst);\n                    if sharded && let Some(barrier) = &self.traffic.barrier {\n                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())\n                            .await\n                            .unwrap();\n                    }\n                    self.traffic.active.fetch_sub(1, Ordering::SeqCst);\n                    if fault == 2 && first_stripe {\n                        data.pop();\n                    }\n                    out.put_string(1, &data);\n                }\n                _ => return Err(Status::unimplemented(\"unexpected copy_port method\")),\n            }\n            Ok(add_ok_trailer(freeze(out)))\n",
+      "source_digest": "515a6ebf26f2b3cacb91831c5c15ba5b35e6d61479e376730c55dc28b1e0bdc5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2412,
+      "end_line": 2436,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            std::env::set_var(ENV_TLS_SERVER_NAME, \"copy.test\");\n            std::env::set_var(\"COPY_PORT_PEER_CONNS_PER_SOURCE\", \"16\");\n        }\n        for (connections, rate) in [(1, None), (2, None), (4, Some(64))] {\n            unsafe {\n                if connections == 1 {\n                    std::env::remove_var(keys[2]);\n                } else {\n                    std::env::set_var(keys[2], connections.to_string());\n                }\n            }\n            let traffic = Arc::new(Traffic {\n                barrier: Some(tokio::sync::Barrier::new(2)),\n                ..Traffic::default()\n            });\n            let files = |pieces: std::ops::Range<usize>| {\n                [\n                    tensor(\"emb_table\", pieces.clone(), 7),\n                    tensor(\"post_embeddings.embeddings\", pieces, 5),\n                    tensor(\"dense\", 0..1, 3),\n                    [(\n                        format!(\"{PREFIX}checksums.0.json\"),\n                        b\"{\\\"created_timestamp\\\":42}\".to_vec(),\n                    )]\n                    .into_iter()\n",
+      "source_digest": "53122c3189ff74a2e283902d49600bb3fd43aaaf562d07b278b064338b8f4841",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 533,
+      "end_line": 557,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Pointer:\n    exec_atom = _cute_nvgpu_ir.atom_make_exec_tma(tma_atom._trait.value, loc=loc, ip=ip)\n    tma_desc_ptr_type = ir.Type.parse(\n        \"!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<128>>\"\n    )\n    return _cute_nvgpu_ir.get_tma_desc_addr(tma_desc_ptr_type, exec_atom, loc=loc, ip=ip)\n\n\n\u0040dsl_user_op\ndef tma_gather4_load(\n    tma_desc_ptr: cute.Pointer,\n    dst_smem_ptr: cute.Pointer,\n    mbarrier_ptr: cute.Pointer,\n    col_idx: Int32,\n    row_indices: Sequence[Int32],\n    *,\n    num_cta: int = 1,\n    multicast_mask=None,\n    loc=None,\n    ip=None,\n) -> None:\n    if len(row_indices) != 4:\n        raise ValueError(f\"gather4 requires exactly 4 row indices, got {len(row_indices)}\")\n    col_val = Int32(col_idx).ir_value()\n    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]\n",
+      "source_digest": "6bddf7c4d40e8ea2ce81ea9190d6950f349be4879357401856c75ce1aa486425",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 548,
+      "end_line": 572,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    *,\n    num_cta: int = 1,\n    multicast_mask=None,\n    loc=None,\n    ip=None,\n) -> None:\n    if len(row_indices) != 4:\n        raise ValueError(f\"gather4 requires exactly 4 row indices, got {len(row_indices)}\")\n    col_val = Int32(col_idx).ir_value()\n    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]\n    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()\n    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()\n    mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)\n    if num_cta > 1:\n        mbar_addr = mbar_addr & Sm100MmaPeerBitMask\n    mbar_addr = mbar_addr.ir_value()\n    multicast_mask_val = None\n    if multicast_mask is not None:\n        multicast_mask_val = Int16(multicast_mask).ir_value()\n    assert multicast_mask_val is None, \"multicast is not supported yet\"\n    ptx = (\n        f\"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} \"\n        \"[$0], [$1, {$2, $3, $4, $5, $6}], [$7];\"\n    )\n\n",
+      "source_digest": "6bda58ca1daa4a20481f2e031372c20a7ee01d8b2a6da3f4a017c37fd9cab6d7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 557,
+      "end_line": 581,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]\n    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()\n    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()\n    mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)\n    if num_cta > 1:\n        mbar_addr = mbar_addr & Sm100MmaPeerBitMask\n    mbar_addr = mbar_addr.ir_value()\n    multicast_mask_val = None\n    if multicast_mask is not None:\n        multicast_mask_val = Int16(multicast_mask).ir_value()\n    assert multicast_mask_val is None, \"multicast is not supported yet\"\n    ptx = (\n        f\"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} \"\n        \"[$0], [$1, {$2, $3, $4, $5, $6}], [$7];\"\n    )\n\n    llvm.inline_asm(\n        None,\n        [\n            dst_addr,\n            desc_addr,\n            col_val,\n            row_vals[0],\n            row_vals[1],\n            row_vals[2],\n",
+      "source_digest": "c814b0d0ca921708a44ec05e4df99f84155eefb9bf5763cd771e273397adb538",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 690,
+      "end_line": 714,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        cute.copy(\n            tiled_copy, src_partition[stage_coord], dst_partition, loc=loc, ip=ip, **new_kwargs\n        )\n\n    return copy_s2t\n\n\ndef tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):\n    def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):\n        copy(\n            src_idx=src_idx,\n            dst_idx=producer_state.index,\n            tma_bar_ptr=pipeline.producer_get_barrier(producer_state),\n            **new_kwargs,\n        )\n\n    return copy_fn\n\n\ndef chain_tma_producer_copy_fns(copy_fns: Sequence[Optional[Callable]]):\n    if not any(fn is not None for fn in copy_fns):\n        return None\n\n    def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):\n        for fn in copy_fns:\n",
+      "source_digest": "becbdaf7330ccb8e6aa3b795b4e1b127ffbcc05e17ecd8f0fb6647d623605e07",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "phoenix/xrex/cutedsl/quack/utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 73,
+      "end_line": 97,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ).ir_value()\n    remote_mbar_ptr_i32 = set_block_rank(\n        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip\n    ).ir_value()\n    if const_expr(isinstance(val, float)):\n        val = Float32(val)\n    assert isinstance(val, (Float32, Int32, cutlass.Int64)), \"val must be Float32, Int32, or Int64\"\n    suffix = {Float32: \"f32\", Int32: \"s32\", cutlass.Int64: \"s64\"}[type(val)]\n    constraint = {Float32: \"f\", Int32: \"r\", cutlass.Int64: \"l\"}[type(val)]\n    llvm.inline_asm(\n        None,\n        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],\n        f\"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];\",\n        f\"r,{constraint},r\",\n        has_side_effects=True,\n        is_align_stack=False,\n    )\n\n\n\u0040dsl_user_op\ndef store_shared_remote_x4(\n    val0: Float32 | Int32,\n    val1: Float32 | Int32,\n    val2: Float32 | Int32,\n    val3: Float32 | Int32,\n",
+      "source_digest": "49e90d7999d6638a98b0fab86d401185eb1b59ea5800c053324b5159ebb521a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "phoenix/xrex/cutedsl/quack/utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 119,
+      "end_line": 143,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            remote_mbar_ptr_i32,\n            dtype(val0).ir_value(loc=loc, ip=ip),\n            dtype(val1).ir_value(loc=loc, ip=ip),\n            dtype(val2).ir_value(loc=loc, ip=ip),\n            dtype(val3).ir_value(loc=loc, ip=ip),\n        ],\n        \"{\\n\\t\"\n        f\".reg .v4 .{suffix} abcd;\\n\\t\"\n        f\"mov.{suffix} abcd.x, $2;\\n\\t\"\n        f\"mov.{suffix} abcd.y, $3;\\n\\t\"\n        f\"mov.{suffix} abcd.z, $4;\\n\\t\"\n        f\"mov.{suffix} abcd.w, $5;\\n\\t\"\n        f\"st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.{suffix} [$0], abcd, [$1];\\n\\t\"\n        \"}\\n\",\n        f\"r,r,{constraint},{constraint},{constraint},{constraint}\",\n        has_side_effects=True,\n        is_align_stack=False,\n    )\n\n\n\u0040dsl_user_op\ndef fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:\n    return Float32(\n        nvvm.fmin(\n            Float32(a).ir_value(loc=loc, ip=ip),\n",
+      "source_digest": "e3ee17786e5e6682ff2bd9fc8f891d47fdaf83d01aaef4f8a30cd3edc299e7f7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_fa4.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 736,
+      "end_line": 760,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n\n    fwd_bs, bwd_bs = block_sparse_layout\n    return _FA4_PACKED_CACHE[cache_key], (\n        *fwd_bs,\n        *bwd_bs,\n        valid_block_upper,\n        valid_block_lower,\n    )\n\n\ndef zeros_after(shape, dtype, anchor: jax.Array) -> jax.Array:\n    zero, _ = jax.lax.optimization_barrier((jnp.zeros((), dtype), anchor))\n    return jnp.broadcast_to(zero, shape)\n\n\ndef varlen_forward(kernels, q, k, v, bs_args):\n    return kernels[\"fwd_call\"](q, k, v, *bs_args[:6], *bs_args[12:])\n\n\ndef varlen_backward(kernels, q, k, v, out, lse, bs_args, g):\n    bbs = bs_args[6:12]\n    valid_bounds = bs_args[12:]\n    dpsum = jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32), axis=-1).transpose(0, 2, 1)\n    if dpsum.shape[-1] < kernels[\"sr_q\"]:\n",
+      "source_digest": "5e2101a88f8b7c2ca2ef0d082d8b0ddf9eb206133cf332613a7a4a3b55577ab1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "phoenix/xrex/cutedsl/ranker_fa4/blackwell_helpers.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 546,
+      "end_line": 570,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ]\n        if const_expr(mbar_ptr is not None):\n            assert mbar_phase is not None, \"mbar_phase must be provided when mbar_ptr is not None\"\n            assert split_arrive is not None, (\n                \"split_arrive must be provided when mbar_ptr is not None\"\n            )\n            split_arrive_idx = split_arrive // op.shape_mnk[2]\n            input_args.append(mbar_ptr.toint().ir_value())\n            input_args.append(Int32(mbar_phase).ir_value())\n            mbar_wait_str = (\n                \".reg .pred P1; \\n\\t\"\n                \"LAB_WAIT: \\n\\t\"\n                \"mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \\n\\t\"\n                \"\u0040P1 bra DONE; \\n\\t\"\n                \"bra     LAB_WAIT; \\n\\t\"\n                \"DONE: \\n\\t\"\n            )\n        else:\n            mbar_wait_str = \"\"\n        llvm.inline_asm(\n            None,\n            input_args,\n            \"{\\n\\t\"\n            \".reg .pred leader_thread;\\n\\t\"\n            \".reg .pred p;\\n\\t\"\n",
+      "source_digest": "cb8108d5c5c11724eb505a5b06488869ef6d5e54e57e42e2370398db92c04ee5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "phoenix/xrex/cutedsl/ranker_fa4/blackwell_helpers.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 873,
+      "end_line": 897,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Int32(cute.arch.make_warp_uniform(smem_desc_start_a)).ir_value(),\n            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),\n            Int32(not zero_init).ir_value(),\n            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),\n        ]\n        if const_expr(mbar_ptr is not None):\n            assert mbar_phase is not None, \"mbar_phase must be provided when mbar_ptr is not None\"\n            input_args.append(mbar_ptr.toint().ir_value())\n            input_args.append(Int32(mbar_phase).ir_value())\n            mbar_wait_str = (\n                \".reg .pred P1; \\n\\t\"\n                \"LAB_WAIT: \\n\\t\"\n                \"mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \\n\\t\"\n                \"\u0040P1 bra DONE; \\n\\t\"\n                \"bra     LAB_WAIT; \\n\\t\"\n                \"DONE: \\n\\t\"\n            )\n        else:\n            mbar_wait_str = \"\"\n        llvm.inline_asm(\n            None,\n            input_args,\n            \"{\\n\\t\"\n            \".reg .pred leader_thread;\\n\\t\"\n            \".reg .pred p;\\n\\t\"\n",
+      "source_digest": "bf1e1bed0305ae4cc172eec9c3a33185c0594f6bd82fcbf1b139eefbc7456ee6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "phoenix/xrex/cutedsl/ranker_fa4/block_sparse_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 33,
+      "end_line": 57,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# Copyright 2026 X.AI Corp.\nimport math\nfrom functools import partial\nfrom typing import Callable, Optional, Tuple\n\nimport cutlass\nimport cutlass.cute as cute\nfrom cutlass import Float32, Int32, const_expr\n\nfrom xrex.cutedsl.quack import copy_utils\n\nfrom xrex.cutedsl.ranker_fa4.block_sparsity import BlockSparseTensors\nfrom xrex.cutedsl.ranker_fa4.named_barrier import NamedBarrierBwd\nfrom xrex.cutedsl.ranker_fa4.seqlen_info import SeqlenInfoQK\n\n\n\u0040cute.jit\ndef _get_curr_blocksparse_tensors_varlen(\n    head_idx: cutlass.Int32,\n    m_block: cutlass.Int32,\n    blocksparse_tensors: BlockSparseTensors,\n    seqlen_info: SeqlenInfoQK,\n) -> Tuple[\n    cutlass.Int32,\n    cute.Tensor,\n",
+      "source_digest": "f7e888d421d4635ebd0a9e9ae027606ff67895e5bb4291fc4332fff916646ac3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2179,
+      "end_line": 2203,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n        let now = bf.run(\"run-00000001\").await.unwrap().unwrap();\n        assert_eq!(now.state, RunState::Stopped);\n        assert_eq!(gate(&now, NOW), Err(STATUS_RUN_STOPPED));\n        assert!(matches!(\n            start(&bf, &ac, &sw, req, \"page\", Some(\"[已隐去源码联系地址]\")).await,\n            Err(RunError::Conflict(\"start_failed\", ..))\n        ));\n    }\n\n                struct BothWrittenStore {\n        inner: Arc<MemControlStore>,\n        barrier: Arc<tokio::sync::Barrier>,\n        waited: std::sync::atomic::AtomicBool,\n    }\n\n    #[async_trait::async_trait]\n    impl ControlStore for BothWrittenStore {\n        async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n            self.inner.scan(pkey).await\n        }\n        async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n            self.inner.get(pkey, lkey).await\n        }\n        async fn put(\n",
+      "source_digest": "cd07740dc1112b5896755b1d89bbdb00c957c5a4c6ed301d5cf427eb5b119a10",
+      "redacted_contacts": 1,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2201,
+      "end_line": 2225,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.inner.get(pkey, lkey).await\n        }\n        async fn put(\n            &self,\n            pkey: &str,\n            lkey: &str,\n            value: Vec<u8>,\n            ttl: u64,\n        ) -> anyhow::Result<()> {\n            let first =\n                pkey == RUN_PKEY && !self.waited.swap(true, std::sync::atomic::Ordering::SeqCst);\n            if first {\n                self.barrier.wait().await;\n            }\n            self.inner.put(pkey, lkey, value, ttl).await?;\n            if first {\n                self.barrier.wait().await;\n            }\n            Ok(())\n        }\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n",
+      "source_digest": "c3c04a993aa3c8353f7459881234761ba7cbcf90d848f1447b61abae2d8e0429",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2205,
+      "end_line": 2229,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pkey: &str,\n            lkey: &str,\n            value: Vec<u8>,\n            ttl: u64,\n        ) -> anyhow::Result<()> {\n            let first =\n                pkey == RUN_PKEY && !self.waited.swap(true, std::sync::atomic::Ordering::SeqCst);\n            if first {\n                self.barrier.wait().await;\n            }\n            self.inner.put(pkey, lkey, value, ttl).await?;\n            if first {\n                self.barrier.wait().await;\n            }\n            Ok(())\n        }\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n    #[tokio::test]\n    async fn two_fresh_starts_at_once_leave_exactly_one_running() {\n        let inner = Arc::new(MemControlStore::default());\n        let barrier = Arc::new(tokio::sync::Barrier::new(2));\n",
+      "source_digest": "8bcd40941163820aec8c45aae6cc325a1b8043a87a4cc153988a847395516048",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2217,
+      "end_line": 2241,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                self.barrier.wait().await;\n            }\n            Ok(())\n        }\n        async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()> {\n            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n    #[tokio::test]\n    async fn two_fresh_starts_at_once_leave_exactly_one_running() {\n        let inner = Arc::new(MemControlStore::default());\n        let barrier = Arc::new(tokio::sync::Barrier::new(2));\n        let pod = |name: &str| {\n            Backfill::new(\n                Arc::new(BothWrittenStore {\n                    inner: inner.clone(),\n                    barrier: barrier.clone(),\n                    waited: Default::default(),\n                }),\n                None,\n                name.into(),\n            )\n        };\n        let (a, b) = (pod(\"pod-a\"), pod(\"pod-b\"));\n",
+      "source_digest": "01b65ebf91a811e0f2a9459651776f39d718f39ecffb3656797321650681a854",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2222,
+      "end_line": 2246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.inner.delete(pkey, lkey).await\n        }\n    }\n\n    #[tokio::test]\n    async fn two_fresh_starts_at_once_leave_exactly_one_running() {\n        let inner = Arc::new(MemControlStore::default());\n        let barrier = Arc::new(tokio::sync::Barrier::new(2));\n        let pod = |name: &str| {\n            Backfill::new(\n                Arc::new(BothWrittenStore {\n                    inner: inner.clone(),\n                    barrier: barrier.clone(),\n                    waited: Default::default(),\n                }),\n                None,\n                name.into(),\n            )\n        };\n        let (a, b) = (pod(\"pod-a\"), pod(\"pod-b\"));\n        let (_, _, ac, sw) = parts();\n        let (got_a, got_b) = tokio::join!(\n            start(\n                &a,\n                &ac,\n",
+      "source_digest": "e983b231eb723696f99fa74e08e46db5929048cae2f0afbe0cc6a249ecab7f76",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 265,
+      "end_line": 289,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    struct Row {\n        state: Option<&'static str>,\n        nonce: i64,\n        at: std::time::Instant,\n        status: Option<String>,\n    }\n\n    #[derive(Default)]\n    pub(crate) struct MemClaimStore {\n        rows: Mutex<HashMap<ClaimKey, Row>>,\n        pub all_listed: bool,\n        pub tickets: Mutex<HashMap<&'static str, u64>>,\n        pub state_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,\n        pub fail_reads: std::sync::atomic::AtomicBool,\n    }\n\n    impl MemClaimStore {\n        pub(crate) fn listing_all() -> Self {\n            Self {\n                all_listed: true,\n                ..Default::default()\n            }\n        }\n\n        pub(crate) fn add(&self, key: ClaimKey) {\n",
+      "source_digest": "41c9b3938fc2b324fd350da31667a9a749278f9983715dbafa70041710fe2967",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 347,
+      "end_line": 371,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    #[async_trait]\n    impl ClaimStore for MemClaimStore {\n        async fn state(&self, key: &ClaimKey) -> anyhow::Result<ItemClaim> {\n            if self.fail_reads.load(std::sync::atomic::Ordering::Relaxed) {\n                anyhow::bail!(\"claim store unreachable (test)\");\n            }\n            let claim = {\n                let rows = self.rows.lock().unwrap();\n                self.claim_of(&rows, key)\n            };\n            let barrier = self.state_barrier.lock().unwrap().clone();\n            if let Some(b) = barrier {\n                b.wait().await;\n            }\n            Ok(claim)\n        }\n\n        async fn take(\n            &self,\n            key: &ClaimKey,\n            nonce: i64,\n            budget: u64,\n            _pod: &str,\n",
+      "source_digest": "e49498d001b7265afd4a59c4ad3d9e2115c5cd6d69979585e264c40a3131fbf2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 348,
+      "end_line": 372,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    #[async_trait]\n    impl ClaimStore for MemClaimStore {\n        async fn state(&self, key: &ClaimKey) -> anyhow::Result<ItemClaim> {\n            if self.fail_reads.load(std::sync::atomic::Ordering::Relaxed) {\n                anyhow::bail!(\"claim store unreachable (test)\");\n            }\n            let claim = {\n                let rows = self.rows.lock().unwrap();\n                self.claim_of(&rows, key)\n            };\n            let barrier = self.state_barrier.lock().unwrap().clone();\n            if let Some(b) = barrier {\n                b.wait().await;\n            }\n            Ok(claim)\n        }\n\n        async fn take(\n            &self,\n            key: &ClaimKey,\n            nonce: i64,\n            budget: u64,\n            _pod: &str,\n        ) -> anyhow::Result<Take> {\n",
+      "source_digest": "8fa2bb734deeb2271398cc66a96c2c7c9b4bab0611a0cdf6f4558978f61b773a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_path_tests.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 866,
+      "end_line": 890,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let b = bed(run_config(false, 10), vec![]).await;\n    let rec = put_running(\n        &b.backfill_store,\n        RUN,\n        BB1.0,\n        vec![SUSPEND],\n        vec![LevelRow::Missing],\n    );\n    let score = bb1(Account::Clean);\n    let mut pod2 = b.ctx.clone();\n    pod2.backfill = pod_backfill(&b, b.claims.clone(), \"pod-2\").await;\n    *b.claims.state_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));\n    let decision = |nonce: i64| DecisionContext {\n        control: resolve_run_control(&b.ctx, &score, EntityType::User, &rec),\n        run: Some(Arc::new(rec.clone())),\n        run_nonce: nonce,\n        ..Default::default()\n    };\n    let (d1, d2) = (decision(1), decision(2));\n    let (a, c) = tokio::join!(\n        run_enforcement(&b.ctx, &score, backfill::BACKFILL_TOPIC, &d1),\n        run_enforcement(&pod2, &score, backfill::BACKFILL_TOPIC, &d2),\n    );\n    *b.claims.state_barrier.lock().unwrap() = None;\n",
+      "source_digest": "5cdca1e00fa9eea6c29c9a26446a1c9e35b3da3c2a5c3d0920a4cb19816c735c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_path_tests.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 878,
+      "end_line": 902,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    *b.claims.state_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));\n    let decision = |nonce: i64| DecisionContext {\n        control: resolve_run_control(&b.ctx, &score, EntityType::User, &rec),\n        run: Some(Arc::new(rec.clone())),\n        run_nonce: nonce,\n        ..Default::default()\n    };\n    let (d1, d2) = (decision(1), decision(2));\n    let (a, c) = tokio::join!(\n        run_enforcement(&b.ctx, &score, backfill::BACKFILL_TOPIC, &d1),\n        run_enforcement(&pod2, &score, backfill::BACKFILL_TOPIC, &d2),\n    );\n    *b.claims.state_barrier.lock().unwrap() = None;\n    let mut statuses = vec![a.unwrap().status, c.unwrap().status];\n    statuses.sort();\n    assert_eq!(\n        statuses,\n        vec![\n            backfill::STATUS_CLAIM_TAKEN.to_owned(),\n            \"success\".to_owned()\n        ]\n    );\n    assert_eq!(\n        ais_names(&Trace {\n            status: String::new(),\n",
+      "source_digest": "d17de63d0df9a9bd82373107af87ac5cdee0c4835964161dcfc6270a473e965c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2197,
+      "end_line": 2221,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    use std::sync::atomic::{AtomicUsize, Ordering};\n    use std::sync::{Arc, Mutex};\n    use tonic::codegen::{Service, http};\n    use tonic::{Status, body};\n\n    const PREFIX: &str = \"elapsed_samples_000000000000000042/trainer/\";\n    type Files = BTreeMap<String, Vec<u8>>;\n\n    #[derive(Default)]\n    struct Traffic {\n        active: AtomicUsize,\n        peak: AtomicUsize,\n        barrier: Option<tokio::sync::Barrier>,\n        fault: AtomicUsize,\n    }\n\n    #[derive(Clone)]\n    struct Trainer {\n        files: Arc<Files>,\n        traffic: Arc<Traffic>,\n        sockets: Arc<Mutex<HashSet<SocketAddr>>>,\n        primary: Arc<Mutex<Option<SocketAddr>>>,\n    }\n\n    impl tonic::server::NamedService for Trainer {\n",
+      "source_digest": "d231caa5b8b0a675ee3f07224f5fe1b3a806a45c74b95aa27565c0d15d3d479c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2306,
+      "end_line": 2330,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        let file = self\n                            .files\n                            .get(&name)\n                            .ok_or_else(|| Status::not_found(&name))?;\n                        data.extend_from_slice(\n                            file.get(offset..offset + size)\n                                .ok_or_else(|| Status::out_of_range(&name))?,\n                        );\n                    }\n                    self.sockets.lock().unwrap().insert(remote);\n                    let active = self.traffic.active.fetch_add(1, Ordering::SeqCst) + 1;\n                    self.traffic.peak.fetch_max(active, Ordering::SeqCst);\n                    if sharded && let Some(barrier) = &self.traffic.barrier {\n                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())\n                            .await\n                            .unwrap();\n                    }\n                    self.traffic.active.fetch_sub(1, Ordering::SeqCst);\n                    if fault == 2 && first_stripe {\n                        data.pop();\n                    }\n                    out.put_string(1, &data);\n                }\n                _ => return Err(Status::unimplemented(\"unexpected copy_port method\")),\n            }\n",
+      "source_digest": "076dc29bd5e3e7c48f01050dde38b332db851618f4a1c67074ec1d90f79bf3d8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2307,
+      "end_line": 2331,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                            .files\n                            .get(&name)\n                            .ok_or_else(|| Status::not_found(&name))?;\n                        data.extend_from_slice(\n                            file.get(offset..offset + size)\n                                .ok_or_else(|| Status::out_of_range(&name))?,\n                        );\n                    }\n                    self.sockets.lock().unwrap().insert(remote);\n                    let active = self.traffic.active.fetch_add(1, Ordering::SeqCst) + 1;\n                    self.traffic.peak.fetch_max(active, Ordering::SeqCst);\n                    if sharded && let Some(barrier) = &self.traffic.barrier {\n                        tokio::time::timeout(Duration::from_secs(5), barrier.wait())\n                            .await\n                            .unwrap();\n                    }\n                    self.traffic.active.fetch_sub(1, Ordering::SeqCst);\n                    if fault == 2 && first_stripe {\n                        data.pop();\n                    }\n                    out.put_string(1, &data);\n                }\n                _ => return Err(Status::unimplemented(\"unexpected copy_port method\")),\n            }\n            Ok(add_ok_trailer(freeze(out)))\n",
+      "source_digest": "515a6ebf26f2b3cacb91831c5c15ba5b35e6d61479e376730c55dc28b1e0bdc5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "phoenix/crates/serving/xai-recsys-engine/src/copy_port_client.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2412,
+      "end_line": 2436,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            std::env::set_var(ENV_TLS_SERVER_NAME, \"copy.test\");\n            std::env::set_var(\"COPY_PORT_PEER_CONNS_PER_SOURCE\", \"16\");\n        }\n        for (connections, rate) in [(1, None), (2, None), (4, Some(64))] {\n            unsafe {\n                if connections == 1 {\n                    std::env::remove_var(keys[2]);\n                } else {\n                    std::env::set_var(keys[2], connections.to_string());\n                }\n            }\n            let traffic = Arc::new(Traffic {\n                barrier: Some(tokio::sync::Barrier::new(2)),\n                ..Traffic::default()\n            });\n            let files = |pieces: std::ops::Range<usize>| {\n                [\n                    tensor(\"emb_table\", pieces.clone(), 7),\n                    tensor(\"post_embeddings.embeddings\", pieces, 5),\n                    tensor(\"dense\", 0..1, 3),\n                    [(\n                        format!(\"{PREFIX}checksums.0.json\"),\n                        b\"{\\\"created_timestamp\\\":42}\".to_vec(),\n                    )]\n                    .into_iter()\n",
+      "source_digest": "53122c3189ff74a2e283902d49600bb3fd43aaaf562d07b278b064338b8f4841",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "phoenix/xrex/cutedsl/qk_norm_rope_backward.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 199,
+      "end_line": 223,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                dot_q, sq_q = partial_row_sums(d_lo, d_hi, x_lo, x_hi, g_lo, g_hi)\n            if is_k:\n                load_rope_pair(mdK, mK, row, in_col, d_lo, d_hi, x_lo, x_hi)\n                rope_transpose(cos, sin, d_lo, d_hi)\n                dot_k, sq_k = partial_row_sums(d_lo, d_hi, x_lo, x_hi, g_lo, g_hi)\n            if is_v:\n                load_tile(mdV, row, v_head * head_dim + v_col, v)\n                cute.autovec_copy(v, tile(mdQKV, row, v_out))\n            sums = [warp_reduce(x, operator.add) for x in (dot_q, sq_q, dot_k, sq_k)]\n            if lane == 0:\n                for i in cutlass.range_constexpr(_NUM_ROW_SUMS):\n                    warp_sums[i, warp, parity] = sums[i]\n            cute.arch.barrier()\n            sums = [warp_sums[i, 0, parity] for i in range(_NUM_ROW_SUMS)]\n            for other_warp in cutlass.range_constexpr(1, num_warps):\n                for i in cutlass.range_constexpr(_NUM_ROW_SUMS):\n                    sums[i] += warp_sums[i, other_warp, parity]\n            dot_q, sq_q, dot_k, sq_k = sums\n            if is_q:\n                norm_transpose(d_lo, x_lo, g_lo, dot_q, sq_q, q_width, mdQKV, row, q_out, dg_lo)\n                norm_transpose(\n                    d_hi, x_hi, g_hi, dot_q, sq_q, q_width, mdQKV, row, q_out + half_dim, dg_hi\n                )\n            if is_k:\n                norm_transpose(d_lo, x_lo, g_lo, dot_k, sq_k, k_width, mdQKV, row, k_out, dg_lo)\n",
+      "source_digest": "873ba91e4cd30180ce9270546f01eb32dde74d6c60fe58c8ab04dc48564ef256",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 533,
+      "end_line": 557,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Pointer:\n    exec_atom = _cute_nvgpu_ir.atom_make_exec_tma(tma_atom._trait.value, loc=loc, ip=ip)\n    tma_desc_ptr_type = ir.Type.parse(\n        \"!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<128>>\"\n    )\n    return _cute_nvgpu_ir.get_tma_desc_addr(tma_desc_ptr_type, exec_atom, loc=loc, ip=ip)\n\n\n\u0040dsl_user_op\ndef tma_gather4_load(\n    tma_desc_ptr: cute.Pointer,\n    dst_smem_ptr: cute.Pointer,\n    mbarrier_ptr: cute.Pointer,\n    col_idx: Int32,\n    row_indices: Sequence[Int32],\n    *,\n    num_cta: int = 1,\n    multicast_mask=None,\n    loc=None,\n    ip=None,\n) -> None:\n    if len(row_indices) != 4:\n        raise ValueError(f\"gather4 requires exactly 4 row indices, got {len(row_indices)}\")\n    col_val = Int32(col_idx).ir_value()\n    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]\n",
+      "source_digest": "6bddf7c4d40e8ea2ce81ea9190d6950f349be4879357401856c75ce1aa486425",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 548,
+      "end_line": 572,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    *,\n    num_cta: int = 1,\n    multicast_mask=None,\n    loc=None,\n    ip=None,\n) -> None:\n    if len(row_indices) != 4:\n        raise ValueError(f\"gather4 requires exactly 4 row indices, got {len(row_indices)}\")\n    col_val = Int32(col_idx).ir_value()\n    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]\n    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()\n    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()\n    mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)\n    if num_cta > 1:\n        mbar_addr = mbar_addr & Sm100MmaPeerBitMask\n    mbar_addr = mbar_addr.ir_value()\n    multicast_mask_val = None\n    if multicast_mask is not None:\n        multicast_mask_val = Int16(multicast_mask).ir_value()\n    assert multicast_mask_val is None, \"multicast is not supported yet\"\n    ptx = (\n        f\"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} \"\n        \"[$0], [$1, {$2, $3, $4, $5, $6}], [$7];\"\n    )\n\n",
+      "source_digest": "6bda58ca1daa4a20481f2e031372c20a7ee01d8b2a6da3f4a017c37fd9cab6d7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 557,
+      "end_line": 581,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]\n    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()\n    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()\n    mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)\n    if num_cta > 1:\n        mbar_addr = mbar_addr & Sm100MmaPeerBitMask\n    mbar_addr = mbar_addr.ir_value()\n    multicast_mask_val = None\n    if multicast_mask is not None:\n        multicast_mask_val = Int16(multicast_mask).ir_value()\n    assert multicast_mask_val is None, \"multicast is not supported yet\"\n    ptx = (\n        f\"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} \"\n        \"[$0], [$1, {$2, $3, $4, $5, $6}], [$7];\"\n    )\n\n    llvm.inline_asm(\n        None,\n        [\n            dst_addr,\n            desc_addr,\n            col_val,\n            row_vals[0],\n            row_vals[1],\n            row_vals[2],\n",
+      "source_digest": "c814b0d0ca921708a44ec05e4df99f84155eefb9bf5763cd771e273397adb538",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "phoenix/xrex/cutedsl/quack/copy_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 690,
+      "end_line": 714,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        cute.copy(\n            tiled_copy, src_partition[stage_coord], dst_partition, loc=loc, ip=ip, **new_kwargs\n        )\n\n    return copy_s2t\n\n\ndef tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):\n    def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):\n        copy(\n            src_idx=src_idx,\n            dst_idx=producer_state.index,\n            tma_bar_ptr=pipeline.producer_get_barrier(producer_state),\n            **new_kwargs,\n        )\n\n    return copy_fn\n\n\ndef chain_tma_producer_copy_fns(copy_fns: Sequence[Optional[Callable]]):\n    if not any(fn is not None for fn in copy_fns):\n        return None\n\n    def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):\n        for fn in copy_fns:\n",
+      "source_digest": "becbdaf7330ccb8e6aa3b795b4e1b127ffbcc05e17ecd8f0fb6647d623605e07",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "phoenix/xrex/cutedsl/quack/utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 73,
+      "end_line": 97,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ).ir_value()\n    remote_mbar_ptr_i32 = set_block_rank(\n        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip\n    ).ir_value()\n    if const_expr(isinstance(val, float)):\n        val = Float32(val)\n    assert isinstance(val, (Float32, Int32, cutlass.Int64)), \"val must be Float32, Int32, or Int64\"\n    suffix = {Float32: \"f32\", Int32: \"s32\", cutlass.Int64: \"s64\"}[type(val)]\n    constraint = {Float32: \"f\", Int32: \"r\", cutlass.Int64: \"l\"}[type(val)]\n    llvm.inline_asm(\n        None,\n        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],\n        f\"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];\",\n        f\"r,{constraint},r\",\n        has_side_effects=True,\n        is_align_stack=False,\n    )\n\n\n\u0040dsl_user_op\ndef store_shared_remote_x4(\n    val0: Float32 | Int32,\n    val1: Float32 | Int32,\n    val2: Float32 | Int32,\n    val3: Float32 | Int32,\n",
+      "source_digest": "49e90d7999d6638a98b0fab86d401185eb1b59ea5800c053324b5159ebb521a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "phoenix/xrex/cutedsl/quack/utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 119,
+      "end_line": 143,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            remote_mbar_ptr_i32,\n            dtype(val0).ir_value(loc=loc, ip=ip),\n            dtype(val1).ir_value(loc=loc, ip=ip),\n            dtype(val2).ir_value(loc=loc, ip=ip),\n            dtype(val3).ir_value(loc=loc, ip=ip),\n        ],\n        \"{\\n\\t\"\n        f\".reg .v4 .{suffix} abcd;\\n\\t\"\n        f\"mov.{suffix} abcd.x, $2;\\n\\t\"\n        f\"mov.{suffix} abcd.y, $3;\\n\\t\"\n        f\"mov.{suffix} abcd.z, $4;\\n\\t\"\n        f\"mov.{suffix} abcd.w, $5;\\n\\t\"\n        f\"st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.{suffix} [$0], abcd, [$1];\\n\\t\"\n        \"}\\n\",\n        f\"r,r,{constraint},{constraint},{constraint},{constraint}\",\n        has_side_effects=True,\n        is_align_stack=False,\n    )\n\n\n\u0040dsl_user_op\ndef fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:\n    return Float32(\n        nvvm.fmin(\n            Float32(a).ir_value(loc=loc, ip=ip),\n",
+      "source_digest": "e3ee17786e5e6682ff2bd9fc8f891d47fdaf83d01aaef4f8a30cd3edc299e7f7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_candidate_packed_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        out, lse, softmax_stats = varlen_forward(kernels, q, k, v, bs_args)\n        cand_o, cand_lse = cand_forward(*candidate_inputs(q, k, v, cand_cu, key_starts, key_counts))\n        return out.at[0, region_start:].set(cand_o), lse, softmax_stats, cand_lse\n\n    \u0040jax.custom_vjp\n    def attention(q, k, v, cand_cu, key_starts, key_counts, *bs_args):\n        return forward(q, k, v, cand_cu, key_starts, key_counts, bs_args)[0]\n\n    def attention_fwd(q, k, v, cand_cu, key_starts, key_counts, *bs_args):\n        out, lse, softmax_stats, cand_lse = forward(\n            q, k, v, cand_cu, key_starts, key_counts, bs_args\n        )\n        out_bits = jax.lax.bitcast_convert_type(jax.lax.optimization_barrier(out), jnp.uint16)\n        out_bits = checkpoint_name(out_bits, \"cutedsl_attn_outputs\")\n        out = jax.lax.bitcast_convert_type(out_bits, out.dtype)\n        lse = checkpoint_name(lse, \"cutedsl_attn_outputs\")\n        softmax_stats = tuple(checkpoint_name(t, \"cutedsl_attn_outputs\") for t in softmax_stats)\n        cand_lse = checkpoint_name(cand_lse, \"cutedsl_attn_outputs\")\n        return out, (\n            q,\n            k,\n            v,\n            cand_cu,\n            key_starts,\n            key_counts,\n",
+      "source_digest": "f960f821598ebb9c7303d1ea1aae0c8eb616c0049028df839d55da4e267f35ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "phoenix/xrex/cutedsl/ranker_attention_varlen_fa4.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 769,
+      "end_line": 793,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fwd_bs, bwd_bs = block_sparse_layout\n    return _FA4_PACKED_CACHE[cache_key], (\n        *fwd_bs,\n        *bwd_bs,\n        valid_block_upper,\n        valid_block_lower,\n    )\n\n\ndef zeros_after(anchor: jax.Array, *structs: jax.ShapeDtypeStruct) -> list[jax.Array]:\n    zeros = []\n    for i, struct in enumerate(structs):\n        zero, _ = jax.lax.optimization_barrier((jnp.zeros(i + 1, struct.dtype), anchor))\n        zeros.append(jnp.broadcast_to(zero[0], struct.shape))\n    return zeros\n\n\ndef varlen_forward(kernels, q, k, v, bs_args):\n    out, lse, *softmax_stats = kernels[\"fwd_call\"](q, k, v, *bs_args[:6], *bs_args[12:])\n    return out, lse, tuple(softmax_stats)\n\n\ndef varlen_backward(kernels, q, k, v, out, lse, softmax_stats, bs_args, g):\n    from xrex.cutedsl.ranker_attention_fa4 import attention_delta, pad_softmax_stats\n\n",
+      "source_digest": "07877687ebbfc17f3c55d2a633beeba7563a63e9bcc65d6924d9acdd254a7878",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E50": {
+      "path": "phoenix/xrex/cutedsl/ranker_fa4/blackwell_helpers.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 546,
+      "end_line": 570,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ]\n        if const_expr(mbar_ptr is not None):\n            assert mbar_phase is not None, \"mbar_phase must be provided when mbar_ptr is not None\"\n            assert split_arrive is not None, (\n                \"split_arrive must be provided when mbar_ptr is not None\"\n            )\n            split_arrive_idx = split_arrive // op.shape_mnk[2]\n            input_args.append(mbar_ptr.toint().ir_value())\n            input_args.append(Int32(mbar_phase).ir_value())\n            mbar_wait_str = (\n                \".reg .pred P1; \\n\\t\"\n                \"LAB_WAIT: \\n\\t\"\n                \"mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \\n\\t\"\n                \"\u0040P1 bra DONE; \\n\\t\"\n                \"bra     LAB_WAIT; \\n\\t\"\n                \"DONE: \\n\\t\"\n            )\n        else:\n            mbar_wait_str = \"\"\n        llvm.inline_asm(\n            None,\n            input_args,\n            \"{\\n\\t\"\n            \".reg .pred leader_thread;\\n\\t\"\n            \".reg .pred p;\\n\\t\"\n",
+      "source_digest": "cb8108d5c5c11724eb505a5b06488869ef6d5e54e57e42e2370398db92c04ee5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9ec0a0e967da2999a12500b1aa3ec0f2f0e0cc04a332a077ed1266e3abd70836",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "734ed407dcbd2b11f88ae809c0868349a35308176c3a9a0d5013077363391834",
+      "context_complete": true,
+      "task_id": "T-422265f4c9bbd45860c2bdda13b07127a76c2f42418a3dad907b753d65d9d17a",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-18591a356684821c97ec64264fb44238d0dbde86fc41be3b93fa5ae02eedeeaa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-5fc7b57ae880f0dbcc2c838f412069a8b07680b8615dd92a9feaa44408b2afdd",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-cd5fbd2defc53af0ed6bac156c5ffbb53893e37876f9138936384c68f329012c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-1d4aa3711ea9a60939ef127b40ff006b28aedfb86bd5f221235c5cff25ea170f",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-0a47cef170bda49279d595f9f466ee249c9be0ac23acafe8f6c4b597cf1f01a6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-0f503e608fecde009f54a978c474e34b6bfe4d2bbc726fb227a7ad8094a45fff",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-37711e3d36565dbe7143abe204e8c7e0501c59b6e4a799050c0918e05ddb4375",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-fbcc4c8bec1c34159d0cd2ab5355764234913d987e5b82ae9d843bbe10719c37",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-141638cbdb01c866fc0e75715945d09385e6f285b2b81e8cd3b270c73ed19b26",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-022b5ce2476f542a83e7fb1d99e19caf8529d45a20a5497b45adc544f0dbbca4",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c586c9d7b1cef67f05747a1ddad2df8eeedbb330e48ee12fa826dbf343638726",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a7dfaa8fa4ff8282e3495593bb7d3866fbffcbd26eb7d480f99a15b4bb72af4",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-de0e84c99f665480b31737ff546d8a57afe3f394ee0a9dde86598c5305a894a9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-85ce8422670ca9bd806d2eead2948bd6d9ea0d393267318433000cab484ebc98",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5eef046f2b728cc3c42bb8aec03ffd8cb36ccd629197ae3922e56336ae7878e6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-1caae757704383d197c0c0d73e3127369a13342863a415269d464e53639f2898",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e07b79821d144897c39139cf98fb6757a695804b99413206a8fba3cac214aaab",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-2f077c6601f78204e8dc156e52fafa9383396d0aff49775a061f2250ff5511fa",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-3a77daa461741665790e392a38667db9e1b144974165a59ab0454090168c5b1f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-d11c98da484d5006ef4ec2d5acd132d919db8acadfc6420bfce32fe497479add",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4cbc508ec08c22a21ef975c9af0509dcc9caa93965f4f3eb58f024109c10bd48",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-e39cd46856de8c276583d403b6a43e739180c036bf2f97200ed1c064b97213f2",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a3ad0151e483c993686b0c2bffbd4f4c9c495b4d7c9edc14c36caa6426260358",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-0ba0de216cf8d14e2e6c4936d1ee4b06066884d8f7484041468fd58141a9557d",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8cdce25b8ab2af5ed0d5352d57e3ab48c96d9095450cb136decd49600a56fbe5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-1c093c92aa4080703e1cadb547b4ec663ae36aa45c8b69231116ead846cf989f",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-debcc0549fbb68b93f9dc37380e4111818be1d8c6b7239242deee5757655219f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-90a439c898c0138d9893ba4c8e216c784414f12b5ee5f5911cf2392373704b4e",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-138434688f7e2a56c61a9e7dc0c08b26273602a54485ee5cec8ff0c9eb21c1d2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-03707ef1869b5e68a2431ed1eadeb9d793c2fa1064f5004f4115544a92712f9f",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d7b05cc8d2788a29ca34595d419a0c98bcdcb3713d49f0c023841bc2d4d8874f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-d39c5138af72f98fa32d93706dc4d5df1c126072e5f4dbbaf56a1006d323649e",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-2e28e4be51a31a3cb256dcc5f857ea65665866c48c1ce9758421cf0b0d6a294b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-2b4c40132e4cba592662ea204d59bb346eac2cc4c88a53aaf8d70338495d273a",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e2423a8bf28cc82c736a0e2395a21525060f813461f8a0ecc1468fecb5ca868d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-e3e7b1a8169525bb5c1048cc07a30bc914e662b429d0df447b872be80bf8775a",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7dfcb13279d1bd367293737a065be235585605fa4f595412a0fa45e44ec9d7b9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a9dd3e4a6eb723c8a4f0265146c3a54fe4e7c312c7a728af6ca6cfe11d9eb25",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5e5a7a9127ecfc5104c6ef9d0c299b83c6e985c1f49783c59c23cc8ff66018a6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-26a3874d36e1d0a7f138206dbcaa658006ee78af0402980c2f2ef28b0ac5f44b",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-af15cb2a1897c3bf3ef45609bdd491d154a1558edc24dc6587bc48c9c31667ef",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-6b08c06cfe1a96cb95fb8b8e4cbd95dd611f5a345ea40ec497c125e7485a3039",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-736f84cea9220657700a76c976ba731b07b4895dcdfeeb0b5b15664caca4941b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-25d25f5e3e38b494d44afdc660d665d5e762d238e2b114a5df4001ae9035f130",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-26b1c39dde1afcd6bb32895635dd806f81af0dd820249f7ca56ae59bf9964186",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-4a464bd1dce980b772098b57f3749a7fb540f0da51ca1cd4e5bbc33a7f1c547c",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-bd1595b9cf0c31f918bbf6d6304953cf75529af45ae6f435a62ba03470d905b8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-ef6a52997bcab9c3e3e01253cd5f41651102f37ccabc4fadb1707a6d70b8c178",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-edf14f0008446e602bcd6a1c7a74a572f33b062ea6c9c75c17024e77e4b0659f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-0f3e3068a6eac4ecf12a316cebff35d074590f3bfd8e0f9005b62326f3bafa0f",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4cfd52ae94c5ac94168242c6919873ed2dd328b1aa00658b68374d436f8827de",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-e8860dd191417b5ad292628aab4eb75d53960f2ce468bc6a1c6e80e4f7831d3c",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-62bdf518de2ea9a73aee7b7b4c024e420bc1dd8d62af6caff0f27c5481b5c409",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-9aaa81d967f8885baeb9b529f62f67aa1c30b554f146411ede62f0808884058d",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e38aeaefb100a0e1c0b49654994731e49af9450550087959d7091922e13bb36b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-c85c1c9096270264715cb999a25e9c5ab824f749e5cb7557e61048471e1b43ac",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8d8b79c56695b138730e59bae8d8b8e6ea929ea309d3a445e0c619b097b68afb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-abc69a557f196ef41e310b7c4f415ba0b203698041a7cc1ea71a98aeed02c2c3",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e9c1329af1f6b282070393dd39022d5edd2edc669da8f3406ea2283c2427e73f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-5519371feeb06dd0dffbc1570069e169a66893307a44d9de8facce2283b80842",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-6c4b4c6b9a66aa433ef1fa65a9d2891fb2940493863ebc8179ba352fb6bce0db",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-1c81ef429734e9ad5c56a3828e68fcc4f13e3b0d6e3ed07282f0b616dcbdc944",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-469162fd1cfc1bfd8ca07e3b845ccefc356b088d47180e3cfc0cde68864ac304",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-b414c3d4abcfa91087cbfe6f4c9a137740e6b3951a1ddcb94c2add61a61798d6",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-616340077f70f3b49668c0448f33d7462ecc1106232dce54c3aa951dd4d195d6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-ceed250e277fc3f4aa3e7391a2cca2c30a46ca78483e556fb123260b6bfb7917",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ae85f7ebee4f0faf752d7bc2ae3980824931c1727023a78149e9df9ac635a6da",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-c85f0f6bd52be2599b35134ed7d13e4c5c9c0136e9e7f23580c5d2501286778f",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-fa77fe5eb50a6f3fb55b7bc5834ef4c5918f1fda050f5d294a63d296ebc2105d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-25d9a96d139c7d3ab4d6d949988f9d53032d19f6a0b5a18b867074efc7873790",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-bed70ad777ed58d5b501915621d68f390d1f5348b8e9d07c5b602d10fe579d99",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-148dc80377178abdcd61dfa52d093945449887f8b511ea659d7ba133fa7fe804",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-2b9fabe9823268afa88ea1b21cb25c910ff1b9fdf642448e28b6fb9d6482f487",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-f8ca3b6671e61531ca593f8c675c6102a4bf957adbabf2a5426b545c22695adb",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d3370e684b4f292b707b6f9cfb86fecd1f5a4cef7ee1c7821fef22f982456bd1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-a99756b67c6a85f5c949f9ce6cae249df610bb2eaada60f41a2ef9eb934d29ee",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9617f2b0e065c1396ba64aff5f3b1595eb2e83593d63a10df94f44982b95cb29",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-79723f51a8393be9566c2e0b2f2292d0b280dae159891cb5a68d4ee3749cca5a",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-99820d42beb9344307bc0399f9cc0d09f088399a39a1dec82581c5f917cd66c2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-1e56c31c46d2e17c73ef64a9048f7dac6a78da3a48c99b672994d57afc29be20",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-1cefb2383776fb00e8166557aca22e832fce2a20809bafc4a6a38577d218efce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-a68f833331749c19517e740c47c0beaf5089645c104e9a57a2f3b378d7e7fadf",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8bcfbf743fbbd34aac2e34c4bf6337b2c37079a52f1430a30187846724d971a7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-d664c95d5fd4f7c04a6ddc56f09d2245ab6935f791f92daae4b475680e52664d",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9fa76286ff2be648da4498e161075905219128689c3874007dce77b9ef3564ff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-ef445bb8ce75f75ec4e917ec9a0afb27d3d605e160210d5c5c91de4802cdca84",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ccb8596e2258d11b505e5ef37ab1e88beafbbef2bc9f18e9629f26bda9ad7ee3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-1c596eadad9d3f8f46790eacf2ed3c446c5b61601b5c8b62c07c2d238e891f71",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f1be739b9168cd9301aded13ada8262f353f8453b9e76c6015fec19a94a1783c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-b137c062a6a3aea2896b094b9a874dcbed017f10ca33cfb1c460a3c33c990a0e",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-fb2a8c8a1b216aa701cc877d80de3264ab679afe08198c1fad5695e8a59828b7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-241a53450417a82dfbe5677cbc73b60eca4171f453ec940b5ddb350063bd260c",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f865a4758f2cc7ce91dc11a17938a48602c3532e5d75bf4e1ec10e21962f52d3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-9da2cb85dab99b4db871bbce548ab7d0fdc44692b5e43d1c4bccd8221c02e013",
+      "evidence_refs": [
+        "E49"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-eff0a4503cbe3320f165a6a3eb846d3532e40ff131ff9bbbfe0683b54a085f0f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "install_offload_state",
+        "d2h_copy",
+        "register_offload_state",
+        "barrier"
+      ],
+      "context_complete": false,
+      "task_id": "T-e9a12aaa1e04409e88d0f0690b7f02e18a56c2c914aa5acc760be3379bec883d",
+      "evidence_refs": [
+        "E50"
+      ]
+    }
+  ],
+  "task_id": "T-484bfb7a5349dc48c3ccc6ae69077e6db628c74996d88f0acee9624938432d99"
+}

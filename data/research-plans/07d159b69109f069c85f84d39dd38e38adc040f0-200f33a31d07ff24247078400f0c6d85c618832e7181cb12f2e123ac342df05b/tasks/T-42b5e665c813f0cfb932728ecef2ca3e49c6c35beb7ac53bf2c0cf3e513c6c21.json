@@ -1,0 +1,1931 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/staging/reference/users.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-760776e8fe6c6f9b2d9f7cd1e70e19645e6fb259d48f75d65cc88813e9e55ff5",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/staging",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 372,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::hydration::request_context;\nuse crate::models::AuthorId;\nuse crate::post_evaluator::{PostEvaluator, UserResult};\nuse crate::rules::{RuleId, SafetyLevel};\nuse crate::staging::reference::vf_service::resolve_build_sha;\nuse crate::thrift_read::read_fields;\nuse futures::future::join;\nuse serde_json::json;\nuse std::collections::HashMap;\nuse std::env;\nuse std::sync::{Arc, Mutex, PoisonError};\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\nuse thrift::protocol::{\n    TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TStructIdentifier, TType,\n};\nuse tokio::sync::Semaphore;\nuse tokio::time::{timeout, Instant};\nuse xai_build_version::current_build_information;\nuse xai_stats_receiver::global_stats_receiver;\nuse xai_strato::strato_thrift::{strato_decode, StratoResult};\nuse xai_strato::{encode, MValCodec, StratoGrpc};\n\nconst COLUMN: &str = \"visibility/service/userVisibilityResult.User\";\nconst LEVELS: [SafetyLevel; 2] = [\n    SafetyLevel::NotificationsWriterV2,\n    SafetyLevel::NotificationsFollow,\n];\nconst MAX_ACTORS: usize = 10;\nconst MAX_IN_FLIGHT: usize = 16;\nconst SCALA_TIMEOUT: Duration = Duration::from_millis(1500);\nconst COMPARE: &str = \"vf_user_reference_compare\";\nconst BATCHES: &str = \"vf_user_reference_batches\";\nconst RECORD_LINE_MARKER: &str = \"vf_user_reference_record\";\nconst RECORD_CAP_PER_MINUTE: u32 = 20;\nconst COLUMN_CANNOT_FIRE: [RuleId; 3] = [\n    RuleId::NoConfirmedEmail,\n    RuleId::NoConfirmedPhone,\n    RuleId::OnlyPeopleIFollow,\n];\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\nenum BatchOutcome {\n    Compared,\n    NoActors,\n    ScalaTimeout,\n    Busy,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\nenum Scala {\n    Allow,\n    Drop,\n    NotEvaluated,\n    Missing,\n    Failed,\n}\n\ntype Bucket = (&'static str, &'static str, &'static str);\n\nfn labels(result: UserResult) -> (&'static str, &'static str) {\n    match result {\n        UserResult::Allowed => (\"allowed\", \"none\"),\n        UserResult::Dropped(rule) => (\"dropped\", rule.into()),\n        UserResult::NotFound => (\"dropped\", \"actor_not_found\"),\n        UserResult::Failed => (\"failed\", \"none\"),\n    }\n}\n\nfn known_difference(result: UserResult) -> &'static str {\n    match result {\n        UserResult::Dropped(rule) if COLUMN_CANNOT_FIRE.contains(&rule) => \"column_cannot_fire\",\n        UserResult::Allowed\n        | UserResult::Dropped(_)\n        | UserResult::NotFound\n        | UserResult::Failed => \"none\",\n    }\n}\n\npub(super) struct UserReference {\n    strato: Arc<StratoGrpc>,\n    post_evaluator: Arc<PostEvaluator>,\n    permits: Arc<Semaphore>,\n    sampler: Mutex<(u64, HashMap<Bucket, u32>)>,\n    build_sha: String,\n}\n\nimpl UserReference {\n    pub(super) fn new(strato: Arc<StratoGrpc>, post_evaluator: &Arc<PostEvaluator>) -> Self {\n        Self {\n            strato,\n            post_evaluator: Arc::clone(post_evaluator),\n            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),\n            sampler: Mutex::default(),\n            build_sha: resolve_build_sha(\n                &current_build_information().git_commit_sha,\n                env::var(super::ENV_IMAGE).ok().as_deref(),\n            ),\n        }\n    }\n\n    pub(super) fn spawn(\n        self: &Arc<Self>,\n        viewer_id: Option<u64>,\n        level: SafetyLevel,\n        tweet_ids: Vec<u64>,\n    ) {\n        let Some(viewer_id) = viewer_id else {\n            return;\n        };\n        match level {\n            SafetyLevel::TimelineHome | SafetyLevel::TimelineHomeRecommendations => {}\n            SafetyLevel::FilterAll\n            | SafetyLevel::TimelineHomeHydration\n            | SafetyLevel::ImmersiveExpandedRecommendations\n            | SafetyLevel::QuotedTweetRules\n            | SafetyLevel::NotificationsFollow\n            | SafetyLevel::NotificationsWriterV2 => return,\n        }\n        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {\n            self.count(BatchOutcome::Busy);\n            return;\n        };\n        let reference = Arc::clone(self);\n        tokio::spawn(async move {\n            let _permit = permit;\n            let outcome = reference.compare(viewer_id, &tweet_ids).await;\n            reference.count(outcome);\n        });\n    }\n\n    async fn compare(&self, viewer_id: u64, tweet_ids: &[u64]) -> BatchOutcome {\n        let mut actors = self.post_evaluator.post_authors(tweet_ids).await;\n        actors.retain(|&actor| actor != AuthorId(viewer_id));\n        actors.sort_unstable_by_key(|actor| actor.get());\n        actors.dedup();\n        actors.truncate(MAX_ACTORS);\n        if actors.is_empty() {\n            return BatchOutcome::NoActors;\n        }\n        for level in LEVELS {\n            let rust = request_context(Instant::now(), None).scope(\n                self.post_evaluator\n                    .evaluate_users(level, viewer_id, actors.clone()),\n            );\n            let scala = timeout(SCALA_TIMEOUT, self.scala(level, viewer_id, &actors));\n            let (rust, scala) = join(rust, scala).await;\n            let Ok(scala) = scala else {\n                return BatchOutcome::ScalaTimeout;\n            };\n            let pairs: Vec<(AuthorId, UserResult, Scala)> = actors\n                .iter()\n                .zip(scala)\n                .map(|(&actor, scala)| {\n                    let result = rust.get(&actor).copied().unwrap_or(UserResult::Failed);\n                    (actor, result, scala)\n                })\n                .collect();\n            self.record(level, viewer_id, &pairs);\n        }\n        BatchOutcome::Compared\n    }\n\n    async fn scala(&self, level: SafetyLevel, viewer_id: u64, actors: &[AuthorId]) -> Vec<Scala> {\n        let Some(safety_level) = level.thrift_number() else {\n            return vec![Scala::Failed; actors.len()];\n        };\n        let view = LookupContext {\n            safety_level,\n            for_user_id: viewer_id,\n        };\n        let calls = actors\n            .iter()\n            .map(|actor| {\n                (\n                    COLUMN.to_owned(),\n                    \"fetch\".to_owned(),\n                    vec![encode(&(actor.get().cast_signed(), view))],\n                )\n            })\n            .collect();\n        self.strato\n            .batch_call(calls, None)\n            .await\n            .into_iter()\n            .map(|answer| answer.map_or(Scala::Failed, |bytes| scala_answer(&bytes)))\n            .collect()\n    }\n\n    fn record(&self, level: SafetyLevel, viewer_id: u64, pairs: &[(AuthorId, UserResult, Scala)]) {\n        let minute = SystemTime::now()\n            .duration_since(UNIX_EPOCH)\n            .map_or(0, |since| since.as_secs() / 60);\n        let mut counts: HashMap<(&str, &str, &str, &str), u64> = HashMap::new();\n        let mut sampler = self.sampler.lock().unwrap_or_else(PoisonError::into_inner);\n        if sampler.0 != minute {\n            *sampler = (minute, HashMap::new());\n        }\n        for &(actor, result, scala) in pairs {\n            let (rust, rule) = labels(result);\n            let scala: &'static str = scala.into();\n            let seen = sampler.1.entry((level.into(), rust, scala)).or_default();\n            *seen += 1;\n            if *seen <= RECORD_CAP_PER_MINUTE {\n                #[expect(clippy::print_stdout, reason = \"stdout is the record sink\")]\n                {\n                    println!(\n                        \"{}\",\n                        json!({\n                            \"h\": RECORD_LINE_MARKER,\n                            \"v\": 1,\n                            \"level\": <&str>::from(level),\n                            \"build\": self.build_sha,\n                            \"recipient\": viewer_id,\n                            \"actor\": actor.get(),\n                            \"vf\": rust,\n                            \"vf_rule\": rule,\n                            \"scala\": scala,\n                        })\n                    );\n                }\n            }\n            *counts\n                .entry((rust, rule, scala, known_difference(result)))\n                .or_default() += 1;\n        }\n        drop(sampler);\n        let Some(stats) = global_stats_receiver() else {\n            return;\n        };\n        for ((rust, rule, scala, difference), count) in counts {\n            stats.incr(\n                COMPARE,\n                &[\n                    (\"safety_level\", level.into()),\n                    (\"vf\", rust),\n                    (\"vf_rule\", rule),\n                    (\"scala\", scala),\n                    (\"known_difference\", difference),\n                    (\"build_sha\", &self.build_sha),\n                ],\n                count,\n            );\n        }\n    }\n\n    fn count(&self, outcome: BatchOutcome) {\n        if let Some(stats) = global_stats_receiver() {\n            stats.incr(\n                BATCHES,\n                &[(\"outcome\", outcome.into()), (\"build_sha\", &self.build_sha)],\n                1,\n            );\n        }\n    }\n}\n\nfn scala_answer(bytes: &[u8]) -> Scala {\n    match strato_decode::<UserVisibilityResult>(bytes) {\n        Ok(StratoResult::Ok { value: None, .. }) => Scala::Missing,\n        Ok(StratoResult::Ok {\n            value: Some(result),\n            ..\n        }) => result.0,\n        Ok(StratoResult::Err { .. }) | Err(_) => Scala::Failed,\n    }\n}\n\n#[derive(Clone, Copy)]\nstruct LookupContext {\n    safety_level: i32,\n    for_user_id: u64,\n}\n\nimpl MValCodec for LookupContext {\n    fn thrift_type() -> TType {\n        TType::Struct\n    }\n\n    #[expect(clippy::unimplemented, reason = \"a view is only encoded\")]\n    fn from_thrift(_proto: &mut dyn TInputProtocol) -> Self {\n        unimplemented!(\"a view is only encoded\")\n    }\n\n    #[expect(\n        clippy::unwrap_used,\n        reason = \"`xai_strato::encode` writes into a Vec, which cannot fail\"\n    )]\n    fn to_thrift(&self, proto: &mut dyn TOutputProtocol) {\n        proto\n            .write_struct_begin(&TStructIdentifier::new(\"VisibilityFilteringLookupContext\"))\n            .unwrap();\n        proto\n            .write_field_begin(&TFieldIdentifier::new(\"safety_level\", TType::I32, 1))\n            .unwrap();\n        proto.write_i32(self.safety_level).unwrap();\n        proto.write_field_end().unwrap();\n        proto\n            .write_field_begin(&TFieldIdentifier::new(\"for_user_id\", TType::I64, 2))\n            .unwrap();\n        proto.write_i64(self.for_user_id.cast_signed()).unwrap();\n        proto.write_field_end().unwrap();\n        proto.write_field_stop().unwrap();\n        proto.write_struct_end().unwrap();\n    }\n}\n\nstruct UserVisibilityResult(Scala);\n\nimpl TSerializable for UserVisibilityResult {\n    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {\n        let mut answer = Scala::NotEvaluated;\n        read_fields(i_prot, |i_prot, field| {\n            if field.id != Some(1) || field.field_type != TType::Struct {\n                return Ok(false);\n            }\n            read_fields(i_prot, |_, action| {\n                answer = match action.id {\n                    Some(2) => Scala::Allow,\n                    Some(3) => Scala::Drop,\n                    _ => Scala::NotEvaluated,\n                };\n                Ok(false)\n            })?;\n            Ok(true)\n        })?;\n        Ok(Self(answer))\n    }\n\n    fn write_to_out_protocol(&self, _o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {\n        Err(thrift::new_protocol_error(\n            thrift::ProtocolErrorKind::NotImplemented,\n            \"a result is only decoded\",\n        ))\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::clients::strato_answer::{found, no_row, Thrift};\n    use crate::rules::RuleEngine;\n\n    #[test]\n    fn the_known_differences_are_rules_both_levels_wire() {\n        let engine = RuleEngine::for_tests();\n        for level in LEVELS {\n            let wired: Vec<RuleId> = engine\n                .wired_rule_names(level)\n                .into_iter()\n                .filter_map(RuleId::of_rule_name)\n                .collect();\n            for rule in COLUMN_CANNOT_FIRE {\n                assert!(wired.contains(&rule), \"{level:?} wires no {rule:?}\");\n            }\n        }\n    }\n\n    #[test]\n    fn the_column_answer_reads_as_its_user_action() {\n        use Thrift::Struct;\n        let action = |field| Struct(vec![(1, Struct(vec![(field, Struct(vec![]))]))]);\n        let answer = |value: Option<Thrift>| scala_answer(&value.map_or_else(no_row, found));\n        assert_eq!(answer(Some(action(2))), Scala::Allow);\n        assert_eq!(answer(Some(action(3))), Scala::Drop);\n        assert_eq!(answer(Some(action(1))), Scala::NotEvaluated);\n        assert_eq!(answer(Some(Struct(vec![]))), Scala::NotEvaluated);\n        assert_eq!(answer(None), Scala::Missing);\n        assert_eq!(scala_answer(b\"not thrift\"), Scala::Failed);\n    }\n}\n",
+      "source_digest": "a9ec581fbb9284110cec4813bf682e0a8155f2e1b0b187110c3be9c1f80f6ff5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 5,
+      "end_line": 29,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n\nfn admin_ui_public_dir() -> PathBuf {\n    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n",
+      "source_digest": "4c5d09679c21c6e8233bb0287739607946329d361e80961166ae9c25aaba8021",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 81,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "6d9bfc55034970054b53bbd9e3f28b458fe77b84a5fdfd213e49faec070b7e10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 83,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "080e0ab2ed2ac8899ae5ac3976b27d41512bbe0f1720cc37e076dfb60108ce83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 15,
+      "end_line": 39,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ActionControlSeenRow, ActionControlView, AllowedActions, ConfidenceEvidence, ConfidenceLevel,\n    ConfidenceView, ControlEntity, ControlMode, CseLists, EvidenceOverride, LevelRow, Lifetime,\n    PageAction, PodActionControlView, RowSetting, RowView, RowsRequest, SafetyChecksByEntity,\n    UnreadableRecord,\n};\n\nmod levels;\npub use levels::level_lkey;\n\nuse crate::confidence::{ConfidenceConfig, RowOutcome};\nuse crate::decision::ActionSpec;\nuse crate::facts::EntityType;\nuse crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};\nuse crate::growthbook::DynamicConfig;\nuse crate::metrics;\nuse crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\n",
+      "source_digest": "ee184535e954ea33de1a052186b36fa3ab762f63c8b0809d912b99912cf3ca45",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 54,
+      "end_line": 78,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub const SEEN_TTL_SECS: u64 = 30 * 86_400;\npub const SEEN_WRITE_EVERY: Duration = Duration::from_secs(600);\nconst SEEN_QUEUE: usize = 256;\nconst SEEN_GUARD_MAX: usize = 10_000;\nconst LOCAL_WRITE_GRACE: Duration = Duration::from_secs(30);\nconst MAX_REASON_LEN: usize = 1_000;\nconst MAX_NAME_LEN: usize = 256;\npub const HISTORY_LIMIT_DEFAULT: usize = 50;\npub const HISTORY_LIMIT_MAX: usize = 500;\npub const CONFIRM_WORD: &str = \"ENFORCE\";\npub const PAGE_RULE_ID: &str = \"page\";\npub const STATUS_NO_ACTIONS: &str = \"no_actions\";\npub const FORCED_RECORDING_KEY: &str = \"action_control_forced_recording\";\n\npub fn lkey_for(\n    entity: ControlEntity,\n    head: &str,\n    classifier: Option<&str>,\n    band: Option<&str>,\n) -> String {\n    let e = entity.as_str();\n    match (classifier, band) {\n        (None, None) => format!(\"{e}/h/{head}\"),\n        (Some(c), None) => format!(\"{e}/c/{head}/{c}\"),\n        (None, Some(b)) => format!(\"{e}/b/{head}/{b}\"),\n",
+      "source_digest": "a94e08e71bd1431ea3eee8c229dc041c8893f9217e005c7d04900e00e3eefc9d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 71,
+      "end_line": 95,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    classifier: Option<&str>,\n    band: Option<&str>,\n) -> String {\n    let e = entity.as_str();\n    match (classifier, band) {\n        (None, None) => format!(\"{e}/h/{head}\"),\n        (Some(c), None) => format!(\"{e}/c/{head}/{c}\"),\n        (None, Some(b)) => format!(\"{e}/b/{head}/{b}\"),\n        (Some(c), Some(b)) => format!(\"{e}/cb/{head}/{c}/{b}\"),\n    }\n}\n\npub fn record_lkey(rec: &ActionControlRecord) -> String {\n    match rec.confidence {\n        Some(level) => level_lkey(rec.entity_type, &rec.head, rec.classifier.as_deref(), level),\n        None => lkey_for(\n            rec.entity_type,\n            &rec.head,\n            rec.classifier.as_deref(),\n            rec.band.as_deref(),\n        ),\n    }\n}\n\nfn record_lkey_of(req: &ActionControlPutRequest) -> String {\n",
+      "source_digest": "7070fc009dc409291bc66c5211a0a7da712f262a2c4359d36b335127766240c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 83,
+      "end_line": 107,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub fn record_lkey(rec: &ActionControlRecord) -> String {\n    match rec.confidence {\n        Some(level) => level_lkey(rec.entity_type, &rec.head, rec.classifier.as_deref(), level),\n        None => lkey_for(\n            rec.entity_type,\n            &rec.head,\n            rec.classifier.as_deref(),\n            rec.band.as_deref(),\n        ),\n    }\n}\n\nfn record_lkey_of(req: &ActionControlPutRequest) -> String {\n    match req.confidence {\n        Some(row) => level_lkey(req.entity_type, &req.head, req.classifier.as_deref(), row),\n        None => lkey_for(\n            req.entity_type,\n            &req.head,\n            req.classifier.as_deref(),\n            req.band.as_deref(),\n        ),\n    }\n}\n\npub fn seen_lkey(seen: &ActionControlSeen) -> String {\n",
+      "source_digest": "75d690e974e22c1f3e89dca878d10aec0068501cc9095f05e2f42d1d10329de6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 109,
+      "end_line": 133,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n",
+      "source_digest": "133a25ba477cdc92ca119affa5f3afd75de625b2232aa7cc3fc6bdff427bd3be",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 110,
+      "end_line": 134,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\npub fn page_specs(actions: &[PageAction]) -> Vec<ActionSpec> {\n    let rank = |a: &PageAction| match a {\n",
+      "source_digest": "326c485da8f3f9a3a832fcf3db96dbad49b751f0159ede29c3173d55ce3ff215",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 135,
+      "end_line": 159,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        PageAction::SpamHighRecall { .. }\n        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n",
+      "source_digest": "a275662129317966380e9e0f58dc0c03e5aa9ac6deb3c4694b7a563caba9cc8b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 139,
+      "end_line": 163,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n",
+      "source_digest": "11cc2f60f8be1dc5b875ec9ce1e6d07d2b384d2bb45680aa68f633962803e7e2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 143,
+      "end_line": 167,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n",
+      "source_digest": "b5e93ce3a56dd8c766817c044a1c195bd32402fef4f8e3d968f3fbb7430d916c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 178,
+      "end_line": 202,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n",
+      "source_digest": "64c8f218d5d73366a01241e0cd0d62a2078216e26d4f2ef9e5ef946d6bc749ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 179,
+      "end_line": 203,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n",
+      "source_digest": "c0a8204a842e4117828c133cb5a8a3edf8ac48babcb3840db7a19a8659a553dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 185,
+      "end_line": 209,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n            }\n            ActionSpec::SpamLivenessCheck => {\n",
+      "source_digest": "c0a3805f37654d53bded13a0bb256231388c2ac3b06da5c8ea0129536be2412b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 231,
+      "end_line": 255,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5,
+      "end_line": 29,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n\nfn admin_ui_public_dir() -> PathBuf {\n    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n",
+      "source_digest": "4c5d09679c21c6e8233bb0287739607946329d361e80961166ae9c25aaba8021",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 81,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "6d9bfc55034970054b53bbd9e3f28b458fe77b84a5fdfd213e49faec070b7e10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 83,
+      "end_line": 103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n    kafka?;\n    info!(\"Server shutdown complete\");\n    Ok(())\n}\n",
+      "source_digest": "080e0ab2ed2ac8899ae5ac3976b27d41512bbe0f1720cc37e076dfb60108ce83",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 15,
+      "end_line": 39,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ActionControlSeenRow, ActionControlView, AllowedActions, ConfidenceEvidence, ConfidenceLevel,\n    ConfidenceView, ControlEntity, ControlMode, CseLists, EvidenceOverride, LevelRow, Lifetime,\n    PageAction, PodActionControlView, ROLLOUT_ALL_BP, ROWS_RECORD_VERSION, RowSetting, RowView,\n    RowsRequest, SafetyChecksByEntity, UnreadableRecord, in_rollout, rollout_bucket,\n};\n\nmod levels;\npub use levels::level_lkey;\n\nuse crate::confidence::{ConfidenceConfig, RowOutcome};\nuse crate::decision::ActionSpec;\nuse crate::facts::EntityType;\nuse crate::gizmoduck_labels::{CLIENT_EVENT_PHOENIX_SKIP, SPAM_HIGH_RECALL};\nuse crate::growthbook::DynamicConfig;\nuse crate::metrics;\nuse crate::off_switch::valid_name;\n\npub const MH_PKEY: &str = \"action_control\";\npub const SEEN_PKEY: &str = \"action_control_seen\";\npub const SEEN_ROWS_PKEY: &str = \"action_control_seen_rows\";\npub const SAVE_PKEY_PREFIX: &str = \"action_control_save:\";\nconst SAVE_HOLD_MS: i64 = 420_000;\nconst SAVE_TTL_SECS: u64 = 3_600;\nconst SAVE_BUDGET: Duration = Duration::from_secs(110);\npub const HISTORY_PKEY_PREFIX: &str = \"action_control_history:\";\n",
+      "source_digest": "10be72f28aec304ac9f66cc6c8360af189b5bdbb4ba76cd4901ea1bb0d439a33",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 58,
+      "end_line": 82,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub const SEEN_TTL_SECS: u64 = 30 * 86_400;\npub const SEEN_WRITE_EVERY: Duration = Duration::from_secs(600);\nconst SEEN_QUEUE: usize = 256;\nconst SEEN_GUARD_MAX: usize = 10_000;\nconst LOCAL_WRITE_GRACE: Duration = Duration::from_secs(30);\nconst MAX_REASON_LEN: usize = 1_000;\nconst MAX_NAME_LEN: usize = 256;\npub const HISTORY_LIMIT_DEFAULT: usize = 50;\npub const HISTORY_LIMIT_MAX: usize = 500;\npub const CONFIRM_WORD: &str = \"ENFORCE\";\npub const PAGE_RULE_ID: &str = \"page\";\npub const STATUS_NO_ACTIONS: &str = \"no_actions\";\npub const FORCED_RECORDING_KEY: &str = \"action_control_forced_recording\";\n\npub fn lkey_for(\n    entity: ControlEntity,\n    head: &str,\n    classifier: Option<&str>,\n    band: Option<&str>,\n) -> String {\n    let e = entity.as_str();\n    match (classifier, band) {\n        (None, None) => format!(\"{e}/h/{head}\"),\n        (Some(c), None) => format!(\"{e}/c/{head}/{c}\"),\n        (None, Some(b)) => format!(\"{e}/b/{head}/{b}\"),\n",
+      "source_digest": "a94e08e71bd1431ea3eee8c229dc041c8893f9217e005c7d04900e00e3eefc9d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    classifier: Option<&str>,\n    band: Option<&str>,\n) -> String {\n    let e = entity.as_str();\n    match (classifier, band) {\n        (None, None) => format!(\"{e}/h/{head}\"),\n        (Some(c), None) => format!(\"{e}/c/{head}/{c}\"),\n        (None, Some(b)) => format!(\"{e}/b/{head}/{b}\"),\n        (Some(c), Some(b)) => format!(\"{e}/cb/{head}/{c}/{b}\"),\n    }\n}\n\npub fn record_lkey(rec: &ActionControlRecord) -> String {\n    match rec.confidence {\n        Some(level) => level_lkey(rec.entity_type, &rec.head, rec.classifier.as_deref(), level),\n        None => lkey_for(\n            rec.entity_type,\n            &rec.head,\n            rec.classifier.as_deref(),\n            rec.band.as_deref(),\n        ),\n    }\n}\n\nfn record_lkey_of(req: &ActionControlPutRequest) -> String {\n",
+      "source_digest": "7070fc009dc409291bc66c5211a0a7da712f262a2c4359d36b335127766240c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 87,
+      "end_line": 111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub fn record_lkey(rec: &ActionControlRecord) -> String {\n    match rec.confidence {\n        Some(level) => level_lkey(rec.entity_type, &rec.head, rec.classifier.as_deref(), level),\n        None => lkey_for(\n            rec.entity_type,\n            &rec.head,\n            rec.classifier.as_deref(),\n            rec.band.as_deref(),\n        ),\n    }\n}\n\nfn record_lkey_of(req: &ActionControlPutRequest) -> String {\n    match req.confidence {\n        Some(row) => level_lkey(req.entity_type, &req.head, req.classifier.as_deref(), row),\n        None => lkey_for(\n            req.entity_type,\n            &req.head,\n            req.classifier.as_deref(),\n            req.band.as_deref(),\n        ),\n    }\n}\n\npub fn seen_lkey(seen: &ActionControlSeen) -> String {\n",
+      "source_digest": "75d690e974e22c1f3e89dca878d10aec0068501cc9095f05e2f42d1d10329de6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 113,
+      "end_line": 137,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"{}/{}/{}/{}\",\n        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\nconst RISKY_HIGH_VIZ_REPLY: &str = \"RiskyHighVizReply\";\n",
+      "source_digest": "d074616a3d3fa8ea4d3c1dbe29e9b221a3961ca130bf0685a711385662640074",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 114,
+      "end_line": 138,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        seen.entity_type.as_str(),\n        seen.head,\n        seen.classifier,\n        seen.band\n    )\n}\n\npub fn strip_dry_run_prefix(label: &str) -> &str {\n    label.strip_prefix(DRY_RUN_LABEL_PREFIX).unwrap_or(label)\n}\n\npub fn has_dry_run_prefix(labels: &[String]) -> bool {\n    labels.iter().any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX))\n}\n\npub fn entity_of(e: EntityType) -> ControlEntity {\n    match e {\n        EntityType::User => ControlEntity::User,\n        EntityType::Post => ControlEntity::Post,\n    }\n}\n\n\nconst RISKY_HIGH_VIZ_REPLY: &str = \"RiskyHighVizReply\";\n\n",
+      "source_digest": "11a121910d2a316ef6bfea43410cc5e320df906b5e9a9c77d50572339c57d3c6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 142,
+      "end_line": 166,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        | PageAction::PhoenixSkip { .. }\n        | PageAction::PostSpamHighRecall { .. }\n        | PageAction::HideReply { .. } => 0,\n        PageAction::LivenessCheck {} => 1,\n        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n",
+      "source_digest": "6e0984a921f2a50841f8ed2424d4cd0174c4cbaab2a57e22922208278379aa82",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 146,
+      "end_line": 170,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        PageAction::Suspend {} | PageAction::SuspendAuthor {} => 2,\n    };\n    let mut sorted: Vec<PageAction> = actions.to_vec();\n    sorted.sort_by_key(rank);\n    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n",
+      "source_digest": "5a6f7d44889c1a7fb5e6e7936c08739bf7b402b8a6865b212274acce0652cc1c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 150,
+      "end_line": 174,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    sorted\n        .into_iter()\n        .map(|a| match a {\n            PageAction::SpamHighRecall { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n",
+      "source_digest": "2610cd5b6b59c3eb07176ac6e3de7395aa5fc387c51e8706d88e6ecd59a4898a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 154,
+      "end_line": 178,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PhoenixSkip { lifetime } => ActionSpec::AddLabelsV2 {\n                labels: vec![CLIENT_EVENT_PHOENIX_SKIP.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::PostSpamHighRecall { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![SPAM_HIGH_RECALL.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::HideReply { lifetime } => ActionSpec::AddPostLabelsV2 {\n                labels: vec![RISKY_HIGH_VIZ_REPLY.into()],\n                ttl_msec: lifetime.ttl_msec(),\n            },\n            PageAction::LivenessCheck {} => ActionSpec::SpamLivenessCheck,\n            PageAction::Suspend {} | PageAction::SuspendAuthor {} => ActionSpec::SuspendUser {\n                perm: false,\n                policy: \"PlatformManipulation\".into(),\n            },\n        })\n        .collect()\n}\n\npub fn label_only(actions: &[PageAction]) -> Option<&'static str> {\n",
+      "source_digest": "adadd7aa876c8ff3598f1157133d7bc56ad9320436f3561f2fb64ba622ee3d85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 183,
+      "end_line": 207,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 189,
+      "end_line": 213,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n",
+      "source_digest": "64c8f218d5d73366a01241e0cd0d62a2078216e26d4f2ef9e5ef946d6bc749ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 190,
+      "end_line": 214,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n",
+      "source_digest": "c0a8204a842e4117828c133cb5a8a3edf8ac48babcb3840db7a19a8659a553dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 196,
+      "end_line": 220,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n                for label in labels {\n                    let mut o = serde_json::json!({\"kind\": kind, \"label\": label});\n                    match ttl_msec {\n                        Some(t) => {\n                            o[\"ttl_days\"] = ttl_days(*t);\n                            o[\"permanent\"] = Value::Bool(false);\n                        }\n                        None => o[\"permanent\"] = Value::Bool(true),\n                    }\n                    out.push(o);\n                }\n            }\n            ActionSpec::SpamLivenessCheck => {\n",
+      "source_digest": "c0a3805f37654d53bded13a0bb256231388c2ac3b06da5c8ea0129536be2412b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 242,
+      "end_line": 266,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-760776e8fe6c6f9b2d9f7cd1e70e19645e6fb259d48f75d65cc88813e9e55ff5",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/staging",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "cb2fa34d170ec374302f5a037102aa736b3670a1679ee92945300c510eb305c8",
+      "context_complete": true,
+      "task_id": "T-7b2d1e7e7a0a86602d933f13f6fc838f08cbdb6caa1edb3c0b0a55d3fa4e19a8",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5554fd745c444a8cf3386f49649a50171f91cc12195cd16cd92fc92183ab9abb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-2cb9862fe7dfe6d25aaa1e4874b65b91b1597037c85b85770c74ff46ce2af677",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6970d3f9127697a13e23feff3a418d73730ea7c3905648d199cae54bc3aa2337",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-7f7e60ec473f6a9add9b3e7a9b3c21679ee0720ef948e28c126677207638801e",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4ff882c8fbca2f34de69c0c1352a104313e80694ce56528efc6c17e24fe4e320",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-b8a59343a2896839ac7e5a7fdd88e3a7bc46a63e5f091d55f8071e505d30fd25",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-da5cda80ee60e7bd435c00b0ecd1cd1120f3b3e64d7ea01748fc1d0c89ea9ac4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-8ba3d2b22b7bef8e72742be9c91742d9f52c88493dfaa4465833da2bef68b491",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-34259bca6b5f4378b22b395d39c8909ae1dad2cf64488d4cc98d2a534a1978ba",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-97c08dc03c91d7987c2d47a2694b01511ea0de10ec4e43300156d4b84d311138",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e08f530f0960497c44b9fac7ad1a838127dc0388a96bab3ea49d828290123b59",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-0470eda68cce188d9b488830b1affbb13f7083b92d2f2a9a0cf56f32796cc7ec",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dec3ab4847136cbed8a8ac847d5bdc27b2f735353c66bc9a8101925bfd2537a5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-63099e9b929db5ecdf91316cdb00b85156c4ceb82ff086427b8897a4d45abec3",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6d9a621fc6371e52c6f22a729376b2eccf99243622fe9acee818b9ae4ee0e89b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-23f501884e59162dc2862cbe542d50cd5fb987991a68441726909e25873a24ed",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-920f5d9ce0ba912d85b9d7fdfdf98f433629c6ae333e30ec4fb18f60340e6ac0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-9f6a6d78d1ccfac9e9db09afab01d926876e3c67e5e6bd0feb4e2d2afd2287ef",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9c890f5987cfea943516f1950294b8974ceb001d5aa14ed6c31421aee13d5362",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-4923b8c9b98f39215441d6e34f241d598a55919b64aad81ebc999067bfd6728b",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d67a4d0b4cb180f1cda412e23c7a629ddc7e42c3bd218cfe7cc2b5beeff464e7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-b75a722dd6c42f94557c86bbf505a3670553e9cd366609868c5bda9c8441fa04",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d31cd473aa7f4d56067ca0c166c5c6f00acd6335a0f16642dfc9e667df3a0d52",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-5b6f1ae518159af1d2f28bbe37863777ccb9611ed77acd5c6988024f7752f9d6",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d950418922613cd4ff1bde9b42b24e3fc8ee86b99a781ebb8cb79a56ec1de992",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-0391c94d99517f153aa0e8d1eda5d46c2b53d934c91a3332042256f8c36e8d9c",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-00f5bf9e1077c508be4a7af11f32d715910acb340fdb794dc2daed9bfb50a69c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-b9328923220a852db09eb13144d55759cbd6b7e8aba166b515ef6895fc36c9b3",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c419c1b6cb1b2e43a96aff1f5d2ab9f5a6d185a098c697ba63bfa21992e7e4a2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-4ddba43ea610116fd43b60fb79c0e90c9fccb030d5c23aa2e92afb510bda296f",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-59822383071054f05d1f0a4adcbca0b50c75a358dfd8d2f2be0d53dc836ee58c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-389cb2d6898a756398da4658fe12d4cb96c5630fd9c596369b750513b01d6a7c",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3b7dcda53b9f130aefcb88dc892faefd687a3696cef92319abdf8fa6b4b9f579",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-905428c6ee8a987629a9ce63c132ba80fd26bba1c72f9fd602bbaddac2a13cd8",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d183ce41213bd02793727439b54919f05b94f24b0bf2476de3e51222be43ef3f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-18b6be66e13470d96b2d1372040b85bc85083a2fea046bc06f7cf88c19309f0a",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5b9bbf30648431c47bf91a485a1721e5e0bf24f16dd26ca5f6d2e7051b0cf1a3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-f3bcd55ba9048349cdccc77e14493e5877f091203b02fb20c54b457de3d3a9e5",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-83922d69c67a3b5e68b95354632b148adcff7132adc140bfe243cb09a8c9fa93",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-94a848e36f7afb52b01999e4d4d7077e91b43620b027dd7bb7fdbab6b17c93cc",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-63aaae1cdbc96a1bed29d6a024fa7c41a6cea322705275b3eed18fbcd3919c84",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-e527d53f046361b6d1aae01272fcaa98dad7c3ca8195b3b6d39ab3fdb91680c3",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-faa2afb191ac1dd8fc00c6424f31f3c03e07674438c1387b9f63609f7b06acbd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-1943628a9b624e42ba662d602872713af4b9adb2544e2d925084ab4194f5bd94",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1b47711fcce6ced207952ace8a2937fb0ee06aa218bfee1cbe37029ae8575e4c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-fe4d581f8668a785be7ff18e14568ab67a13bad30dbfbd0695560858b66b9727",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ba3ed8befc330a53d8e10c8e655fa31133f038d81353e465d038c7bc22cd76e6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-3467132698dc149d9ebaee286b96b24c10902f1a5ff6b65f7286197b0681dc39",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-301f9470eee22a15ee2113c90a6f0e9f2e6d6aaf1ef6467efdcd86376e284701",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-f4098727f4cf83a5d669f27b92c48a9cdea13a3718e9cad1c86f1ffcd612fdf5",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fa02b0d433736ec3fa5e7de4984b33e9ba66f0474d14f7a531a7e895ff89e0e7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-527f2969dabfc93f906231fad933721b654660b6b3cc27437a94ffa88bcd13a0",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f0f4e987124af7c1d3bbba9bbf6fd18fe5c7e02c4b2a66f5c0a9e5ad6e98e6d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-4b8dc2ee223f55d3381651bb3a8ae85e7017e1721654d8b3ae0ddf1e88f8cd68",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-85dcd59fc4c253689e6cfd761725f3efbb3d1f40c1bde724790cce2aa1c3a056",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-c98639d57c23742987b5bf547b5ba8dd1310d64517c808b2e145c407860f69c0",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d3d97ae9cfd5a3b11dcadd8cb11123413e86b818320e8f80ccd23d6311d1514b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-2720791b7ef31755e47b704905ce4012b5d194fd939e85e50531508c85fc1154",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7ff953a8d4eaecd935f86c85b24429f160655f8bf3f46b3301f7714ebad303bc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa6bbf7ca8f4b56aef90c5f29ebfb7fa2652b87a1aea78b650fdc76d1c364da5",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-44986e6682024e40aa9e3ff67f6191bc3303fec279c15e0c998b241ebb921a3a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-43b8a018f130603d2e82755d214f17401a595aede1391ba5b399214cfb130cf9",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2f74762130f00c40c375cf3d5ee1d39bf7a08651964f98a15e16164b928cba6d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-1f088fc2fec45862a8bdb8a15c030ff3573e1a9d8c54288aaa41e9cafa531918",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-832b03c09bba70173713b2961d6227cebc24a9dcab7bfa31b373b2350b0d3eea",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-cedd96b02ad05490a1ce76ba015f68646db49db5f45265dcc4d50fae92d610cd",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-17729d63359939e023b66927040825dbfc64dcbde37bbe23244910a6e9c7b8eb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-64e169698a006ee989e65919c795c2da3f4dfe8035d0ec815bd879592dca96be",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1cc33264288445ebbbb86a9b7719a6aff9fe9dfe69e95a3a7cb5f4e14b6d8029",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-4abed44e51647dcbc9ccef869625e8b7f2c10a872dcf6fedeb1db5bd3bbed366",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f36464e6993a5dc228f7d510a76075acc434915e645ed9dde91a0dfb13ecd965",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-8fceb758fa499ca7cd5c7a546ac8da8a69180a49d0f20255e9a9196f6945c25e",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6f09f30738f45974fb4aa0fcb221171b2a51d4c85e17e91fb80c299994c5f7a9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-3d5ca04d8c46f19e83a1c2f69d184af897ee7a3401ff64f3ef7c176cee748862",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dd1969a28f78c7bfc7737b127017bf3e49969f8f47962e7d15d1722809cd5fdb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-0125ecff35fc80b4e8554c7d4750ba8af331f6672733d2d5cdd8baec001943cc",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5af1e06af46b0e2a8d91b6f6cc68c8fe9b41c09f25bca4f23fa91608943c6690",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-8d94e7e1adb44d3e9462f81b208da6ddfe992471741fb9bc803cb9f68bffa3e6",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ea6f5aea715987fd1ee9a18a9513f38ebb269e02b709e749f94a814e6dc74b44",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-de739261b91c22260d554096fdcf91a0e060ebaca9ca84d6df869591cf6fc385",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-555b999caeaf5d09146726c9f94b8bc07c150de6a169cf2945f114cdd6745fd1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-1c3ed4e6b54f8419d46e0b475268f44e90dcf42ca488b7908d292c5ead8dd7bd",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-de4ff0cd249e4d51d244deae27f7aceb164e1b845c0ce653c06fbce799b4618b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-4654c9d43db8b7fd653faffbb2b147f7caf52a72b5f7f56f0f7c546dddf33102",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aa88939e096df93015969bc5c473a6c303bf5bb66a9a9c17dcf4b5987d186171",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-bf7d7527340f2bfbc3753fd8eb072e6eaec5b81ae04b7f914329fe949cd0f663",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fecca9e7f7d14a5c0eb3182b3db50bf2e467720e56223387e713d1fac6e98bcc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-10e77392bd1641343419dd2948cea46fcc66f7be073c6cd45e7a6d4db8e17d61",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ae4443e0e65733c4c8ed717c0fd39682b5f4e3fb758373e8b1889807f0e07610",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-6e12500d69182021418e0fe498f6085eb2e84bf2f8ce22782c3dbaf91e0dcde4",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3867783d6d70aefbbda0a9abfc1c92d2f71ff6bcc3db4f1331be21589d5a1dd1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-331f161b0986e5f41135d4ddf097f28d3eacfc1cda33e09c419a140e7ca4d90b",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e7f6851e1cdc52ede496e8b70f0f5f42c0d1a5c13f8a6c309d34948d728aca32",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-305a42dc969807521b4419f23c3eccdb16ee90935c6053550142ca8cf6eedd58",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/users.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f778ed2a8ada1a2d0806384af3497de5acb3ae0a4cf9badbc3d51f770dfbf654",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "labels",
+        "known_difference",
+        "UserReference",
+        "new",
+        "spawn",
+        "compare",
+        "scala",
+        "record"
+      ],
+      "context_complete": false,
+      "task_id": "T-fb450fac7e91e9e1a9e242be1fa8bc3b9499b6519c58ece07f799ee214470fca",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-42b5e665c813f0cfb932728ecef2ca3e49c6c35beb7ac53bf2c0cf3e513c6c21"
+}

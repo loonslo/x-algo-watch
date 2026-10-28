@@ -1,0 +1,1915 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/staging/reference/mod.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-aa22330a610fdf64fbb74b69cd4b550ce9f0b20e2accb3232cb1b5ad053eabe2",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/staging",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 235,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::config::{ENV_APP_ENV, ENV_REFERENCE, parse_env_flag};\nuse crate::evaluate_tweets::EntryComparator;\nuse crate::filter_tweets::{Comparator, FinishComparison};\nuse crate::params::ClientSwitches;\nuse crate::post_evaluator::{PostEvaluation, PostEvaluator};\nuse crate::quote::Passes;\nuse crate::rules::SafetyLevel;\nuse crate::server_deps::{Comparators, init_client_with_retry, with_metadata};\nuse std::env;\nuse std::sync::Arc;\nuse strum::VariantNames;\nuse tokio::time::Instant;\nuse tonic::metadata::MetadataMap;\nuse tweetypie::TweetypieReference;\nuse vf_service::{ReferenceCompareHarness, TweetVerdict};\nuse xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};\nuse xai_twittercontext_proto::TwitterContextViewer;\nuse xai_visibility_filtering::vf_client::{StratoVfClient, VfClient};\n\npub(crate) mod tweetypie;\npub(crate) mod vf_service;\n\nconst ENV_DUAL_CALL_HARNESS_ENABLED: &str = \"VF_DUAL_CALL_HARNESS_ENABLED\";\npub const ENV_IMAGE: &str = \"VF_IMAGE\";\npub const ENV_TWEETYPIE_XDS_LISTENER: &str = \"VF_TWEETYPIE_XDS_LISTENER\";\npub const ENV_TWEETYPIE_TLS_DOMAIN: &str = \"VF_TWEETYPIE_TLS_DOMAIN\";\npub const ENV_TWEETYPIE_CLIENT_ID: &str = \"VF_TWEETYPIE_CLIENT_ID\";\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::VariantNames)]\n#[strum(serialize_all = \"snake_case\")]\npub enum Reference {\n    None,\n        VfService,\n        Tweetypie,\n}\n\nimpl Reference {\n        pub fn resolve(\n        configured: Option<&str>,\n        legacy_harness_flag: bool,\n        app_env: Option<&str>,\n    ) -> Result<Self, String> {\n        if legacy_harness_flag {\n            return Err(format!(\n                \"{ENV_DUAL_CALL_HARNESS_ENABLED} is replaced by {ENV_REFERENCE}=vf_service\"\n            ));\n        }\n        let reference = configured.map_or(Ok(Self::None), |value| {\n            value.parse().map_err(|_| {\n                format!(\n                    \"{ENV_REFERENCE}={value:?} is not one of {}\",\n                    Self::VARIANTS.join(\", \")\n                )\n            })\n        })?;\n        match (reference, app_env) {\n            (Self::None, _) => Ok(Self::None),\n            (_, Some(\"prod\")) => Err(format!(\n                \"{ENV_REFERENCE} selects {reference:?} but {ENV_APP_ENV}=prod; reference comparisons are staging-only\"\n            )),\n            (reference, _) => Ok(reference),\n        }\n    }\n}\n\n#[expect(clippy::panic, reason = \"startup fail-fast on misconfiguration\")]\nfn reference() -> Reference {\n    Reference::resolve(\n        env::var(ENV_REFERENCE).ok().as_deref(),\n        parse_env_flag(env::var(ENV_DUAL_CALL_HARNESS_ENABLED).ok().as_deref()),\n        env::var(ENV_APP_ENV).ok().as_deref(),\n    )\n    .unwrap_or_else(|misconfiguration| panic!(\"{misconfiguration}\"))\n}\n\npub(crate) async fn build(\n    datacenter: &str,\n    init_deadline: Instant,\n    post_evaluator: &Arc<PostEvaluator>,\n    client_switches: &ClientSwitches,\n    metadata: Option<&MetadataMap>,\n) -> Comparators {\n    match reference() {\n        Reference::None => Comparators::default(),\n        Reference::VfService => Comparators {\n            filter_tweets: Some(Box::new(\n                build_vf_service(datacenter, init_deadline, metadata).await,\n            )),\n            evaluate_tweets: None,\n        },\n        Reference::Tweetypie => {\n            let reference = tweetypie::build(\n                init_deadline,\n                post_evaluator,\n                client_switches.clone(),\n                metadata,\n            )\n            .await;\n            Comparators {\n                filter_tweets: Some(Box::new(Arc::clone(&reference))),\n                evaluate_tweets: Some(Box::new(reference)),\n            }\n        }\n    }\n}\n\n#[expect(\n    clippy::expect_used,\n    reason = \"startup fail-fast: init failure is fatal\"\n)]\nasync fn build_vf_service(\n    datacenter: &str,\n    init_deadline: Instant,\n    metadata: Option<&MetadataMap>,\n) -> Arc<ReferenceCompareHarness> {\n    let client_id = format!(\n        \"visibility-filtering-service.{}\",\n        env::var(ENV_APP_ENV).unwrap_or_else(|_| \"staging\".to_string())\n    );\n    let strato: Arc<dyn VfClient + Send + Sync> = Arc::new(\n        init_client_with_retry(\"strato_vf\", init_deadline, || {\n            let client_id = client_id.clone();\n            async move {\n                let mut client = StratoVfClient::new(\n                    S2S_CHAIN_PATH.clone(),\n                    S2S_CRT_PATH.clone(),\n                    S2S_KEY_PATH.clone(),\n                    client_id,\n                    datacenter.to_string(),\n                )\n                .await\n                .map_err(|e| e.to_string())?;\n                client.grpc_client = Arc::new(with_metadata(\n                    Arc::unwrap_or_clone(client.grpc_client),\n                    metadata,\n                ));\n                Ok::<_, String>(client)\n            }\n        })\n        .await\n        .expect(\"Failed to initialize Strato VF client (reference comparator)\"),\n    );\n    Arc::new(ReferenceCompareHarness::new(strato, datacenter))\n}\n\nimpl Comparator for Arc<ReferenceCompareHarness> {\n    fn begin(\n        &self,\n        viewer_id: Option<u64>,\n        country_code: Option<String>,\n        safety_level: SafetyLevel,\n        tweet_ids: Vec<u64>,\n    ) -> Option<FinishComparison> {\n        let verdicts = self.begin_compare(viewer_id, country_code, safety_level, tweet_ids)?;\n        Some(Box::new(move |outcomes| {\n            verdicts.send(\n                outcomes\n                    .iter()\n                    .map(|outcome| TweetVerdict {\n                        tweet_id: outcome.tweet_id.0,\n                        verdict: outcome.evaluation.verdict().clone(),\n                    })\n                    .collect(),\n            );\n        }))\n    }\n}\n\nimpl Comparator for Arc<TweetypieReference> {\n    fn begin(\n        &self,\n        viewer_id: Option<u64>,\n        country_code: Option<String>,\n        safety_level: SafetyLevel,\n        _tweet_ids: Vec<u64>,\n    ) -> Option<FinishComparison> {\n        let reference = Arc::clone(self);\n        Some(Box::new(move |outcomes| {\n            reference.spawn(viewer_id, country_code, safety_level, outcomes);\n        }))\n    }\n}\n\nimpl EntryComparator for Arc<TweetypieReference> {\n    fn compare(\n        &self,\n        viewer_id: Option<u64>,\n        context: Option<&TwitterContextViewer>,\n        country_code: Option<&str>,\n        safety_level: SafetyLevel,\n        outcomes: &[PostEvaluation],\n        quote_passes: &Passes,\n    ) {\n        self.spawn_quote_comparison(\n            viewer_id,\n            context,\n            country_code,\n            safety_level,\n            outcomes,\n            quote_passes.ran(),\n        );\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::Reference;\n\n    #[test]\n    fn reference_defaults_to_none_and_is_refused_in_prod() {\n        assert_eq!(\n            Reference::resolve(None, false, Some(\"staging\")),\n            Ok(Reference::None)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"none\"), false, Some(\"staging\")),\n            Ok(Reference::None)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"vf_service\"), false, Some(\"staging\")),\n            Ok(Reference::VfService)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"tweetypie\"), false, Some(\"staging\")),\n            Ok(Reference::Tweetypie)\n        );\n        assert!(Reference::resolve(Some(\"VfService\"), false, Some(\"staging\")).is_err());\n        assert!(Reference::resolve(Some(\"vf_service\"), false, Some(\"prod\")).is_err());\n        assert_eq!(\n            Reference::resolve(Some(\"none\"), false, Some(\"prod\")),\n            Ok(Reference::None)\n        );\n        assert!(Reference::resolve(None, true, Some(\"staging\")).is_err());\n    }\n}\n",
+      "source_digest": "d4c67a80eea79176b96830340c7c54523e8ef491e493da8908fadc6b57adaf96",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 299,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::config::{ENV_APP_ENV, ENV_REFERENCE, parse_env_flag};\nuse crate::evaluate_tweets::EntryComparator;\nuse crate::filter_tweets::{Comparator, FinishComparison};\nuse crate::params::ClientSwitches;\nuse crate::post_evaluator::{PostEvaluation, PostEvaluator};\nuse crate::quote::Passes;\nuse crate::rules::SafetyLevel;\nuse crate::server_deps::{Comparators, init_client_with_retry, with_metadata};\nuse std::env;\nuse std::sync::Arc;\nuse strum::VariantNames;\nuse tokio::time::Instant;\nuse tonic::metadata::MetadataMap;\nuse tweetypie::TweetypieReference;\nuse users::UserReference;\nuse vf_service::{ReferenceCompareHarness, TweetVerdict};\nuse xai_core_entities::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};\nuse xai_twittercontext_proto::TwitterContextViewer;\nuse xai_visibility_filtering::vf_client::StratoVfClient;\n\npub(crate) mod tweetypie;\nmod users;\npub(crate) mod vf_service;\n\nconst ENV_DUAL_CALL_HARNESS_ENABLED: &str = \"VF_DUAL_CALL_HARNESS_ENABLED\";\npub const ENV_IMAGE: &str = \"VF_IMAGE\";\npub const ENV_TWEETYPIE_XDS_LISTENER: &str = \"VF_TWEETYPIE_XDS_LISTENER\";\npub const ENV_TWEETYPIE_TLS_DOMAIN: &str = \"VF_TWEETYPIE_TLS_DOMAIN\";\npub const ENV_TWEETYPIE_CLIENT_ID: &str = \"VF_TWEETYPIE_CLIENT_ID\";\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::VariantNames)]\n#[strum(serialize_all = \"snake_case\")]\npub enum Reference {\n    None,\n        VfService,\n        Tweetypie,\n            Users,\n}\n\nimpl Reference {\n        pub fn resolve(\n        configured: Option<&str>,\n        legacy_harness_flag: bool,\n        app_env: Option<&str>,\n    ) -> Result<Self, String> {\n        if legacy_harness_flag {\n            return Err(format!(\n                \"{ENV_DUAL_CALL_HARNESS_ENABLED} is replaced by {ENV_REFERENCE}=vf_service\"\n            ));\n        }\n        let reference = configured.map_or(Ok(Self::None), |value| {\n            value.parse().map_err(|_| {\n                format!(\n                    \"{ENV_REFERENCE}={value:?} is not one of {}\",\n                    Self::VARIANTS.join(\", \")\n                )\n            })\n        })?;\n        match (reference, app_env) {\n            (Self::None, _) => Ok(Self::None),\n            (_, Some(\"prod\")) => Err(format!(\n                \"{ENV_REFERENCE} selects {reference:?} but {ENV_APP_ENV}=prod; reference comparisons are staging-only\"\n            )),\n            (reference, _) => Ok(reference),\n        }\n    }\n}\n\n#[expect(clippy::panic, reason = \"startup fail-fast on misconfiguration\")]\nfn reference() -> Reference {\n    Reference::resolve(\n        env::var(ENV_REFERENCE).ok().as_deref(),\n        parse_env_flag(env::var(ENV_DUAL_CALL_HARNESS_ENABLED).ok().as_deref()),\n        env::var(ENV_APP_ENV).ok().as_deref(),\n    )\n    .unwrap_or_else(|misconfiguration| panic!(\"{misconfiguration}\"))\n}\n\npub(crate) async fn build(\n    datacenter: &str,\n    init_deadline: Instant,\n    post_evaluator: &Arc<PostEvaluator>,\n    client_switches: &ClientSwitches,\n    metadata: Option<&MetadataMap>,\n) -> Comparators {\n    match reference() {\n        Reference::None => Comparators::default(),\n        Reference::VfService => Comparators {\n            filter_tweets: Some(Box::new(Arc::new(ReferenceCompareHarness::new(\n                strato_vf(datacenter, init_deadline, metadata).await,\n                datacenter,\n            )))),\n            evaluate_tweets: None,\n        },\n        Reference::Users => {\n            let strato = strato_vf(datacenter, init_deadline, metadata).await;\n            Comparators {\n                filter_tweets: Some(Box::new(Arc::new(UserReference::new(\n                    Arc::clone(&strato.grpc_client),\n                    post_evaluator,\n                )))),\n                evaluate_tweets: None,\n            }\n        }\n        Reference::Tweetypie => {\n            let reference = tweetypie::build(\n                init_deadline,\n                post_evaluator,\n                client_switches.clone(),\n                metadata,\n            )\n            .await;\n            Comparators {\n                filter_tweets: Some(Box::new(Arc::clone(&reference))),\n                evaluate_tweets: Some(Box::new(reference)),\n            }\n        }\n    }\n}\n\n#[expect(\n    clippy::expect_used,\n    reason = \"startup fail-fast: init failure is fatal\"\n)]\nasync fn strato_vf(\n    datacenter: &str,\n    init_deadline: Instant,\n    metadata: Option<&MetadataMap>,\n) -> Arc<StratoVfClient> {\n    let client_id = format!(\n        \"visibility-filtering-service.{}\",\n        env::var(ENV_APP_ENV).unwrap_or_else(|_| \"staging\".to_string())\n    );\n    Arc::new(\n        init_client_with_retry(\"strato_vf\", init_deadline, || {\n            let client_id = client_id.clone();\n            async move {\n                let mut client = StratoVfClient::new(\n                    S2S_CHAIN_PATH.clone(),\n                    S2S_CRT_PATH.clone(),\n                    S2S_KEY_PATH.clone(),\n                    client_id,\n                    datacenter.to_string(),\n                )\n                .await\n                .map_err(|e| e.to_string())?;\n                client.grpc_client = Arc::new(with_metadata(\n                    Arc::unwrap_or_clone(client.grpc_client),\n                    metadata,\n                ));\n                Ok::<_, String>(client)\n            }\n        })\n        .await\n        .expect(\"Failed to initialize Strato VF client (reference comparator)\"),\n    )\n}\n\nimpl Comparator for Arc<ReferenceCompareHarness> {\n    fn begin(\n        &self,\n        viewer_id: Option<u64>,\n        country_code: Option<String>,\n        safety_level: SafetyLevel,\n        tweet_ids: Vec<u64>,\n    ) -> Option<FinishComparison> {\n        let verdicts = self.begin_compare(viewer_id, country_code, safety_level, tweet_ids)?;\n        Some(Box::new(move |outcomes| {\n            verdicts.send(\n                outcomes\n                    .iter()\n                    .map(|outcome| TweetVerdict {\n                        tweet_id: outcome.tweet_id.0,\n                        verdict: outcome.evaluation.verdict().clone(),\n                    })\n                    .collect(),\n            );\n        }))\n    }\n}\n\nimpl Comparator for Arc<UserReference> {\n    fn begin(\n        &self,\n        viewer_id: Option<u64>,\n        _country_code: Option<String>,\n        safety_level: SafetyLevel,\n        tweet_ids: Vec<u64>,\n    ) -> Option<FinishComparison> {\n        let reference = Arc::clone(self);\n        Some(Box::new(move |_| {\n            reference.spawn(viewer_id, safety_level, tweet_ids);\n        }))\n    }\n}\n\nimpl Comparator for Arc<TweetypieReference> {\n    fn begin(\n        &self,\n        viewer_id: Option<u64>,\n        country_code: Option<String>,\n        safety_level: SafetyLevel,\n        _tweet_ids: Vec<u64>,\n    ) -> Option<FinishComparison> {\n        let reference = Arc::clone(self);\n        Some(Box::new(move |outcomes| {\n            reference.spawn(viewer_id, country_code, safety_level, outcomes);\n        }))\n    }\n}\n\nimpl EntryComparator for Arc<TweetypieReference> {\n    fn compare(\n        &self,\n        viewer_id: Option<u64>,\n        context: Option<&TwitterContextViewer>,\n        country_code: Option<&str>,\n        safety_level: SafetyLevel,\n        outcomes: &[PostEvaluation],\n        quote_passes: &Passes,\n    ) {\n        self.spawn_quote_comparison(\n            viewer_id,\n            context,\n            country_code,\n            safety_level,\n            outcomes,\n            quote_passes.ran(),\n        );\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::Reference;\n    use serde::Deserialize;\n\n    #[test]\n    fn reference_defaults_to_none_and_is_refused_in_prod() {\n        assert_eq!(\n            Reference::resolve(None, false, Some(\"staging\")),\n            Ok(Reference::None)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"none\"), false, Some(\"staging\")),\n            Ok(Reference::None)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"vf_service\"), false, Some(\"staging\")),\n            Ok(Reference::VfService)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"tweetypie\"), false, Some(\"staging\")),\n            Ok(Reference::Tweetypie)\n        );\n        assert_eq!(\n            Reference::resolve(Some(\"users\"), false, Some(\"staging\")),\n            Ok(Reference::Users)\n        );\n        assert!(Reference::resolve(Some(\"VfService\"), false, Some(\"staging\")).is_err());\n        assert!(Reference::resolve(Some(\"vf_service\"), false, Some(\"prod\")).is_err());\n        assert_eq!(\n            Reference::resolve(Some(\"none\"), false, Some(\"prod\")),\n            Ok(Reference::None)\n        );\n        assert!(Reference::resolve(None, true, Some(\"staging\")).is_err());\n    }\n\n    #[derive(Deserialize)]\n    #[serde(rename_all = \"snake_case\")]\n    enum Kind {\n        Deliberate,\n        Gap,\n    }\n\n        #[derive(Deserialize)]\n    #[serde(deny_unknown_fields)]\n    struct Divergence {\n        divergence: String,\n        kind: Kind,\n        ticket: Option<String>,\n        behavior: String,\n    }\n\n    #[test]\n    fn each_divergence_states_its_behavior_and_a_gap_names_its_ticket() {\n        let path = crate::pinned::crate_path(\"tests/divergences.json\");\n        let registry: Vec<Divergence> =\n            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();\n        for entry in registry {\n            let name = &entry.divergence;\n            assert!(!entry.behavior.is_empty(), \"{name}: no behavior\");\n            assert!(\n                matches!(entry.kind, Kind::Deliberate) || entry.ticket.is_some(),\n                \"{name}: a gap names its ticket\"\n            );\n        }\n    }\n}\n",
+      "source_digest": "a6d0b50217c2b1a8a135e400b0e932ca0efde8d9514f72bf6b223902a45f5dcd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::{path::PathBuf, time::Duration};\n\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n\nfn admin_ui_public_dir() -> PathBuf {\n    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n",
+      "source_digest": "7979ea336c5b2fd5d771efdc06eeb9ca5f13cc801269880a96a9f1ff9b7a393b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 25,
+      "end_line": 49,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n",
+      "source_digest": "f659ecc6385c6a314427149139c0ce6a81288c07f13606763334fcac6fb90259",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 42,
+      "end_line": 66,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n",
+      "source_digest": "bdea344d79e2c5ab5ef6886542dea9e16fa58a8563477345501d052cb6cac978",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 43,
+      "end_line": 67,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n",
+      "source_digest": "33d54927058bb24afce52d917c13701835c1adf748b80e3f5fb2fe5e177381c4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 326,
+      "end_line": 350,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .pointer(\"/aisException/message\")\n            .and_then(Value::as_str)\n            .unwrap_or(\"aisException\");\n        return Err(classify_ais_failure(action_name, msg, &resp));\n    }\n    let parsed = parse_ais_response(entity_id, &resp);\n    if !parsed.success {\n        return Err(classify_ais_failure(action_name, &parsed.message, &resp));\n    }\n    Ok(resp)\n}\n\npub fn build_intake_request(\n    actor_header: Value,\n    action: Value,\n    tool: &str,\n    audit_note: Option<&str>,\n) -> Value {\n    let mut req = json!({\n        \"actorHeader\": actor_header,\n        \"action\": action,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n",
+      "source_digest": "170993c2202b0466eb1b4670b6fd2c25674d8b3e75e55696cf7d874aa28c6f29",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 343,
+      "end_line": 367,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": ") -> Value {\n    let mut req = json!({\n        \"actorHeader\": actor_header,\n        \"action\": action,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n    }\n    req\n}\n\npub fn build_multi_entity_request(\n    actor_header: Value,\n    actions: Vec<Value>,\n    tool: &str,\n    audit_note: Option<&str>,\n) -> Value {\n    let mut req = json!({\n        \"actorHeader\": actor_header,\n        \"actions\": actions,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n",
+      "source_digest": "8d1e9762e88ed4b31ba9bebf6519bb9336b8860464d8552c102ed1bb10abcb0d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 516,
+      "end_line": 540,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n            json!({\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}}),\n            vec![\n                json!({\"suspendUser\": {\n                    \"userId\": 1,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": []\n                }}),\n                json!({\"bounceViaSelection\": {\n                    \"target\": {\"user\": {\"userId\": 1}},\n                    \"tags\": [],\n                    \"uncheckedTags\": [\"FAKE\"],\n",
+      "source_digest": "558812b9baf595e7bdb572156e826fca6970eb8a140f0138fe4a761d076aa6af",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/api_doc.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    Modify, OpenApi, ToSchema,\n};\n\nuse crate::service;\n\npub struct SecurityAddon;\n\nimpl Modify for SecurityAddon {\n    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {\n        let components = openapi.components.get_or_insert_with(Default::default);\n        components.add_security_scheme(\n            \"BearerAuth\",\n            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),\n        );\n    }\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct ApiError {\n    pub error: String,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct DryRunStatus {\n    pub dry_run: bool,\n",
+      "source_digest": "a16d0832a130b4f7597d36f8a28c4acb750fbdfceea39034a55806c15b1927f6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/api_doc.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 229,
+      "end_line": 253,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for (path, method, want_protected) in EXPECTED_OPERATIONS {\n            let key = ((*path).to_owned(), (*method).to_owned());\n            let got_protected = *got.get(&key).expect(\"checked above\");\n            if got_protected != *want_protected {\n                wrong.push(format!(\n                    \"{method} {path}: expected security={want_protected}, got security={got_protected}\",\n                ));\n            }\n        }\n        assert!(\n            wrong.is_empty(),\n            \"ApiDoc `security(...)` annotations disagree with the protected/public split \\\n             in `build_api_router`:\\n  {}\",\n            wrong.join(\"\\n  \"),\n        );\n\n        let schemes = json\n            .pointer(\"/components/securitySchemes\")\n            .and_then(|v| v.as_object())\n            .expect(\"componentss.securitySchemes must be an object\");\n        assert!(\n            schemes.contains_key(\"BearerAuth\"),\n            \"BearerAuth security scheme missing — `SecurityAddon` modifier didn't run? \\\n             schemes={schemes:?}\",\n        );\n",
+      "source_digest": "29e28a26bc7dd2f885c8988cdecc780fc68eee3c806c933c44d5cdf2b3217599",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 177,
+      "end_line": 201,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        && h.run_version == rec.version\n    {\n        rec.state = RunState::Paused;\n        rec.paused_reason = Some(PausedReason::OffSwitch);\n        rec.paused_at_ms = Some(h.at_ms);\n    }\n    rec\n}\n\nfn parse_record(bytes: &[u8]) -> anyhow::Result<BackfillRunRecord> {\n    let rec: BackfillRunRecord = serde_json::from_slice(bytes)?;\n    if rec.v > BACKFILL_RUN_RECORD_VERSION {\n        anyhow::bail!(\"run record v{} is newer than this build reads\", rec.v);\n    }\n    Ok(rec)\n}\n\npub fn gate(rec: &BackfillRunRecord, now_ms: i64) -> Result<(), &'static str> {\n    match rec.state {\n        RunState::Running => Ok(()),\n        RunState::Paused => Err(STATUS_RUN_PAUSED),\n        RunState::Stopped => Err(STATUS_RUN_STOPPED),\n        RunState::Done\n            if rec\n                .done_at_ms\n",
+      "source_digest": "155e51ce06b46c08155d9534078fe944e9bea4474f843af6220ccab872e0b3e7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 350,
+      "end_line": 374,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub fn access(&self) -> &BackfillAccess {\n        &self.access\n    }\n\n\n    async fn stored_settings(&self) -> anyhow::Result<Option<BackfillSettingsRecord>> {\n        match self.store.get(SETTINGS_PKEY, SETTINGS_LKEY).await? {\n            None => Ok(None),\n            Some(b) => {\n                let rec: BackfillSettingsRecord = serde_json::from_slice(&b)?;\n                if rec.v > BACKFILL_SETTINGS_RECORD_VERSION {\n                    anyhow::bail!(\"settings record v{} is newer than this build reads\", rec.v);\n                }\n                Ok(Some(rec))\n            }\n        }\n    }\n\n    fn keep_settings(&self, record: Option<BackfillSettingsRecord>) {\n        *self.settings.write().unwrap_or_else(|p| p.into_inner()) = Some(SettingsCopy {\n            record,\n            read_at: std::time::Instant::now(),\n        });\n    }\n",
+      "source_digest": "fed99180ea5e53e014c319e3571a4b43cf7141c72ac4dec520929d85e0bd8085",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 9,
+      "end_line": 33,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::facts::EntityType;\n\npub const STALE_AFTER: Duration = Duration::from_secs(600);\n\nconst STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);\nconst POOL_MAX: usize = 8;\nconst POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);\n\npub fn new_claim_nonce() -> i64 {\n    use std::hash::{BuildHasher, Hasher};\n    use std::sync::atomic::{AtomicU64, Ordering};\n    static N: AtomicU64 = AtomicU64::new(0);\n    let mut h = std::collections::hash_map::RandomState::new().build_hasher();\n    h.write_u64(N.fetch_add(1, Ordering::Relaxed));\n    h.write_u128(\n        std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .unwrap_or_default()\n            .as_nanos(),\n    );\n    (h.finish() >> 1) as i64\n}\n\n#[derive(Debug, Clone, PartialEq, Eq, Hash)]\npub struct ClaimKey {\n",
+      "source_digest": "503a3fb740ac7a3055c96ba3bbf278faefb31c82f7d6a91abb832027997a7a09",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 72,
+      "end_line": 96,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl PgClaimStore {\n    pub fn new(dsn: &str, env: &str) -> anyhow::Result<Self> {\n        let app_name = format!(\"xai-abuse-enforcement-service-backfill/{env}\");\n        let config = xai_abuse_ledger_service::pg::parse_dsn(dsn, &app_name, STATEMENT_TIMEOUT)\n            .map_err(|e| anyhow::anyhow!(\"BACKFILL_CLAIMS_PG_DSN {e}\"))?;\n        let manager = Manager::from_config(\n            config,\n            xai_abuse_ledger_service::pg::make_tls(),\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .wait_timeout(Some(POOL_WAIT_TIMEOUT))\n            .create_timeout(Some(POOL_WAIT_TIMEOUT))\n            .build()\n            .map_err(|e| anyhow::anyhow!(\"backfill claims pool: {e}\"))?;\n        info!(\n            application_name = app_name,\n            max_size = POOL_MAX,\n            \"backfill claims pool built (lazy)\"\n        );\n        Ok(Self { pool })\n",
+      "source_digest": "8df6dd91f6bad2c51bb4609a35f6153da548424b8d177affecfe70f13792b941",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 77,
+      "end_line": 101,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let manager = Manager::from_config(\n            config,\n            xai_abuse_ledger_service::pg::make_tls(),\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .wait_timeout(Some(POOL_WAIT_TIMEOUT))\n            .create_timeout(Some(POOL_WAIT_TIMEOUT))\n            .build()\n            .map_err(|e| anyhow::anyhow!(\"backfill claims pool: {e}\"))?;\n        info!(\n            application_name = app_name,\n            max_size = POOL_MAX,\n            \"backfill claims pool built (lazy)\"\n        );\n        Ok(Self { pool })\n    }\n\n    #[cfg(test)]\n    pub(crate) fn new_plaintext_for_test(dsn: &str) -> anyhow::Result<Self> {\n        let config: tokio_postgres::Config = dsn.parse()?;\n",
+      "source_digest": "b2f699a0cadc98d28c3da38bca12bd23754ec33de6fea36bda247bf190797f9f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 97,
+      "end_line": 121,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    #[cfg(test)]\n    pub(crate) fn new_plaintext_for_test(dsn: &str) -> anyhow::Result<Self> {\n        let config: tokio_postgres::Config = dsn.parse()?;\n        let manager = Manager::from_config(\n            config,\n            tokio_postgres::NoTls,\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .build()?;\n        Ok(Self { pool })\n    }\n}\n\nconst STATE_SQL: &str = \"SELECT claim_state, claim_nonce, \\\n     (extract(epoch FROM (now() - claimed_at)) * 1000)::bigint, claim_status \\\n     FROM log_only.backfill_items WHERE run_id = $1 AND entity_type = $2 AND entity_id = $3\";\n\nfn row_claim(row: Option<tokio_postgres::Row>) -> anyhow::Result<ItemClaim> {\n",
+      "source_digest": "2e47ca180f45a2c5c9ea270b2d26b7c8769c9f28bee7fe116464551d5ca031eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 100,
+      "end_line": 124,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub(crate) fn new_plaintext_for_test(dsn: &str) -> anyhow::Result<Self> {\n        let config: tokio_postgres::Config = dsn.parse()?;\n        let manager = Manager::from_config(\n            config,\n            tokio_postgres::NoTls,\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .build()?;\n        Ok(Self { pool })\n    }\n}\n\nconst STATE_SQL: &str = \"SELECT claim_state, claim_nonce, \\\n     (extract(epoch FROM (now() - claimed_at)) * 1000)::bigint, claim_status \\\n     FROM log_only.backfill_items WHERE run_id = $1 AND entity_type = $2 AND entity_id = $3\";\n\nfn row_claim(row: Option<tokio_postgres::Row>) -> anyhow::Result<ItemClaim> {\n    let Some(row) = row else {\n        return Ok(ItemClaim::NotInList);\n    };\n",
+      "source_digest": "715996ffccce8b912b07fa208114418f00f17ecf23660d114684eb80b7658c65",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 17,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    token_env: String,\n    #[arg(long)]\n    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n",
+      "source_digest": "475416e80fc9ab3d89076349af81f832c8d2e1705d5bcb3c93f44a8f5884039e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 19,
+      "end_line": 43,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n            \"the record list came from a pod's copy ({}), not the store; retry when the store answers\",\n            list.error.unwrap_or_default()\n",
+      "source_digest": "4c8a7f8b5b4d6dc4ca0fb8944a5586f736be0587d78ab6bf30b0710bf8385ecb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 10,
+      "end_line": 34,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Clone)]\npub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n    write_lock: Arc<tokio::sync::Mutex<()>>,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v1\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n            write_lock: Arc::new(tokio::sync::Mutex::new(())),\n        }\n    }\n\n    pub async fn get_feature(&self, feature_key: &str) -> Result<Value> {\n",
+      "source_digest": "69d6dae40c507829674e0e6b5712c3c2905e3db2f1be0d2e8c04fd3a1a1a5f14",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 12,
+      "end_line": 36,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n    write_lock: Arc<tokio::sync::Mutex<()>>,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v1\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n            write_lock: Arc::new(tokio::sync::Mutex::new(())),\n        }\n    }\n\n    pub async fn get_feature(&self, feature_key: &str) -> Result<Value> {\n        let url = format!(\"{}/features/{}\", self.api_base, feature_key);\n        let resp = self\n",
+      "source_digest": "a1fc00bc4a8cee033ad8f3aabc76d5c96631ea05f751b4f630f8bccf2bba9296",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 13,
+      "end_line": 37,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    api_base: String,\n    api_key: String,\n    client: Client,\n    write_lock: Arc<tokio::sync::Mutex<()>>,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v1\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n            write_lock: Arc::new(tokio::sync::Mutex::new(())),\n        }\n    }\n\n    pub async fn get_feature(&self, feature_key: &str) -> Result<Value> {\n        let url = format!(\"{}/features/{}\", self.api_base, feature_key);\n        let resp = self\n            .client\n",
+      "source_digest": "ed5590188d6773aea52e018b865170f199174d6bc206af009f108ce46e6f6405",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 54,
+      "end_line": 78,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub async fn get_env_value(&self, feature_key: &str, environment: &str) -> Result<Value> {\n        let feature = self.get_feature(feature_key).await?;\n        parse_env_value(&feature, environment)\n    }\n\n    pub async fn set_env_value(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        value: Value,\n    ) -> Result<Value> {\n        let feature = self.get_feature(feature_key).await?;\n        let body = build_env_update_body(&feature, environment, &value)?;\n\n        let url = format!(\"{}/features/{}\", self.api_base, feature_key);\n        let resp = self\n            .client\n            .post(&url)\n            .bearer_auth(&self.api_key)\n            .json(&body)\n            .send()\n            .await\n            .with_context(|| format!(\"POST {url}\"))?;\n\n        let status = resp.status();\n",
+      "source_digest": "48b25188ed813a1849cb9c0f90d456cfd018b2ea4cb05af7dbe6b148214d3387",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 127,
+      "end_line": 151,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        serde_json::from_str(s).map_err(|e| {\n            anyhow!(\n                \"rule value for environment '{}' is not valid JSON: {}\",\n                environment,\n                e\n            )\n        })\n    } else {\n        Ok(raw)\n    }\n}\n\nfn build_env_update_body(feature: &Value, environment: &str, new_value: &Value) -> Result<Value> {\n    let env = feature\n        .get(\"environments\")\n        .and_then(|e| e.get(environment))\n        .ok_or_else(|| anyhow!(\"environment '{}' not found in feature\", environment))?;\n    let mut rules = env\n        .get(\"rules\")\n        .and_then(|r| r.as_array())\n        .cloned()\n        .ok_or_else(|| anyhow!(\"no rules in environment '{}'\", environment))?;\n    if rules.is_empty() {\n        bail!(\"rules array is empty in environment '{}'\", environment);\n    }\n",
+      "source_digest": "41448a958df0ffd2373437f7e5656712637dd5440b687e7d97a26db0a970a611",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 210,
+      "end_line": 234,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn parse_env_value_errors_on_missing_environment() {\n        let err = parse_env_value(&sample_feature(), \"nonexistent\").unwrap_err();\n        assert!(err.to_string().contains(\"nonexistent\"));\n    }\n\n    #[test]\n    fn parse_env_value_errors_on_empty_rules() {\n        let err = parse_env_value(&sample_feature(), \"staging\").unwrap_err();\n        assert!(err.to_string().contains(\"empty\"));\n    }\n\n    #[test]\n    fn build_env_update_body_encodes_value_as_json_string() {\n        let body = build_env_update_body(\n            &sample_feature(),\n            \"production\",\n            &json!({\"dry_run\": true, \"max_enforcements_per_day\": 100}),\n        )\n        .unwrap();\n        let stored_value = &body[\"environments\"][\"production\"][\"rules\"][0][\"value\"];\n        assert!(matches!(stored_value, Value::String(_)));\n        let s = stored_value.as_str().unwrap();\n        let parsed: Value = serde_json::from_str(s).unwrap();\n        assert_eq!(parsed[\"dry_run\"], json!(true));\n        assert_eq!(parsed[\"max_enforcements_per_day\"], json!(100));\n",
+      "source_digest": "e414656d30d4a2f6d8e85b6a6b511527eafc517fdbcf5e6ac45d54da1a28dcff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::{path::PathBuf, time::Duration};\n\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n\nfn admin_ui_public_dir() -> PathBuf {\n    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n",
+      "source_digest": "7979ea336c5b2fd5d771efdc06eeb9ca5f13cc801269880a96a9f1ff9b7a393b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 25,
+      "end_line": 49,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n",
+      "source_digest": "f659ecc6385c6a314427149139c0ce6a81288c07f13606763334fcac6fb90259",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 42,
+      "end_line": 66,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n",
+      "source_digest": "bdea344d79e2c5ab5ef6886542dea9e16fa58a8563477345501d052cb6cac978",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 43,
+      "end_line": 67,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n",
+      "source_digest": "33d54927058bb24afce52d917c13701835c1adf748b80e3f5fb2fe5e177381c4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 326,
+      "end_line": 350,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .pointer(\"/aisException/message\")\n            .and_then(Value::as_str)\n            .unwrap_or(\"aisException\");\n        return Err(classify_ais_failure(action_name, msg, &resp));\n    }\n    let parsed = parse_ais_response(entity_id, &resp);\n    if !parsed.success {\n        return Err(classify_ais_failure(action_name, &parsed.message, &resp));\n    }\n    Ok(resp)\n}\n\npub fn build_intake_request(\n    actor_header: Value,\n    action: Value,\n    tool: &str,\n    audit_note: Option<&str>,\n) -> Value {\n    let mut req = json!({\n        \"actorHeader\": actor_header,\n        \"action\": action,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n",
+      "source_digest": "170993c2202b0466eb1b4670b6fd2c25674d8b3e75e55696cf7d874aa28c6f29",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 343,
+      "end_line": 367,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": ") -> Value {\n    let mut req = json!({\n        \"actorHeader\": actor_header,\n        \"action\": action,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n    }\n    req\n}\n\npub fn build_multi_entity_request(\n    actor_header: Value,\n    actions: Vec<Value>,\n    tool: &str,\n    audit_note: Option<&str>,\n) -> Value {\n    let mut req = json!({\n        \"actorHeader\": actor_header,\n        \"actions\": actions,\n        \"tool\": tool,\n    });\n    if let Some(note) = audit_note {\n        req[\"auditHeader\"] = json!({ \"note\": note });\n",
+      "source_digest": "8d1e9762e88ed4b31ba9bebf6519bb9336b8860464d8552c102ed1bb10abcb0d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 516,
+      "end_line": 540,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n            json!({\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}}),\n            vec![\n                json!({\"suspendUser\": {\n                    \"userId\": 1,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": []\n                }}),\n                json!({\"bounceViaSelection\": {\n                    \"target\": {\"user\": {\"userId\": 1}},\n                    \"tags\": [],\n                    \"uncheckedTags\": [\"FAKE\"],\n",
+      "source_digest": "558812b9baf595e7bdb572156e826fca6970eb8a140f0138fe4a761d076aa6af",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/api_doc.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    Modify, OpenApi, ToSchema,\n};\n\nuse crate::service;\n\npub struct SecurityAddon;\n\nimpl Modify for SecurityAddon {\n    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {\n        let components = openapi.components.get_or_insert_with(Default::default);\n        components.add_security_scheme(\n            \"BearerAuth\",\n            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),\n        );\n    }\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct ApiError {\n    pub error: String,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct DryRunStatus {\n    pub dry_run: bool,\n",
+      "source_digest": "a16d0832a130b4f7597d36f8a28c4acb750fbdfceea39034a55806c15b1927f6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/api_doc.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 252,
+      "end_line": 276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for (path, method, want_protected) in EXPECTED_OPERATIONS {\n            let key = ((*path).to_owned(), (*method).to_owned());\n            let got_protected = *got.get(&key).expect(\"checked above\");\n            if got_protected != *want_protected {\n                wrong.push(format!(\n                    \"{method} {path}: expected security={want_protected}, got security={got_protected}\",\n                ));\n            }\n        }\n        assert!(\n            wrong.is_empty(),\n            \"ApiDoc `security(...)` annotations disagree with the protected/public split \\\n             in `build_api_router`:\\n  {}\",\n            wrong.join(\"\\n  \"),\n        );\n\n        let schemes = json\n            .pointer(\"/components/securitySchemes\")\n            .and_then(|v| v.as_object())\n            .expect(\"componentss.securitySchemes must be an object\");\n        assert!(\n            schemes.contains_key(\"BearerAuth\"),\n            \"BearerAuth security scheme missing — `SecurityAddon` modifier didn't run? \\\n             schemes={schemes:?}\",\n        );\n",
+      "source_digest": "29e28a26bc7dd2f885c8988cdecc780fc68eee3c806c933c44d5cdf2b3217599",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 177,
+      "end_line": 201,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        && h.run_version == rec.version\n    {\n        rec.state = RunState::Paused;\n        rec.paused_reason = Some(PausedReason::OffSwitch);\n        rec.paused_at_ms = Some(h.at_ms);\n    }\n    rec\n}\n\nfn parse_record(bytes: &[u8]) -> anyhow::Result<BackfillRunRecord> {\n    let rec: BackfillRunRecord = serde_json::from_slice(bytes)?;\n    if rec.v > BACKFILL_RUN_RECORD_VERSION {\n        anyhow::bail!(\"run record v{} is newer than this build reads\", rec.v);\n    }\n    Ok(rec)\n}\n\npub fn gate(rec: &BackfillRunRecord, now_ms: i64) -> Result<(), &'static str> {\n    match rec.state {\n        RunState::Running => Ok(()),\n        RunState::Paused => Err(STATUS_RUN_PAUSED),\n        RunState::Stopped => Err(STATUS_RUN_STOPPED),\n        RunState::Done\n            if rec\n                .done_at_ms\n",
+      "source_digest": "155e51ce06b46c08155d9534078fe944e9bea4474f843af6220ccab872e0b3e7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 349,
+      "end_line": 373,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub fn access(&self) -> &BackfillAccess {\n        &self.access\n    }\n\n\n    async fn stored_settings(&self) -> anyhow::Result<Option<BackfillSettingsRecord>> {\n        match self.store.get(SETTINGS_PKEY, SETTINGS_LKEY).await? {\n            None => Ok(None),\n            Some(b) => {\n                let rec: BackfillSettingsRecord = serde_json::from_slice(&b)?;\n                if rec.v > BACKFILL_SETTINGS_RECORD_VERSION {\n                    anyhow::bail!(\"settings record v{} is newer than this build reads\", rec.v);\n                }\n                Ok(Some(rec))\n            }\n        }\n    }\n\n    fn keep_settings(&self, record: Option<BackfillSettingsRecord>) {\n        *self.settings.write().unwrap_or_else(|p| p.into_inner()) = Some(SettingsCopy {\n            record,\n            read_at: std::time::Instant::now(),\n        });\n    }\n",
+      "source_digest": "fed99180ea5e53e014c319e3571a4b43cf7141c72ac4dec520929d85e0bd8085",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 9,
+      "end_line": 33,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::facts::EntityType;\n\npub const STALE_AFTER: Duration = Duration::from_secs(600);\n\nconst STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);\nconst POOL_MAX: usize = 8;\nconst POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);\n\npub fn new_claim_nonce() -> i64 {\n    use std::hash::{BuildHasher, Hasher};\n    use std::sync::atomic::{AtomicU64, Ordering};\n    static N: AtomicU64 = AtomicU64::new(0);\n    let mut h = std::collections::hash_map::RandomState::new().build_hasher();\n    h.write_u64(N.fetch_add(1, Ordering::Relaxed));\n    h.write_u128(\n        std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .unwrap_or_default()\n            .as_nanos(),\n    );\n    (h.finish() >> 1) as i64\n}\n\n#[derive(Debug, Clone, PartialEq, Eq, Hash)]\npub struct ClaimKey {\n",
+      "source_digest": "503a3fb740ac7a3055c96ba3bbf278faefb31c82f7d6a91abb832027997a7a09",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 72,
+      "end_line": 96,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl PgClaimStore {\n    pub fn new(dsn: &str, env: &str) -> anyhow::Result<Self> {\n        let app_name = format!(\"xai-abuse-enforcement-service-backfill/{env}\");\n        let config = xai_abuse_ledger_service::pg::parse_dsn(dsn, &app_name, STATEMENT_TIMEOUT)\n            .map_err(|e| anyhow::anyhow!(\"BACKFILL_CLAIMS_PG_DSN {e}\"))?;\n        let manager = Manager::from_config(\n            config,\n            xai_abuse_ledger_service::pg::make_tls(),\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .wait_timeout(Some(POOL_WAIT_TIMEOUT))\n            .create_timeout(Some(POOL_WAIT_TIMEOUT))\n            .build()\n            .map_err(|e| anyhow::anyhow!(\"backfill claims pool: {e}\"))?;\n        info!(\n            application_name = app_name,\n            max_size = POOL_MAX,\n            \"backfill claims pool built (lazy)\"\n        );\n        Ok(Self { pool })\n",
+      "source_digest": "8df6dd91f6bad2c51bb4609a35f6153da548424b8d177affecfe70f13792b941",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 77,
+      "end_line": 101,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let manager = Manager::from_config(\n            config,\n            xai_abuse_ledger_service::pg::make_tls(),\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .wait_timeout(Some(POOL_WAIT_TIMEOUT))\n            .create_timeout(Some(POOL_WAIT_TIMEOUT))\n            .build()\n            .map_err(|e| anyhow::anyhow!(\"backfill claims pool: {e}\"))?;\n        info!(\n            application_name = app_name,\n            max_size = POOL_MAX,\n            \"backfill claims pool built (lazy)\"\n        );\n        Ok(Self { pool })\n    }\n\n    #[cfg(test)]\n    pub(crate) fn new_plaintext_for_test(dsn: &str) -> anyhow::Result<Self> {\n        let config: tokio_postgres::Config = dsn.parse()?;\n",
+      "source_digest": "b2f699a0cadc98d28c3da38bca12bd23754ec33de6fea36bda247bf190797f9f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 97,
+      "end_line": 121,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    #[cfg(test)]\n    pub(crate) fn new_plaintext_for_test(dsn: &str) -> anyhow::Result<Self> {\n        let config: tokio_postgres::Config = dsn.parse()?;\n        let manager = Manager::from_config(\n            config,\n            tokio_postgres::NoTls,\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .build()?;\n        Ok(Self { pool })\n    }\n}\n\nconst STATE_SQL: &str = \"SELECT claim_state, claim_nonce, \\\n     (extract(epoch FROM (now() - claimed_at)) * 1000)::bigint, claim_status \\\n     FROM log_only.backfill_items WHERE run_id = $1 AND entity_type = $2 AND entity_id = $3\";\n\nfn row_claim(row: Option<tokio_postgres::Row>) -> anyhow::Result<ItemClaim> {\n",
+      "source_digest": "2e47ca180f45a2c5c9ea270b2d26b7c8769c9f28bee7fe116464551d5ca031eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_claims.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 100,
+      "end_line": 124,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub(crate) fn new_plaintext_for_test(dsn: &str) -> anyhow::Result<Self> {\n        let config: tokio_postgres::Config = dsn.parse()?;\n        let manager = Manager::from_config(\n            config,\n            tokio_postgres::NoTls,\n            ManagerConfig {\n                recycling_method: RecyclingMethod::Fast,\n            },\n        );\n        let pool = Pool::builder(manager)\n            .max_size(POOL_MAX)\n            .runtime(Runtime::Tokio1)\n            .build()?;\n        Ok(Self { pool })\n    }\n}\n\nconst STATE_SQL: &str = \"SELECT claim_state, claim_nonce, \\\n     (extract(epoch FROM (now() - claimed_at)) * 1000)::bigint, claim_status \\\n     FROM log_only.backfill_items WHERE run_id = $1 AND entity_type = $2 AND entity_id = $3\";\n\nfn row_claim(row: Option<tokio_postgres::Row>) -> anyhow::Result<ItemClaim> {\n    let Some(row) = row else {\n        return Ok(ItemClaim::NotInList);\n    };\n",
+      "source_digest": "715996ffccce8b912b07fa208114418f00f17ecf23660d114684eb80b7658c65",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 17,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    token_env: String,\n    #[arg(long)]\n    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n",
+      "source_digest": "475416e80fc9ab3d89076349af81f832c8d2e1705d5bcb3c93f44a8f5884039e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 19,
+      "end_line": 43,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n            \"the record list came from a pod's copy ({}), not the store; retry when the store answers\",\n            list.error.unwrap_or_default()\n",
+      "source_digest": "4c8a7f8b5b4d6dc4ca0fb8944a5586f736be0587d78ab6bf30b0710bf8385ecb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 18,
+      "end_line": 42,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[derive(Clone)]\npub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v2\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n        }\n    }\n\n    pub async fn propose_value(\n        &self,\n",
+      "source_digest": "9ff8f2dfd0673904f688d7b36d7f0605f2f2dc9b7232281c9b8d9465cfacda44",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[derive(Clone)]\npub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v2\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n        }\n    }\n\n    pub async fn propose_value(\n        &self,\n        feature_key: &str,\n        environment: &str,\n",
+      "source_digest": "2c85b57ec1a6e47e15630841c4754d68ac1f21f98583d781c567a1af420787f5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 21,
+      "end_line": 45,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v2\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n        }\n    }\n\n    pub async fn propose_value(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        note: &str,\n",
+      "source_digest": "acd894975d20e77f1d12720ef6e349f90e9e6087a6b575ea5fc9cb268a58668c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/lib.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1473,
+      "end_line": 1497,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "fn safety_checks_ok(ctx: &EnforcementCtx, entity: EntityType) -> bool {\n    let rules = ctx.rules_cache.resolve(\n        entity,\n        ctx.dynamic_config.enforcement_rules_yaml(entity).as_ref(),\n    );\n    let ok = safety_checks::status(entity, &rules).ok;\n    metrics::ACTION_CONTROL_SAFETY_CHECKS_OK\n        .with_label_values(&[entity.as_str()])\n        .set(i64::from(ok));\n    ok\n}\n\nasync fn build_kafka_producers(cfg: &Config, boot_config: &serde_json::Value) -> KafkaProducers {\n    let mut producers = KafkaProducers::default();\n\n    for (name, spec) in growthbook::kafka_producers_from_config(Some(boot_config)) {\n        if !spec.enabled {\n            warn!(\"kafka producer '{name}' configured but disabled (enabled=false)\");\n            continue;\n        }\n        let Some(topic) = spec.topic else {\n            warn!(\"kafka producer '{name}' enabled but no topic set; skipping\");\n            continue;\n        };\n        let cluster =\n",
+      "source_digest": "0758d39a6c6bf0da4ad1e8227b18376a1739d25601e29fc17f51d585913e1f8a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/lib.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1493,
+      "end_line": 1517,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let Some(topic) = spec.topic else {\n            warn!(\"kafka producer '{name}' enabled but no topic set; skipping\");\n            continue;\n        };\n        let cluster =\n            override_or_default(spec.cluster.as_deref(), &cfg.kafka_producer_mtls_cluster);\n        let zone = override_or_default(spec.zone.as_deref(), &cfg.kafka_producer_mtls_zone);\n        let producer_config = match KafkaProducerConfigBuilder::for_cluster_mtls_auto(\n            cluster,\n            topic.clone(),\n            Some(zone),\n        ) {\n            Ok(builder) => builder.build(),\n            Err(e) => {\n                error!(\"kafka producer '{name}' mTLS config failed; skipping: {e}\");\n                continue;\n            }\n        };\n        let mut producer = KafkaProducer::new(producer_config);\n        match producer.start().await {\n            Ok(()) => {\n                info!(\"kafka producer '{name}' started -> topic {topic} on {cluster} ({zone})\");\n                producers.by_name.insert(name, Arc::new(producer));\n            }\n            Err(e) => {\n",
+      "source_digest": "97584e81a618cfc8d398f64f5b418089b82e75e53d0c856c9e50958a370d9c2e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E50": {
+      "path": "abuse-enforcement-service/service-lib/src/lib.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2036,
+      "end_line": 2060,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\npub fn init_runtime_globals() {\n    let _ = tracing_subscriber::fmt()\n        .with_env_filter(\n            tracing_subscriber::EnvFilter::try_from_default_env()\n                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(\"info\")),\n        )\n        .try_init();\n    xai_init_utils::init().rustls();\n    metrics::init();\n}\n\npub async fn build_state(cfg: Config) -> Result<(Arc<service::AppState>, Config)> {\n    info!(\"Service starting (port={})\", cfg.port);\n\n    let ais_cert = cfg\n        .strato_client_cert_path\n        .clone()\n        .unwrap_or_else(|| \"/etc/strato-tls/client/tls.crt\".into());\n    let ais_key = cfg\n        .strato_client_key_path\n        .clone()\n        .unwrap_or_else(|| \"/etc/strato-tls/client/tls.key\".into());\n    let ais_ca = cfg\n        .strato_ca_cert_path\n",
+      "source_digest": "961700d871bdcac1a8debe20dbcd570ff39514118d158d8fe571ced92852da44",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aa22330a610fdf64fbb74b69cd4b550ce9f0b20e2accb3232cb1b5ad053eabe2",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/staging",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "64090e859f4a6507afee0dcaf0371fb017171c2f616c313c5feecc71f2b14846",
+      "context_complete": true,
+      "task_id": "T-04257ff1fba9eb426398f007a7ef5efd33bd0998d53453629d5fad60c27518ac",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-600f6f66b807c8ae145219da68ffb148e0fc3a9c52e18636a3129652a01a2729",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-949e7dfbea89eb874834c3e52d212dde9597dd2a9eeb7089fec77b91ccc592ef",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca81d3b59065152058932549a639fe9c1b8f774b10d9d51d2964c4292912ca56",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-eefd0805c95c5df4a3b036403b85b342c9bc099e8d5ecc60e6aac9537ae0c307",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a0bfded3a34b477b73e02020dcf2c1ce9baf1e3fe68c42f8d1b1fed32e30be16",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-409bf1055ff3cd75ac09bb4e3094c761ae05f2a8ec6b35969d4bea2b1f679c30",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f91608f3fbc456495cf46494eb8ff12bf1e6a9c5675dc461a5b7b48b4708f57b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-dbd1b7ee8cc21f2e737fbbfb1c7b3c7c446ff20c3fdd2f46f28048eb6968b3b2",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7190fb7298de28709546d3bbe63c4a70725d1382431665d2e2aedb4e943fa558",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-a1bdeb6522e8cfbc12d19098c4752577c081305284f140bb37ea9f81422b29a2",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4881a8cb2577e66dd6b97f86f3ed12dce1b5cb8e5f703fb69ca3defbae2b40d5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-7b3361e06e59b909f1f13ee6a38eca10e0315fa2efb00a5c216b3b0649541968",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-361afbadba8e2b4b263b4cdd7071ef957520dc805536b3fc9df49ff03ac17742",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-0e1af51054eaf76567c4baeadf6e80d80674871c1ba5dc3182f6968a7f739b25",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9573af0c9f769ec9cfdfc435741d50e0edf2b6d7974de33c9642ded7ea93f4a3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ce015a2da06802cada4230f81d29671ecd471bd2977515d819dec864cbcf668",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cc662dd24e162f288aa877fe82a212bd828a6390de8a5cd99ef84e48c8df104e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-ac5c5d6265ad8320418bb6419f84bc7fe1800efad6f7b7b4000c2e8217b144f0",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-227d293ddf124238864f8d362d92a819920a88c0708325c10e2bfb57b26345af",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-b72e2e3d9ac9dda183873b72cede948f503d3eb1551a95f6984829ea26cd727a",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7ac6b4204df2e3f11a045ed765139ee6c63708de4f8babd0370c33a3872f5baf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-09227832fcec895d4b14ce7b4c53fd1b93f1e950d45420805ef328d1d56722d9",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d3c0753b00c0d01ed36fa6d2befbafbe3b3273e98b2e58b5a7aa0a9514b62721",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-03138399841d3e51af53058cad06d713bfb76063bff7318b7b7387d2f8a4bb8f",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d0bc91a8a829256cd107f24799bca17d198a8cf4115359406d822388eadbab8e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-ea3744963c2a869d2af35c456bfae09916b0fee56272e94b819d01be08d99b41",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7ac26a9d3ce648b89786202e370b874d813e0888d8869be10b239f52e2dfb724",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec561986e0fe770879ceb72a3fccb2bd7cf743c3a000bf495f558debc04d5b60",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ce00dbd6da49f1d12757140f55f4b5649ed72c424833bcfe365b2c50edd967ad",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-5585cab15d519f52ac69bafee238227eedbd94d4501670117b75542198c4d55b",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-57e1591334e96da97509f2990d733b437d9ca50e076fca67c6f2c024cdb1803d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-af49a47d9d81a58f87556569b21c0fcb1f4634eac1622aa62835bbb01125b545",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2fa140997fd829df8d3e5b45da2eb91ef4b6ca3c2c6fe27432ba8ef6bb455201",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-7a73c2ca5331118fd0ce2281e1ff626256015e75b2dacbd90803cd4eaa2c2e29",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e6c71634a7ae5d539179033c79df43cceff7ad367d2c6019296ff4c903be2bd4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-d095a5aba5c842f887e28370a8c84841ccedc3b6afcc70f748031d11ab86593e",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7515a15306d4dcf21e02217d7c0a46d6f2fb5f4075b88fc8ce0a1b4b7d474411",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-9920f7a8013a0e811563aa9dd0c2ab5a7b3871e87d874bf2e19e1f15e93593fd",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c7d9d5d668ac43983766df747efe0c0e4161aa57992809ad390b0fb33c627380",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-c8445a8362f67a44265f9a6044758c93bd16f31d5591683b8164276f7f7df76e",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-376660ce8b64323a0ad36b236bfa0620ebf9f742a71dbfc8ab68a5f025a9c074",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-579c42a771aa9f71ab29439355411635358e9269600c5908c8449075e2155be2",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cf129a3f8f15f097c90eabc47bc4531993c3af8f9509b285db5ad3e009144144",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-62a5e60c3963f9100887b41edb4e9ddc352c97d283808cdf9a707a9ed4390af0",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fb1d295a7b957006b864cbf0572fa363097b1508ad305d3755b68a55b76ec726",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-9fb106f25400250f7c82a46cb2d9b1f7b368ce97545ce2f871d5b135dee9ae88",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-46556455eda0465003810649772f16884aa252aacf52678975827fa2981042d6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-b21c7dbeaffdcf7f2570588ce2a25012456da3c2973023910b0d78c939fffdc0",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-80a081df42a914887474a2f386141773cb8cd834f3253f8a3896c4d1bc4d5b31",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-d68be52f5285df5e8a0051c3425bbff9db90a883aee023023166207a755dce01",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8ec4d345284acd579dd5bca6210b366f3152a8547431cc1b51c3b3b110092607",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-bbfe3b47dbdd725841c387c41b043ff2753b63029289f1d3f616538d8a068c9c",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-da2638c2a08e82d2e9931469b9fbb86c809cb3319bb83c72d0da9935705ccdc2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-64211105dc49cbc435498b1d05eeeabd0e18267ff1b14563584bb633ea51e7ee",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f3273e52c30bbb60a5ee6e4b3225a06b9b32bc486e14886044eedcae49721fb4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-194ac1a83e36483be60af18a2b04359d59686ccbbbbea8710c086b37907f2ab8",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-36239e75f7e64b5b1440d686ad7444c6d48e6c2d17c8191d02a1d308e214e2b8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-5924ef12590398ba4df14318f0d9a2dc4acf2e675e631e2b6543beadd28e7b75",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d9da849dbcc3994f1413638a37e75688299296de177ae17c491cf43e4a993019",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-8b28e3df31ef1b6b3b3a50ac4cbf0ce46e7cec69f461236f2f974987d75a51d6",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a1aa0da30d433c305b3479db4909ac35bdab5b34cc6114e2aa1027c54975f67",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-86107b6cefe1edb7f1372fdc4762a9eef3634092b9ddffc7b3aa82566f3ca855",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-58a06fe60a458e7a61f3c0942abf493301484cf9dc68bf66636c75995a7804ad",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-09f82a357048ee5268479182faf9260765b3f0e291e0488b30b777ab6c940b43",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-425428e43db741e5f5e553686b8ff703b0beb4d5c5406b71875e6929cf1e0e82",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-114a115d507b02ce146fd2ae7b04442b195316ba33646c74b24dc9fed5fbb00a",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-72b277511fcdf0eea0c8483bbec35b94b2dd0d76aab26593f7f9a567b5ef16f0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-db4ccefc3e93489d7ddeb08605d1b5ebba12398e53855b3c2c46822616be4179",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-06c34b3502c6b7a99a011d4bd99254a1c309c2ccd412d099d4b92936a6192f1c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-2d9e19ff34e756e224ac91ab492fcf767098ea9be95c1cf7d0434c8771073578",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3d7c2e80c12db230fc02e13bffdd75a92c322997357252d5875a4ba3b4259dcf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-687c759bd196d8ee34d6938388cc647f93b6cbf10200d8832a40c471e3d66fcb",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3ab470978669303c9571106ffa448b2db8ef004c2fad77f6dd90c5f804a7e4fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-21f9a8109fb443975cef651dc13912b172b578802cf602119eb266a3319fa6a2",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-49321e6dd8e1d41399cb39f809b658202f3f0220229fff551168438e8cd85265",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-27d845164b48f769957b1bcfbdd7955acc9cba6a13acea39ff966a20754643cd",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6b3fae03b3e2f810b4306166a72e54f511eb977034121b0b79f93339dbabc038",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-6f25f18536508fcd6612faf7cc00781f4f6c7f7de18df84c16da58fc6a4e6e0b",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-20b5a8bfe1802c4f254b5a848804ca4f6ad5373db14522cd14ea32d6bf9361a8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-24feea139f2f7dbd08697e4cf932f66601bf973d55f43259e36c1dafe34c3afc",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cdf7f5af3958c4f092099fbd52ad9d01a47d2e939072c30b8c2823713f6ed219",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-2a6d22abfb8fe7a599a674920fe175d2ab9c80e693b40637f3e96aa651a033d5",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b841fa4557f21d35271aa764b015c567a11fc3104ce30d883a2cdc131fca48d6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-0a1926c525d5928868ccc03f9ae6036eabf24f080e970fc419b4d621e536c948",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-edbe81aefe6144ffd3a724037aaa264180d46fbd95e3a281f1db74ea2e4ab6c0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-52e8146781f334652a82b5dfef60d38c457658e6c6ea8fef7ce29626cd4eff32",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f9d086e0d47b4931812e0019ddba67d8e1fda1feac48de2e8da4b8da95751507",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-b7239110fe87d9c932f886e0f4a59b2922ad762783d541b1f1fdac816b931888",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-10e283838d4c14f81c2e3883d30182ba6e7d826c562994dbaebd921a2dccf05b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-acdaa72799a356c671fb97542612cbce75a1ede9718604037cd489f60cce2d09",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-65a530f323c00f508156378622dcb434b547429dd7af2225e08a3bc72d3cb48b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-81b73b2545c32a1f6c0500cd23d885982fd07655b9dacbc5f6e25131abe43b19",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-69332e29b3122e157f89dd4f479ca022db14f2011b8e197ef0291f32e4a38d3d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-946831cb890d33d0ddd1371b002b03e8d0df0b88a5723265007e346042ff74b6",
+      "evidence_refs": [
+        "E49"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f74bb06861dc2ab6b29c8c23beeff494b48dde647ac22aefe000bfbfb3889861",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "build",
+        "build_vf_service",
+        "strato_vf",
+        "begin",
+        "reference_defaults_to_none_and_is_refused_in_prod",
+        "Divergence",
+        "each_divergence_states_its_behavior_and_a_gap_names_its_ticket"
+      ],
+      "context_complete": false,
+      "task_id": "T-2d6e1a9db2f9ae9fa98c33f61468da550436fa7f2b2d62d2ea1145a050e2a351",
+      "evidence_refs": [
+        "E50"
+      ]
+    }
+  ],
+  "task_id": "T-b019e7396eea18cca5dd922c309db2810716c1e0c7449122a2b080e180cf39f3"
+}

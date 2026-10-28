@@ -1,0 +1,1529 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/rules/legacy_table.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-1bf25a6b16565fb2e6d1be06b9bffd97dda64c2dfeb3a51ef50852980ce1cdcb",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/rules",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 144,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::rules::rule_spec::engine::Engine;\nuse crate::rules::rule_spec::features::{PostFactsLeaf, RequestLeaf};\nuse crate::rules::rule_spec::rule::{Rule, RuleCond};\nuse crate::rules::rule_spec::Predicate;\nuse std::fmt::Write;\n\n#[derive(Debug, PartialEq, Eq)]\npub(super) struct Unrepresentable {\n    pub(super) rule: &'static str,\n    pub(super) part: String,\n}\n\npub(super) fn legacy_table<E: Engine>(\n    rules: &[(&'static str, Rule<E>)],\n) -> Result<String, Unrepresentable> {\n    let mut table = String::new();\n    let mut severity = None;\n    for &(name, ref rule) in rules {\n        let unrepresentable = |part: RuleCond<E>| Unrepresentable {\n            rule: name,\n            part: part.spelled(),\n        };\n        let action = rule.action.spec();\n        if severity != Some(action.severity()) {\n            severity = Some(action.severity());\n            match action.kind_and_slot() {\n                (kind, \"withholding\") => writeln!(table, \"## {kind}, withholding\"),\n                (kind, slot) => writeln!(table, \"## {kind}, {slot} slot\"),\n            }\n            .unwrap();\n        }\n        let mut when = Vec::new();\n        conjuncts(rule.when, &mut when).map_err(unrepresentable)?;\n        let when = if when.is_empty() {\n            \"always\".to_owned()\n        } else {\n            when.join(\" & \")\n        };\n        writeln!(\n            table,\n            \"{name} | {:?} | {when} | {}\",\n            rule.audience,\n            action.spelled()\n        )\n        .unwrap();\n    }\n    Ok(table)\n}\n\nfn conjuncts<E: Engine>(\n    condition: RuleCond<E>,\n    conjuncts: &mut Vec<String>,\n) -> Result<(), RuleCond<E>> {\n    let leaves = |branches: &[RuleCond<E>]| -> Option<Vec<Predicate>> {\n        branches\n            .iter()\n            .map(|branch| match *branch {\n                RuleCond::Leaf(leaf) => Some(E::lift(leaf)),\n                RuleCond::All(_) | RuleCond::Any(_) | RuleCond::Not(_) | RuleCond::Named(_) => None,\n            })\n            .collect()\n    };\n    match condition {\n        RuleCond::Leaf(leaf) => conjuncts.push(E::lift(leaf).spelled()),\n        RuleCond::Not(&RuleCond::Leaf(leaf)) => conjuncts.push(negated(E::lift(leaf))),\n        RuleCond::All(children) => {\n            for &child in children {\n                self::conjuncts(child, conjuncts)?;\n            }\n        }\n        RuleCond::Named(named) => match named.condition {\n            RuleCond::All(_) => self::conjuncts(named.condition, conjuncts)?,\n            RuleCond::Any(branches) => {\n                let leaves = leaves(branches).ok_or(condition)?;\n                let leaves: Vec<String> = leaves.into_iter().map(Predicate::spelled).collect();\n                conjuncts.push(format!(\"{}[{}]\", named.name, leaves.join(\" | \")));\n            }\n            RuleCond::Not(&RuleCond::Any(branches)) => {\n                conjuncts.extend(leaves(branches).ok_or(condition)?.into_iter().map(negated));\n            }\n            RuleCond::Leaf(_) | RuleCond::Not(_) | RuleCond::Named(_) => return Err(condition),\n        },\n        RuleCond::Any(_) | RuleCond::Not(_) => return Err(condition),\n    }\n    Ok(())\n}\n\nfn negated(leaf: Predicate) -> String {\n    if let Predicate::PostFacts(PostFactsLeaf::TweetCreatedAfter(unix_ms)) = leaf {\n        format!(\"tweet_created_before({unix_ms})\")\n    } else if leaf == Predicate::Request(RequestLeaf::ClientHasModernBlur) {\n        \"is_client_deprecated\".to_owned()\n    } else {\n        format!(\"not({})\", leaf.spelled())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::rules::rule_spec::leaves::*;\n    use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors};\n    use crate::rules::rule_spec::rule::{all, any, Audience, NamedCond};\n    use crate::rules::rule_spec::{drop_post, DropAs, RuleId};\n\n    #[test]\n    fn the_legacy_table_rejects_a_rule_it_cannot_print() {\n        static NESTED: NamedCond = NamedCond {\n            name: \"nested\",\n            condition: any![\n                ViewerMutesAuthor,\n                all![ViewerFollowsAuthor, ViewerBlocksAuthor]\n            ],\n        };\n        let printed = |audience: Audience, when: RuleCond| {\n            let rule = Rule {\n                id: RuleId::FilterAll,\n                audience,\n                when,\n                action: drop_post(DropAs::UnspecifiedReason),\n            };\n            legacy_table(&[(\"rule\", rule)]).map_err(|error| error.part)\n        };\n        let nested_any = const { RuleCond::Not(&any![ViewerMutesAuthor, ViewerBlocksAuthor]) };\n        for (audience, when, part) in [\n            (\n                Everyone,\n                nested_any,\n                \"not(any[viewer_mutes_author | viewer_blocks_author])\",\n            ),\n            (\n                NonAuthors,\n                const { all![ViewerFollowsAuthor, RuleCond::Named(&NESTED)] },\n                \"nested=any[viewer_mutes_author | all[viewer_follows_author & viewer_blocks_author]]\",\n            ),\n        ] {\n            assert_eq!(printed(audience, when), Err(part.to_owned()));\n        }\n        assert_eq!(\n            printed(NonAuthors, const { all![ViewerFollowsAuthor] }),\n            Ok(\"## drop, withholding\\nrule | NonAuthors | viewer_follows_author | Legacy(UnspecifiedReason)\\n\".to_owned())\n        );\n    }\n}\n",
+      "source_digest": "48cd9b581f0807df2e41347f68990d25e8b11b5286ee4756b4997e0c6e34d324",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/explain.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1852,
+      "end_line": 1876,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            [Truth::True, Truth::True, Truth::False]\n        );\n        assert_eq!(first.skip, None);\n        assert_eq!(second.skip, Some(Skip::TrueDisjunct(first.node)));\n        assert_eq!(third.skip, Some(Skip::TrueDisjunct(first.node)));\n        let any = &trace.nodes[first.parent.unwrap()];\n        assert_eq!(any.kind, NodeKind::Any);\n        assert_eq!(\n            any.witnesses,\n            [first, second].map(|node| Witness {\n                node: node.node,\n                truth: Truth::True,\n                negated: false,\n            })\n        );\n    }\n\n    #[tokio::test]\n    async fn an_excluded_author_reads_a_failed_follow_as_neutral_in_the_audience() {\n        let explanation = explainer(\n            InMemorySources::default()\n                .tweet(4, 40)\n                .authors(&[40])\n                .fail_edge(Graph::Follows, 40),\n            no_copy(),\n",
+      "source_digest": "7af19fe0bbc3d82b10914a363074216d8c5660801969374927e84121d7c84f97",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "visibility-filtering/explain.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1898,
+      "end_line": 1922,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n            assert_eq!(follows.truth, failed_follow);\n            assert!(matches!(follows.skip, Some(Skip::FalseConjunct(_))));\n            let not = &trace.nodes[follows.parent.unwrap()];\n            assert_eq!(not.kind, NodeKind::Not);\n            assert_eq!(\n                not.truth,\n                Truth::Unknown {\n                    default: true,\n                    failed: Hydrators::of(Hydrator::Follows)\n                }\n            );\n            let negated = |truth| Witness {\n                node: follows.node,\n                truth,\n                negated: true,\n            };\n            assert_eq!(not.witnesses, [negated(failed_follow)]);\n            assert_eq!(not.default_witnesses, [negated(Truth::False)]);\n        }\n        assert!(rows > 0);\n        let ViewerFacts::NoUser { relationship, .. } = explanation.viewer else {\n            panic!(\"{:?}\", explanation.viewer);\n        };\n        assert!(relationship.is_author);\n",
+      "source_digest": "e02753355804aa6e979dc528d21199316aac9d8b4fd21e9ed7315fb3121e583b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "visibility-filtering/explain.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1901,
+      "end_line": 1925,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let not = &trace.nodes[follows.parent.unwrap()];\n            assert_eq!(not.kind, NodeKind::Not);\n            assert_eq!(\n                not.truth,\n                Truth::Unknown {\n                    default: true,\n                    failed: Hydrators::of(Hydrator::Follows)\n                }\n            );\n            let negated = |truth| Witness {\n                node: follows.node,\n                truth,\n                negated: true,\n            };\n            assert_eq!(not.witnesses, [negated(failed_follow)]);\n            assert_eq!(not.default_witnesses, [negated(Truth::False)]);\n        }\n        assert!(rows > 0);\n        let ViewerFacts::NoUser { relationship, .. } = explanation.viewer else {\n            panic!(\"{:?}\", explanation.viewer);\n        };\n        assert!(relationship.is_author);\n        assert_eq!(relationship.follows, Seen::Failed);\n    }\n\n",
+      "source_digest": "4c0144ebddaa6b6c62d208657b68d961a4225011ad8106863116806201a5a267",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "visibility-filtering/explain.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1903,
+      "end_line": 1927,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            assert_eq!(\n                not.truth,\n                Truth::Unknown {\n                    default: true,\n                    failed: Hydrators::of(Hydrator::Follows)\n                }\n            );\n            let negated = |truth| Witness {\n                node: follows.node,\n                truth,\n                negated: true,\n            };\n            assert_eq!(not.witnesses, [negated(failed_follow)]);\n            assert_eq!(not.default_witnesses, [negated(Truth::False)]);\n        }\n        assert!(rows > 0);\n        let ViewerFacts::NoUser { relationship, .. } = explanation.viewer else {\n            panic!(\"{:?}\", explanation.viewer);\n        };\n        assert!(relationship.is_author);\n        assert_eq!(relationship.follows, Seen::Failed);\n    }\n\n    #[tokio::test]\n    async fn each_use_of_a_named_condition_is_its_own_observed_occurrence() {\n",
+      "source_digest": "9dbdedeaef3b763574589093f40b805038829212d19b6486d977c18eccee7b08",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "visibility-filtering/explain.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1904,
+      "end_line": 1928,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                not.truth,\n                Truth::Unknown {\n                    default: true,\n                    failed: Hydrators::of(Hydrator::Follows)\n                }\n            );\n            let negated = |truth| Witness {\n                node: follows.node,\n                truth,\n                negated: true,\n            };\n            assert_eq!(not.witnesses, [negated(failed_follow)]);\n            assert_eq!(not.default_witnesses, [negated(Truth::False)]);\n        }\n        assert!(rows > 0);\n        let ViewerFacts::NoUser { relationship, .. } = explanation.viewer else {\n            panic!(\"{:?}\", explanation.viewer);\n        };\n        assert!(relationship.is_author);\n        assert_eq!(relationship.follows, Seen::Failed);\n    }\n\n    #[tokio::test]\n    async fn each_use_of_a_named_condition_is_its_own_observed_occurrence() {\n        let [.., level_82] = explainer(\n",
+      "source_digest": "552877c3391c06f86bb83ffac4287f0dd8d031dd24d73ee5e4a0687d1a95d17b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 21,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::hydration::{HydratedUser, Hydration, HydrationPlan, Hydrators, Quoted, RequestRows};\nuse crate::models::{\n    AuthorId, Decided, Evaluation, LimitedEngagement, MediaRestriction, Notice, Placement,\n    PostCandidate, QuoteFacts, TweetId, UserCandidate, UserEntity, Verdict, ViewerFeatures,\n    ViewerRelationship,\n};\nuse crate::params::CountryLists;\n#[cfg(test)]\nuse crate::rules::legacy_table::{legacy_table, Unrepresentable};\nuse crate::rules::levels::LevelRules;\nuse crate::rules::rule_spec::engine::{Engine, Fold, PostEngine, UserEngine};\nuse crate::rules::rule_spec::inputs::EvaluateInputs;\nuse crate::rules::rule_spec::observed::{self, NoTrace, NodeObserver, NodeTrace, NodeTracer, Skip};\nuse crate::rules::rule_spec::rule::{self, Rule, RuleCond};\nuse crate::rules::rule_spec::{rule_name, ActionSpec, Contribution, RuleAction, RuleId, Truth};\nuse crate::rules::{RuleContext, SafetyLevel};\nuse std::borrow::Cow;\nuse std::cmp::Reverse;\nuse std::sync::Arc;\nuse strum::VariantArray;\n\n",
+      "source_digest": "22343567adf438bbb1434e5ab9a6db8a52f88c7c017a13e65961324ba2d9cda8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 960,
+      "end_line": 984,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[cfg(test)]\nimpl Policy {\n    pub(super) fn trace(&self, context: &RuleContext<'_>) -> PolicyTrace {\n        let mut total = Total::default();\n        let evaluation = fold(&self.rules, context, &mut total);\n        total.into_trace(evaluation)\n    }\n}\n\n#[cfg(test)]\nimpl PostPolicy {\n    fn legacy_table(&self) -> Result<String, Unrepresentable> {\n        Ok(format!(\n            \"# user\\n{}# post\\n{}\",\n            legacy_table(&self.user.rules)?,\n            legacy_table(&self.post.rules)?\n        ))\n    }\n}\n\n#[cfg(test)]\nimpl RuleEngine {\n    pub(super) fn trace(\n        &self,\n",
+      "source_digest": "c7bc068bd887406a24a27cfc0fac9fca5af6b7e3d74badd885a13d66a2e4d571",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 963,
+      "end_line": 987,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub(super) fn trace(&self, context: &RuleContext<'_>) -> PolicyTrace {\n        let mut total = Total::default();\n        let evaluation = fold(&self.rules, context, &mut total);\n        total.into_trace(evaluation)\n    }\n}\n\n#[cfg(test)]\nimpl PostPolicy {\n    fn legacy_table(&self) -> Result<String, Unrepresentable> {\n        Ok(format!(\n            \"# user\\n{}# post\\n{}\",\n            legacy_table(&self.user.rules)?,\n            legacy_table(&self.post.rules)?\n        ))\n    }\n}\n\n#[cfg(test)]\nimpl RuleEngine {\n    pub(super) fn trace(\n        &self,\n        level: SafetyLevel,\n        viewer: &ViewerFeatures,\n        candidate: &PostCandidate,\n",
+      "source_digest": "a287f80f9fbf0c96905eeea67ceb56a3ee7cc3c66b53b1fad61331e4c78e4b6b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 964,
+      "end_line": 988,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut total = Total::default();\n        let evaluation = fold(&self.rules, context, &mut total);\n        total.into_trace(evaluation)\n    }\n}\n\n#[cfg(test)]\nimpl PostPolicy {\n    fn legacy_table(&self) -> Result<String, Unrepresentable> {\n        Ok(format!(\n            \"# user\\n{}# post\\n{}\",\n            legacy_table(&self.user.rules)?,\n            legacy_table(&self.post.rules)?\n        ))\n    }\n}\n\n#[cfg(test)]\nimpl RuleEngine {\n    pub(super) fn trace(\n        &self,\n        level: SafetyLevel,\n        viewer: &ViewerFeatures,\n        candidate: &PostCandidate,\n    ) -> PolicyTrace {\n",
+      "source_digest": "40fe06de465220090d29053f70d02414f8cbe45f226dfaf59875d37ddab8f1d1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1205,
+      "end_line": 1229,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            assert!(!plans_from_its_rows(user_only, &plan), \"{post_keyed:?}\");\n        }\n    }\n\n    #[test]\n    fn each_level_evaluates_its_pinned_policy() {\n        let rule_engine = RuleEngine::for_tests();\n        let tables: Vec<(String, String)> = SafetyLevel::VARIANTS\n            .iter()\n            .map(|&level| {\n                let table = rule_engine\n                    .policy(level)\n                    .legacy_table()\n                    .unwrap_or_else(|error| panic!(\"{level:?} has no legacy table: {error:?}\"));\n                (\n                    format!(\"tests/fixtures/policy/{}.txt\", <&str>::from(level)),\n                    table,\n                )\n            })\n            .collect();\n        let orphans: Vec<String> =\n            std::fs::read_dir(crate::pinned::crate_path(\"tests/fixtures/policy\"))\n                .unwrap()\n                .map(|entry| {\n                    let name = entry.unwrap().file_name();\n",
+      "source_digest": "d979deb66ab232dea3f9a92c6a19b4b5d0b23f126cfd110fabf5c4cf2be89659",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1289,
+      "end_line": 1313,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        }\n    }\n\n    #[test]\n    fn each_rule_of_a_rule_id_names_the_same_labels() {\n        fn labels<E: Engine>(rules: &[&Rule<E>]) -> Vec<(RuleId, String, Vec<String>)> {\n            rules\n                .iter()\n                .map(|rule| {\n                    let mut labels: Vec<String> = rule\n                        .when\n                        .conjuncts()\n                        .iter()\n                        .filter_map(|condition| condition.own_tweet_label())\n                        .collect();\n                    labels.sort_unstable();\n                    (rule.id, rule.name(), labels)\n                })\n                .collect()\n        }\n        let mut first: Vec<(RuleId, String, Vec<String>)> = Vec::new();\n        for &level in SafetyLevel::VARIANTS {\n            let rules = level.spec().rules.lists();\n            for (id, name, labels) in labels(rules.user).into_iter().chain(labels(rules.post)) {\n",
+      "source_digest": "5c084bcb1adb6ab8a58c906695501cd10dbc554b61867d3933b00f1958ab2452",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1969,
+      "end_line": 1993,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                action,\n            }\n        }\n\n        fn children<'t>(trace: &'t PolicyTrace, parent: usize) -> Vec<&'t NodeTrace> {\n            trace\n                .nodes\n                .iter()\n                .filter(|node| node.parent == Some(parent))\n                .collect()\n        }\n\n        fn witness(node: &NodeTrace, truth: Truth, negated: bool) -> Witness {\n            Witness {\n                node: node.node,\n                truth,\n                negated,\n            }\n        }\n\n        #[test]\n        fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {\n            let rule_engine = RuleEngine::for_tests();\n            let mut seen = (0, 0);\n            for (own_level, viewer, fetched) in cases() {\n",
+      "source_digest": "69c1e032d8044e841ec378fd5de2e93c2a89aa262fbf6fb896d741f7bc0d6881",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1973,
+      "end_line": 1997,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        fn children<'t>(trace: &'t PolicyTrace, parent: usize) -> Vec<&'t NodeTrace> {\n            trace\n                .nodes\n                .iter()\n                .filter(|node| node.parent == Some(parent))\n                .collect()\n        }\n\n        fn witness(node: &NodeTrace, truth: Truth, negated: bool) -> Witness {\n            Witness {\n                node: node.node,\n                truth,\n                negated,\n            }\n        }\n\n        #[test]\n        fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {\n            let rule_engine = RuleEngine::for_tests();\n            let mut seen = (0, 0);\n            for (own_level, viewer, fetched) in cases() {\n                for &level in SafetyLevel::VARIANTS {\n                    let failed_alone = if level == own_level {\n                        rule_engine.policy(level).hydrators\n                    } else {\n",
+      "source_digest": "55767cf0dd5e7ff05fc86829834e12b8f5b0d5bdcd4ec85ee2697ebcc87d510e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "visibility-filtering/rules/mod.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 23,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "mod author_rules;\n#[cfg(test)]\nmod catalog;\nmod context;\npub mod engine;\n#[cfg(test)]\npub(crate) mod fixtures;\n#[cfg(test)]\nmod golden_corpus;\n#[cfg(test)]\nmod legacy_table;\nmod levels;\nmod rule_spec;\nmod safety_level;\nmod tweet_rules;\n\n#[cfg(test)]\nuse crate::models::{Placement, PostCandidate, QuoteFacts, ViewerFeatures};\n#[cfg(test)]\nuse crate::params::CountryLists;\nuse context::RuleContext;\npub use engine::{Effect, PolicyTrace, RowTrace, RuleEngine};\npub(crate) use rule_spec::observed::NoTrace;\n",
+      "source_digest": "202b86ebbb623f3dcd788412683ae298a0482488f7a16e2d4b400e0e5cee6b09",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 292,
+      "end_line": 316,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n    }\n}\n\nfn reads_one_definition<E: Fold>(\n    rule: &Rule<E>,\n    definitions: &[RuleCond<E>],\n    leaves: &[Predicate],\n) -> bool {\n    fn walk<E: Engine>(\n        condition: RuleCond<E>,\n        definitions: &[RuleCond<E>],\n        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n",
+      "source_digest": "e18e3743beaf0f72bc8eca6e4dfdebddbe22dc5a7272cc8165fb7cd4ae73484b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 297,
+      "end_line": 321,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    rule: &Rule<E>,\n    definitions: &[RuleCond<E>],\n    leaves: &[Predicate],\n) -> bool {\n    fn walk<E: Engine>(\n        condition: RuleCond<E>,\n        definitions: &[RuleCond<E>],\n        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n",
+      "source_digest": "c74c4eb4326d6222a782366b7c7d32c655044240d58c60752f09a09ff1b4e6b6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 301,
+      "end_line": 325,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn walk<E: Engine>(\n        condition: RuleCond<E>,\n        definitions: &[RuleCond<E>],\n        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n        walk(root, definitions, false, &mut outside, &mut uses);\n    }\n    for leaf in leaves {\n        assert!(\n",
+      "source_digest": "e2756ee657250403b8148817d4210a5f208ec4f13d0e41ad058d3211bed678db",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 304,
+      "end_line": 328,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n        walk(root, definitions, false, &mut outside, &mut uses);\n    }\n    for leaf in leaves {\n        assert!(\n            !outside.contains(leaf),\n            \"{} reads {leaf:?} outside its named definition\",\n            rule.name()\n",
+      "source_digest": "0b0db07bdce273a46cc24b2f552eb4a3ddf1db7d547419810709b284d251933a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 305,
+      "end_line": 329,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n        walk(root, definitions, false, &mut outside, &mut uses);\n    }\n    for leaf in leaves {\n        assert!(\n            !outside.contains(leaf),\n            \"{} reads {leaf:?} outside its named definition\",\n            rule.name()\n        );\n",
+      "source_digest": "7affa607868e0ce9f3a17f113e58d76a0bc9a1d14e336730955fdadd455c73c8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 156,
+      "end_line": 180,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    Rule,\n    Leaf(Predicate),\n    All,\n    Any,\n    Not,\n    Named(&'static str),\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub struct Witness {\n    pub node: usize,\n    pub truth: Truth,\n    pub negated: bool,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub struct NodeTrace {\n    pub node: usize,\n    pub parent: Option<usize>,\n    pub kind: NodeKind,\n    pub truth: Truth,\n    pub skip: Option<Skip<usize>>,\n    pub witnesses: Vec<Witness>,\n    pub default_witnesses: Vec<Witness>,\n}\n",
+      "source_digest": "bf4ca026b3a0983c09da54b8bf6d7294f4f2e1996ebf9cfd70de12e21accb1bc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 218,
+      "end_line": 242,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[expect(\n        clippy::indexing_slicing,\n        reason = \"`enter` returned `handle` as the index of the node it pushed\"\n    )]\n    fn finish(&mut self, handle: usize, truth: Truth) {\n        let kind = self.nodes[handle].kind;\n        let children: Vec<(usize, Truth)> = self\n            .nodes\n            .iter()\n            .filter(|child| child.parent == Some(handle))\n            .map(|child| (child.node, child.truth))\n            .collect();\n        let negated = kind == NodeKind::Not;\n        let conjunction = matches!(kind, NodeKind::All | NodeKind::Rule);\n        let decides = |child: Truth| match (kind, truth) {\n            (NodeKind::Leaf(_), _) => false,\n            (NodeKind::Not | NodeKind::Named(_), _) => true,\n            (_, Truth::Unknown { .. }) => matches!(child, Truth::Unknown { .. }),\n            (_, Truth::False) if conjunction => child == Truth::False,\n            (_, Truth::True) if !conjunction => child == Truth::True,\n            (_, Truth::True | Truth::False) => true,\n        };\n        let witnesses = children\n            .iter()\n            .filter(|&&(_, child)| decides(child))\n",
+      "source_digest": "cc4a67eba91ff383bb5c08204a3a7b969a88552494b255c09786e486f0ace346",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 234,
+      "end_line": 258,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (NodeKind::Not | NodeKind::Named(_), _) => true,\n            (_, Truth::Unknown { .. }) => matches!(child, Truth::Unknown { .. }),\n            (_, Truth::False) if conjunction => child == Truth::False,\n            (_, Truth::True) if !conjunction => child == Truth::True,\n            (_, Truth::True | Truth::False) => true,\n        };\n        let witnesses = children\n            .iter()\n            .filter(|&&(_, child)| decides(child))\n            .map(|&(node, child)| Witness {\n                node,\n                truth: child,\n                negated,\n            })\n            .collect();\n        let default_witnesses = match truth {\n            Truth::Unknown { default, .. } => children\n                .iter()\n                .filter(|&&(_, child)| match kind {\n                    NodeKind::Leaf(_) => false,\n                    NodeKind::Not | NodeKind::Named(_) => true,\n                    NodeKind::All | NodeKind::Rule | NodeKind::Any => {\n                        child.resolves_true() == default\n                    }\n                })\n",
+      "source_digest": "4dff8c73b11c3735d8b4d8fb5ca3a95b735e7cf039b6c377d44d620fe840a32c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 254,
+      "end_line": 276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    NodeKind::Not | NodeKind::Named(_) => true,\n                    NodeKind::All | NodeKind::Rule | NodeKind::Any => {\n                        child.resolves_true() == default\n                    }\n                })\n                .map(|&(node, child)| Witness {\n                    node,\n                    truth: if child.resolves_true() {\n                        Truth::True\n                    } else {\n                        Truth::False\n                    },\n                    negated,\n                })\n                .collect(),\n            Truth::True | Truth::False => Vec::new(),\n        };\n        let node = &mut self.nodes[handle];\n        node.truth = truth;\n        node.witnesses = witnesses;\n        node.default_witnesses = default_witnesses;\n    }\n}\n",
+      "source_digest": "b8d54196f837fe8223d97aec1e247befec8284740c3b858ce3f86e9a004e1db8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "visibility-filtering/rules/rule_spec/rule.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            other.name == definition.name\n                && !ptr::eq(*other, *definition)\n                && other.condition != definition.condition\n        }) {\n            return Err(DescriptionError::ConflictingName(definition.name));\n        }\n    }\n    Ok(named)\n}\n\n#[cfg(test)]\nimpl<E: Engine> RuleCond<E> {\n    pub(in crate::rules) fn conjuncts(&self) -> &[Self] {\n        match self {\n            Self::All(children) => children,\n            Self::Leaf(_) | Self::Any(_) | Self::Not(_) | Self::Named(_) => slice::from_ref(self),\n        }\n    }\n\n    pub(in crate::rules) fn named(self, named: &mut Vec<&'static NamedCond<E>>) {\n        match self {\n            Self::Leaf(_) => {}\n            Self::All(children) | Self::Any(children) => {\n                for child in children {\n                    child.named(named);\n",
+      "source_digest": "0e235485f6fc578c9344e89451a59d13822402033b39dd56c97cbe13c80493ec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1226,
+      "end_line": 1250,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        }\n    }\n\n    #[test]\n    fn each_rule_of_a_rule_id_names_the_same_labels() {\n        fn labels<E: Engine>(rules: &[&Rule<E>]) -> Vec<(RuleId, String, Vec<String>)> {\n            rules\n                .iter()\n                .map(|rule| {\n                    let mut labels: Vec<String> = rule\n                        .when\n                        .conjuncts()\n                        .iter()\n                        .filter_map(|condition| condition.own_tweet_label())\n                        .collect();\n                    labels.sort_unstable();\n                    (rule.id, rule.name(), labels)\n                })\n                .collect()\n        }\n        let mut first: Vec<(RuleId, String, Vec<String>)> = Vec::new();\n        for &level in SafetyLevel::VARIANTS {\n            let rules = level.spec().rules.lists();\n            for (id, name, labels) in labels(rules.user).into_iter().chain(labels(rules.post)) {\n",
+      "source_digest": "5c084bcb1adb6ab8a58c906695501cd10dbc554b61867d3933b00f1958ab2452",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1847,
+      "end_line": 1871,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                action,\n            }\n        }\n\n        fn children<'t>(trace: &'t PolicyTrace, parent: usize) -> Vec<&'t NodeTrace> {\n            trace\n                .nodes\n                .iter()\n                .filter(|node| node.parent == Some(parent))\n                .collect()\n        }\n\n        fn witness(node: &NodeTrace, truth: Truth, negated: bool) -> Witness {\n            Witness {\n                node: node.node,\n                truth,\n                negated,\n            }\n        }\n\n        #[test]\n        fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {\n            let rule_engine = RuleEngine::for_tests();\n            let mut seen = (0, 0);\n            for (own_level, viewer, fetched) in post_cases() {\n",
+      "source_digest": "71d43d6e43443e25bc17650ecfd13f75d51efe1ede6a46c75ffb0151e526feb8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "visibility-filtering/rules/engine.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1851,
+      "end_line": 1875,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        fn children<'t>(trace: &'t PolicyTrace, parent: usize) -> Vec<&'t NodeTrace> {\n            trace\n                .nodes\n                .iter()\n                .filter(|node| node.parent == Some(parent))\n                .collect()\n        }\n\n        fn witness(node: &NodeTrace, truth: Truth, negated: bool) -> Witness {\n            Witness {\n                node: node.node,\n                truth,\n                negated,\n            }\n        }\n\n        #[test]\n        fn total_observation_keeps_every_evaluation_with_none_one_or_all_nodes_failed() {\n            let rule_engine = RuleEngine::for_tests();\n            let mut seen = (0, 0);\n            for (own_level, viewer, fetched) in post_cases() {\n                for &level in SafetyLevel::VARIANTS {\n                    let failed_alone = if level == own_level {\n                        rule_engine.policy(level).hydrators\n                    } else {\n",
+      "source_digest": "f5b83f767f7e8f2a4857f461098c0f0a7b91683ffc39c71d94c5be26e617036b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 353,
+      "end_line": 377,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n    }\n}\n\nfn reads_one_definition<E: Fold>(\n    rule: &Rule<E>,\n    definitions: &[RuleCond<E>],\n    leaves: &[Predicate],\n) -> bool {\n    fn walk<E: Engine>(\n        condition: RuleCond<E>,\n        definitions: &[RuleCond<E>],\n        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n",
+      "source_digest": "e18e3743beaf0f72bc8eca6e4dfdebddbe22dc5a7272cc8165fb7cd4ae73484b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 358,
+      "end_line": 382,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    rule: &Rule<E>,\n    definitions: &[RuleCond<E>],\n    leaves: &[Predicate],\n) -> bool {\n    fn walk<E: Engine>(\n        condition: RuleCond<E>,\n        definitions: &[RuleCond<E>],\n        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n",
+      "source_digest": "c74c4eb4326d6222a782366b7c7d32c655044240d58c60752f09a09ff1b4e6b6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 362,
+      "end_line": 386,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn walk<E: Engine>(\n        condition: RuleCond<E>,\n        definitions: &[RuleCond<E>],\n        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n        walk(root, definitions, false, &mut outside, &mut uses);\n    }\n    for leaf in leaves {\n        assert!(\n",
+      "source_digest": "e2756ee657250403b8148817d4210a5f208ec4f13d0e41ad058d3211bed678db",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 365,
+      "end_line": 389,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        negated: bool,\n        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n        walk(root, definitions, false, &mut outside, &mut uses);\n    }\n    for leaf in leaves {\n        assert!(\n            !outside.contains(leaf),\n            \"{} reads {leaf:?} outside its named definition\",\n            rule.name()\n",
+      "source_digest": "0b0db07bdce273a46cc24b2f552eb4a3ddf1db7d547419810709b284d251933a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "visibility-filtering/rules/rule_spec/laws.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 366,
+      "end_line": 390,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        outside: &mut Vec<Predicate>,\n        uses: &mut Vec<bool>,\n    ) {\n        match condition {\n            condition if definitions.contains(&condition) => uses.push(negated),\n            RuleCond::Leaf(leaf) => outside.push(E::lift(leaf)),\n            RuleCond::All(children) | RuleCond::Any(children) => {\n                for &child in children {\n                    walk(child, definitions, negated, outside, uses);\n                }\n            }\n            RuleCond::Not(child) => walk(*child, definitions, !negated, outside, uses),\n            RuleCond::Named(named) => walk(named.condition, definitions, negated, outside, uses),\n        }\n    }\n    let (mut outside, mut uses) = (Vec::new(), Vec::new());\n    for root in [rule.audience.condition::<E>(), rule.when] {\n        walk(root, definitions, false, &mut outside, &mut uses);\n    }\n    for leaf in leaves {\n        assert!(\n            !outside.contains(leaf),\n            \"{} reads {leaf:?} outside its named definition\",\n            rule.name()\n        );\n",
+      "source_digest": "7affa607868e0ce9f3a17f113e58d76a0bc9a1d14e336730955fdadd455c73c8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 156,
+      "end_line": 180,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    Rule,\n    Leaf(Predicate),\n    All,\n    Any,\n    Not,\n    Named(&'static str),\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub struct Witness {\n    pub node: usize,\n    pub truth: Truth,\n    pub negated: bool,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub struct NodeTrace {\n    pub node: usize,\n    pub parent: Option<usize>,\n    pub kind: NodeKind,\n    pub truth: Truth,\n    pub skip: Option<Skip<usize>>,\n    pub witnesses: Vec<Witness>,\n    pub default_witnesses: Vec<Witness>,\n}\n",
+      "source_digest": "bf4ca026b3a0983c09da54b8bf6d7294f4f2e1996ebf9cfd70de12e21accb1bc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 218,
+      "end_line": 242,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[expect(\n        clippy::indexing_slicing,\n        reason = \"`enter` returned `handle` as the index of the node it pushed\"\n    )]\n    fn finish(&mut self, handle: usize, truth: Truth) {\n        let kind = self.nodes[handle].kind;\n        let children: Vec<(usize, Truth)> = self\n            .nodes\n            .iter()\n            .filter(|child| child.parent == Some(handle))\n            .map(|child| (child.node, child.truth))\n            .collect();\n        let negated = kind == NodeKind::Not;\n        let conjunction = matches!(kind, NodeKind::All | NodeKind::Rule);\n        let decides = |child: Truth| match (kind, truth) {\n            (NodeKind::Leaf(_), _) => false,\n            (NodeKind::Not | NodeKind::Named(_), _) => true,\n            (_, Truth::Unknown { .. }) => matches!(child, Truth::Unknown { .. }),\n            (_, Truth::False) if conjunction => child == Truth::False,\n            (_, Truth::True) if !conjunction => child == Truth::True,\n            (_, Truth::True | Truth::False) => true,\n        };\n        let witnesses = children\n            .iter()\n            .filter(|&&(_, child)| decides(child))\n",
+      "source_digest": "cc4a67eba91ff383bb5c08204a3a7b969a88552494b255c09786e486f0ace346",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 234,
+      "end_line": 258,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (NodeKind::Not | NodeKind::Named(_), _) => true,\n            (_, Truth::Unknown { .. }) => matches!(child, Truth::Unknown { .. }),\n            (_, Truth::False) if conjunction => child == Truth::False,\n            (_, Truth::True) if !conjunction => child == Truth::True,\n            (_, Truth::True | Truth::False) => true,\n        };\n        let witnesses = children\n            .iter()\n            .filter(|&&(_, child)| decides(child))\n            .map(|&(node, child)| Witness {\n                node,\n                truth: child,\n                negated,\n            })\n            .collect();\n        let default_witnesses = match truth {\n            Truth::Unknown { default, .. } => children\n                .iter()\n                .filter(|&&(_, child)| match kind {\n                    NodeKind::Leaf(_) => false,\n                    NodeKind::Not | NodeKind::Named(_) => true,\n                    NodeKind::All | NodeKind::Rule | NodeKind::Any => {\n                        child.resolves_true() == default\n                    }\n                })\n",
+      "source_digest": "4dff8c73b11c3735d8b4d8fb5ca3a95b735e7cf039b6c377d44d620fe840a32c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "visibility-filtering/rules/rule_spec/observed.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 254,
+      "end_line": 276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    NodeKind::Not | NodeKind::Named(_) => true,\n                    NodeKind::All | NodeKind::Rule | NodeKind::Any => {\n                        child.resolves_true() == default\n                    }\n                })\n                .map(|&(node, child)| Witness {\n                    node,\n                    truth: if child.resolves_true() {\n                        Truth::True\n                    } else {\n                        Truth::False\n                    },\n                    negated,\n                })\n                .collect(),\n            Truth::True | Truth::False => Vec::new(),\n        };\n        let node = &mut self.nodes[handle];\n        node.truth = truth;\n        node.witnesses = witnesses;\n        node.default_witnesses = default_witnesses;\n    }\n}\n",
+      "source_digest": "b8d54196f837fe8223d97aec1e247befec8284740c3b858ce3f86e9a004e1db8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "visibility-filtering/rules/rule_spec/rule.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            other.name == definition.name\n                && !ptr::eq(*other, *definition)\n                && other.condition != definition.condition\n        }) {\n            return Err(DescriptionError::ConflictingName(definition.name));\n        }\n    }\n    Ok(named)\n}\n\n#[cfg(test)]\nimpl<E: Engine> RuleCond<E> {\n    pub(in crate::rules) fn conjuncts(&self) -> &[Self] {\n        match self {\n            Self::All(children) => children,\n            Self::Leaf(_) | Self::Any(_) | Self::Not(_) | Self::Named(_) => slice::from_ref(self),\n        }\n    }\n\n    pub(in crate::rules) fn named(self, named: &mut Vec<&'static NamedCond<E>>) {\n        match self {\n            Self::Leaf(_) => {}\n            Self::All(children) | Self::Any(children) => {\n                for child in children {\n                    child.named(named);\n",
+      "source_digest": "0e235485f6fc578c9344e89451a59d13822402033b39dd56c97cbe13c80493ec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "visibility-filtering/rules/tweet_rules.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1222,
+      "end_line": 1246,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    #[test]\n    fn home_hydration_label_blurs_add_the_modern_blur_gate_to_the_timeline_home_conditions() {\n        use crate::rules::levels::{TIMELINE_HOME, TIMELINE_HOME_HYDRATION};\n        let label_blurs: Vec<&Rule> = TIMELINE_HOME\n            .post\n            .iter()\n            .copied()\n            .filter(|rule| {\n                matches!(rule.action.spec(), ActionSpec::MediaRestriction(_))\n                    && rule\n                        .when\n                        .conjuncts()\n                        .iter()\n                        .any(|condition| !condition.positive_tweet_labels().is_empty())\n            })\n            .collect();\n        assert!(!label_blurs.is_empty());\n        for home in label_blurs {\n            let mut gated = home.when.conjuncts().to_vec();\n            gated.push(ClientHasModernBlur.leaf());\n            assert!(\n                TIMELINE_HOME_HYDRATION\n                    .post\n                    .iter()\n",
+      "source_digest": "2efafb20bf34745f1255cb1b1d10484880d39cfc6d8e391b6c6f4a4842541e7d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "visibility-filtering/rules/tweet_rules.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1229,
+      "end_line": 1253,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .copied()\n            .filter(|rule| {\n                matches!(rule.action.spec(), ActionSpec::MediaRestriction(_))\n                    && rule\n                        .when\n                        .conjuncts()\n                        .iter()\n                        .any(|condition| !condition.positive_tweet_labels().is_empty())\n            })\n            .collect();\n        assert!(!label_blurs.is_empty());\n        for home in label_blurs {\n            let mut gated = home.when.conjuncts().to_vec();\n            gated.push(ClientHasModernBlur.leaf());\n            assert!(\n                TIMELINE_HOME_HYDRATION\n                    .post\n                    .iter()\n                    .any(|rule| rule.id == home.id\n                        && rule.action == home.action\n                        && rule.when.conjuncts() == gated.as_slice()),\n                \"{} has no TimelineHomeHydration rule with its conditions and client_has_modern_blur\",\n                home.name()\n            );\n        }\n",
+      "source_digest": "6454630277b4b0f0fe9c418bd65d9f1f742f46133028e5fffb8bc70e47b4efa7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "visibility-filtering/rules/tweet_rules.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1237,
+      "end_line": 1255,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            })\n            .collect();\n        assert!(!label_blurs.is_empty());\n        for home in label_blurs {\n            let mut gated = home.when.conjuncts().to_vec();\n            gated.push(ClientHasModernBlur.leaf());\n            assert!(\n                TIMELINE_HOME_HYDRATION\n                    .post\n                    .iter()\n                    .any(|rule| rule.id == home.id\n                        && rule.action == home.action\n                        && rule.when.conjuncts() == gated.as_slice()),\n                \"{} has no TimelineHomeHydration rule with its conditions and client_has_modern_blur\",\n                home.name()\n            );\n        }\n    }\n}\n",
+      "source_digest": "f0ac84b4da24a1bce31da55d2381e23e618f31100fb893970e3cd8389b6e67aa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": false
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1bf25a6b16565fb2e6d1be06b9bffd97dda64c2dfeb3a51ef50852980ce1cdcb",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/rules",
+      "presence": {
+        "before_exists": true,
+        "after_exists": false
+      },
+      "diff_digest": "676bb6407786425b28ae61905328e514b16993d040229ba5506457a49df47657",
+      "context_complete": true,
+      "task_id": "T-aae23d5588b486996cb752dc94790cea6980a95c32a810399234b48d569567ed",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d547f7f523286fc143e44985f8d69a2934904a81e65d621781f8443cf66bf6b8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-8dfec3fbfb6686d8fd51d0928b3bf67c0aee9770ff93ed94320b66bd9eb9071e",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1dc293c33ef2be6a604e12d48a0aec5ad26fae08d60ec14b3bcc72303cd61dfd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-8fd28e703d267bae81649c1877da080ab54a2be5091a8978dd405c8085f3cac8",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0d41e4c1629577b4e58cb095144eadbf8dd3b89960753393202484e797f9c0db",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa6dabd64af5701106e92cf6092b3d808fc208a5714f6617986e1c30a2417f25",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0592f260a8bcc04bb9b24bc4ade900a4da9e020f7aafa57c4cc02b4011490569",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-c5528f61b4a110716040506e0e1e7201515fc23445615b614b4e6c213a88701d",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-48011a0bafc2f7e3ba6cbc6a6b6e08546bb7ebb0c54ecbab98a83c2f79abd312",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-dafc4e604bd1eb951446e5204750ed2ef9d1ced48b424a58a7f4a085d6b9a290",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-84eacdda41a75e54c0e3fd71624f1139c005c57a46359c202c77695e619ae581",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec7bd868c48fb1c003ebc0d55a3acf80de8edf7a520f9bfa846bf9db7bd19a0f",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0b1e62b07188d7ee16d111874a1986ac347af64337c6eb7a011a67d07cb05ba9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-fe9b09669a25d5fd86bd99635aaffbbd75fd43a49d18fc07db04952d4a899ac1",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8263e4d8ea4cc6db1e4118869e0ee7bc74ef2b2f6abb8f0017b96c22bad03860",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-713b48d40612b3ef58866f3286d3088b60d5a3a9b9e92803ddd033f02f8f18ed",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7d6ebac56a50363563e6e922184f1fed25e4668a3f96b806f8982dad3fa032f0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-24f138911c6c4e1fc80c519ec8fc87d3ff687b601cf7700c83baa8c1672f05cf",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f1101ed70edd634f94515a2330f4c40cbe0b4033fbd019411ffa224b382b6534",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-40e92af46413480d3a30ab55e395dbe140d06fb91ce85ce57aa68a842539a0ed",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e22d72d4cde40e0a968dcdc794a8114ab7137dca79ee5e28b75f73ddecd53e2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-fbd2825687d36f54fe9c1879c88016267b585b8f3ee0650bdbc54d10593372d2",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3cd860a78158eceda02ca5d60ae83a4376fefd10432cfeb551ab83050309ba7d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-80ee004f185db3a21910b28c37835052dec9033a714d655736ad6cf8e4d91233",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b889491f7b5cc97ae0db35af7b0a7e5c05d7aa27d55cd2d5f0e99ed8ad340f11",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-9c1daa12d34f0c560e6065977eb6b818ba7d8e5bc45b990287fb76e900bfed57",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-48bbd0f09cf7a2cba1e0d109beea2d7f41f285026886d59f8ad0572047283821",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-777a3380066132bf5f4107f7b9897c8b1333930f19c9b1fd4b3da5c57bcee82b",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d7288c857890c432901f17086fffdc27c914c90be42035208f8cefb20ad714f8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-0da98daaa8c0eee7a6c7fcfd5d35803b6c3c74d2186626be4b0dc152145d6f3e",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dc109812a4860c21db8c25bb4da12648a002b4f3906ac7bc28d1666d53188a77",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-d736e988685d03d7250a3178b5e73dd9dec841767d6d5dadf0e85beaa9c10667",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b8f818d2acbc0730527891710b08529cd496e118708e5c6ad8a5d710cd5c3d49",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-b7bee839651a497719a633ddb5c4550f1a28bc5f1cfdcecb660cf96c6bbefbd2",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e5b288a50d15ea778eb4cac343f1aa25987a98d3ddf8d29d1e5902b44cdb8b8b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-6633ecd215f010da0cd551e07c8e3c236d3bf9639fdc21be3ff359ca89c77997",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-12f5e28b46b8257d460af12b304b8bf5ed89accc3ff64c682c186c1777a0272a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-48ee5bfe4287dce6c341efec4bc8a69a7a02d3522c1cb1b730c4e1abbd19baeb",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e11846412fa07853a545df3f98b087ee1fc8d32eff7a88e9801857cde73a0a90",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-e25de5632239cb51696e638c3de559b124981723e71dacd855b4b620d094637f",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-352f317bbbc902537ca40252045da4499afdc79c33e5f09b7f592275d20302d5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c99fee3ee36fe434fa2029956787c0d47d974ca897ea06412eb88c67ee0a8b7",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0db4c9dba832a26ca2c8f4881fb3fafcd1a191c0ab42c519090154a247669218",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-c7eb990bc8d103c348ac241858d2613c1ef6148361c03c06559072010a77ec0c",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-73e4d923fc6547d76c729d382695bb8674f0de926ca8d2f6c14762c76f596fdf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-0f0f80e877d7078af2b4c1903d57b7d59545a50f65257b32749ce4866cc0cbe9",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aac88cc2d7955e2187df7c9e6d67221c8aa7afd0e585539c6976ff5fdbfbe16e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-054e7c6728e4471f3c61f403b82973c7ec29ea12cb9f4580fe55dc53b9871277",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c57610460b81f7d443f31a2c79c6b6cc38a3714ccc24e4dc51074ba0b18c4bca",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-24b69895340e02384ea8efd02c1449c079e7542d4af57c22bf098f3c4081ecc2",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f46896eebc933ea9793f1d408ff0b31977eb306769de71b3eb449941142e654b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-dd45f3342e46e42de0dbd11a0ca64cccd7710ef79cb44eb2c4c10fb071b257e2",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0d4d1dfd197ec97515a8cc560db471f754aa243419acbc87a554157c219aeb65",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-e96c3149c0587f50dcf414eb10abb3803f218db81e52825e9a30031bf36ad421",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cdb00f0942b746e077bab1657d128e84e1861be64325a71e7cb1be2058399bf6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-1f365eb512539f5439b3029c6c437f5c697adcc7ff2772b4ccbf24680e3a8ff0",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-88e9e2e63088f941d6f98876e078612f6bd9fd70400b7b3d8d06727f10092dda",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-3acdba8aec8561c4c3b2a4944fcb0a4fa53426fa3beb9009f3de10ddacf93f8f",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d87960e88246f734a08ed9da907295fa1f8515727beff700bcee5c0a94776ff9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-43e0c10e70d0e6e9b1eec4661305c0a3fc63d07be7d82902aa2d191139f7ea0b",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3117ff993ab80dca946484cbfcca177bd110567dc6ccf732883e6729a4a69d45",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-7e2d5de6f8ad65958aff2153e8f5d2a870bcaf464c152d24fb51c7a54ecf5b43",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b07ef3213192e9f3b575a1de9ce4456eccad9c049210abc76de9e46ac2c9286e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-8b66f2590f00d9124ace0dfbcdb39daa00ff014d39a9c04de6dc2224905f0731",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6cc684e349d5cc9f9574dda2911b15311309ba7d3c1ab1d7708d8c8eade3fd3f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-24edcdefcd64964117a03a0e848fe00896c54a6b9150fc762000a86c0dbeebd8",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6c31a4ee5fc688d6311f3c27e12d3ea2e0e497f4d57a4feecd6023cbb6284438",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-e5b258dcad15e16c9144a805e2440eaaaddb55f6666a5758c7bead5c869c928c",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-794d53855a174d50aff9190b124e120ea4b56dbea7a38d5429fde32a826dd7d9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-fef9d341bcd563f8919b0ebc7844c3064ac2efee5e82287891b313f081ee1e60",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e199e31809115645e261b515be61e95776aab2523cd28bf2d681d794187e81ee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-324724a2aa0ac517718388bb764ef3ecb5f956261703e18a96ca58d80bc5d471",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5aeb606803f51f0cb119dd781cb1ca5558d4010b9183db6af96ae215235f0ee4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-16bde2c4d6ff3ecff860fd27f5391ec87de7642ea5f7bdcf8d3876e9dd772607",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fb07c456db20aa8c8847031b01feb96325a8bda7cb15de3c23c4068329feb5ae",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-a482600b6cdfc3ad59842bf58e2659711e880dcfb0c8739fc2dda063369fbba6",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-23b7b7560d09db4e36d145a837c360dba4cced7cdc8a40fce8e849c256fefa02",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-f5cc16a4b467ad48d86c4bbee48005944906d8559886b8f78da655e8a8fc95cc",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b3df0d9706361322baaed68b38391d4e2490bf177df64e7a2dbe9eb10dda02fb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/rules",
+      "query_symbols": [
+        "Unrepresentable",
+        "legacy_table",
+        "conjuncts",
+        "negated",
+        "the_legacy_table_rejects_a_rule_it_cannot_print"
+      ],
+      "context_complete": false,
+      "task_id": "T-28a6db9e04e794bb05733462d9100458d6b9b0c77d49e7e7c96bd6c86da941a9",
+      "evidence_refs": [
+        "E41"
+      ]
+    }
+  ],
+  "task_id": "T-7479932aa22d9c4832f1a562c776e916d85b5d380d97954507cb7f6e7ad8c259"
+}

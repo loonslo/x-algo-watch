@@ -1,0 +1,1736 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/sources/exchange.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-6e4d157a4e2a926452eaa77f611a798ea6ac8932f75716fa73f3e61707aa5077",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 636,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery, Graph};\nuse crate::hydration::tweet_source::decode_tweet;\nuse crate::models;\nuse crate::thrift_read::read_fields;\nuse anyhow::anyhow;\nuse prost::Message;\nuse serde::de::DeserializeOwned;\nuse serde::{Deserialize, Deserializer, Serialize, Serializer};\nuse std::fmt::{self, Display};\nuse std::iter;\nuse std::str::FromStr;\nuse strum::VariantArray;\nuse thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};\nuse xai_core_entities::entities::{\n    ConversationControl, EditControl, GizmoduckUser, GizmoduckUserResult, PureCoreData, QuotedTweet,\n};\nuse xai_strato::strato_thrift::{strato_decode, StratoResult};\nuse xai_visibility_filtering_proto as vf_pb;\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub(crate) enum Id {\n    User(u64),\n    Tweet(u64),\n    Community(u64),\n    Article(u64),\n    Place(u64),\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub(crate) enum Scope {\n    Shared,\n    Case,\n    Viewer,\n}\n\npub(crate) trait Exchange {\n    const NAME: &'static str;\n    const SCOPE: Scope;\n    const FIELDS: Option<&'static str> = None;\n    const KEEPS_PARTIAL: bool = false;\n    type Key: Display + FromStr;\n    type Wire: Serialize + DeserializeOwned + 'static;\n\n    fn ids(key: &Self::Key, wire: Option<&Self::Wire>) -> anyhow::Result<Vec<Id>>;\n}\n\npub(crate) trait Visit {\n    fn exchange<X: Exchange>(&mut self);\n}\n\n#[derive(Clone, Debug, PartialEq)]\npub(crate) struct Bytes(pub(crate) Vec<u8>);\n\nimpl AsRef<[u8]> for Bytes {\n    fn as_ref(&self) -> &[u8] {\n        &self.0\n    }\n}\n\nimpl Display for Bytes {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        self.0.iter().try_for_each(|byte| write!(f, \"{byte:02x}\"))\n    }\n}\n\nimpl Serialize for Bytes {\n    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {\n        serializer.collect_str(self)\n    }\n}\n\nimpl<'de> Deserialize<'de> for Bytes {\n    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {\n        let hex = String::deserialize(deserializer)?;\n        (0..hex.len())\n            .step_by(2)\n            .map(|at| {\n                hex.get(at..at + 2)\n                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())\n            })\n            .collect::<Option<Vec<u8>>>()\n            .map(Self)\n            .ok_or_else(|| serde::de::Error::custom(\"odd-length or non-hex bytes\"))\n    }\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub(crate) struct EdgeKey {\n    pub(crate) graph: Graph,\n    pub(crate) direction: EdgeDirection,\n    pub(crate) destination: u64,\n}\n\nimpl EdgeKey {\n    pub(crate) fn of(query: &EdgeQuery, destination: u64) -> Self {\n        Self {\n            graph: query.graph,\n            direction: query.direction,\n            destination,\n        }\n    }\n}\n\nimpl Display for EdgeKey {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        let graph: &str = self.graph.into();\n        write!(f, \"{graph}/{:?}/{}\", self.direction, self.destination)\n    }\n}\n\nimpl FromStr for EdgeKey {\n    type Err = anyhow::Error;\n\n    fn from_str(key: &str) -> anyhow::Result<Self> {\n        let mut parts = key.splitn(3, '/');\n        let (Some(graph), Some(direction), Some(destination)) =\n            (parts.next(), parts.next(), parts.next())\n        else {\n            anyhow::bail!(\"{key}: not a graph/direction/destination key\");\n        };\n        Ok(Self {\n            graph: *Graph::VARIANTS\n                .iter()\n                .find(|known| <&str>::from(**known) == graph)\n                .ok_or_else(|| anyhow!(\"{key}: no graph {graph}\"))?,\n            direction: *EdgeDirection::VARIANTS\n                .iter()\n                .find(|known| format!(\"{known:?}\") == direction)\n                .ok_or_else(|| anyhow!(\"{key}: no direction {direction}\"))?,\n            destination: destination.parse()?,\n        })\n    }\n}\n\npub(crate) struct TesPureCoreData;\n\nimpl Exchange for TesPureCoreData {\n    const NAME: &'static str = \"pure_cores\";\n    const SCOPE: Scope = Scope::Shared;\n    type Key = u64;\n    type Wire = PureCoreData;\n\n    fn ids(&tweet_id: &u64, core: Option<&PureCoreData>) -> anyhow::Result<Vec<Id>> {\n        let linked = core.into_iter().flat_map(|core| {\n            [\n                Some(Id::User(core.author_id)),\n                core.source_user_id.map(Id::User),\n                core.in_reply_to_user_id.map(Id::User),\n                core.source_tweet_id.map(Id::Tweet),\n                core.in_reply_to_tweet_id.map(Id::Tweet),\n                core.conversation_id.map(Id::Tweet),\n            ]\n        });\n        Ok(iter::once(Id::Tweet(tweet_id))\n            .chain(linked.flatten())\n            .collect())\n    }\n}\n\npub(crate) struct TesTweet;\n\nimpl Exchange for TesTweet {\n    const NAME: &'static str = \"tweets\";\n    const SCOPE: Scope = Scope::Shared;\n    type Key = u64;\n    type Wire = Bytes;\n\n    fn ids(&tweet_id: &u64, bytes: Option<&Bytes>) -> anyhow::Result<Vec<Id>> {\n        let mut ids = vec![Id::Tweet(tweet_id)];\n        let Some(Bytes(bytes)) = bytes else {\n            return Ok(ids);\n        };\n        match strato_decode::<RawTweetIds>(bytes)? {\n            StratoResult::Ok { value, .. } => ids.extend(value.unwrap_or_default().ids),\n            StratoResult::Err { code, message } => {\n                anyhow::bail!(\"Strato error code {code}: {message}\")\n            }\n        }\n        if let Some(tweet) = decode_tweet(bytes)? {\n            ids.extend(\n                [\n                    tweet.exclusive_conversation_author_id,\n                    tweet.trusted_friends_list_id,\n                ]\n                .into_iter()\n                .flatten()\n                .map(Id::User),\n            );\n            ids.extend(edit_ids(tweet.edit_control).into_iter().map(Id::Tweet));\n            ids.extend(tweet.narrowcast_place_id.map(Id::Place));\n        }\n        Ok(ids)\n    }\n}\n\nfn edit_ids(edit_control: Option<EditControl>) -> Vec<u64> {\n    match edit_control {\n        Some(EditControl::Initial(initial)) => initial.edit_tweet_ids,\n        Some(EditControl::Edit(edit)) => iter::once(edit.initial_tweet_id)\n            .chain(\n                edit.edit_control_initial\n                    .into_iter()\n                    .flat_map(|initial| initial.edit_tweet_ids),\n            )\n            .collect(),\n        None => vec![],\n    }\n}\n\ntype IdAt = (&'static [i16], fn(u64) -> Id);\n\nconst RAW_ID_PATHS: [IdAt; 11] = [\n    (&[1], Id::Tweet),\n    (&[2, 1], Id::User),\n    (&[2, 5, 1], Id::Tweet),\n    (&[2, 5, 2], Id::User),\n    (&[2, 6, 1], Id::User),\n    (&[2, 7, 1], Id::Tweet),\n    (&[2, 7, 2], Id::User),\n    (&[2, 7, 3], Id::Tweet),\n    (&[2, 14], Id::Tweet),\n    (&[125, 1], Id::Community),\n    (&[170, 1], Id::Article),\n];\n\n#[derive(Default)]\nstruct RawTweetIds {\n    ids: Vec<Id>,\n}\n\nimpl RawTweetIds {\n    fn read(&mut self, proto: &mut dyn TInputProtocol, at: &mut Vec<i16>) -> thrift::Result<()> {\n        read_fields(proto, |proto, field| {\n            at.push(field.id.unwrap_or_default());\n            let id = RAW_ID_PATHS\n                .iter()\n                .find(|(path, _)| *path == at.as_slice())\n                .map(|&(_, id)| id);\n            let read = match (id, field.field_type) {\n                (Some(id), TType::I64) => {\n                    self.push(id, proto.read_i64()?);\n                    true\n                }\n                (Some(id), TType::List) => {\n                    let list = proto.read_list_begin()?;\n                    if list.element_type != TType::I64 {\n                        return Err(not_an_id(at));\n                    }\n                    for _ in 0..list.size {\n                        self.push(id, proto.read_i64()?);\n                    }\n                    proto.read_list_end()?;\n                    true\n                }\n                (Some(_), _) => return Err(not_an_id(at)),\n                (None, TType::Struct)\n                    if RAW_ID_PATHS.iter().any(|(path, _)| path.starts_with(at)) =>\n                {\n                    self.read(proto, at)?;\n                    true\n                }\n                (None, _) => false,\n            };\n            at.pop();\n            Ok(read)\n        })\n    }\n\n    fn push(&mut self, id: fn(u64) -> Id, value: i64) {\n        if value != 0 {\n            self.ids.push(id(value.cast_unsigned()));\n        }\n    }\n}\n\nfn not_an_id(at: &[i16]) -> thrift::Error {\n    thrift::new_protocol_error(\n        thrift::ProtocolErrorKind::InvalidData,\n        format!(\"tweet field {at:?} is not an i64 id\"),\n    )\n}\n\nimpl TSerializable for RawTweetIds {\n    fn read_from_in_protocol(proto: &mut dyn TInputProtocol) -> thrift::Result<Self> {\n        let mut ids = Self::default();\n        ids.read(proto, &mut vec![])?;\n        Ok(ids)\n    }\n\n    fn write_to_out_protocol(&self, _proto: &mut dyn TOutputProtocol) -> thrift::Result<()> {\n        Err(thrift::new_protocol_error(\n            thrift::ProtocolErrorKind::NotImplemented,\n            \"RawTweetIds is decode-only\",\n        ))\n    }\n}\n\npub(crate) struct TesConversationControl;\n\nimpl Exchange for TesConversationControl {\n    const NAME: &'static str = \"conversation_controls\";\n    const SCOPE: Scope = Scope::Shared;\n    type Key = u64;\n    type Wire = ConversationControl;\n\n    fn ids(&tweet_id: &u64, control: Option<&ConversationControl>) -> anyhow::Result<Vec<Id>> {\n        let users = control.into_iter().flat_map(|control| {\n            iter::once(control.conversation_tweet_author_id)\n                .chain(control.invited_user_ids.iter().copied())\n        });\n        Ok(iter::once(Id::Tweet(tweet_id))\n            .chain(users.map(Id::User))\n            .collect())\n    }\n}\n\npub(crate) struct TesQuotedTweet;\n\nimpl Exchange for TesQuotedTweet {\n    const NAME: &'static str = \"quoted_tweets\";\n    const SCOPE: Scope = Scope::Shared;\n    type Key = u64;\n    type Wire = QuotedTweet;\n\n    fn ids(&outer_id: &u64, quoted: Option<&QuotedTweet>) -> anyhow::Result<Vec<Id>> {\n        let quoted = quoted\n            .into_iter()\n            .flat_map(|quoted| [Id::Tweet(quoted.tweet_id), Id::User(quoted.user_id)]);\n        Ok(iter::once(Id::Tweet(outer_id)).chain(quoted).collect())\n    }\n}\n\npub(crate) struct SafetyLabels;\n\nimpl Exchange for SafetyLabels {\n    const NAME: &'static str = \"safety_labels\";\n    const SCOPE: Scope = Scope::Shared;\n    type Key = u64;\n    type Wire = Bytes;\n\n    fn ids(&tweet_id: &u64, bytes: Option<&Bytes>) -> anyhow::Result<Vec<Id>> {\n        let labels = match bytes {\n            Some(Bytes(bytes)) => vf_pb::SafetyLabelMap::decode(bytes.as_slice())?.labels,\n            None => Default::default(),\n        };\n        anyhow::ensure!(\n            !labels.values().any(|label| matches!(\n                label.safety_label_source,\n                Some(vf_pb::safety_label::SafetyLabelSource::ToolAction(_))\n            )),\n            \"a tool-action label names an employee\"\n        );\n        iter::once(Ok(Id::Tweet(tweet_id)))\n            .chain(\n                labels\n                    .into_values()\n                    .flat_map(|label| label.applicable_users)\n                    .map(|user| Ok(Id::User(u64::try_from(user)?))),\n            )\n            .collect()\n    }\n}\n\npub(crate) struct GizmoduckViewer;\n\nimpl Exchange for GizmoduckViewer {\n    const NAME: &'static str = \"viewers\";\n    const SCOPE: Scope = Scope::Viewer;\n    const FIELDS: Option<&'static str> = Some(\"viewer_fields\");\n    type Key = u64;\n    type Wire = GizmoduckUser;\n\n    fn ids(&viewer_id: &u64, user: Option<&GizmoduckUser>) -> anyhow::Result<Vec<Id>> {\n        Ok(iter::once(viewer_id)\n            .chain(user.map(|user| user.user_id))\n            .map(Id::User)\n            .collect())\n    }\n}\n\npub(crate) struct GizmoduckAuthor;\n\nimpl Exchange for GizmoduckAuthor {\n    const NAME: &'static str = \"users\";\n    const SCOPE: Scope = Scope::Shared;\n    const FIELDS: Option<&'static str> = Some(\"user_fields\");\n    type Key = u64;\n    type Wire = GizmoduckUserResult;\n\n    fn ids(&user_id: &u64, result: Option<&GizmoduckUserResult>) -> anyhow::Result<Vec<Id>> {\n        let answered = result.and_then(|result| result.user.as_ref());\n        Ok(iter::once(user_id)\n            .chain(answered.map(|user| user.user_id))\n            .map(Id::User)\n            .collect())\n    }\n}\n\npub(crate) struct Flock;\n\nimpl Exchange for Flock {\n    const NAME: &'static str = \"edges\";\n    const SCOPE: Scope = Scope::Viewer;\n    const KEEPS_PARTIAL: bool = true;\n    type Key = EdgeKey;\n    type Wire = bool;\n\n    fn ids(key: &EdgeKey, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::User(key.destination)])\n    }\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\npub(crate) struct PairEdgeKey {\n    pub(crate) graph: Graph,\n    pub(crate) source: u64,\n    pub(crate) destination: u64,\n}\n\nimpl PairEdgeKey {\n    pub(crate) fn of(query: &EdgeQuery, destination: u64) -> Option<Self> {\n        let EdgeFrom::User(source) = query.from else {\n            return None;\n        };\n        Some(Self {\n            graph: query.graph,\n            source,\n            destination,\n        })\n    }\n}\n\nimpl Display for PairEdgeKey {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        let graph: &str = self.graph.into();\n        write!(f, \"{graph}/{}/{}\", self.source, self.destination)\n    }\n}\n\nimpl FromStr for PairEdgeKey {\n    type Err = anyhow::Error;\n\n    fn from_str(key: &str) -> anyhow::Result<Self> {\n        let mut parts = key.splitn(3, '/');\n        let (Some(graph), Some(source), Some(destination)) =\n            (parts.next(), parts.next(), parts.next())\n        else {\n            anyhow::bail!(\"{key}: not a graph/source/destination key\");\n        };\n        Ok(Self {\n            graph: *Graph::VARIANTS\n                .iter()\n                .find(|known| <&str>::from(**known) == graph)\n                .ok_or_else(|| anyhow!(\"{key}: no graph {graph}\"))?,\n            source: source.parse()?,\n            destination: destination.parse()?,\n        })\n    }\n}\n\npub(crate) struct FlockUserPair;\n\nimpl Exchange for FlockUserPair {\n    const NAME: &'static str = \"user_pair_edges\";\n    const SCOPE: Scope = Scope::Shared;\n    const KEEPS_PARTIAL: bool = true;\n    type Key = PairEdgeKey;\n    type Wire = bool;\n\n    fn ids(key: &PairEdgeKey, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::User(key.source), Id::User(key.destination)])\n    }\n}\n\npub(crate) struct ViewerCountry;\n\nimpl Exchange for ViewerCountry {\n    const NAME: &'static str = \"viewer_countries\";\n    const SCOPE: Scope = Scope::Viewer;\n    type Key = u64;\n    type Wire = String;\n\n    fn ids(&viewer_id: &u64, _: Option<&String>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::User(viewer_id)])\n    }\n}\n\npub(crate) struct Wingman;\n\nimpl Exchange for Wingman {\n    const NAME: &'static str = \"second_degree\";\n    const SCOPE: Scope = Scope::Viewer;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&root: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::User(root)])\n    }\n}\n\npub(crate) struct TrustedFriends;\n\nimpl Exchange for TrustedFriends {\n    const NAME: &'static str = \"trusted_friends\";\n    const SCOPE: Scope = Scope::Viewer;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&list_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::User(list_id)])\n    }\n}\n\npub(crate) struct UserLocation;\n\nimpl Exchange for UserLocation {\n    const NAME: &'static str = \"outside_places\";\n    const SCOPE: Scope = Scope::Viewer;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&place_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Place(place_id)])\n    }\n}\n\npub(crate) struct ArticleLifecycle;\n\nimpl Exchange for ArticleLifecycle {\n    const NAME: &'static str = \"article_lifecycles\";\n    const SCOPE: Scope = Scope::Case;\n    type Key = u64;\n    type Wire = i32;\n\n    fn ids(&article_id: &u64, _: Option<&i32>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Article(article_id)])\n    }\n}\n\npub(crate) struct ArticleMediaEntities;\n\nimpl Exchange for ArticleMediaEntities {\n    const NAME: &'static str = \"article_media_entities\";\n    const SCOPE: Scope = Scope::Case;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&article_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Article(article_id)])\n    }\n}\n\npub(crate) struct ArticleCoverMedia;\n\nimpl Exchange for ArticleCoverMedia {\n    const NAME: &'static str = \"article_cover_media\";\n    const SCOPE: Scope = Scope::Case;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&article_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Article(article_id)])\n    }\n}\n\npub(crate) struct CommunityModeration;\n\nimpl Exchange for CommunityModeration {\n    const NAME: &'static str = \"community_moderations\";\n    const SCOPE: Scope = Scope::Case;\n    type Key = u64;\n    type Wire = models::CommunityModeration;\n\n    fn ids(&tweet_id: &u64, _: Option<&models::CommunityModeration>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Tweet(tweet_id)])\n    }\n}\n\npub(crate) struct CommunityModerator;\n\nimpl Exchange for CommunityModerator {\n    const NAME: &'static str = \"community_moderators\";\n    const SCOPE: Scope = Scope::Viewer;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&community_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Community(community_id)])\n    }\n}\n\npub(crate) struct CommunityViewerRemoved;\n\nimpl Exchange for CommunityViewerRemoved {\n    const NAME: &'static str = \"community_viewer_removals\";\n    const SCOPE: Scope = Scope::Viewer;\n    type Key = u64;\n    type Wire = bool;\n\n    fn ids(&community_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {\n        Ok(vec![Id::Community(community_id)])\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use vf_pb::safety_label::SafetyLabelSource;\n\n    fn label_ids(source: Option<SafetyLabelSource>) -> anyhow::Result<Vec<Id>> {\n        let label = vf_pb::SafetyLabel {\n            safety_label_source: source,\n            applicable_users: vec![7],\n            ..Default::default()\n        };\n        let labels = vf_pb::SafetyLabelMap {\n            labels: [(1, label)].into(),\n        };\n        SafetyLabels::ids(&1, Some(&Bytes(labels.encode_to_vec())))\n    }\n\n    #[test]\n    fn a_recorded_tool_action_label_is_refused() {\n        assert_eq!(label_ids(None).unwrap(), [Id::Tweet(1), Id::User(7)]);\n        let botmaker = SafetyLabelSource::BotmakerAction(vf_pb::BotmakerAction::default());\n        assert_eq!(\n            label_ids(Some(botmaker)).unwrap(),\n            [Id::Tweet(1), Id::User(7)]\n        );\n        let tool = SafetyLabelSource::ToolAction(vf_pb::ToolAction::default());\n        assert_eq!(\n            label_ids(Some(tool)).unwrap_err().to_string(),\n            \"a tool-action label names an employee\"\n        );\n    }\n}\n",
+      "source_digest": "97c82bc23a715a7efc5cdcf79e6c41a583b9f11b981c9b58baa13b2c6d352b49",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 37,
+      "end_line": 61,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n",
+      "source_digest": "ad5f18601149846c820654c18d8f3d9de7365bd2b0f65252abf457d713edad3d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 299,
+      "end_line": 323,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n        }\n        out\n    }\n\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n",
+      "source_digest": "e95ab9a6a2d4ee515d19c0d55d69e95103e6cd05c4dd36ec1e2a8a8811255371",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1689,
+      "end_line": 1713,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return bad(\n                \"wrong_entity\",\n                format!(\n                    \"this head has only sent {} decisions; a {} record would never match\",\n                    head_rows[0].entity_type.as_str(),\n                    entity.as_str()\n                ),\n            );\n        }\n        let scope_rows: Vec<&ActionControlSeen> = head_rows\n            .into_iter()\n            .filter(|s| s.entity_type == entity)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let acts = matches!(req.mode, ControlMode::Live | ControlMode::Rows);\n        let factory = scope_rows.iter().any(|s| s.factory);\n        if factory && (acts || (req.mode == ControlMode::Recording && !req.actions.is_empty())) {\n            return bad(\n                \"factory_managed\",\n                \"this head's actions come from its Model Factory policy; change them there (the off switch and recording without actions are allowed here)\"\n                    .into(),\n            );\n        }\n        Ok(())\n",
+      "source_digest": "617520ac0a87ded404b4c3ce3bd70ba8184024eb1f11a71fd5fb473273acf33c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1690,
+      "end_line": 1714,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"wrong_entity\",\n                format!(\n                    \"this head has only sent {} decisions; a {} record would never match\",\n                    head_rows[0].entity_type.as_str(),\n                    entity.as_str()\n                ),\n            );\n        }\n        let scope_rows: Vec<&ActionControlSeen> = head_rows\n            .into_iter()\n            .filter(|s| s.entity_type == entity)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let acts = matches!(req.mode, ControlMode::Live | ControlMode::Rows);\n        let factory = scope_rows.iter().any(|s| s.factory);\n        if factory && (acts || (req.mode == ControlMode::Recording && !req.actions.is_empty())) {\n            return bad(\n                \"factory_managed\",\n                \"this head's actions come from its Model Factory policy; change them there (the off switch and recording without actions are allowed here)\"\n                    .into(),\n            );\n        }\n        Ok(())\n    }\n",
+      "source_digest": "6e068e459e17b06b04cdbb7f043a8d9e97fe7aca8bb5878372de9e50d0e2ad0c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1754,
+      "end_line": 1778,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mine = format!(\"{now_ms:013}-{:020}\", new_nonce());\n        let deadline = Instant::now() + self.save_budget;\n        self.save_marker(&pkey, &mine, now_ms, false).await?;\n        let out = match self.other_save(&pkey, &mine, now_ms).await {\n            Ok(false) => {\n                self.set_unlocked(req, who, key_id, now_ms, cfg, safety, deadline)\n                    .await\n            }\n            Ok(true) => {\n                let lkey = record_lkey_of(&req);\n                match self.get_record(&lkey).await {\n                    Ok(stored) => Err(SetError::Conflict(\n                        stored.as_ref().and_then(|(r, _)| r.clone()),\n                        stored.map(|(_, v)| v),\n                    )),\n                    Err(e) => Err(e),\n                }\n            }\n            Err(e) => Err(e),\n        };\n        if let Err(e) = self.save_marker(&pkey, &mine, now_ms, true).await {\n            warn!(\n                ?e,\n                pkey, \"action control: save marker not cleared; it lapses in 7 minutes\"\n            );\n",
+      "source_digest": "582261205ac74a05b39a71dbe742ac7d8811e1e9b5a157544b82f98c80b06548",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1908,
+      "end_line": 1932,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        }\n        let lkey = match req.confidence {\n            Some(level) => level_lkey(req.entity_type, &req.head, req.classifier.as_deref(), level),\n            None => lkey_for(\n                req.entity_type,\n                &req.head,\n                req.classifier.as_deref(),\n                req.band.as_deref(),\n            ),\n        };\n        let stored = self.get_record(&lkey).await?;\n        let stored_version = stored.as_ref().map(|(_, v)| *v);\n        let before = stored.and_then(|(r, _)| r);\n        if stored_version != req.expected_version {\n            return Err(SetError::Conflict(before, stored_version));\n        }\n        let mut rec = ActionControlRecord {\n            v: ACTION_CONTROL_RECORD_VERSION,\n            entity_type: req.entity_type,\n            head: req.head.clone(),\n            classifier: req.classifier.clone(),\n            band: req.band.clone(),\n            mode: req.mode,\n            actions: req.actions.clone(),\n",
+      "source_digest": "d58439db5afbf476d8bb7b83e60d20c7e76ae18c7f23205e821a376a4081208e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1982,
+      "end_line": 2006,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                            .collect();\n                        if !head_covers {\n                            all.push(None);\n                        }\n                        all\n                    }\n                }\n            }\n        };\n        let scope_rows: Vec<&ActionControlSeen> = seen\n            .iter()\n            .filter(|s| s.head == req.head && s.entity_type == req.entity_type)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let rules_specs: Option<Vec<Value>> = (!scope_rows.is_empty()).then(|| {\n            scope_rows\n                .iter()\n                .flat_map(|s| s.action_specs.as_array().cloned().unwrap_or_default())\n                .collect()\n        });\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n",
+      "source_digest": "8ca0d7b83d5b86a9702681bb1446eff3014a75e6d98210a1e9a0948324131c62",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1983,
+      "end_line": 2007,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        if !head_covers {\n                            all.push(None);\n                        }\n                        all\n                    }\n                }\n            }\n        };\n        let scope_rows: Vec<&ActionControlSeen> = seen\n            .iter()\n            .filter(|s| s.head == req.head && s.entity_type == req.entity_type)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let rules_specs: Option<Vec<Value>> = (!scope_rows.is_empty()).then(|| {\n            scope_rows\n                .iter()\n                .flat_map(|s| s.action_specs.as_array().cloned().unwrap_or_default())\n                .collect()\n        });\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n",
+      "source_digest": "571ef185b983795eb9693aca143b4ea227f3fe4dd5dada5e970d62ee92c8c1ce",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2014,
+      "end_line": 2038,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let factory = factory_heads.contains(&(p.entity_type, p.head.clone()))\n                || factory_heads.contains(&(req.entity_type, req.head.clone()));\n            let (mode, _, _) = effective(&p, entity, factory, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n            )\n            .into_iter()\n            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n",
+      "source_digest": "6f136b3e6d2f40da0b59bc0d9996d3fa93025646a8e1d35144ef5a56f469f1f2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2017,
+      "end_line": 2041,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let factory = factory_heads.contains(&(p.entity_type, p.head.clone()))\n                || factory_heads.contains(&(req.entity_type, req.head.clone()));\n            let (mode, _, _) = effective(&p, entity, factory, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n            )\n            .into_iter()\n            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n            ));\n            for w in why {\n                if !harsher.contains(&w) {\n",
+      "source_digest": "6801cfcf84d1dfb69821f390f6fbbc422a8fe3aae3e8fe50c65d6a0f2d8d4891",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2023,
+      "end_line": 2047,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n            )\n            .into_iter()\n            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n            ));\n            for w in why {\n                if !harsher.contains(&w) {\n                    harsher.push(w);\n                }\n            }\n        }\n        if !harsher.is_empty() && req.confirm.as_deref() != Some(CONFIRM_WORD) {\n            return Err(SetError::Invalid(\n",
+      "source_digest": "e93242151a7e8a092af84abd0dbb22b3f2817995781ec5bf5c31365813070491",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3351,
+      "end_line": 3375,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Err(SetError::Conflict(Some(cur), Some(1))) => assert_eq!(cur.version, 1),\n            other => panic!(\"{other:?}\"),\n        }\n        let mut next = put(\"H\", ControlMode::Live, vec![SUSPEND]);\n        next.expected_version = Some(1);\n        let out = set(&ac, next).await.unwrap();\n        assert_eq!(out.view.record.version, 2);\n        assert_eq!(out.before.unwrap().mode, ControlMode::Recording);\n        assert_eq!(out.harsher_because, vec![\"turns the scope live\"]);\n        let h = ac.history(\"H\", 50).await;\n        assert_eq!(h.entries.len(), 2);\n        assert_eq!(h.entries[0].version, 2, \"newest first\");\n        assert_eq!(h.entries[0].before.as_ref().unwrap().version, 1);\n        assert_eq!(h.entries[1].before, None);\n        assert_eq!(ac.history(\"H\", 1).await.entries.len(), 1);\n        assert_eq!(\n            store.pkey_rows(MH_PKEY).len(),\n            1,\n            \"one record per scope, never deleted\"\n        );\n    }\n\n    #[tokio::test]\n    async fn put_reports_a_lost_race() {\n        let (ac, store) = loaded(&[]).await;\n",
+      "source_digest": "f5ccc4862921f44665ecd019974808a3074483a49f16b408112f2c63291df682",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4052,
+      "end_line": 4076,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for head in [\"H\", CHILD_SAFETY_HEAD] {\n            let stored = [record(head, None, None, ControlMode::Live, vec![SUSPEND])];\n            let (ac, _) = loaded(&stored).await;\n            let ls = labels(&[\"anchor_campaign_suspend_cse\"]);\n            let before = ac.resolve(&input(head, \"c\", &ls), &on(), |_| true);\n            assert_eq!(\n                (before.mode, before.forced),\n                (ControlMode::Live, None),\n                \"{head}\"\n            );\n            let out = set(&ac, move_live(head, None)).await;\n            assert!(\n                out.as_ref().is_ok_and(|o| o.harsher_because.is_empty()),\n                \"{head}: {out:?}\"\n            );\n            let after = ac.resolve(\n                &ResolveInput {\n                    confidence: Some(high_claim()),\n                    ..input(head, \"c\", &ls)\n                },\n                &on(),\n                |_| true,\n            );\n            assert_eq!(\n                (after.mode, after.forced),\n",
+      "source_digest": "c286b575822e10aa77e47fc1394d6e89d80e1edaeae75664ec5633370a0a8e7d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nfn evidence_floor(\n    row: Option<&ActionControlRecord>,\n    claim: &Claim,\n    cfg: &ControlConfig,\n    outcome: &mut RowOutcome,\n) -> Option<&'static str> {\n    let level = claim.row.level()?;\n    let evidence = row\n        .and_then(|r| r.evidence.as_deref().cloned())\n        .or_else(|| claim.evidence.clone());\n    let supports = evidence.as_ref().and_then(|e| {\n        confidence::supported_level(e, claim.now_ms, cfg.confidence.evidence_max_age_ms)\n    });\n    outcome.evidence_supports = Some(supports);\n    if supports.is_some_and(|s| s >= level) {\n        return None;\n    }\n    let overridden = row.and_then(|r| {\n        r.evidence_override\n            .as_ref()\n            .filter(|o| confidence::override_active(o, r.updated_at_ms, claim.now_ms))\n    });\n    match overridden {\n",
+      "source_digest": "23b6e4422a41cde55c0cc451775f89913b50cdbb71b54e7321f14ca6c627ccc2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 249,
+      "end_line": 273,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let evidence = row\n        .and_then(|r| r.evidence.as_deref().cloned())\n        .or_else(|| claim.evidence.clone());\n    let supports = evidence.as_ref().and_then(|e| {\n        confidence::supported_level(e, claim.now_ms, cfg.confidence.evidence_max_age_ms)\n    });\n    outcome.evidence_supports = Some(supports);\n    if supports.is_some_and(|s| s >= level) {\n        return None;\n    }\n    let overridden = row.and_then(|r| {\n        r.evidence_override\n            .as_ref()\n            .filter(|o| confidence::override_active(o, r.updated_at_ms, claim.now_ms))\n    });\n    match overridden {\n        Some(o) => {\n            outcome.override_by = Some(o.by.clone());\n            None\n        }\n        None if evidence.is_some() => Some(\"evidence_below_floor\"),\n        None => Some(\"evidence_missing\"),\n    }\n}\n\n",
+      "source_digest": "8b24ec25a134c4854e3c818c8cc6684454e9f094162c27429eaeec0073967976",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 427,
+      "end_line": 451,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let (was, now) = (supports(before), supports(Some(after)));\n    if now > was\n        && let Some(l) = now\n    {\n        why.push(format!(\n            \"new evidence lets the record act at {}\",\n            l.as_str()\n        ));\n    }\n    let expiry = |r: Option<&ActionControlRecord>| {\n        r.and_then(|r| {\n            r.evidence_override\n                .as_ref()\n                .filter(|o| confidence::override_active(o, r.updated_at_ms, now_ms))\n                .map(|o| o.expires_at_ms)\n        })\n    };\n    if let Some(until) = expiry(Some(after))\n        && expiry(before).is_none_or(|was| until > was)\n    {\n        why.push(format!(\n            \"an override lets the level act past its evidence floor until {until} (epoch ms)\"\n        ));\n    }\n    why\n",
+      "source_digest": "7fc3bde5d9852c9448492647cbb8d83b49bb503effbb9ea621bc89bb649ea406",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 572,
+      "end_line": 596,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"invalid_evidence\",\n                \"evidence and overrides belong on a row\".into(),\n            );\n        }\n        if let Some(rows) = &req.rows {\n            for row in LevelRow::ALL {\n                if let Some(s) = rows.get(row) {\n                    row_problem(\n                        req.entity_type,\n                        row,\n                        s.mode,\n                        &s.actions,\n                        s.evidence.as_ref(),\n                        s.evidence_override.as_ref(),\n                        now_ms,\n                    )?;\n                }\n            }\n        }\n        return Ok(());\n    }\n    match req.confidence {\n        Some(row) => row_problem(\n            req.entity_type,\n            row,\n",
+      "source_digest": "62d9b45a69ccbcf930f2da8fa87cf0dd5141755618a4c0179e4a55c40ca050d9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 573,
+      "end_line": 597,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"evidence and overrides belong on a row\".into(),\n            );\n        }\n        if let Some(rows) = &req.rows {\n            for row in LevelRow::ALL {\n                if let Some(s) = rows.get(row) {\n                    row_problem(\n                        req.entity_type,\n                        row,\n                        s.mode,\n                        &s.actions,\n                        s.evidence.as_ref(),\n                        s.evidence_override.as_ref(),\n                        now_ms,\n                    )?;\n                }\n            }\n        }\n        return Ok(());\n    }\n    match req.confidence {\n        Some(row) => row_problem(\n            req.entity_type,\n            row,\n            req.mode,\n",
+      "source_digest": "bb78134e42d520595e1634dbcf6c4efad7bc3a6257c09e96b0ddce47549749ad",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 587,
+      "end_line": 611,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    )?;\n                }\n            }\n        }\n        return Ok(());\n    }\n    match req.confidence {\n        Some(row) => row_problem(\n            req.entity_type,\n            row,\n            req.mode,\n            &req.actions,\n            req.evidence.as_ref(),\n            req.evidence_override.as_ref(),\n            now_ms,\n        ),\n        None if req.evidence.is_some() => bad(\n            \"invalid_evidence\",\n            \"evidence belongs on a low, mid or high row\".into(),\n        ),\n        None if req.evidence_override.is_some() => bad(\n            \"invalid_override\",\n            \"an evidence override belongs on a live low, mid or high row\".into(),\n        ),\n        None => Ok(()),\n",
+      "source_digest": "f0eb1992d9ddb02fab2105575351cb6f4d147cd909c87020337db58c14869fdc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 588,
+      "end_line": 612,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }\n            }\n        }\n        return Ok(());\n    }\n    match req.confidence {\n        Some(row) => row_problem(\n            req.entity_type,\n            row,\n            req.mode,\n            &req.actions,\n            req.evidence.as_ref(),\n            req.evidence_override.as_ref(),\n            now_ms,\n        ),\n        None if req.evidence.is_some() => bad(\n            \"invalid_evidence\",\n            \"evidence belongs on a low, mid or high row\".into(),\n        ),\n        None if req.evidence_override.is_some() => bad(\n            \"invalid_override\",\n            \"an evidence override belongs on a live low, mid or high row\".into(),\n        ),\n        None => Ok(()),\n    }\n",
+      "source_digest": "e7f404124deeb2d05212b4a1b770779f1f6149c820bfbf0f3d9a5c1fda794c3e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 610,
+      "end_line": 634,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ),\n        None => Ok(()),\n    }\n}\n\npub(super) fn record_problem(rec: &ActionControlRecord, now_ms: i64) -> Option<&'static str> {\n    let ahead = now_ms.saturating_add(confidence::CLOCK_SKEW_MS);\n    if rec.updated_at_ms > ahead {\n        return Some(\"written later than this pod's clock\");\n    }\n    if rec\n        .evidence\n        .as_ref()\n        .is_some_and(|ev| ev.read_at_ms > ahead)\n    {\n        return Some(\"evidence read later than this pod's clock\");\n    }\n    if let Some(ov) = &rec.evidence_override {\n        if ov.by.trim().is_empty() || ov.reason.trim().is_empty() {\n            return Some(\"an evidence override must name a person and a reason\");\n        }\n        if ov.expires_at_ms <= rec.updated_at_ms {\n            return Some(\"an evidence override can't expire before its own write\");\n        }\n        if ov.expires_at_ms\n",
+      "source_digest": "950272112b99ecf52b831d55cce2cce9fe20289b55f45d5881905cbd8dd5cc76",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 713,
+      "end_line": 737,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let classifier = req.classifier.as_deref();\n        let scope_lkey = lkey_for(entity, &req.head, classifier, None);\n        let alias = cfg.aliases.get(&req.head).map(String::as_str);\n        let names: Vec<&str> = std::iter::once(req.head.as_str()).chain(alias).collect();\n        let rows = self.scan_rows().await?;\n        let snap = Snapshot::of_rows(&rows, \"\");\n        let scope_prior = self.get_raw(&scope_lkey).await?;\n        let scope_version = scope_prior.as_deref().map(raw_version);\n        let scope_before = scope_prior.as_deref().and_then(|b| parse_record(b).ok());\n        let moving = req.mode == ControlMode::Rows;\n        let leaving = !moving && req.confidence.is_none();\n        let on_rows = scope_before\n            .as_ref()\n            .is_some_and(|r| r.mode == ControlMode::Rows);\n        if ((moving || leaving) && scope_version != req.expected_version) || (leaving && !on_rows) {\n            return Err(SetError::Conflict(scope_before, scope_version));\n        }\n        if moving {\n            let not_rules: Vec<String> = snap\n                .under_scope(entity, &names, classifier)\n                .into_iter()\n                .filter(|(_, mode)| *mode != Some(ControlMode::Rules))\n                .map(|(k, _)| k)\n                .collect();\n            if !not_rules.is_empty() {\n",
+      "source_digest": "2cf166c4d80e65bcb7465620269ea13ffd29b434c9e1d9bcf2c2a7d62864e4a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 780,
+      "end_line": 804,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n                            s.actions.clone(),\n                            s.evidence.clone(),\n                            s.evidence_override.clone(),\n                        )\n                    }),\n                    s.and_then(|s| s.expected_version),\n                )\n            } else {\n",
+      "source_digest": "d0c1698b24b1c0792da0f01edd82dd64b8995799afacfb2fab57725390d78ef2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 891,
+      "end_line": 915,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            })\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for (row, after) in compare {\n            let mut priors = vec![snap.row_decider(entity, &names, classifier, row, &recording)];\n            if set_aside {\n                priors.push(None);\n            }\n            let judged_priors = priors\n                .into_iter()\n                .map(|prior| prior.map(|p| as_running(p, cfg, stale, safety_ok, factory, now_ms)));\n            for judged in judged_priors {\n                let why = harsher_because(judged.as_ref(), &after, rules_specs.as_deref())\n                    .into_iter()\n                    .chain(evidence_harsher(\n                        judged.as_ref(),\n                        &after,\n                        now_ms,\n                        cfg.confidence.evidence_max_age_ms,\n                    ));\n                for reason in why {\n                    let reason = format!(\"{} row: {reason}\", row.as_str());\n                    if !harsher.contains(&reason) {\n                        harsher.push(reason);\n                    }\n",
+      "source_digest": "bc95161098d75ffd0b1de6479411f0e692eec38db6e6dd3ab53bb7bcaa346657",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 37,
+      "end_line": 61,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n        );\n    } else {\n        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n",
+      "source_digest": "ad5f18601149846c820654c18d8f3d9de7365bd2b0f65252abf457d713edad3d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 310,
+      "end_line": 334,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                error!(\n                    value = %bad,\n                    \"GrowthBook {CONFIG_KEY} is malformed; page-live scopes run as recording only until it is fixed\"\n                );\n                *last = Some(bad);\n            }\n        }\n        out\n    }\n\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n",
+      "source_digest": "e95ab9a6a2d4ee515d19c0d55d69e95103e6cd05c4dd36ec1e2a8a8811255371",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1874,
+      "end_line": 1898,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mine = format!(\"{now_ms:013}-{:020}\", new_nonce());\n        let deadline = Instant::now() + self.save_budget;\n        self.save_marker(&pkey, &mine, now_ms, false).await?;\n        let out = match self.other_save(&pkey, &mine, now_ms).await {\n            Ok(false) => {\n                self.set_unlocked(req, who, key_id, now_ms, cfg, safety, deadline)\n                    .await\n            }\n            Ok(true) => {\n                let lkey = record_lkey_of(&req);\n                match self.get_record(&lkey).await {\n                    Ok(stored) => Err(SetError::Conflict(\n                        stored.as_ref().and_then(|(r, _)| r.clone()),\n                        stored.map(|(_, v)| v),\n                    )),\n                    Err(e) => Err(e),\n                }\n            }\n            Err(e) => Err(e),\n        };\n        if let Err(e) = self.save_marker(&pkey, &mine, now_ms, true).await {\n            warn!(\n                ?e,\n                pkey, \"action control: save marker not cleared; it lapses in 7 minutes\"\n            );\n",
+      "source_digest": "582261205ac74a05b39a71dbe742ac7d8811e1e9b5a157544b82f98c80b06548",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2028,
+      "end_line": 2052,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        }\n        let lkey = match req.confidence {\n            Some(level) => level_lkey(req.entity_type, &req.head, req.classifier.as_deref(), level),\n            None => lkey_for(\n                req.entity_type,\n                &req.head,\n                req.classifier.as_deref(),\n                req.band.as_deref(),\n            ),\n        };\n        let stored = self.get_record(&lkey).await?;\n        let stored_version = stored.as_ref().map(|(_, v)| *v);\n        let before = stored.and_then(|(r, _)| r);\n        if stored_version != req.expected_version {\n            return Err(SetError::Conflict(before, stored_version));\n        }\n        let mut rec = ActionControlRecord {\n            v: ACTION_CONTROL_RECORD_VERSION,\n            entity_type: req.entity_type,\n            head: req.head.clone(),\n            classifier: req.classifier.clone(),\n            band: req.band.clone(),\n            mode: req.mode,\n            actions: req.actions.clone(),\n",
+      "source_digest": "d58439db5afbf476d8bb7b83e60d20c7e76ae18c7f23205e821a376a4081208e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2050,
+      "end_line": 2074,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            band: req.band.clone(),\n            mode: req.mode,\n            actions: req.actions.clone(),\n            reason: req.reason.trim().to_owned(),\n            updated_by: who.to_owned(),\n            key_id: key_id.to_owned(),\n            updated_at_ms: now_ms,\n            version: stored_version.unwrap_or(0) + 1,\n            write_nonce: new_nonce(),\n            confidence: req.confidence,\n            evidence: req.evidence.clone().map(Box::new),\n            evidence_override: req.evidence_override.clone().map(Box::new),\n            admit_unlisted_labels: admits_unlisted_after(&req, before.as_ref()),\n            rollout_bp: None,\n        };\n        rec.v = rec.schema_version();\n        let recording = || ActionControlRecord {\n            mode: ControlMode::Recording,\n            actions: Vec::new(),\n            ..rec.clone()\n        };\n        let priors: Vec<Option<ActionControlRecord>> = match (&before, stored_version) {\n            (Some(b), _) => vec![Some(b.clone())],\n            (None, Some(_)) => vec![Some(recording())],\n            (None, None) => {\n",
+      "source_digest": "ed414b9f8e160635a5cdc3903a7edd44353786c87a8fa9e520506cfbfcbe364a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2104,
+      "end_line": 2128,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                            .collect();\n                        if !head_covers {\n                            all.push(None);\n                        }\n                        all\n                    }\n                }\n            }\n        };\n        let scope_rows: Vec<&ActionControlSeen> = seen\n            .iter()\n            .filter(|s| s.head == req.head && s.entity_type == req.entity_type)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let rules_specs: Option<Vec<Value>> = (!scope_rows.is_empty()).then(|| {\n            scope_rows\n                .iter()\n                .flat_map(|s| s.action_specs.as_array().cloned().unwrap_or_default())\n                .collect()\n        });\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n",
+      "source_digest": "163f10de75c6de0dbaec0b7984cd7a85f901bffb39b03d7d0167be2404056345",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2105,
+      "end_line": 2129,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        if !head_covers {\n                            all.push(None);\n                        }\n                        all\n                    }\n                }\n            }\n        };\n        let scope_rows: Vec<&ActionControlSeen> = seen\n            .iter()\n            .filter(|s| s.head == req.head && s.entity_type == req.entity_type)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let rules_specs: Option<Vec<Value>> = (!scope_rows.is_empty()).then(|| {\n            scope_rows\n                .iter()\n                .flat_map(|s| s.action_specs.as_array().cloned().unwrap_or_default())\n                .collect()\n        });\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n            }\n",
+      "source_digest": "573bf150b8803807010e91ecd2b68fc1e61e57733ba1c38b5f7dc0aca7e67b57",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2129,
+      "end_line": 2153,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            let (entity, safety_ok) = match p.entity_type {\n                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let (mode, _, _) = effective(&p, entity, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n            )\n            .into_iter()\n            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n",
+      "source_digest": "11e1734de1eb29ca9ea5c81e49837d800b93302830b07a0af7ed310badd1dc03",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2132,
+      "end_line": 2156,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let (mode, _, _) = effective(&p, entity, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n            )\n            .into_iter()\n            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n            ));\n            for w in why {\n                if !harsher.contains(&w) {\n",
+      "source_digest": "f3d696dfd1611dd57025d26e4113681ca58728fb4604f90eead3a6914cf1d781",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2138,
+      "end_line": 2162,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n            )\n            .into_iter()\n            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n            ));\n            for w in why {\n                if !harsher.contains(&w) {\n                    harsher.push(w);\n                }\n            }\n        }\n        if let Some(why) = admits_unlisted_harsher(before.as_ref(), &rec) {\n            harsher.push(why.to_owned());\n",
+      "source_digest": "1191471eb2fbdf3cd22690738fa323a33b90d85c542ed0f8f56e585ee93b1808",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2149,
+      "end_line": 2173,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .chain(levels::evidence_harsher(\n                prior.as_ref(),\n                &rec,\n                now_ms,\n                cfg.confidence.evidence_max_age_ms,\n            ));\n            for w in why {\n                if !harsher.contains(&w) {\n                    harsher.push(w);\n                }\n            }\n        }\n        if let Some(why) = admits_unlisted_harsher(before.as_ref(), &rec) {\n            harsher.push(why.to_owned());\n        }\n        if !harsher.is_empty() && req.confirm.as_deref() != Some(CONFIRM_WORD) {\n            return Err(SetError::Invalid(\n                \"confirm_required\",\n                format!(\n                    \"this change enforces more ({}); send confirm: \\\"{CONFIRM_WORD}\\\"\",\n                    harsher.join(\"; \")\n                ),\n            ));\n        }\n        let value = serde_json::to_vec(&rec).map_err(|e| SetError::Store(e.to_string()))?;\n",
+      "source_digest": "71dbbefa7a6e8d177021c7f6574c7b88064d8649754242172021e9b99723bf78",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2816,
+      "end_line": 2840,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            r.incoming_dedup_class(|| panic!(\"rules asked for a factory decision\")),\n            want\n        );\n    }\n\n                    #[tokio::test]\n    async fn a_factory_head_records_only_until_its_row_is_set() {\n        let (empty, _) = loaded(&[]).await;\n        let r = empty.resolve(&factory_input(\"F\", \"c\", None), &on(), |_| true);\n        assert_eq!(r.mode, ControlMode::Recording);\n        assert_eq!((r.forced, r.matched.is_none()), (None, true));\n        assert!(r.factory && r.by_row && r.page_driven());\n        assert_eq!(r.row.as_ref().map(|o| o.row), Some(LevelRow::Missing));\n        assert_eq!(logged_because(&r).as_deref(), Some(\"no_selection\"));\n        claims_without_the_rules(&r);\n\n        let (ac, _) = loaded(&[\n            live(\"F\", None, None, vec![SUSPEND]),\n            live(\"F\", Some(\"c\"), None, vec![SUSPEND]),\n            live(\"F\", None, Some(\"model_factory\"), vec![SUSPEND]),\n        ])\n        .await;\n        let ls = labels(&[\"model_factory\"]);\n        let r = ac.resolve(\n            &ResolveInput {\n",
+      "source_digest": "a0e1a05848f83b8a0f82b82ada0af5cc501b128bbea9af198869ede13f9824ca",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3949,
+      "end_line": 3973,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Err(SetError::Conflict(Some(cur), Some(1))) => assert_eq!(cur.version, 1),\n            other => panic!(\"{other:?}\"),\n        }\n        let mut next = put(\"H\", ControlMode::Live, vec![SUSPEND]);\n        next.expected_version = Some(1);\n        let out = set(&ac, next).await.unwrap();\n        assert_eq!(out.view.record.version, 2);\n        assert_eq!(out.before.unwrap().mode, ControlMode::Recording);\n        assert_eq!(out.harsher_because, vec![\"turns the scope live\"]);\n        let h = ac.history(\"H\", 50).await;\n        assert_eq!(h.entries.len(), 2);\n        assert_eq!(h.entries[0].version, 2, \"newest first\");\n        assert_eq!(h.entries[0].before.as_ref().unwrap().version, 1);\n        assert_eq!(h.entries[1].before, None);\n        assert_eq!(ac.history(\"H\", 1).await.entries.len(), 1);\n        assert_eq!(\n            store.pkey_rows(MH_PKEY).len(),\n            1,\n            \"one record per scope, never deleted\"\n        );\n    }\n\n    #[tokio::test]\n    async fn put_reports_a_lost_race() {\n        let (ac, store) = loaded(&[]).await;\n",
+      "source_digest": "f5ccc4862921f44665ecd019974808a3074483a49f16b408112f2c63291df682",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4855,
+      "end_line": 4879,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for head in [\"H\", CHILD_SAFETY_HEAD] {\n            let stored = [record(head, None, None, ControlMode::Live, vec![SUSPEND])];\n            let (ac, _) = loaded(&stored).await;\n            let ls = labels(&[\"anchor_campaign_suspend_cse\"]);\n            let before = ac.resolve(&input(head, \"c\", &ls), &on(), |_| true);\n            assert_eq!(\n                (before.mode, before.forced),\n                (ControlMode::Live, None),\n                \"{head}\"\n            );\n            let out = set(&ac, move_live(head, None)).await;\n            assert!(\n                out.as_ref().is_ok_and(|o| o.harsher_because.is_empty()),\n                \"{head}: {out:?}\"\n            );\n            let after = ac.resolve(\n                &ResolveInput {\n                    confidence: Some(high_claim()),\n                    ..input(head, \"c\", &ls)\n                },\n                &on(),\n                |_| true,\n            );\n            assert_eq!(\n                (after.mode, after.forced),\n",
+      "source_digest": "c286b575822e10aa77e47fc1394d6e89d80e1edaeae75664ec5633370a0a8e7d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 330,
+      "end_line": 354,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        (\n            claim.evidence.clone(),\n            cfg.confidence.factory_evidence_max_age_ms,\n        )\n    } else {\n        (\n            row.and_then(|r| r.evidence.as_deref().cloned())\n                .or_else(|| claim.evidence.clone()),\n            cfg.confidence.evidence_max_age_ms,\n        )\n    };\n    let supports = evidence\n        .as_ref()\n        .and_then(|e| confidence::supported_level(e, claim.now_ms, max_age_ms));\n    outcome.evidence_supports = Some(supports);\n    if supports.is_some_and(|s| s >= level) {\n        return None;\n    }\n    let overridden = row.and_then(|r| {\n        r.evidence_override\n            .as_ref()\n            .filter(|o| confidence::override_active(o, r.updated_at_ms, claim.now_ms))\n    });\n    match overridden {\n        Some(o) => {\n",
+      "source_digest": "0b4c793b810599fbbfc9e97d329123006e1cff6cc8cacc7decff5d625d351d7f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 338,
+      "end_line": 362,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            cfg.confidence.evidence_max_age_ms,\n        )\n    };\n    let supports = evidence\n        .as_ref()\n        .and_then(|e| confidence::supported_level(e, claim.now_ms, max_age_ms));\n    outcome.evidence_supports = Some(supports);\n    if supports.is_some_and(|s| s >= level) {\n        return None;\n    }\n    let overridden = row.and_then(|r| {\n        r.evidence_override\n            .as_ref()\n            .filter(|o| confidence::override_active(o, r.updated_at_ms, claim.now_ms))\n    });\n    match overridden {\n        Some(o) => {\n            outcome.override_by = Some(o.by.clone());\n            None\n        }\n        None if evidence.is_some() => Some(\"evidence_below_floor\"),\n        None => Some(\"evidence_missing\"),\n    }\n}\n\n",
+      "source_digest": "7ad583db787b98a82e64ebe9dbc2214ff50427cee89d73c006443e3be999de1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 364,
+      "end_line": 388,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    snap: &Snapshot,\n    m: &RowContext<'_>,\n    claim: &Claim,\n    cfg: &ControlConfig,\n    safety_ok: &mut dyn FnMut(EntityType) -> bool,\n    actions: &[PageAction],\n) -> Resolved {\n    let entity = entity_of(m.entity);\n    let names: Vec<&str> = std::iter::once(m.head).chain(m.alias).collect();\n    let classifier = (!m.classifier.is_empty() && valid_name(m.classifier)).then_some(m.classifier);\n    let scope = snap.row_scope(entity, &names, classifier, m.factory);\n    let on_rows = scope.is_some();\n    let unreadable = scope.as_ref().is_some_and(|s| s.unreadable);\n    let mut outcome = RowOutcome::new(claim);\n    let row = scope.and_then(|scope| {\n        match snap.at(&level_lkey(entity, scope.head, scope.classifier, claim.row)) {\n            Some(Hit::Record(_, r)) if r.mode != ControlMode::Rows => Some(r),\n            _ => None,\n        }\n    });\n    let forced = if unreadable {\n        Some(\"unreadable\")\n    } else if actions.is_empty() || actions.iter().any(|a| a.entity() != entity) {\n        Some(\"wrong_entity\")\n    } else if !cfg.enabled {\n",
+      "source_digest": "487b9217198d2730c459cda5f4e916622ed175918e0ac57e52c4273ac7842f3c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 514,
+      "end_line": 538,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let (was, now) = (supports(before), supports(Some(after)));\n    if now > was\n        && let Some(l) = now\n    {\n        why.push(format!(\n            \"new evidence lets the record act at {}\",\n            l.as_str()\n        ));\n    }\n    let expiry = |r: Option<&ActionControlRecord>| {\n        r.and_then(|r| {\n            r.evidence_override\n                .as_ref()\n                .filter(|o| confidence::override_active(o, r.updated_at_ms, now_ms))\n                .map(|o| o.expires_at_ms)\n        })\n    };\n    if let Some(until) = expiry(Some(after))\n        && expiry(before).is_none_or(|was| until > was)\n    {\n        why.push(format!(\n            \"an override lets the level act past its evidence floor until {until} (epoch ms)\"\n        ));\n    }\n    why\n",
+      "source_digest": "7fc3bde5d9852c9448492647cbb8d83b49bb503effbb9ea621bc89bb649ea406",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 742,
+      "end_line": 766,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"invalid_rollout\",\n                \"a rollout belongs on a row; send it in rows\".into(),\n            );\n        }\n        if let Some(rows) = &req.rows {\n            for row in LevelRow::ALL {\n                if let Some(s) = rows.get(row) {\n                    row_problem(\n                        req.entity_type,\n                        row,\n                        s.mode,\n                        &s.actions,\n                        s.evidence.as_ref(),\n                        s.evidence_override.as_ref(),\n                        s.rollout_bp,\n                        now_ms,\n                    )?;\n                }\n            }\n        }\n        return Ok(());\n    }\n    match req.confidence {\n        Some(row) => row_problem(\n            req.entity_type,\n",
+      "source_digest": "2031b687a6b5716ea99e7ca53138e50f992d21ffec10bcca3e16a8f1641a75bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": false
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6e4d157a4e2a926452eaa77f611a798ea6ac8932f75716fa73f3e61707aa5077",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": false
+      },
+      "diff_digest": "0bfa1eb7fa17412791652a7e03d809fb05af842bbfc23605cefa64f2c64fabf7",
+      "context_complete": true,
+      "task_id": "T-d9c65b3d48a0bdd528e44190adfe14f48be8e0235bea0e7b9f61b9b989fe6033",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9c93dc13d62b316d06279bff9fbcdcb897682de98af7b9c17b6ea55fe7d9dc79",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-7f398604171d4f86774f46e53a50a47f520d457cf058b7a21015b53e59277729",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ed6374cbb1bac0ffd7504092e890df37a680d7267160e11e6221bab5f5c2f3a1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-6ae5bc6644368b6a208a93a547d032873487ab8e5703573092d68bbae8e600aa",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-26ca1e1784c2c6eda0cc3804785d1841b403f0897c1f5f5753e1a1e46443f609",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-81bb008f4e2d6926b709eacc07181be91ac4334090e1c4422b1d070b12f0e6e5",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9628a7d49fe7b1b627508cb3dea9172a3e4c7f30c1a1615eeb7e6bcdabeec197",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-21e31664bfdddc72a3c07bf382329b41d505dfe0094082204ea24bc79a302372",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bb67ca64a6824620a1df956a554db547fd52186d7818cafa93b99274e04d811f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-94b0425530c421869fb094c2e35ce5b60dc1eacce317de7d03ef2273cd65fd8b",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8d4befad757f4b753605597070804629977a0ea3edc131e9b6b4ac1b789ab20a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-2baf7bbcbb76cbf98ea15828d6d89c496cb0d8e1dc1ff063e18386a7000a7f05",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab7c2bbe738d13a43cc319f40c34c040a7d861c5d915af4c4e28c1ef7516fd46",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-ffa3b53159520610de0738ae88c6d3475a94578b4dcb5cb1894792b4ab8af514",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e4acc8834bdea95a441ab0577dac10b5c9c041c9664555653d9ebdc96f5843f7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-d6fc276b6c9da8c4704ee7c9a65e8df8f0ed40b99b094911d23d43f280c2b08a",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8f45ad9050e97f0b966df0b82ab2168a29b5b28a8f7d0640f8caa06e85b6e241",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-397ca7380c1a2ee876940ceda881ec9af747b7fa3182e0fe0cb1b4bbe03e9d97",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f8204844f4fff6873f275fb1529d2bf67b73425ed905728b6b83028eba72a1c1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-2550015e70b0ba43f774ade899313443f539566e15cb51b2e8080ee30ced4141",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-03a8a1179418960a56206cbf19ce9b7d7707796e9bcdaa16aab102ed1fa16e09",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-9fb829283f6c5372b9d7e7a42658065612055701ae89a5802eb344ed87223363",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c54472c2544f104d80ca30f7dc6e352657c7aaed7f7500f3b2aa38a7734189f3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-2e065bf8bb4bf7d04cbf4fb57213d0074bd3eed28c194c29ca3c9ae6a0a9ffa7",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f3f97ff98b0814c56cdea332be0c58d4dbde1c42654986b6caa838210ae3ed0d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-88e1221ac71596294893ebd0d2372540ea28e13d2f4e04450eebaf3ff5cba0c7",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ed9a892caf6ea5fd9cae6f15618be08e661357a167ee3c2cc4e7b0252205a498",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-5792ca64a1954b2afc4c8339790e8b1f0315ef67b867a7841d8ba8cc04540de0",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-389493adabf07943b8f2f5d263d87b59c1cdaf753c5836161ac79bf4fe0fe1d2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-b84d62359485c250173e0761b2bf34099f1a3b1975e36df6d3129027e27cf0dc",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fbadbd5d3a304cd012253056787410376caca180769387cd8ceaa089217e4ecb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-9b6ba83529f34aedb0f0899ce6a5d0f4f9830cb3247f88b3259da7f65cfb1719",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e188e132f4e3294e821cf404c8258cdc0c188c3f6d6fffc20c7656f8bfeb2b3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-874238ace2135c3589a1480a3d5438f29ef68a808e0bf3023eeb2fc9b1684ac4",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-87e1246fc96027a3eb388552ad665b12abae0efcfff8db75e408ed191c8a7791",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-e84e8f7798692cf01e67e071068488593e5180b4cede22b17b2bcf08f00af6cc",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8702c55e1c9e2fee90c7f2b03570aa5648a9738a4d6db99e838bce3b1aec5b88",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-7aaacf72c36cb6ff4caef02f3fc144c4b4228c5820a049c539a4063244c5cab9",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-70085b086a353869797618cac810e2949b12b1ac2210ca18575c7f7f944cad01",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-eb03723aa7809c84effcb03e645c75e303cd2a74e531217ee18ea3fb395c916d",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-988cb03d5000cfb75b5c11f0235310bd3684624aa6d0f78a0cb0661d821e443f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-b6b25bd684b753e22a7b7706b6b4f190de9b89661573821477771d3acf9bae6f",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e1e6274293d91b7ac8c0cebdc81128e1cd411b534b3b7fb5a97471b231eb0ccf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-ea5d321c59ff16e5599a678068a7189060fc9a4af629ea20ab5270c8bd4f0f2d",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9b48c5843e3b148f573a2abf825b1be0233e4d3f931a9f353dc3aedc90bed2d8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-75ae90d2cceab7fd0f5abe8dcd797a984850823d9ee99a20a0a20b8f1d770cb8",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-85887e007cacc176339cd274e14c8abfd08c73ebf26618ecad966fe3f9d805bb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-8fda9846fb998f2ccea923ed37362380cdc74b242d2d6ff82519013c7fb66464",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d037dc4a9274861cad245de3c97553886f2e77bbd90877ae2042293caf626d99",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-585fc6ef4642b9be1bba49169393663613fdc22667c3ee94c37482e264229cd7",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1cc74dc36a80708d89481384f38f0be4aa114afdb69e0c44f8297af8df819f8d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-a3fc8b182f0dae335d69a2d0a4ceb953a1b913429d7cb9da8163d6c03eb9e78d",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5452d98279368cb4fda16de60817216aef61ea7bd60ac39d8e024c9588335fa3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-8fcd0823f66e25737fd4f97003fbc658661748a36f276d362d89e50b1acae344",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-02ea953d3f8df6d90bcab22af0e33b24d54123b0492e0ea65e842083ae9228e5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-c485a0474f09558d9cd18e372c5e0b3e415c6b616e13abda1cfe4efdbefd5074",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9bc5f7344550139012161cfefa3255ee5b420088dec28e51c45008fa1c317c87",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-ae997965f928f06f536b4c5739d510459b08d53bba1a109824a160de9bcffed0",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0ab9a0acde7d66cc53a5b120d9f296e0c68405c798a11e3825b943c7231935ca",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f6404bbecad726168335e283d16593dc58e9fc5e544308d89a5149d70ecc632",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-85fba40c16228d4bd311780e4bd60228e2c6051a25f3b50e8dd9fe8aea98808f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-e9b8c2f1f875a5a840c54d163d775ca27ff9f4df1cb54c1c2438317cebcdc87f",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ef4781b2bde854caf33558c6feea3664905953d8dc3678c458060b972bab79b9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-03b0a91a3b00ac835b2c8630cb1804acaf42264317a64596863cd22153cbb01d",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-916657c293c5d3ff2671cbd3ce5bf3d51fed969e1c9452f47b3a0d1cc048499c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-7953a54fe312905e4688a62ef0618fd195f9421a34b087a933ef63080a2a0579",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-89cad93ebfb81513fa178eef2f4347857fc74846a5122da70bc512b7e28a9746",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-9e02a9e7a4119cceefcdf5395f9ccb25669a904113606552c061262e1cb52576",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3fae4f33d45d2657ac670adbdaaa1bedd5cd6a78cc171c053d41a2dd5680114b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-81dc0d2240753debc3b48998f229f973b34d372295447f11e6455ea0b53a5908",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-59c1a4d9ee929b503dea0b18c32b71f1e24463bc12f0309ddde60a192b8f3d15",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-c7efe0711cdbbf470e07b0b753e26f7ca429dc0cc4310865b433ccb799ac9a64",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7af6801801f2aafcd1110bbb9fecb9f65e78dddaec13e75378439ffc86483d08",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-70eabb4699d1802077ccb550c6c5532073885302466256a2f6fae791b3aace83",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bf0f59dc3b7f80d11001ad4695853feba315992bdb042b9c9dfa15a07b4a8753",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-aece627532362f10833440a9706c123ee4accb793a3a65813bffa1bf88dce9bf",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b1ea57e6aa08ba71b9926e81d9f6ffd74917a77e16fd8aeb750bcc10d30e7b86",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-93699859d32cee9cb77daf37c264faff0efe0a738fe78d24ad7c97feb3455284",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6396346f9a78c85785580d90640d038b68e32ebe5130806a2f5aac6bf2c1724b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-e40c6267612de6c8b898b82299ebfd6831e98acb26f927f21591c2da59fbacca",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-308b753ae97e121492523f1188eca1e1a40f86306335139b793c4e3b9b7b5ef8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-168d88cf33aa51574121cdb4040e8f4b6742727dd5bf57bff6b729297ed1368a",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-03be5a66589f1d668825f7fbc1848de31ab76dbc8970efddf1cbb450284b9759",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-860accc98f27f50725e400e33b5668811bbd13062593bac54a399c588393cee9",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/sources/exchange.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-090e0cbae2cb7b2109417233a8e949500aec5cab660e58045fff6f57e342c129",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "ids",
+        "exchange",
+        "Bytes",
+        "as_ref",
+        "fmt",
+        "serialize",
+        "deserialize",
+        "EdgeKey"
+      ],
+      "context_complete": false,
+      "task_id": "T-6f7a0668f98fae212a5528614b3030a76c234991caa07780bde5dc6d89e82acb",
+      "evidence_refs": [
+        "E44"
+      ]
+    }
+  ],
+  "task_id": "T-abf33a36b390c30122b72ab4de747751bece461adefea34349ac4f9b7871316a"
+}

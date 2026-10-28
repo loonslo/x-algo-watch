@@ -1,0 +1,1851 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/models/fp8.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-93eec7318280149015d440c1f84dd8b57601aba021014b646ca4d4e68854fa93",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/models/fp8.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 200,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport collections\nimport dataclasses\nimport enum\nimport functools\nimport math\nimport re\n\nimport jax\nimport jax.numpy as jnp\nfrom jax import lax\nfrom jax.ad_checkpoint import checkpoint_name\nfrom jax.sharding import AxisType\nfrom jax.typing import DTypeLike\n\nfrom xrex.cutedsl import fp8_transpose\nfrom xrex.utils import gpu\n\n\nclass Fp8Gemms(enum.StrEnum):\n    OFF = \"off\"\n    BWD = \"bwd\"\n    ALL = \"all\"\n\n\n_E4M3 = jnp.float8_e4m3fn\n_E5M2 = jnp.float8_e5m2\n_FWD_PRECISION = lax.Precision.DEFAULT\n_GRAD_PRECISION = lax.Precision.HIGHEST\n_NN = (((1,), (0,)), ((), ()))\n_NT = (((1,), (1,)), ((), ()))\n_TN = (((0,), (0,)), ((), ()))\n_CUBLASLT_FP8_GEMM = 'custom_call_target=\"__cublas$lt$matmul$f8\"'\n_OPERAND_PRECISION = re.compile(r'\"operand_precision\":\\[([^]]*)\\]')\n\n\n\u0040dataclasses.dataclass(frozen=True)\nclass Fp8Dot:\n    gemms: Fp8Gemms = Fp8Gemms.OFF\n    input_is_materialized: bool = False\n    transposed_input_checkpoint_name: str | None = None\n    fuse_gradient_amax: bool = False\n\n    def __call__(self, x: jax.Array, w: jax.Array) -> jax.Array:\n        if self.gemms == Fp8Gemms.OFF:\n            return jnp.dot(x, w)\n        assert x.dtype == w.dtype, (x.dtype, w.dtype)\n        use_transpose_kernels = _use_transpose_kernels(self.gemms, x.shape, w.shape[1], x.dtype)\n        assert not (\n            use_transpose_kernels\n            and jax.device_count() > 1\n            and (jax.typeof(x).vma or jax.typeof(w).vma)\n        ), \"Fp8Dot's transpose kernels need check_vma=False in their shard_map\"\n        return _fp8_dot(x, w, self, use_transpose_kernels)\n\n\ndef count_compiled_fp8_gemms(hlo: str) -> tuple[int, int]:\n    precisions = collections.Counter(\n        match[1] if (match := _OPERAND_PRECISION.search(line)) else None\n        for line in hlo.splitlines()\n        if _CUBLASLT_FP8_GEMM in line\n    )\n    forward, gradient = (\n        precisions.pop(f'\"{precision.name}\",\"{precision.name}\"', 0)\n        for precision in (_FWD_PRECISION, _GRAD_PRECISION)\n    )\n    assert not precisions, f\"FP8 GEMMs of other operand precisions: {precisions}\"\n    return forward, gradient\n\n\ndef check_compiled_fp8_gemms(program_name: str, hlo: str, gemms: Fp8Gemms) -> None:\n    forward, gradient = count_compiled_fp8_gemms(hlo)\n    min_forward = gradient // 2 if gemms == Fp8Gemms.ALL else 0\n    if not gradient or forward < min_forward:\n        raise ValueError(\n            f\"{program_name} compiled {forward} forward and {gradient} gradient FP8 GEMMs \"\n            f\"(at least {min_forward} and 1 expected): check its XLA flags\"\n        )\n\n\ndef _use_transpose_kernels(\n    gemms: Fp8Gemms, x_shape: tuple[int, ...], output_size: int, dtype: DTypeLike\n) -> bool:\n    num_rows = math.prod(x_shape[:-1])\n    x_2d_shape, g_2d_shape = (num_rows, x_shape[-1]), (num_rows, output_size)\n    mesh = jax.sharding.get_abstract_mesh()\n    per_device_operands = jax.device_count() == 1 or (\n        not mesh.empty\n        and all(\n            kind == AxisType.Manual or size == 1\n            for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True)\n        )\n    )\n    return (\n        gemms == Fp8Gemms.ALL\n        and gpu.cuda_compute_capability(jax.devices()[0]) == (9, 0)\n        and dtype == jnp.bfloat16\n        and fp8_transpose.transpose_supported(x_2d_shape)\n        and fp8_transpose.quantize_transposed_supported(x_2d_shape)\n        and fp8_transpose.quantize_transposed_supported(g_2d_shape)\n        and per_device_operands\n    )\n\n\ndef _scale(x: jax.Array, dtype: DTypeLike) -> jax.Array:\n    amax = jnp.max(jnp.abs(x)).astype(jnp.float32)\n    largest_mantissa, largest_exponent = math.frexp(float(jnp.finfo(dtype).max))\n    mantissa, exponent = jnp.frexp(amax)\n    scale_exponent = exponent - largest_exponent + (mantissa > largest_mantissa).astype(jnp.int32)\n    finfo = jnp.finfo(jnp.float32)\n    scale_exponent = jnp.clip(scale_exponent, finfo.minexp, finfo.maxexp - 1)\n    scale = jnp.ldexp(jnp.float32(1), scale_exponent)\n    return jnp.where(amax == 0, 1.0, jnp.where(jnp.isfinite(amax), scale, jnp.nan))\n\n\ndef _quantize(x: jax.Array, scale: jax.Array, dtype: DTypeLike) -> jax.Array:\n    limit = float(jnp.finfo(dtype).max)\n    return jnp.clip(x.astype(jnp.float32) / scale, -limit, limit).astype(dtype)\n\n\ndef _dequantize(q: jax.Array, scale: jax.Array, dtype: DTypeLike) -> jax.Array:\n    return q.astype(dtype) * scale.astype(dtype)\n\n\ndef _quantize_dequantize(x: jax.Array, scale: jax.Array, dtype: DTypeLike) -> jax.Array:\n    return _dequantize(_quantize(x, scale, dtype), scale, x.dtype)\n\n\ndef _matmul(\n    a: jax.Array, b: jax.Array, dims: lax.DotDimensionNumbers, precision: lax.Precision\n) -> jax.Array:\n    return lax.dot_general(a, b, dims, precision=precision, preferred_element_type=a.dtype)\n\n\n\u0040functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))\ndef _fp8_dot(x: jax.Array, w: jax.Array, dot: Fp8Dot, use_transpose_kernels: bool) -> jax.Array:\n    return jnp.dot(x, w)\n\n\ndef _fp8_dot_fwd(x, w, dot: Fp8Dot, use_transpose_kernels: bool):\n    w_scale = checkpoint_name(_scale(w, _E4M3), \"scalar_stats\")\n    if dot.gemms != Fp8Gemms.ALL:\n        return jnp.dot(x, w), (x, w, None, w_scale, None)\n    x_2d = x.reshape(-1, x.shape[-1])\n    x_scale = _scale(x_2d, _E4M3)\n    x_q_t_bits = None\n    if use_transpose_kernels and dot.transposed_input_checkpoint_name is not None:\n        x_q, x_q_t = fp8_transpose.quantize_transposed(x_2d, 1.0 / x_scale, _E4M3)\n        x_fp8 = _dequantize(x_q, x_scale, x_2d.dtype)\n        x_q_t_bits = checkpoint_name(\n            lax.bitcast_convert_type(x_q_t, jnp.uint8), dot.transposed_input_checkpoint_name\n        )\n    else:\n        x_fp8 = _quantize_dequantize(x_2d, x_scale, _E4M3)\n    y = _matmul(x_fp8, _quantize_dequantize(w, w_scale, _E4M3), _NN, _FWD_PRECISION)\n    x_scale = checkpoint_name(x_scale, \"scalar_stats\")\n    x_residual = None if x_q_t_bits is not None else x\n    return y.reshape(*x.shape[:-1], w.shape[1]), (x_residual, w, x_scale, w_scale, x_q_t_bits)\n\n\ndef _fp8_dot_bwd(dot: Fp8Dot, use_transpose_kernels: bool, residuals, g):\n    x, w, x_scale, w_scale, x_q_t_bits = residuals\n    g_2d = g.reshape(-1, g.shape[-1])\n    x_2d = None if x is None else x.reshape(-1, x.shape[-1])\n    if x_scale is None:\n        x_scale = _scale(x_2d, _E4M3)\n    w_fp8 = _quantize_dequantize(w, w_scale, _E4M3)\n    if not use_transpose_kernels:\n        g_fp8 = _quantize_dequantize(g_2d, _scale(g_2d, _E5M2), _E5M2)\n        dx = _matmul(g_fp8, w_fp8, _NT, _GRAD_PRECISION)\n        dw = _matmul(_quantize_dequantize(x_2d, x_scale, _E4M3), g_fp8, _TN, _GRAD_PRECISION)\n        return dx.reshape(*g.shape[:-1], w.shape[0]), dw\n\n    if dot.fuse_gradient_amax:\n        finfo = jnp.finfo(g_2d.dtype)\n        g_2d = lax.reduce_precision(g_2d, exponent_bits=finfo.nexp, mantissa_bits=finfo.nmant)\n    else:\n        g_2d = lax.optimization_barrier(g_2d)\n    g_scale = _scale(g_2d, _E5M2)\n    g_q, g_q_t = fp8_transpose.quantize_transposed(g_2d, 1.0 / g_scale, _E5M2)\n    dx = _matmul(_dequantize(g_q, g_scale, g_2d.dtype), w_fp8, _NT, _GRAD_PRECISION)\n    if x_q_t_bits is not None:\n        x_q_t = lax.bitcast_convert_type(x_q_t_bits, _E4M3)\n    elif dot.input_is_materialized:\n        _, x_q_t = fp8_transpose.quantize_transposed(\n            x_2d, 1.0 / x_scale, _E4M3, with_untransposed=False\n        )\n    else:\n        x_q_t = fp8_transpose.transpose(_quantize(x_2d, x_scale, _E4M3))\n    dw = _matmul(\n        _dequantize(x_q_t, x_scale, g_2d.dtype),\n        _dequantize(g_q_t, g_scale, g_2d.dtype),\n        _NT,\n        _GRAD_PRECISION,\n    )\n    return dx.reshape(*g.shape[:-1], w.shape[0]), dw\n\n\n_fp8_dot.defvjp(_fp8_dot_fwd, _fp8_dot_bwd)\n",
+      "source_digest": "685f0c961d72cd22e182c2c0c529bf35baf1ad63cc77da3a6e8c04fd779ac43c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "clip/config.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nclass ClipConfig:\n    DEFAULT_FINAL_EMBEDDING_DIM = 256\n\n    def __init__(\n        self,\n        dataset_path,\n        input_resolution=224,\n        use_data_augmentation=False,\n        clip_model_type=\"ViT-B/32\",\n        top_feedforward=True,\n        final_embedding_dim=None,\n        logit_scale=4.5065,\n        model_dir=None,\n        save_interval=5000,\n        save_last_ckpt_only=True,\n        batch_size=128,\n        learning_rate=2e-5,\n        num_training_steps=100000,\n        num_warmup_steps=500,\n        num_decay_steps=None,\n        mixed_precision=False,\n    ):\n        if model_dir is None:\n            model_dir = os.path.join(\"runs\", datetime.now().strftime(\"%Y%m%d_%H%M%S\"))\n",
+      "source_digest": "7893b45c0a0b7031ec631304ded55d659dc0d15a697cca698f284869bc45b445",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    MODELS = {**PRETRAINED_MODELS, **TWITTER_MODELS}\n\n    MODEL_NAMES = tuple(MODELS.keys())\n\n    def __init__(\n        self,\n        clip_model_type=DEFAULT_CLIP_MODEL_TYPE,\n        top_feedforward=True,\n        final_embedding_dim=DEFAULT_FINAL_EMBEDDING_DIM,\n        truncate_text=True,\n        logit_scale=None,\n        use_gpu=None,\n    ):\n        self.clip_model_type = clip_model_type\n\n        if clip_model_type not in self.MODELS:\n            raise ValueError(\n                f\"Unknown model type: {clip_model_type}. Choices: {self.MODELS.keys()}\"\n            )\n\n        if clip_model_type in self.PRETRAINED_MODELS:\n            self.base_clip_model_type = clip_model_type\n        else:\n",
+      "source_digest": "d9eb2ee3aa030e6225bfb523cde4c05d3d7f5f99c4021bf729ee3d58f3d223df",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 87,
+      "end_line": 111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.text_encoder = TextCLIP(\n            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.top_feedforward = top_feedforward\n        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n",
+      "source_digest": "4de4805e4eccf1c12586c79745b9b9f3e4b7fcae2e326bda0013595a71ed5901",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 88,
+      "end_line": 112,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.text_encoder = TextCLIP(\n            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.top_feedforward = top_feedforward\n        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n            map_location = None if self.use_gpu else torch.device(\"cpu\")\n",
+      "source_digest": "38afc80c47d9f0b9f113cf3ca4a627dfa526c77b2f6836c0b98e6018609c7c9c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 90,
+      "end_line": 114,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        self.text_encoder = TextCLIP(\n            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.top_feedforward = top_feedforward\n        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n            map_location = None if self.use_gpu else torch.device(\"cpu\")\n            local_model_path = io_utils.maybe_download_file(\n                self.TWITTER_MODELS[clip_model_type]\n",
+      "source_digest": "d63df3043bb5a48588063c65116e67a67667e294b67ef02651b94c34da839e61",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 97,
+      "end_line": 121,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n            map_location = None if self.use_gpu else torch.device(\"cpu\")\n            local_model_path = io_utils.maybe_download_file(\n                self.TWITTER_MODELS[clip_model_type]\n            )\n            print(f\"loading model from: {local_model_path}\")\n            checkpoint_contents = torch.load(\n                local_model_path, map_location=map_location\n            )\n\n            config = checkpoint_contents[\"config\"]\n",
+      "source_digest": "77e50ce3cf2fbcfcd43f61135d3a2b0a4f64d4a52f44cfdc97cebf01044f848b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 215,
+      "end_line": 239,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                return_numpy=return_numpy,\n                normalize_outputs=normalize_outputs,\n            ),\n            \"text_embeddings\": self.encode_texts(\n                features[text_field],\n                return_numpy=return_numpy,\n                normalize_outputs=normalize_outputs,\n            ),\n        }\n\n    def get_logits(self, features, image_field=\"image\", text_field=\"tweet_text\"):\n        out = self.encode(features, image_field=image_field, text_field=text_field)\n        logit_scale = torch.clamp(self.clip_model.logit_scale.exp(), max=100)\n        image_logits, text_logits = model_utils.create_logits(\n            out[\"image_embeddings\"], out[\"text_embeddings\"], logit_scale\n        )\n        return {\n            \"image_logits\": image_logits,\n            \"text_logits\": text_logits,\n        }\n\n    \u0040staticmethod\n    def normalize_outputs(x):\n        if isinstance(x, np.ndarray):\n            return x / np.linalg.norm(x, axis=-1, keepdims=True)\n",
+      "source_digest": "2b8fc2688b60feb86c76aed3fbfc3506556158c3b23d785a78c5ee76e3dd3311",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 217,
+      "end_line": 241,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            ),\n            \"text_embeddings\": self.encode_texts(\n                features[text_field],\n                return_numpy=return_numpy,\n                normalize_outputs=normalize_outputs,\n            ),\n        }\n\n    def get_logits(self, features, image_field=\"image\", text_field=\"tweet_text\"):\n        out = self.encode(features, image_field=image_field, text_field=text_field)\n        logit_scale = torch.clamp(self.clip_model.logit_scale.exp(), max=100)\n        image_logits, text_logits = model_utils.create_logits(\n            out[\"image_embeddings\"], out[\"text_embeddings\"], logit_scale\n        )\n        return {\n            \"image_logits\": image_logits,\n            \"text_logits\": text_logits,\n        }\n\n    \u0040staticmethod\n    def normalize_outputs(x):\n        if isinstance(x, np.ndarray):\n            return x / np.linalg.norm(x, axis=-1, keepdims=True)\n        elif isinstance(x, tf.Tensor):\n            return x / tf.norm(x, ord=\"euclidean\", axis=-1, keepdims=True)\n",
+      "source_digest": "05f2879b6ce2ddaa3c9692ed0a6ede8b12e00c47e68cb0af14ea8d90cceb2f86",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "clip/training.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    parser.add_argument(\n        \"--top_feedforward\",\n        help=\"pass this flag to add a feed-forward layer to change dimensionality \"\n        \"of CLIP output embeddings\",\n        action=\"store_true\",\n    )\n    parser.add_argument(\n        \"--final_embedding_dim\",\n        help=\"dimension to map CLIP embeddings to, if --top_feedforward\",\n        type=int,\n    )\n    parser.add_argument(\n        \"--logit_scale\",\n        help=\"initial value of learnable temperature parameter\",\n        type=float,\n    )\n\n\ndef add_training_args(parser):\n    parser.add_argument(\n        \"--model_dir\",\n        help=\"save directory location\",\n        type=str,\n    )\n    parser.add_argument(\n",
+      "source_digest": "3d84e00d2f34c236163dd38af1ce99104a96d94581d27939d8351ee7f821ebb4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "clip/training.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 128,
+      "end_line": 152,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        .create_dataset(\n            dataset_path=config.dataset_path,\n            is_training=True,\n        )\n        .take(config.num_training_steps + 1)\n    )\n\n    model = TwitterCLIP(\n        clip_model_type=config.clip_model_type,\n        top_feedforward=config.top_feedforward,\n        final_embedding_dim=config.final_embedding_dim,\n        logit_scale=config.logit_scale,\n    )\n\n    image_loss_op, text_loss_op = nn.CrossEntropyLoss(), nn.CrossEntropyLoss()\n    optimizer, scheduler = train_utils.create_optimizer(\n        model,\n        learning_rate=config.learning_rate,\n        num_training_steps=config.num_training_steps,\n        num_warmup_steps=config.num_warmup_steps,\n        num_decay_steps=config.num_decay_steps,\n    )\n    writer = SummaryWriter(config.model_dir)\n    if config.mixed_precision:\n",
+      "source_digest": "1379531f4f4a50aa3da19935bb6418dd566be0f87876ef227cc4b1351a36d491",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "clip/training.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 144,
+      "end_line": 168,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    optimizer, scheduler = train_utils.create_optimizer(\n        model,\n        learning_rate=config.learning_rate,\n        num_training_steps=config.num_training_steps,\n        num_warmup_steps=config.num_warmup_steps,\n        num_decay_steps=config.num_decay_steps,\n    )\n    writer = SummaryWriter(config.model_dir)\n    if config.mixed_precision:\n        scaler = torch.cuda.amp.GradScaler()\n\n    pbar = tqdm.tqdm(\n        enumerate(train_dataset), unit=\"samples\", unit_scale=config.batch_size\n    )\n    running_loss = 0.0\n    for step, features in pbar:\n        optimizer.zero_grad()\n\n        def _compute_loss():\n            logits = model.get_logits(features)\n            targets = torch.arange(\n                logits[\"image_logits\"].size()[0], dtype=torch.long\n            ).to(\"cuda:0\" if model.use_gpu else \"cpu\")\n            loss = (\n                image_loss_op(logits[\"image_logits\"], targets)\n",
+      "source_digest": "e1f89139e9846c7d86f3bbded494ce4db598868f8adc0413bb2030594a3fb9d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "clip/training.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 174,
+      "end_line": 198,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            with torch.cuda.amp.autocast():\n                loss = _compute_loss()\n        else:\n            loss = _compute_loss()\n        with torch.no_grad():\n            running_loss = train_utils.get_avg(running_loss, loss.item(), step)\n\n        if not model._multi_gpu or torch.cuda.current_device() == 0:\n            scalar_summaries = {\n                \"batch_loss\": loss.item(),\n                \"running_loss\": running_loss,\n                \"learning_rate\": float(scheduler.get_last_lr()[0]),\n                \"logit_scale\": model.clip_model.logit_scale.item(),\n            }\n            if config.mixed_precision:\n                scalar_summaries[\"loss_scale\"] = scaler.get_scale()\n            for name, val in scalar_summaries.items():\n                writer.add_scalar(name, val, step)\n            if step == 0:\n                image_sample = torch.Tensor(features[\"image\"][:16].numpy())\n                writer.add_images(\"preprocessed_images\", image_sample, step)\n\n            if step % config.save_interval == 0 or step == config.num_training_steps:\n                ckpt_path = (\n                    \"ckpt-last.pt\"\n",
+      "source_digest": "6d6ee242381bc81a6e03b6f0499b41b7c2700733dd6a1ba69d1c96d038f157c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "clip/training.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 177,
+      "end_line": 201,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            loss = _compute_loss()\n        with torch.no_grad():\n            running_loss = train_utils.get_avg(running_loss, loss.item(), step)\n\n        if not model._multi_gpu or torch.cuda.current_device() == 0:\n            scalar_summaries = {\n                \"batch_loss\": loss.item(),\n                \"running_loss\": running_loss,\n                \"learning_rate\": float(scheduler.get_last_lr()[0]),\n                \"logit_scale\": model.clip_model.logit_scale.item(),\n            }\n            if config.mixed_precision:\n                scalar_summaries[\"loss_scale\"] = scaler.get_scale()\n            for name, val in scalar_summaries.items():\n                writer.add_scalar(name, val, step)\n            if step == 0:\n                image_sample = torch.Tensor(features[\"image\"][:16].numpy())\n                writer.add_images(\"preprocessed_images\", image_sample, step)\n\n            if step % config.save_interval == 0 or step == config.num_training_steps:\n                ckpt_path = (\n                    \"ckpt-last.pt\"\n                    if config.save_last_ckpt_only\n                    else f\"ckpt-step-{step:06d}.pt\"\n                )\n",
+      "source_digest": "0572a8d5f7742f85413bb1c79599debc8521492ef372ad062bd04a79170abbd6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "clip/training.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 197,
+      "end_line": 221,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ckpt_path = (\n                    \"ckpt-last.pt\"\n                    if config.save_last_ckpt_only\n                    else f\"ckpt-step-{step:06d}.pt\"\n                )\n                save_dict = {\n                    \"config\": vars(config),\n                    \"step\": step,\n                    \"image_encoder_state_dict\": model.image_encoder.state_dict(),\n                    \"text_encoder_state_dict\": model.text_encoder.state_dict(),\n                    \"optimizer_state_dict\": optimizer.state_dict(),\n                    \"scheduler_state_dict\": scheduler.state_dict(),\n                    \"logit_scale\": model.clip_model.logit_scale.item(),\n                    \"running_loss\": running_loss,\n                }\n                torch.save(save_dict, os.path.join(config.model_dir, ckpt_path))\n                writer.flush()\n\n        if config.mixed_precision:\n            scaler.scale(loss).backward()\n            scaler.step(optimizer)\n            scaler.update()\n        else:\n            loss.backward()\n            optimizer.step()\n",
+      "source_digest": "c5c355f199011081219e8fde2380d351f8769881f14cdf90be7888149ec5655f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "clip/utils/model_utils.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 16,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import numpy as np\n\n\ndef create_logits(x1, x2, logit_scale):\n    x1 = x1 / x1.norm(dim=-1, keepdim=True)\n    x2 = x2 / x2.norm(dim=-1, keepdim=True)\n\n    logits_per_x1 = logit_scale * x1 \u0040 x2.t()\n    logits_per_x2 = logits_per_x1.t()\n\n    return logits_per_x1, logits_per_x2\n\n\ndef print_clip_model_stats(model):\n    input_resolution = model.visual.input_resolution\n    context_length = model.context_length\n",
+      "source_digest": "92ba0b62ede729a9b3ded4930830fd1d60b49829556920f5ec4bee96aef87ec1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "grox/libs/video_tools/image.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 244,
+      "end_line": 268,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        & (ycrcb[:, :, 1] > 135)\n        & (ycrcb[:, :, 1] < 175)\n        & (ycrcb[:, :, 2] > 80)\n        & (ycrcb[:, :, 2] < 130)\n    )\n    return float(mask.mean())\n\n\ndef _to_gray_u8(frame: np.ndarray) -> np.ndarray:\n    return cv2.cvtColor(np.clip(frame, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)\n\n\ndef _ecc_working_scale(h: int, w: int) -> float:\n    return min(1.0, _MOTION_REVEAL_ECC_MAX_DIM / max(h, w))\n\n\ndef _ecc_downscale(gray: np.ndarray, scale: float) -> np.ndarray:\n    if scale >= 1.0:\n        return gray\n    h, w = gray.shape[:2]\n    return cv2.resize(\n        gray,\n        (max(8, round(w * scale)), max(8, round(h * scale))),\n        interpolation=cv2.INTER_AREA,\n    )\n",
+      "source_digest": "098159141bc8ef58bfba603102f40d4ca99df1bdf3ec10e5182336dd849bc1ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "grox/libs/video_tools/image.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 440,
+      "end_line": 464,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    raw_residual = _residual_magnitude(originals_u8, raw_median)\n    raw_p99 = np.percentile(raw_residual.reshape(len(originals_u8), -1), 99, axis=1)\n    if (\n        not _MOTION_REVEAL_PREGATE_P99[0]\n        <= float(np.median(raw_p99))\n        <= _MOTION_REVEAL_PREGATE_P99[1]\n    ):\n        return []\n\n    reference_gray = _to_gray_u8(raw_median)\n    warps: dict[int, np.ndarray] = {}\n    if _cover_gradient(reference_gray) >= _MOTION_REVEAL_MIN_COVER_GRADIENT:\n        scale = _ecc_working_scale(*originals_u8.shape[1:3])\n        reference_gray_f32 = reference_gray.astype(np.float32)\n        reference_small = _ecc_downscale(reference_gray, scale)\n        for index, frame_u8 in enumerate(originals_u8):\n            gray = cv2.cvtColor(frame_u8, cv2.COLOR_BGR2GRAY)\n            if _is_static(reference_gray_f32, gray.astype(np.float32)):\n                continue\n            warp = _ecc_align(\n                reference_small, _ecc_downscale(gray, scale), cv2.MOTION_AFFINE, scale\n            )\n            if warp is not None:\n                warps[index] = warp\n    del reference_gray\n",
+      "source_digest": "94052198f688fafedf3387a0ccd5243677db983002c6345b3c9987cced1ac080",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "home-mixer/params/param.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 597,
+      "end_line": 621,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    \"rust_home_mixer_cold_start_beta_beta0\",\n    49.25\n);\nparam!(\n    ColdStartTsTopK,\n    u32,\n    \"rust_home_mixer_cold_start_ts_top_k\",\n    2\n);\nparam!(\n    ColdStartImpressionScale,\n    f64,\n    \"rust_home_mixer_cold_start_impression_scale\",\n    1.0\n);\nparam!(\n    ColdStartTrackedIds,\n    String,\n    \"rust_home_mixer_cold_start_tracked_ids\",\n    \"\"\n);\n\nparam!(\n    EnableCachedPosts,\n    bool,\n",
+      "source_digest": "48a3efcccb2388166e23a4bdadbff2e847a2a8dc005baebfaa4d06ed291f6bfe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 44,
+      "end_line": 68,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    enabled: bool,\n    tracked_ids: String,\n    arm: ViewerArm,\n    follower_cap: i64,\n    impression_threshold: u64,\n    max_post_age: Duration,\n    max_position_ratio: f64,\n    slot_min: usize,\n    slot_max: usize,\n    use_thompson_sampling: bool,\n    beta_alpha0: f64,\n    beta_beta0: f64,\n    impression_scale: f64,\n    ts_top_k: usize,\n}\n\nimpl ColdStartParams {\n    fn read(query: &ScoredPostsQuery) -> Self {\n        Self {\n            enabled: query.params.get(EnableViewerColdStart),\n            tracked_ids: query.params.get(ColdStartTrackedIds),\n            arm: viewer_arm(query),\n            follower_cap: query.params.get(ColdStartFollowerCap),\n            impression_threshold: query.params.get(ColdStartImpressionThreshold) as u64,\n            max_post_age: Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs)),\n",
+      "source_digest": "4628a371013bb3e880fbcc33ce776661c696b59a807ea3f25014e25d1b950390",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 63,
+      "end_line": 87,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            enabled: query.params.get(EnableViewerColdStart),\n            tracked_ids: query.params.get(ColdStartTrackedIds),\n            arm: viewer_arm(query),\n            follower_cap: query.params.get(ColdStartFollowerCap),\n            impression_threshold: query.params.get(ColdStartImpressionThreshold) as u64,\n            max_post_age: Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs)),\n            max_position_ratio: query.params.get(LowImpressionsMaxPositionRatio),\n            slot_min: query.params.get(ColdStartSlotMin) as usize,\n            slot_max: query.params.get(ColdStartSlotMax) as usize,\n            use_thompson_sampling: query.params.get(EnableColdStartThompsonSampling),\n            beta_alpha0: query.params.get(ColdStartBetaAlpha0),\n            beta_beta0: query.params.get(ColdStartBetaBeta0),\n            impression_scale: query.params.get(ColdStartImpressionScale),\n            ts_top_k: query.params.get(ColdStartTsTopK) as usize,\n        }\n    }\n}\n\nfn viewer_arm(query: &ScoredPostsQuery) -> ViewerArm {\n    let is_treatment = query.params.get(PhoenixMoeCodivertViewerIsTreatment);\n    let is_control = query.params.get(PhoenixMoeCodivertViewerIsControl);\n    match (is_treatment, is_control) {\n        (true, _) => ViewerArm::Treatment,\n        (false, true) => ViewerArm::Control,\n        (false, false) => ViewerArm::Holdout,\n",
+      "source_digest": "c939858b773d6fc2c6af271265bd0c7674090d9adc40e80f40aaf13e5c6da13f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 306,
+      "end_line": 330,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    .is_some_and(|imp| imp < params.impression_threshold)\n        })\n        .map(|(i, _)| i)\n        .collect();\n\n    let best_idx = if params.use_thompson_sampling {\n        pick_thompson(\n            &eligible,\n            candidates,\n            scores,\n            params.beta_alpha0,\n            params.beta_beta0,\n            params.impression_scale,\n            params.ts_top_k,\n            &mut rand::rng(),\n        )\n    } else {\n        pick_by_score(&eligible, scores)\n    };\n\n    let Some(best_idx) = best_idx else {\n        return (scores.to_vec(), None);\n    };\n\n    let mut effective = scores.to_vec();\n",
+      "source_digest": "405b4fe9c6d2ad2aa35189e6df5825f69c3f0cfddc0daf7de9e781b024a1b24c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 589,
+      "end_line": 613,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        results.override_fs(\n            \"rust_home_mixer_cold_start_max_post_age_secs\".to_string(),\n            \"7200\",\n        );\n        results.override_fs(\n            \"rust_home_mixer_enable_cold_start_thompson_sampling\".to_string(),\n            \"false\",\n        );\n        results.override_fs(\"rust_home_mixer_cold_start_beta_alpha0\".to_string(), \"0.75\");\n        results.override_fs(\"rust_home_mixer_cold_start_beta_beta0\".to_string(), \"49.25\");\n        results.override_fs(\"rust_home_mixer_cold_start_ts_top_k\".to_string(), \"5\");\n        results.override_fs(\n            \"rust_home_mixer_cold_start_impression_scale\".to_string(),\n            \"1.0\",\n        );\n        query.params = results.into();\n        query\n    }\n\n    fn ts_query(viewer_treatment: bool, top_k: u32) -> ScoredPostsQuery {\n        let mut query = codivert_query(!viewer_treatment, viewer_treatment);\n        let mut results = query.params.0.expect(\"params set\");\n        results.override_fs(\n            \"rust_home_mixer_enable_cold_start_thompson_sampling\".to_string(),\n            \"true\",\n",
+      "source_digest": "e7f452346e3cc82ddbea9ed95d00cc7373be80e3d735bf4508b3f01c104a8113",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "phoenix/crates/common/xai-recsys/src/model_config.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 62,
+      "end_line": 86,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"v6\" => Ok(Self::V6),\n            \"v8\" => Ok(Self::V8),\n            other => Err(format!(\n                \"unknown multimodal_embedding_type {other:?} (expected none|v1|v3|v5|v6|v8)\"\n            )),\n        }\n    }\n}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct HashTableConfig {\n    pub user_id_table_size: usize,\n    pub user_hash_scales: Vec<i64>,\n    pub user_biases: Vec<i64>,\n    pub user_modulus: i64,\n\n    pub item_id_table_size: usize,\n    pub item_hash_vocab_size: usize,\n    pub item_hash_scales: Vec<i64>,\n    pub item_biases: Vec<i64>,\n    pub item_modulus: i64,\n\n    pub author_id_table_size: usize,\n    pub author_hash_scales: Vec<i64>,\n    pub author_biases: Vec<i64>,\n",
+      "source_digest": "ec170fc31e19f92ddaaacb726d51f693f9827129677b00fe7b923a8cbd30f43d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "clip/config.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 4,
+      "end_line": 28,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nclass ClipConfig:\n    DEFAULT_FINAL_EMBEDDING_DIM = 256\n\n    def __init__(\n        self,\n        dataset_path,\n        input_resolution=224,\n        use_data_augmentation=False,\n        clip_model_type=\"ViT-B/32\",\n        top_feedforward=True,\n        final_embedding_dim=None,\n        logit_scale=4.5065,\n        model_dir=None,\n        save_interval=5000,\n        save_last_ckpt_only=True,\n        batch_size=128,\n        learning_rate=2e-5,\n        num_training_steps=100000,\n        num_warmup_steps=500,\n        num_decay_steps=None,\n        mixed_precision=False,\n    ):\n        if model_dir is None:\n            model_dir = os.path.join(\"runs\", datetime.now().strftime(\"%Y%m%d_%H%M%S\"))\n",
+      "source_digest": "7893b45c0a0b7031ec631304ded55d659dc0d15a697cca698f284869bc45b445",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    MODELS = {**PRETRAINED_MODELS, **TWITTER_MODELS}\n\n    MODEL_NAMES = tuple(MODELS.keys())\n\n    def __init__(\n        self,\n        clip_model_type=DEFAULT_CLIP_MODEL_TYPE,\n        top_feedforward=True,\n        final_embedding_dim=DEFAULT_FINAL_EMBEDDING_DIM,\n        truncate_text=True,\n        logit_scale=None,\n        use_gpu=None,\n    ):\n        self.clip_model_type = clip_model_type\n\n        if clip_model_type not in self.MODELS:\n            raise ValueError(\n                f\"Unknown model type: {clip_model_type}. Choices: {self.MODELS.keys()}\"\n            )\n\n        if clip_model_type in self.PRETRAINED_MODELS:\n            self.base_clip_model_type = clip_model_type\n        else:\n",
+      "source_digest": "d9eb2ee3aa030e6225bfb523cde4c05d3d7f5f99c4021bf729ee3d58f3d223df",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 87,
+      "end_line": 111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.text_encoder = TextCLIP(\n            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.top_feedforward = top_feedforward\n        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n",
+      "source_digest": "4de4805e4eccf1c12586c79745b9b9f3e4b7fcae2e326bda0013595a71ed5901",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 88,
+      "end_line": 112,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.text_encoder = TextCLIP(\n            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.top_feedforward = top_feedforward\n        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n            map_location = None if self.use_gpu else torch.device(\"cpu\")\n",
+      "source_digest": "38afc80c47d9f0b9f113cf3ca4a627dfa526c77b2f6836c0b98e6018609c7c9c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 90,
+      "end_line": 114,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        self.text_encoder = TextCLIP(\n            self.clip_model,\n            top_feedforward=top_feedforward,\n            d_out=final_embedding_dim,\n        )\n        self.top_feedforward = top_feedforward\n        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n            map_location = None if self.use_gpu else torch.device(\"cpu\")\n            local_model_path = io_utils.maybe_download_file(\n                self.TWITTER_MODELS[clip_model_type]\n",
+      "source_digest": "d63df3043bb5a48588063c65116e67a67667e294b67ef02651b94c34da839e61",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 97,
+      "end_line": 121,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.truncate_text = truncate_text\n\n        logit_scale = (\n            logit_scale if logit_scale is not None else self.clip_model.logit_scale\n        )\n        self.clip_model.logit_scale = torch.nn.Parameter(torch.ones([]) * logit_scale)\n        self.use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()\n        self._multi_gpu = self.use_gpu and torch.cuda.device_count() > 1\n        self._device = \"cuda:0\" if self.use_gpu else \"cpu\"\n        if self.use_gpu:\n            self._prepare_model_for_gpu()\n\n        self.clip_model.logit_scale.to(self._device)\n\n        if clip_model_type in self.TWITTER_MODELS:\n            map_location = None if self.use_gpu else torch.device(\"cpu\")\n            local_model_path = io_utils.maybe_download_file(\n                self.TWITTER_MODELS[clip_model_type]\n            )\n            print(f\"loading model from: {local_model_path}\")\n            checkpoint_contents = torch.load(\n                local_model_path, map_location=map_location\n            )\n\n            config = checkpoint_contents[\"config\"]\n",
+      "source_digest": "77e50ce3cf2fbcfcd43f61135d3a2b0a4f64d4a52f44cfdc97cebf01044f848b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 215,
+      "end_line": 239,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                return_numpy=return_numpy,\n                normalize_outputs=normalize_outputs,\n            ),\n            \"text_embeddings\": self.encode_texts(\n                features[text_field],\n                return_numpy=return_numpy,\n                normalize_outputs=normalize_outputs,\n            ),\n        }\n\n    def get_logits(self, features, image_field=\"image\", text_field=\"tweet_text\"):\n        out = self.encode(features, image_field=image_field, text_field=text_field)\n        logit_scale = torch.clamp(self.clip_model.logit_scale.exp(), max=100)\n        image_logits, text_logits = model_utils.create_logits(\n            out[\"image_embeddings\"], out[\"text_embeddings\"], logit_scale\n        )\n        return {\n            \"image_logits\": image_logits,\n            \"text_logits\": text_logits,\n        }\n\n    \u0040staticmethod\n    def normalize_outputs(x):\n        if isinstance(x, np.ndarray):\n            return x / np.linalg.norm(x, axis=-1, keepdims=True)\n",
+      "source_digest": "2b8fc2688b60feb86c76aed3fbfc3506556158c3b23d785a78c5ee76e3dd3311",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "clip/model.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 217,
+      "end_line": 241,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            ),\n            \"text_embeddings\": self.encode_texts(\n                features[text_field],\n                return_numpy=return_numpy,\n                normalize_outputs=normalize_outputs,\n            ),\n        }\n\n    def get_logits(self, features, image_field=\"image\", text_field=\"tweet_text\"):\n        out = self.encode(features, image_field=image_field, text_field=text_field)\n        logit_scale = torch.clamp(self.clip_model.logit_scale.exp(), max=100)\n        image_logits, text_logits = model_utils.create_logits(\n            out[\"image_embeddings\"], out[\"text_embeddings\"], logit_scale\n        )\n        return {\n            \"image_logits\": image_logits,\n            \"text_logits\": text_logits,\n        }\n\n    \u0040staticmethod\n    def normalize_outputs(x):\n        if isinstance(x, np.ndarray):\n            return x / np.linalg.norm(x, axis=-1, keepdims=True)\n        elif isinstance(x, tf.Tensor):\n            return x / tf.norm(x, ord=\"euclidean\", axis=-1, keepdims=True)\n",
+      "source_digest": "05f2879b6ce2ddaa3c9692ed0a6ede8b12e00c47e68cb0af14ea8d90cceb2f86",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "clip/training.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    parser.add_argument(\n        \"--top_feedforward\",\n        help=\"pass this flag to add a feed-forward layer to change dimensionality \"\n        \"of CLIP output embeddings\",\n        action=\"store_true\",\n    )\n    parser.add_argument(\n        \"--final_embedding_dim\",\n        help=\"dimension to map CLIP embeddings to, if --top_feedforward\",\n        type=int,\n    )\n    parser.add_argument(\n        \"--logit_scale\",\n        help=\"initial value of learnable temperature parameter\",\n        type=float,\n    )\n\n\ndef add_training_args(parser):\n    parser.add_argument(\n        \"--model_dir\",\n        help=\"save directory location\",\n        type=str,\n    )\n    parser.add_argument(\n",
+      "source_digest": "3d84e00d2f34c236163dd38af1ce99104a96d94581d27939d8351ee7f821ebb4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "clip/training.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 128,
+      "end_line": 152,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        )\n        .create_dataset(\n            dataset_path=config.dataset_path,\n            is_training=True,\n        )\n        .take(config.num_training_steps + 1)\n    )\n\n    model = TwitterCLIP(\n        clip_model_type=config.clip_model_type,\n        top_feedforward=config.top_feedforward,\n        final_embedding_dim=config.final_embedding_dim,\n        logit_scale=config.logit_scale,\n    )\n\n    image_loss_op, text_loss_op = nn.CrossEntropyLoss(), nn.CrossEntropyLoss()\n    optimizer, scheduler = train_utils.create_optimizer(\n        model,\n        learning_rate=config.learning_rate,\n        num_training_steps=config.num_training_steps,\n        num_warmup_steps=config.num_warmup_steps,\n        num_decay_steps=config.num_decay_steps,\n    )\n    writer = SummaryWriter(config.model_dir)\n    if config.mixed_precision:\n",
+      "source_digest": "1379531f4f4a50aa3da19935bb6418dd566be0f87876ef227cc4b1351a36d491",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "clip/training.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 144,
+      "end_line": 168,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    optimizer, scheduler = train_utils.create_optimizer(\n        model,\n        learning_rate=config.learning_rate,\n        num_training_steps=config.num_training_steps,\n        num_warmup_steps=config.num_warmup_steps,\n        num_decay_steps=config.num_decay_steps,\n    )\n    writer = SummaryWriter(config.model_dir)\n    if config.mixed_precision:\n        scaler = torch.cuda.amp.GradScaler()\n\n    pbar = tqdm.tqdm(\n        enumerate(train_dataset), unit=\"samples\", unit_scale=config.batch_size\n    )\n    running_loss = 0.0\n    for step, features in pbar:\n        optimizer.zero_grad()\n\n        def _compute_loss():\n            logits = model.get_logits(features)\n            targets = torch.arange(\n                logits[\"image_logits\"].size()[0], dtype=torch.long\n            ).to(\"cuda:0\" if model.use_gpu else \"cpu\")\n            loss = (\n                image_loss_op(logits[\"image_logits\"], targets)\n",
+      "source_digest": "e1f89139e9846c7d86f3bbded494ce4db598868f8adc0413bb2030594a3fb9d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "clip/training.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 174,
+      "end_line": 198,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            with torch.cuda.amp.autocast():\n                loss = _compute_loss()\n        else:\n            loss = _compute_loss()\n        with torch.no_grad():\n            running_loss = train_utils.get_avg(running_loss, loss.item(), step)\n\n        if not model._multi_gpu or torch.cuda.current_device() == 0:\n            scalar_summaries = {\n                \"batch_loss\": loss.item(),\n                \"running_loss\": running_loss,\n                \"learning_rate\": float(scheduler.get_last_lr()[0]),\n                \"logit_scale\": model.clip_model.logit_scale.item(),\n            }\n            if config.mixed_precision:\n                scalar_summaries[\"loss_scale\"] = scaler.get_scale()\n            for name, val in scalar_summaries.items():\n                writer.add_scalar(name, val, step)\n            if step == 0:\n                image_sample = torch.Tensor(features[\"image\"][:16].numpy())\n                writer.add_images(\"preprocessed_images\", image_sample, step)\n\n            if step % config.save_interval == 0 or step == config.num_training_steps:\n                ckpt_path = (\n                    \"ckpt-last.pt\"\n",
+      "source_digest": "6d6ee242381bc81a6e03b6f0499b41b7c2700733dd6a1ba69d1c96d038f157c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "clip/training.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 177,
+      "end_line": 201,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            loss = _compute_loss()\n        with torch.no_grad():\n            running_loss = train_utils.get_avg(running_loss, loss.item(), step)\n\n        if not model._multi_gpu or torch.cuda.current_device() == 0:\n            scalar_summaries = {\n                \"batch_loss\": loss.item(),\n                \"running_loss\": running_loss,\n                \"learning_rate\": float(scheduler.get_last_lr()[0]),\n                \"logit_scale\": model.clip_model.logit_scale.item(),\n            }\n            if config.mixed_precision:\n                scalar_summaries[\"loss_scale\"] = scaler.get_scale()\n            for name, val in scalar_summaries.items():\n                writer.add_scalar(name, val, step)\n            if step == 0:\n                image_sample = torch.Tensor(features[\"image\"][:16].numpy())\n                writer.add_images(\"preprocessed_images\", image_sample, step)\n\n            if step % config.save_interval == 0 or step == config.num_training_steps:\n                ckpt_path = (\n                    \"ckpt-last.pt\"\n                    if config.save_last_ckpt_only\n                    else f\"ckpt-step-{step:06d}.pt\"\n                )\n",
+      "source_digest": "0572a8d5f7742f85413bb1c79599debc8521492ef372ad062bd04a79170abbd6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "clip/training.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 197,
+      "end_line": 221,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ckpt_path = (\n                    \"ckpt-last.pt\"\n                    if config.save_last_ckpt_only\n                    else f\"ckpt-step-{step:06d}.pt\"\n                )\n                save_dict = {\n                    \"config\": vars(config),\n                    \"step\": step,\n                    \"image_encoder_state_dict\": model.image_encoder.state_dict(),\n                    \"text_encoder_state_dict\": model.text_encoder.state_dict(),\n                    \"optimizer_state_dict\": optimizer.state_dict(),\n                    \"scheduler_state_dict\": scheduler.state_dict(),\n                    \"logit_scale\": model.clip_model.logit_scale.item(),\n                    \"running_loss\": running_loss,\n                }\n                torch.save(save_dict, os.path.join(config.model_dir, ckpt_path))\n                writer.flush()\n\n        if config.mixed_precision:\n            scaler.scale(loss).backward()\n            scaler.step(optimizer)\n            scaler.update()\n        else:\n            loss.backward()\n            optimizer.step()\n",
+      "source_digest": "c5c355f199011081219e8fde2380d351f8769881f14cdf90be7888149ec5655f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "clip/utils/model_utils.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 16,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import numpy as np\n\n\ndef create_logits(x1, x2, logit_scale):\n    x1 = x1 / x1.norm(dim=-1, keepdim=True)\n    x2 = x2 / x2.norm(dim=-1, keepdim=True)\n\n    logits_per_x1 = logit_scale * x1 \u0040 x2.t()\n    logits_per_x2 = logits_per_x1.t()\n\n    return logits_per_x1, logits_per_x2\n\n\ndef print_clip_model_stats(model):\n    input_resolution = model.visual.input_resolution\n    context_length = model.context_length\n",
+      "source_digest": "92ba0b62ede729a9b3ded4930830fd1d60b49829556920f5ec4bee96aef87ec1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "grox/libs/video_tools/image.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 244,
+      "end_line": 268,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        & (ycrcb[:, :, 1] > 135)\n        & (ycrcb[:, :, 1] < 175)\n        & (ycrcb[:, :, 2] > 80)\n        & (ycrcb[:, :, 2] < 130)\n    )\n    return float(mask.mean())\n\n\ndef _to_gray_u8(frame: np.ndarray) -> np.ndarray:\n    return cv2.cvtColor(np.clip(frame, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)\n\n\ndef _ecc_working_scale(h: int, w: int) -> float:\n    return min(1.0, _MOTION_REVEAL_ECC_MAX_DIM / max(h, w))\n\n\ndef _ecc_downscale(gray: np.ndarray, scale: float) -> np.ndarray:\n    if scale >= 1.0:\n        return gray\n    h, w = gray.shape[:2]\n    return cv2.resize(\n        gray,\n        (max(8, round(w * scale)), max(8, round(h * scale))),\n        interpolation=cv2.INTER_AREA,\n    )\n",
+      "source_digest": "098159141bc8ef58bfba603102f40d4ca99df1bdf3ec10e5182336dd849bc1ea",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "grox/libs/video_tools/image.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 440,
+      "end_line": 464,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    raw_residual = _residual_magnitude(originals_u8, raw_median)\n    raw_p99 = np.percentile(raw_residual.reshape(len(originals_u8), -1), 99, axis=1)\n    if (\n        not _MOTION_REVEAL_PREGATE_P99[0]\n        <= float(np.median(raw_p99))\n        <= _MOTION_REVEAL_PREGATE_P99[1]\n    ):\n        return []\n\n    reference_gray = _to_gray_u8(raw_median)\n    warps: dict[int, np.ndarray] = {}\n    if _cover_gradient(reference_gray) >= _MOTION_REVEAL_MIN_COVER_GRADIENT:\n        scale = _ecc_working_scale(*originals_u8.shape[1:3])\n        reference_gray_f32 = reference_gray.astype(np.float32)\n        reference_small = _ecc_downscale(reference_gray, scale)\n        for index, frame_u8 in enumerate(originals_u8):\n            gray = cv2.cvtColor(frame_u8, cv2.COLOR_BGR2GRAY)\n            if _is_static(reference_gray_f32, gray.astype(np.float32)):\n                continue\n            warp = _ecc_align(\n                reference_small, _ecc_downscale(gray, scale), cv2.MOTION_AFFINE, scale\n            )\n            if warp is not None:\n                warps[index] = warp\n    del reference_gray\n",
+      "source_digest": "94052198f688fafedf3387a0ccd5243677db983002c6345b3c9987cced1ac080",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "home-mixer/params/param.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 597,
+      "end_line": 621,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    \"rust_home_mixer_cold_start_beta_beta0\",\n    49.25\n);\nparam!(\n    ColdStartTsTopK,\n    u32,\n    \"rust_home_mixer_cold_start_ts_top_k\",\n    2\n);\nparam!(\n    ColdStartImpressionScale,\n    f64,\n    \"rust_home_mixer_cold_start_impression_scale\",\n    1.0\n);\nparam!(\n    ColdStartTrackedIds,\n    String,\n    \"rust_home_mixer_cold_start_tracked_ids\",\n    \"\"\n);\n\nparam!(\n    EnableCachedPosts,\n    bool,\n",
+      "source_digest": "48a3efcccb2388166e23a4bdadbff2e847a2a8dc005baebfaa4d06ed291f6bfe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 44,
+      "end_line": 68,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    enabled: bool,\n    tracked_ids: String,\n    arm: ViewerArm,\n    follower_cap: i64,\n    impression_threshold: u64,\n    max_post_age: Duration,\n    max_position_ratio: f64,\n    slot_min: usize,\n    slot_max: usize,\n    use_thompson_sampling: bool,\n    beta_alpha0: f64,\n    beta_beta0: f64,\n    impression_scale: f64,\n    ts_top_k: usize,\n}\n\nimpl ColdStartParams {\n    fn read(query: &ScoredPostsQuery) -> Self {\n        Self {\n            enabled: query.params.get(EnableViewerColdStart),\n            tracked_ids: query.params.get(ColdStartTrackedIds),\n            arm: viewer_arm(query),\n            follower_cap: query.params.get(ColdStartFollowerCap),\n            impression_threshold: query.params.get(ColdStartImpressionThreshold) as u64,\n            max_post_age: Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs)),\n",
+      "source_digest": "4628a371013bb3e880fbcc33ce776661c696b59a807ea3f25014e25d1b950390",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 63,
+      "end_line": 87,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            enabled: query.params.get(EnableViewerColdStart),\n            tracked_ids: query.params.get(ColdStartTrackedIds),\n            arm: viewer_arm(query),\n            follower_cap: query.params.get(ColdStartFollowerCap),\n            impression_threshold: query.params.get(ColdStartImpressionThreshold) as u64,\n            max_post_age: Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs)),\n            max_position_ratio: query.params.get(LowImpressionsMaxPositionRatio),\n            slot_min: query.params.get(ColdStartSlotMin) as usize,\n            slot_max: query.params.get(ColdStartSlotMax) as usize,\n            use_thompson_sampling: query.params.get(EnableColdStartThompsonSampling),\n            beta_alpha0: query.params.get(ColdStartBetaAlpha0),\n            beta_beta0: query.params.get(ColdStartBetaBeta0),\n            impression_scale: query.params.get(ColdStartImpressionScale),\n            ts_top_k: query.params.get(ColdStartTsTopK) as usize,\n        }\n    }\n}\n\nfn viewer_arm(query: &ScoredPostsQuery) -> ViewerArm {\n    let is_treatment = query.params.get(PhoenixMoeCodivertViewerIsTreatment);\n    let is_control = query.params.get(PhoenixMoeCodivertViewerIsControl);\n    match (is_treatment, is_control) {\n        (true, _) => ViewerArm::Treatment,\n        (false, true) => ViewerArm::Control,\n        (false, false) => ViewerArm::Holdout,\n",
+      "source_digest": "c939858b773d6fc2c6af271265bd0c7674090d9adc40e80f40aaf13e5c6da13f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 306,
+      "end_line": 330,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    .is_some_and(|imp| imp < params.impression_threshold)\n        })\n        .map(|(i, _)| i)\n        .collect();\n\n    let best_idx = if params.use_thompson_sampling {\n        pick_thompson(\n            &eligible,\n            candidates,\n            scores,\n            params.beta_alpha0,\n            params.beta_beta0,\n            params.impression_scale,\n            params.ts_top_k,\n            &mut rand::rng(),\n        )\n    } else {\n        pick_by_score(&eligible, scores)\n    };\n\n    let Some(best_idx) = best_idx else {\n        return (scores.to_vec(), None);\n    };\n\n    let mut effective = scores.to_vec();\n",
+      "source_digest": "405b4fe9c6d2ad2aa35189e6df5825f69c3f0cfddc0daf7de9e781b024a1b24c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "home-mixer/scorers/author_cold_start.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 589,
+      "end_line": 613,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        results.override_fs(\n            \"rust_home_mixer_cold_start_max_post_age_secs\".to_string(),\n            \"7200\",\n        );\n        results.override_fs(\n            \"rust_home_mixer_enable_cold_start_thompson_sampling\".to_string(),\n            \"false\",\n        );\n        results.override_fs(\"rust_home_mixer_cold_start_beta_alpha0\".to_string(), \"0.75\");\n        results.override_fs(\"rust_home_mixer_cold_start_beta_beta0\".to_string(), \"49.25\");\n        results.override_fs(\"rust_home_mixer_cold_start_ts_top_k\".to_string(), \"5\");\n        results.override_fs(\n            \"rust_home_mixer_cold_start_impression_scale\".to_string(),\n            \"1.0\",\n        );\n        query.params = results.into();\n        query\n    }\n\n    fn ts_query(viewer_treatment: bool, top_k: u32) -> ScoredPostsQuery {\n        let mut query = codivert_query(!viewer_treatment, viewer_treatment);\n        let mut results = query.params.0.expect(\"params set\");\n        results.override_fs(\n            \"rust_home_mixer_enable_cold_start_thompson_sampling\".to_string(),\n            \"true\",\n",
+      "source_digest": "e7f452346e3cc82ddbea9ed95d00cc7373be80e3d735bf4508b3f01c104a8113",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "phoenix/crates/common/xai-recsys/src/model_config.rs",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 62,
+      "end_line": 86,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"v6\" => Ok(Self::V6),\n            \"v8\" => Ok(Self::V8),\n            other => Err(format!(\n                \"unknown multimodal_embedding_type {other:?} (expected none|v1|v3|v5|v6|v8)\"\n            )),\n        }\n    }\n}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct HashTableConfig {\n    pub user_id_table_size: usize,\n    pub user_hash_scales: Vec<i64>,\n    pub user_biases: Vec<i64>,\n    pub user_modulus: i64,\n\n    pub item_id_table_size: usize,\n    pub item_hash_vocab_size: usize,\n    pub item_hash_scales: Vec<i64>,\n    pub item_biases: Vec<i64>,\n    pub item_modulus: i64,\n\n    pub author_id_table_size: usize,\n    pub author_hash_scales: Vec<i64>,\n    pub author_biases: Vec<i64>,\n",
+      "source_digest": "ec170fc31e19f92ddaaacb726d51f693f9827129677b00fe7b923a8cbd30f43d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-93eec7318280149015d440c1f84dd8b57601aba021014b646ca4d4e68854fa93",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "b71d3314c38ba095fdc8420a45a362af0ed326d29ec59de1eb431a1f3cfa80f5",
+      "context_complete": true,
+      "task_id": "T-ebabdd1e82a451042cb22c1e1a44889d0b3ba38a1c4beb8782ef2507db60d6ef",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-0e09d42d3e94fcfa449c9cc4d98a6daf12e128190d5738409aba33381ee63b7e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-3b48b0bfdaaf90dbac9f9b336248c7a3a32e7c8ab06a79ee61a0359416f0692d",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a0e6f91156be6f4b3faf2af2ba8a1f21f4e4f989bee5a58a4ffe25ecc3e2b1f9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-55ad2295be157171726f178f11e52eefe5ac91a8155c20e57ca28fd07caaffb3",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5090c8c8bb5bda8fcce2a9355d313634b00e6959da9af48fa346e1999b561956",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-759122792532cd34480ac452fbe4f79570f625b72129b2a4ce24aeeb825ecaf3",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ad4508f74c1e68d3507b88408d2c4fcdea5078eba98599ba8370707bdf237c7c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-d9e4226a76721cfe6a9d0e92e01b748c03c7eba39e94b6453861528ee031a9da",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5a3f0c58ea27bf7b35a10c942f281c23f2d4aa56041e5196fd0cd8b4f0573e46",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-2c5d2b52c2eff175add5ecb8467dc2670472b739f3f923d4f76eb4b684db66ff",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-68c46713e89c973a4d5bf2456fd0f06c5fde36ec9b493ff8fdd2cee4ec8a7bfa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-90887c1694c7a7746cd674b65ceccbf3800db3ec1a4da46e6c32fa58292027e5",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-bb539de38d72aa69712fcac174b6928fec83b033e358222c50f32dca57f9ac5e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-ebd786f0591a9432b84ec374cdb4b5e9c4cb5802fc9342083f3cb4e554129208",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ad5ff8b94b3266bd68ef84b25e0fae4439547dfce5ca35de4b55545a5e00f1d5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-94c6066f791abb2bbf942125e5aec167a63a6abb82e31b2c45f3d98cd2e461c2",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8fe6f33e1dae2f49e1d5986d0a311540e5ef6cc482743adb57358833a5bde502",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-0eebd4b8ccffe45615cb57d04d5946c19639f9bcac74d2ffb9dc61c3bc82669c",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e0ec48408846e564adca5a794f425c598f7708fe5736ef6ca969c2a492324823",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-395a18147d3be52bd17b765cf7a0efbcc661cb94b3cdbfc855114fccbb891fde",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-3904d9b269aae077069e34f483f41adce5b32bb3b5fde84c74ad64ed8c384c69",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-557a0c1a713686bb1581921996e93e2d3a508bbfef3fa660fb5d0b0545517d5d",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-0febe3d4ca5497f966b82bc706beb0e0e91f020dc9f55d266074792437a79856",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-08afa14d7afe3d8e3c9addccd6ea7156d0b42a9a5daec3a598b494acb408744b",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-f7b82b75dcd4877eac6082b690181d2d6affabd21ba625fa3363b6fbe34848f6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-312dc3c4b17e507ef5e21211167a087306716f36cc4222a0ed8dcbf5bfd1d3ed",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e3e180fab78db12be910b11e27a8ba381aa1eaf202213ce93d2e320c03963837",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-cea86de76875369ee3a60692847d76e25b16911dd90fb9a5acd892f963687bff",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-3c8963e9f710640152adaec589064b8c5e0df4d21faa506fa9babc8904cfdc23",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-9136467aeb01cfab3191cc0d32e792e988c8e99881f874c0da6b63564b84d914",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-c938909fe5bfc01e270f9135f614a708b6676e6d60ae614151a272b108bf5d69",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-db1ffc16c2f72c0518e0bfc207688c468aadcab66ac8d01ca04ce0ebbde3d4f2",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8278115aa708e67ebe6d25493968dca74320b331c2cdb68696657d8498098492",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-1ffd530137f82b98b0cf7c5db4c47afb6a64ea9a6c2e9c29af4957fffac44fc7",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-679e2e5d4d05d17108796931b68401e8ff204fb4c55165a1c72df9c06cd22475",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-4713fc30408dd4c1dceaf9a20fa553a609089c5d0a748693fe645c1f98bc9a06",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9e4213ef470631fadcae0deb440ae9d40ee06cb685e0e8638bc90e71866f1645",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-4171946d1d56f99f27323077ad0a99272e51b6e75cfac5af8b715446c059d285",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d5d456546efccf3d992742ad2dadcc044f78dc1294506a5b5c2753a6b3805eec",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-35c4ce2a0c226183882ccf8ca7edc57978c6d04eacf5c24b31fde02111df9610",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-28bbfbf7e2cbe52f0507888ca76499803db6d640c8ceca780fb955de275e165c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-db038772dd65472e7661ce4882a805bb3123dcb70008530fc0c9d0b79f74b44d",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-305cd15cb925d0cedaed4eaedacdeae40c8569c050359c0a947c42634bf21d77",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-3d2b350414b3f343bd51ee877918a00b5e440a876dc8335d81bc0e21d514f842",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ece3943a4599203e54680efe5293b38807b9cf66916b483288aa93a9f704f6df",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-e1b4a5634f4ae1edfe31271c2fd14cc5c103162f9a3ae01ce9dc52254e880110",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-24b7845b769757e507b0f7d70733f509dfd96b69849f6cdec8077bafe80c3900",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-66afae124744cda7e9b32b3f66f198d3c30a1e9df0585869ef8699db99c78e74",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-043a85e886dd740021a053ac55ddf17abf3ac755d7ce04b4430dc62a5631b6fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-f78c590c9f7039f0f40b8e56e263c66dcf139b22214d3df3b0bed303d7e747ab",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5a4d3d4340cc0dc57969ab20c8534985728e40a3358c1f578e0e7008d9b10655",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-012aa4312189fa52f231fef2c1cfb7dba3d48eaa2432e8384cc8ff9488c059a8",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-21c4801e088a8deed25e962b56290fffe64dfebd863713c2b27558b5a0f7d28b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-5d5476864aecfda0dcd7b9796da7d5f6eea5d49a318a10f4a48c5e4ca8b1023a",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-bbf8e6cbefc3e22a8f9255034509a4a4986a42b777eb16be443c5f1b71da402b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-3eaa6a1ac92e76666a5930e7db2864c14e9da68de0c3976ff0cdc884daef9df7",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8514b61f13f44b031b063f5a6df5648e66ad852aae9c1737df74f87182a3a78d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-471761cfa7ec0b1023c3fe6efc4e5d6aceeea40edcc61462018e245de5e0aef3",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-56f21462b454e8c0165bee46ba9ac4aac066703957048f5a88bd6d5e2fc6c5d1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-144e029d2767047a6e04acf10ffa461cc50edd58b772192adb6f23c74a651e6a",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a3114871422173dd700d2ef33e45b1f26d643fefc97c28a03b312e1b5b702189",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-f3b3dc381fe627e33be45d8390516916840ec39c6718d0a45fd40d0f0874f366",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-e4f7f11e1066caf7a476f66290d09ac04c894d574e9fffd4763163f927afb1ce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-5debe6bd41bef67f4be2c31055df1cb87ee6546e678b97f1a136136dc2f53b18",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-d2fa6e82123e662549ad484e4b27c4e59a4aea3c55dd52cf15f598a4f961b2fc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-1e7b1684de6f07988a7ff9e675c511ea443e77b9ef161f713b1fb55c1643a1e6",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-69eefe5ab676f4eb916b4faa57f4bfa44dc6b038aae31b16f02878c498b05aec",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-1c858ebc53659e2bf91dbb525db8627c8aaed3170725679c27c2541e809f5898",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-025f7d5bcbf866817e9520fae38ed5f6db9e8e30f744084f4eb9bbb9541c9074",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-a2f71ef1d129e4fb61d4d74b343096ed33e047f4175b7a52427048d06ace4835",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-37456142c8f6787e94072722f18b071ac647ca8eb2e86b9edbeb624faa645ae4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-ac8c8816711b2ba3044c79b46abfe3a57e06c1c0297a5cfd5b23decc14c8929c",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8189d3391ea55e0d36ffc25a8ee87c3e9ceb0b60a329b90bc653ab33b145ca10",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-368814c2220bbb761ded5191f98038d71ae6cf2dbad9227f943dc71f872f6c29",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-57f8972b97553fbe78be4216be784d84e82047291e19f8f59ef641cbe9f7041c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-6196ec72610aaacf91dec9a61786f54741fdb81dc178d21bba30d339febc5b8e",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-141b654bdee7fe24d7341d79f7214a3ae9858b738ef2164ee9019653c2b2fb1c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-bf416c18c14c3760aeb13cf8dac8e74c8c46b36da524aeadf2075af5272eeebb",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-398c0ad2c445dc2f335df184b0e99b3b9154eabf5cb93bf735710c69ec5e95c2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-3b5d44ae0a5eb8cfc6cb4d9f19e5642090c9483f91e4cb3a296690d4f3a854c7",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-196606563423c76c43b15471ee36585c0ca6c6194da22a5f1c0783de93fe95cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-ea4b48314da2bac1e4d92034908a98477bb3f932b172579c0114d60286d23094",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8f164938f8c091234b460d625dd8814222cead72840fa19fd95be72eb62b1d13",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-4659324aa2c19dacc10d0843dc77a97dcb49c1662eebc4f36c5400038cfa78d1",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-92c3c6cb29e793a99c3ce501a852d16eed9b8607689181abc6dd82fdb6f8dadd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-ed0065bbbeba8b64e54e1a87fb6ad1d56a805854c6571b87a294536805929c39",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7e5f1d0ce3682fcb3d41786de3bc9afeeab580090cba98f76954a4af4088efe2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-7e6dee9a468af3c2620b49f0f6303d8158649a593a3c46725c4389408b09fcb3",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-a4b47dbdf1451e1098799ab19b8a8263a715660f7de773a6aa9e5739d5e3e04a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-64eed7c3d7081d2c886292685eeb5740bb14f7c2744ed4d32c1e5b43bf0ebace",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-49bdedf8c9f98699e796c8c45bd9ecc58b069193e2866c9e7c2e62b12643c0d5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "Fp8Gemms",
+        "Fp8Dot",
+        "__call__",
+        "count_compiled_fp8_gemms",
+        "check_compiled_fp8_gemms",
+        "_use_transpose_kernels",
+        "_scale",
+        "_quantize"
+      ],
+      "context_complete": false,
+      "task_id": "T-e66ae2a0cfd6bf4663f3083dbedfe2553bfc700c8b93755064a9e136a756e26a",
+      "evidence_refs": [
+        "E47"
+      ]
+    }
+  ],
+  "task_id": "T-b32ab89d50b70828eb971de746510ff8ee578b899b77c5753cb5e3a1423bf01d"
+}

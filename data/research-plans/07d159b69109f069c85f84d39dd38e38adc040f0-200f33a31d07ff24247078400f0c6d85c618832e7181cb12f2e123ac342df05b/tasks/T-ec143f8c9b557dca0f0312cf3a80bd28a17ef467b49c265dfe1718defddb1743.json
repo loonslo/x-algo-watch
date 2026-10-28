@@ -1,0 +1,1126 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/data/recsys/id_list_features.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-fc29db37787f4531f68644a12f76a0d18852e72dac13ae8565051b66e61b7895",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 306,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport dataclasses\nimport enum\nimport os\nimport re\nfrom collections.abc import Callable, Sequence\n\nimport numpy as np\nimport pyarrow as pa\nimport pyarrow.parquet as pq\n\nCOLUMN = \"userIdListFeatures\"\nHASHES_KEY = \"user_id_list_hashes\"\nMASK_KEY = \"user_id_list_mask\"\n\nCANONICAL_TYPE: pa.DataType = pa.list_(\n    pa.struct([pa.field(\"name\", pa.string()), pa.field(\"ids\", pa.list_(pa.int64()))])\n)\n\n_PARTITION_SEG_RE = re.compile(r\"(partition=\\d+/)\")\n\n\nclass IdListFamily(enum.Enum):\n    TOP_POST = \"top_post\"\n    TOP_AUTHOR = \"top_author\"\n    TOP_CONVERSION_POST = \"top_conversion_post\"\n    TOP_CONVERSION_AUTHOR = \"top_conversion_author\"\n    SEQ_POST = \"seq_post\"\n    SEQ_AUTHOR = \"seq_author\"\n\n    \u0040property\n    def is_author(self) -> bool:\n        return self in (\n            IdListFamily.TOP_AUTHOR,\n            IdListFamily.TOP_CONVERSION_AUTHOR,\n            IdListFamily.SEQ_AUTHOR,\n        )\n\n\ndef family_of(name: str) -> IdListFamily:\n    if name.startswith(\"top_cp_\"):\n        return IdListFamily.TOP_CONVERSION_POST\n    if name.startswith(\"top_cau_\"):\n        return IdListFamily.TOP_CONVERSION_AUTHOR\n    if name.startswith(\"top_p_\"):\n        return IdListFamily.TOP_POST\n    if name.startswith(\"top_au_\"):\n        return IdListFamily.TOP_AUTHOR\n    if name.startswith(\"latest_au_\"):\n        return IdListFamily.SEQ_AUTHOR\n    if name.startswith((\"latest_p_\", \"longest_dwell_p_\")):\n        return IdListFamily.SEQ_POST\n    raise ValueError(f\"unknown id-list feature name: {name!r}\")\n\n\ndef default_k(name: str) -> int:\n    m = re.match(r\"^(?:top_(?:p|au|cp|cau)|latest_(?:p|au)|longest_dwell_p)_(\\d+)_\", name)\n    if m is None:\n        raise ValueError(f\"cannot infer k from id-list feature name: {name!r}\")\n    return int(m.group(1))\n\n\n\u0040dataclasses.dataclass(frozen=True)\nclass IdListFeatureSpec:\n    name: str\n    k: int\n\n    def __post_init__(self) -> None:\n        if self.k <= 0:\n            raise ValueError(f\"{self.name}: k must be > 0, got {self.k}\")\n        if self.name != self.name.strip() or not self.name:\n            raise ValueError(f\"id-list feature name has surrounding whitespace: {self.name!r}\")\n        family_of(self.name)\n\n    \u0040property\n    def family(self) -> IdListFamily:\n        return family_of(self.name)\n\n\ndef parse_spec(spec: str) -> IdListFeatureSpec:\n    name, sep, k = spec.strip().partition(\":\")\n    name = name.strip()\n    return IdListFeatureSpec(name, int(k.strip()) if sep else default_k(name))\n\n\ndef parse_specs(specs: Sequence[str] | str) -> tuple[IdListFeatureSpec, ...]:\n    if isinstance(specs, str):\n        specs = [s for s in specs.split(\",\") if s.strip()]\n    out = tuple(parse_spec(s) for s in specs)\n    names = [s.name for s in out]\n    if len(set(names)) != len(names):\n        raise ValueError(f\"duplicate id-list feature names: {names}\")\n    return out\n\n\ndef slot_offsets(specs: Sequence[IdListFeatureSpec]) -> list[int]:\n    offsets = [0]\n    for s in specs:\n        offsets.append(offsets[-1] + s.k)\n    return offsets\n\n\ndef total_k(specs: Sequence[IdListFeatureSpec]) -> int:\n    return slot_offsets(specs)[-1]\n\n\ndef sidecar_path_for(batch_file_path: str, sidecar_root: str) -> str:\n    m = _PARTITION_SEG_RE.search(batch_file_path)\n    if m is None:\n        raise ValueError(f\"not a partition batch file path: {batch_file_path}\")\n    rel = batch_file_path[m.start() :]\n    if not rel.endswith(\".parquet\"):\n        raise ValueError(f\"not a parquet path: {batch_file_path}\")\n    return os.path.join(sidecar_root, rel[: -len(\".parquet\")] + \".list_features.parquet\")\n\n\ndef load_sidecar_column(sidecar_path: str, expected_rows: int | None = None) -> pa.Array:\n    col = _as_array(pq.read_table(sidecar_path, columns=[COLUMN]).column(COLUMN))\n    if expected_rows is not None and len(col) != expected_rows:\n        raise ValueError(\n            f\"sidecar {sidecar_path} has {len(col)} rows, batch file has {expected_rows}\"\n        )\n    return col\n\n\ndef canonical_column(col: pa.Array | pa.ChunkedArray) -> pa.Array:\n    arr = _as_array(col)\n    if arr.type.equals(CANONICAL_TYPE):\n        return arr\n    if pa.types.is_null(arr.type):\n        return pa.nulls(len(arr), type=CANONICAL_TYPE)\n    return arr.cast(CANONICAL_TYPE)\n\n\ndef null_column(num_rows: int) -> pa.Array:\n    return pa.nulls(num_rows, type=CANONICAL_TYPE)\n\n\ndef set_column(batch: pa.RecordBatch, col: pa.Array) -> pa.RecordBatch:\n    if len(col) != batch.num_rows:\n        raise ValueError(f\"{COLUMN}: {len(col)} rows != batch rows {batch.num_rows}\")\n    if COLUMN in batch.schema.names:\n        batch = batch.drop_columns([COLUMN])\n    return batch.append_column(pa.field(COLUMN, col.type, nullable=True), col)\n\n\ndef empty_arrays(\n    batch_size: int, specs: Sequence[IdListFeatureSpec]\n) -> tuple[np.ndarray, np.ndarray]:\n    width = total_k(specs)\n    return np.zeros((batch_size, width), dtype=np.int64), np.zeros(\n        (batch_size, width), dtype=np.bool_\n    )\n\n\ndef _as_array(col: pa.Array | pa.ChunkedArray) -> pa.Array:\n    if isinstance(col, pa.ChunkedArray):\n        if col.num_chunks == 0:\n            return pa.array([], type=col.type)\n        combined = col.combine_chunks()\n        if isinstance(combined, pa.ChunkedArray):\n            return combined.chunk(0)\n        return combined\n    return col\n\n\ndef parse_id_lists(\n    col: pa.Array | pa.ChunkedArray | None,\n    specs: Sequence[IdListFeatureSpec],\n    batch_size: int,\n) -> tuple[np.ndarray, np.ndarray]:\n    ids_out, mask_out = empty_arrays(batch_size, specs)\n    if not specs or col is None:\n        return ids_out, mask_out\n    arr: pa.Array = _as_array(col)\n    if len(arr) != batch_size:\n        raise ValueError(f\"{COLUMN}: {len(arr)} rows != batch_size {batch_size}\")\n    if pa.types.is_null(arr.type) or arr.null_count == len(arr):\n        return ids_out, mask_out\n    if not pa.types.is_list(arr.type) and not pa.types.is_large_list(arr.type):\n        raise ValueError(f\"{COLUMN}: expected List<Struct>, got {arr.type}\")\n\n    outer_offsets = np.asarray(arr.offsets, dtype=np.int64)\n    base = outer_offsets[0]\n    outer_offsets = outer_offsets - base\n    row_valid = np.ones(batch_size, dtype=np.bool_)\n    if arr.null_count:\n        row_valid = arr.is_valid().to_numpy(zero_copy_only=False)\n    structs = arr.values.slice(base, outer_offsets[-1])\n    n_structs = len(structs)\n    if n_structs == 0:\n        return ids_out, mask_out\n    struct_row = np.repeat(np.arange(batch_size, dtype=np.int64), np.diff(outer_offsets))\n    struct_valid = row_valid[struct_row]\n    if structs.null_count:\n        struct_valid &= structs.is_valid().to_numpy(zero_copy_only=False)\n\n    names = structs.field(\"name\")\n    ids_lists = structs.field(\"ids\")\n    dict_names = names.dictionary_encode()\n    vocab = dict_names.dictionary.to_pylist()\n    if not vocab:\n        return ids_out, mask_out\n    slot_of_vocab = np.full(len(vocab), -1, dtype=np.int64)\n    k_of_slot = np.asarray([s.k for s in specs], dtype=np.int64)\n    off_of_slot = np.asarray(slot_offsets(specs)[:-1], dtype=np.int64)\n    spec_index = {s.name: i for i, s in enumerate(specs)}\n    for vi, vname in enumerate(vocab):\n        if vname in spec_index:\n            slot_of_vocab[vi] = spec_index[vname]\n    codes = dict_names.indices.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)\n    slot = np.where(codes >= 0, slot_of_vocab[np.clip(codes, 0, None)], -1)\n    struct_valid &= slot >= 0\n\n    inner_offsets = np.asarray(ids_lists.offsets, dtype=np.int64)\n    inner_base = inner_offsets[0]\n    inner_offsets = inner_offsets - inner_base\n    flat_ids = ids_lists.values.slice(inner_base, inner_offsets[-1])\n    if ids_lists.null_count:\n        struct_valid &= ids_lists.is_valid().to_numpy(zero_copy_only=False)\n\n    values = flat_ids.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)\n    keep = values != 0\n    if keep.all():\n        valid_count = np.diff(inner_offsets)\n        valid_idx = None\n    else:\n        cum = np.concatenate(([0], np.cumsum(keep, dtype=np.int64)))\n        valid_count = cum[inner_offsets[1:]] - cum[inner_offsets[:-1]]\n        valid_idx = np.nonzero(keep)[0]\n        inner_offsets = cum[inner_offsets]\n    struct_valid &= valid_count > 0\n\n    key = struct_row * (len(specs) + 1) + np.where(struct_valid, slot, len(specs))\n    if n_structs > 1:\n        order = np.argsort(key, kind=\"stable\")\n        sorted_key = key[order]\n        dup = np.zeros(n_structs, dtype=np.bool_)\n        dup[order[1:]] = sorted_key[1:] == sorted_key[:-1]\n        struct_valid &= ~dup\n\n    take = np.where(struct_valid, np.minimum(valid_count, k_of_slot[np.clip(slot, 0, None)]), 0)\n    total = int(take.sum())\n    if total == 0:\n        return ids_out, mask_out\n\n    sel = np.nonzero(take)[0]\n    rep = take[sel]\n    pos = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(rep) - rep, rep)\n    src = np.repeat(inner_offsets[sel], rep) + pos\n    if valid_idx is not None:\n        src = valid_idx[src]\n    dst_row = np.repeat(struct_row[sel], rep)\n    dst_col = np.repeat(off_of_slot[slot[sel]], rep) + pos\n    ids_out[dst_row, dst_col] = values[src]\n    mask_out[dst_row, dst_col] = True\n    return ids_out, mask_out\n\n\ndef author_columns(specs: Sequence[IdListFeatureSpec]) -> np.ndarray:\n    out = np.zeros(total_k(specs), dtype=np.bool_)\n    offsets = slot_offsets(specs)\n    for i, s in enumerate(specs):\n        if s.family.is_author:\n            out[offsets[i] : offsets[i + 1]] = True\n    return out\n\n\ndef hash_id_lists(\n    ids: np.ndarray,\n    specs: Sequence[IdListFeatureSpec],\n    item_hash: Callable[[np.ndarray], np.ndarray],\n    author_hash: Callable[[np.ndarray], np.ndarray],\n) -> np.ndarray:\n    is_author = author_columns(specs)\n    parts: list[np.ndarray] = []\n    for sel, fn in ((~is_author, item_hash), (is_author, author_hash)):\n        if sel.any():\n            parts.append(np.asarray(fn(ids[:, sel]), dtype=np.int32))\n    if not parts:\n        return np.zeros((ids.shape[0], 0, 0), dtype=np.int32)\n    num_hashes = parts[0].shape[-1]\n    if any(p.shape[-1] != num_hashes for p in parts):\n        raise ValueError(\n            \"id-list features need the same number of item and author hashes, got \"\n            f\"{[p.shape[-1] for p in parts]}\"\n        )\n    out = np.zeros((ids.shape[0], ids.shape[1], num_hashes), dtype=np.int32)\n    i = 0\n    for sel in (~is_author, is_author):\n        if sel.any():\n            out[:, sel] = parts[i]\n            i += 1\n    return out\n\n\ndef fill_rates(mask: np.ndarray, specs: Sequence[IdListFeatureSpec]) -> dict[str, float]:\n    offsets = slot_offsets(specs)\n    rows = max(mask.shape[0], 1)\n    return {\n        s.name: float(mask[:, offsets[i] : offsets[i + 1]].any(axis=1).sum()) / rows\n        for i, s in enumerate(specs)\n    }\n",
+      "source_digest": "7a42a864bda3938bb89e8a204dd460cfaa2de734566303792004e747d4e3fa75",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 515,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport dataclasses\nimport enum\nimport os\nimport re\nfrom collections.abc import Callable, Sequence\n\nimport numpy as np\nimport pyarrow as pa\nimport pyarrow.parquet as pq\n\nCOLUMN = \"userIdListFeatures\"\nHASHES_KEY = \"user_id_list_hashes\"\nMASK_KEY = \"user_id_list_mask\"\n\nCANONICAL_TYPE: pa.DataType = pa.list_(\n    pa.struct([pa.field(\"name\", pa.string()), pa.field(\"ids\", pa.list_(pa.int64()))])\n)\n\n_PARTITION_SEG_RE = re.compile(r\"(partition=\\d+/)\")\n\n\nclass IdListFamily(enum.Enum):\n    TOP_POST = \"top_post\"\n    TOP_AUTHOR = \"top_author\"\n    TOP_CONVERSION_POST = \"top_conversion_post\"\n    TOP_CONVERSION_AUTHOR = \"top_conversion_author\"\n    SEQ_POST = \"seq_post\"\n    SEQ_AUTHOR = \"seq_author\"\n    TOP_ORGANIC_POST = \"top_organic_post\"\n    SEQ_ORGANIC_POST = \"seq_organic_post\"\n\n    \u0040property\n    def is_author(self) -> bool:\n        return self in (\n            IdListFamily.TOP_AUTHOR,\n            IdListFamily.TOP_CONVERSION_AUTHOR,\n            IdListFamily.SEQ_AUTHOR,\n        )\n\n    \u0040property\n    def is_organic_post(self) -> bool:\n        return self in (IdListFamily.TOP_ORGANIC_POST, IdListFamily.SEQ_ORGANIC_POST)\n\n\ndef family_of(name: str) -> IdListFamily:\n    if is_history_list(name):\n        return parse_history_list(name).family\n    if name.startswith(\"top_cp_\"):\n        return IdListFamily.TOP_CONVERSION_POST\n    if name.startswith(\"top_cau_\"):\n        return IdListFamily.TOP_CONVERSION_AUTHOR\n    if name.startswith(\"top_p_\"):\n        return IdListFamily.TOP_POST\n    if name.startswith(\"top_au_\"):\n        return IdListFamily.TOP_AUTHOR\n    if name.startswith(\"latest_au_\"):\n        return IdListFamily.SEQ_AUTHOR\n    if name.startswith((\"latest_p_\", \"longest_dwell_p_\")):\n        return IdListFamily.SEQ_POST\n    raise ValueError(f\"unknown id-list feature name: {name!r}\")\n\n\n_K_IN_NAME_RE = re.compile(\n    r\"^(?:hist_)?(?:top_(?:p|au|pau|cp|cau|ap|op)|latest_(?:p|au|pau|cau|ap|op|cp)|longest_dwell_p)_(\\d+)_\"\n)\n\n\ndef default_k(name: str) -> int:\n    m = _K_IN_NAME_RE.match(name)\n    if m is None:\n        raise ValueError(f\"cannot infer k from id-list feature name: {name!r}\")\n    return int(m.group(1))\n\n\ndef feature_name_for(name: str, k: int) -> str:\n    m = _K_IN_NAME_RE.match(name)\n    if m is None:\n        return name\n    return name[: m.start(1)] + str(k) + name[m.end(1) :]\n\n\ndef identity_for(name: str) -> str:\n    m = _K_IN_NAME_RE.match(name)\n    if m is None:\n        return name\n    return name[: m.start(1)] + name[m.end(1) + 1 :]\n\n\ndef source_cap(name: str) -> int | None:\n    if is_history_list(name):\n        return None\n    m = _K_IN_NAME_RE.match(name)\n    return int(m.group(1)) if m else None\n\n\nHIST_PREFIX = \"hist_\"\n\nHISTORY_EVENTS: frozenset[str] = frozenset(\n    {\n        \"FAV\",\n        \"REPLY\",\n        \"RETWEET\",\n        \"QUOTE\",\n        \"FOLLOW_AUTHOR\",\n        \"BOOKMARK\",\n        \"TAKE_SCREENSHOT\",\n        \"CLICK\",\n        \"CLICK_PROFILE\",\n        \"OPEN_LINK\",\n        \"PHOTO_EXPAND\",\n        \"SHOW_MORE_EXPAND\",\n        \"CLICK_HASHTAG\",\n        \"CLICK_MENTION\",\n        \"QUOTED_TWEET_CLICK\",\n        \"TRANSLATE_CLICK\",\n        \"CLICK_GROK_ANALYZE\",\n        \"EXTERNAL_LINK_SESSION\",\n        \"EXTERNAL_LINK_LONG_DWELLED\",\n        \"VIDEO_QUALITY_VIEW\",\n        \"RECAP_DWELLED\",\n        \"SHARE\",\n        \"RESHARE\",\n        \"ENGAGE\",\n        \"BRAND_ENGAGE\",\n        \"CAROUSEL_SWIPE\",\n        \"ADS_SESSION_CONVERSION\",\n        \"ADS_SITE_VISIT_CONVERSION\",\n        \"ADS_LONG_SITE_DWELL_CONVERSION\",\n        \"ADS_LANDING_PAGE_VIEW_CONVERSION\",\n        \"ADS_PURCHASE_CONVERSION\",\n        \"ADS_CONTENT_VIEW_CONVERSION\",\n        \"ADS_SIGN_UP_CONVERSION\",\n        \"ADS_CUSTOM_CONVERSION\",\n        \"ADS_ADD_TO_CART_CONVERSION\",\n        \"CUSTOM_SIGNUP_ADDTOCART\",\n        \"OTHER_CONVERSION\",\n        \"ANY_CONVERSION\",\n    }\n)\n\nENTITIES = (\"au\", \"pau\", \"cau\", \"ap\", \"op\", \"cp\")\n_AUTHOR_ENTITIES = (\"au\", \"pau\", \"cau\")\n_PROMOTED_ENTITIES = (\"pau\", \"cau\", \"ap\", \"cp\")\n_ORGANIC_ENTITIES = (\"op\",)\n\n_HIST_NAME_RE = re.compile(\n    r\"^hist_(?P<kind>top|latest)_(?P<entity>au|pau|cau|ap|op|cp)_(?P<k>\\d+)_\"\n    r\"(?:(?P<window>\\d+)(?P<unit>d|hr|h)_)?(?P<event>[A-Z][A-Z0-9_]*)$\"\n)\n\n_HIST_FAMILY = {\n    (\"top\", \"au\"): IdListFamily.TOP_AUTHOR,\n    (\"top\", \"pau\"): IdListFamily.TOP_AUTHOR,\n    (\"latest\", \"au\"): IdListFamily.SEQ_AUTHOR,\n    (\"latest\", \"pau\"): IdListFamily.SEQ_AUTHOR,\n    (\"top\", \"cau\"): IdListFamily.TOP_CONVERSION_AUTHOR,\n    (\"latest\", \"cau\"): IdListFamily.TOP_CONVERSION_AUTHOR,\n    (\"top\", \"ap\"): IdListFamily.TOP_POST,\n    (\"latest\", \"ap\"): IdListFamily.SEQ_POST,\n    (\"top\", \"cp\"): IdListFamily.TOP_CONVERSION_POST,\n    (\"latest\", \"cp\"): IdListFamily.TOP_CONVERSION_POST,\n    (\"top\", \"op\"): IdListFamily.TOP_ORGANIC_POST,\n    (\"latest\", \"op\"): IdListFamily.SEQ_ORGANIC_POST,\n}\n\n\ndef is_history_list(name: str) -> bool:\n    return name.startswith(HIST_PREFIX)\n\n\n\u0040dataclasses.dataclass(frozen=True)\nclass HistoryListSpec:\n    name: str\n    kind: str\n    entity: str\n    k: int\n    window_days: float | None\n    event: str\n\n    \u0040property\n    def family(self) -> IdListFamily:\n        return _HIST_FAMILY[(self.kind, self.entity)]\n\n    \u0040property\n    def is_author(self) -> bool:\n        return self.entity in _AUTHOR_ENTITIES\n\n    \u0040property\n    def promoted_only(self) -> bool:\n        return self.entity in _PROMOTED_ENTITIES\n\n    \u0040property\n    def organic_only(self) -> bool:\n        return self.entity in _ORGANIC_ENTITIES\n\n\ndef parse_history_list(name: str) -> HistoryListSpec:\n    m = _HIST_NAME_RE.match(name)\n    if m is None:\n        raise ValueError(\n            f\"not a history id-list name: {name!r} (expected \"\n            \"hist_(top|latest)_(au|pau|cau|ap|op|cp)_<k>_[<window>_]<EVENT>)\"\n        )\n    event = m.group(\"event\")\n    if event not in HISTORY_EVENTS:\n        raise ValueError(f\"{name}: unknown event {event!r}; known: {sorted(HISTORY_EVENTS)}\")\n    window = None\n    if m.group(\"window\"):\n        n = float(m.group(\"window\"))\n        window = n if m.group(\"unit\") == \"d\" else n / 24.0\n    return HistoryListSpec(\n        name=name,\n        kind=m.group(\"kind\"),\n        entity=m.group(\"entity\"),\n        k=int(m.group(\"k\")),\n        window_days=window,\n        event=event,\n    )\n\n\n\u0040dataclasses.dataclass(frozen=True)\nclass IdListFeatureSpec:\n    name: str\n    k: int\n\n    def __post_init__(self) -> None:\n        if self.k <= 0:\n            raise ValueError(f\"{self.name}: k must be > 0, got {self.k}\")\n        if self.name != self.name.strip() or not self.name:\n            raise ValueError(f\"id-list feature name has surrounding whitespace: {self.name!r}\")\n        family_of(self.name)\n        cap = source_cap(self.name)\n        if cap is not None and self.k > cap:\n            raise ValueError(\n                f\"{self.name}: k={self.k} exceeds the {cap} ids the hydrator writes per list; \"\n                \"the extra slots could never fill\"\n            )\n\n    \u0040property\n    def family(self) -> IdListFamily:\n        return family_of(self.name)\n\n    \u0040property\n    def is_history(self) -> bool:\n        return is_history_list(self.name)\n\n    \u0040property\n    def feature_name(self) -> str:\n        return feature_name_for(self.name, self.k)\n\n    \u0040property\n    def identity(self) -> str:\n        return identity_for(self.name)\n\n\ndef parse_spec(spec: str) -> IdListFeatureSpec:\n    name, sep, k = spec.strip().partition(\":\")\n    name = name.strip()\n    return IdListFeatureSpec(name, int(k.strip()) if sep else default_k(name))\n\n\ndef parse_specs(specs: Sequence[str] | str) -> tuple[IdListFeatureSpec, ...]:\n    if isinstance(specs, str):\n        specs = [s for s in specs.split(\",\") if s.strip()]\n    out = tuple(parse_spec(s) for s in specs)\n    names = [s.name for s in out]\n    if len(set(names)) != len(names):\n        raise ValueError(f\"duplicate id-list feature names: {names}\")\n    features = [s.feature_name for s in out]\n    if len(set(features)) != len(features):\n        raise ValueError(f\"duplicate id-list feature names after k substitution: {features}\")\n    return out\n\n\ndef slot_offsets(specs: Sequence[IdListFeatureSpec]) -> list[int]:\n    offsets = [0]\n    for s in specs:\n        offsets.append(offsets[-1] + s.k)\n    return offsets\n\n\ndef total_k(specs: Sequence[IdListFeatureSpec]) -> int:\n    return slot_offsets(specs)[-1]\n\n\ndef sidecar_path_for(batch_file_path: str, sidecar_root: str) -> str:\n    m = _PARTITION_SEG_RE.search(batch_file_path)\n    if m is None:\n        raise ValueError(f\"not a partition batch file path: {batch_file_path}\")\n    rel = batch_file_path[m.start() :]\n    if not rel.endswith(\".parquet\"):\n        raise ValueError(f\"not a parquet path: {batch_file_path}\")\n    return os.path.join(sidecar_root, rel[: -len(\".parquet\")] + \".list_features.parquet\")\n\n\ndef load_sidecar_column(sidecar_path: str, expected_rows: int | None = None) -> pa.Array:\n    col = _as_array(pq.read_table(sidecar_path, columns=[COLUMN]).column(COLUMN))\n    if expected_rows is not None and len(col) != expected_rows:\n        raise ValueError(\n            f\"sidecar {sidecar_path} has {len(col)} rows, batch file has {expected_rows}\"\n        )\n    return col\n\n\ndef canonical_column(col: pa.Array | pa.ChunkedArray) -> pa.Array:\n    arr = _as_array(col)\n    if arr.type.equals(CANONICAL_TYPE):\n        return arr\n    if pa.types.is_null(arr.type):\n        return pa.nulls(len(arr), type=CANONICAL_TYPE)\n    return arr.cast(CANONICAL_TYPE)\n\n\ndef null_column(num_rows: int) -> pa.Array:\n    return pa.nulls(num_rows, type=CANONICAL_TYPE)\n\n\ndef set_column(batch: pa.RecordBatch, col: pa.Array) -> pa.RecordBatch:\n    if len(col) != batch.num_rows:\n        raise ValueError(f\"{COLUMN}: {len(col)} rows != batch rows {batch.num_rows}\")\n    if COLUMN in batch.schema.names:\n        batch = batch.drop_columns([COLUMN])\n    return batch.append_column(pa.field(COLUMN, col.type, nullable=True), col)\n\n\ndef empty_arrays(\n    batch_size: int, specs: Sequence[IdListFeatureSpec]\n) -> tuple[np.ndarray, np.ndarray]:\n    width = total_k(specs)\n    return np.zeros((batch_size, width), dtype=np.int64), np.zeros(\n        (batch_size, width), dtype=np.bool_\n    )\n\n\ndef _as_array(col: pa.Array | pa.ChunkedArray) -> pa.Array:\n    if isinstance(col, pa.ChunkedArray):\n        if col.num_chunks == 0:\n            return pa.array([], type=col.type)\n        combined = col.combine_chunks()\n        if isinstance(combined, pa.ChunkedArray):\n            return combined.chunk(0)\n        return combined\n    return col\n\n\ndef parse_id_lists(\n    col: pa.Array | pa.ChunkedArray | None,\n    specs: Sequence[IdListFeatureSpec],\n    batch_size: int,\n) -> tuple[np.ndarray, np.ndarray]:\n    ids_out, mask_out = empty_arrays(batch_size, specs)\n    if not specs or col is None:\n        return ids_out, mask_out\n    arr: pa.Array = _as_array(col)\n    if len(arr) != batch_size:\n        raise ValueError(f\"{COLUMN}: {len(arr)} rows != batch_size {batch_size}\")\n    if pa.types.is_null(arr.type) or arr.null_count == len(arr):\n        return ids_out, mask_out\n    if not pa.types.is_list(arr.type) and not pa.types.is_large_list(arr.type):\n        raise ValueError(f\"{COLUMN}: expected List<Struct>, got {arr.type}\")\n\n    outer_offsets = np.asarray(arr.offsets, dtype=np.int64)\n    base = outer_offsets[0]\n    outer_offsets = outer_offsets - base\n    row_valid = np.ones(batch_size, dtype=np.bool_)\n    if arr.null_count:\n        row_valid = arr.is_valid().to_numpy(zero_copy_only=False)\n    structs = arr.values.slice(base, outer_offsets[-1])\n    n_structs = len(structs)\n    if n_structs == 0:\n        return ids_out, mask_out\n    struct_row = np.repeat(np.arange(batch_size, dtype=np.int64), np.diff(outer_offsets))\n    struct_valid = row_valid[struct_row]\n    if structs.null_count:\n        struct_valid &= structs.is_valid().to_numpy(zero_copy_only=False)\n\n    names = structs.field(\"name\")\n    ids_lists = structs.field(\"ids\")\n    dict_names = names.dictionary_encode()\n    vocab = dict_names.dictionary.to_pylist()\n    if not vocab:\n        return ids_out, mask_out\n    slot_of_vocab = np.full(len(vocab), -1, dtype=np.int64)\n    k_of_slot = np.asarray([s.k for s in specs], dtype=np.int64)\n    off_of_slot = np.asarray(slot_offsets(specs)[:-1], dtype=np.int64)\n    spec_index = {s.name: i for i, s in enumerate(specs)}\n    for vi, vname in enumerate(vocab):\n        if vname in spec_index:\n            slot_of_vocab[vi] = spec_index[vname]\n    codes = dict_names.indices.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)\n    slot = np.where(codes >= 0, slot_of_vocab[np.clip(codes, 0, None)], -1)\n    struct_valid &= slot >= 0\n\n    inner_offsets = np.asarray(ids_lists.offsets, dtype=np.int64)\n    inner_base = inner_offsets[0]\n    inner_offsets = inner_offsets - inner_base\n    flat_ids = ids_lists.values.slice(inner_base, inner_offsets[-1])\n    if ids_lists.null_count:\n        struct_valid &= ids_lists.is_valid().to_numpy(zero_copy_only=False)\n\n    values = flat_ids.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)\n    keep = values != 0\n    if keep.all():\n        valid_count = np.diff(inner_offsets)\n        valid_idx = None\n    else:\n        cum = np.concatenate(([0], np.cumsum(keep, dtype=np.int64)))\n        valid_count = cum[inner_offsets[1:]] - cum[inner_offsets[:-1]]\n        valid_idx = np.nonzero(keep)[0]\n        inner_offsets = cum[inner_offsets]\n    struct_valid &= valid_count > 0\n\n    key = struct_row * (len(specs) + 1) + np.where(struct_valid, slot, len(specs))\n    if n_structs > 1:\n        order = np.argsort(key, kind=\"stable\")\n        sorted_key = key[order]\n        dup = np.zeros(n_structs, dtype=np.bool_)\n        dup[order[1:]] = sorted_key[1:] == sorted_key[:-1]\n        struct_valid &= ~dup\n\n    take = np.where(struct_valid, np.minimum(valid_count, k_of_slot[np.clip(slot, 0, None)]), 0)\n    total = int(take.sum())\n    if total == 0:\n        return ids_out, mask_out\n\n    sel = np.nonzero(take)[0]\n    rep = take[sel]\n    pos = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(rep) - rep, rep)\n    src = np.repeat(inner_offsets[sel], rep) + pos\n    if valid_idx is not None:\n        src = valid_idx[src]\n    dst_row = np.repeat(struct_row[sel], rep)\n    dst_col = np.repeat(off_of_slot[slot[sel]], rep) + pos\n    ids_out[dst_row, dst_col] = values[src]\n    mask_out[dst_row, dst_col] = True\n    return ids_out, mask_out\n\n\ndef author_columns(specs: Sequence[IdListFeatureSpec]) -> np.ndarray:\n    out = np.zeros(total_k(specs), dtype=np.bool_)\n    offsets = slot_offsets(specs)\n    for i, s in enumerate(specs):\n        if s.family.is_author:\n            out[offsets[i] : offsets[i + 1]] = True\n    return out\n\n\ndef hash_id_lists(\n    ids: np.ndarray,\n    specs: Sequence[IdListFeatureSpec],\n    item_hash: Callable[[np.ndarray], np.ndarray],\n    author_hash: Callable[[np.ndarray], np.ndarray],\n) -> np.ndarray:\n    is_author = author_columns(specs)\n    parts: list[np.ndarray] = []\n    for sel, fn in ((~is_author, item_hash), (is_author, author_hash)):\n        if sel.any():\n            parts.append(np.asarray(fn(ids[:, sel]), dtype=np.int32))\n    if not parts:\n        return np.zeros((ids.shape[0], 0, 0), dtype=np.int32)\n    num_hashes = parts[0].shape[-1]\n    if any(p.shape[-1] != num_hashes for p in parts):\n        raise ValueError(\n            \"id-list features need the same number of item and author hashes, got \"\n            f\"{[p.shape[-1] for p in parts]}\"\n        )\n    out = np.zeros((ids.shape[0], ids.shape[1], num_hashes), dtype=np.int32)\n    i = 0\n    for sel in (~is_author, is_author):\n        if sel.any():\n            out[:, sel] = parts[i]\n            i += 1\n    return out\n\n\ndef fill_rates(mask: np.ndarray, specs: Sequence[IdListFeatureSpec]) -> dict[str, float]:\n    offsets = slot_offsets(specs)\n    rows = max(mask.shape[0], 1)\n    return {\n        s.feature_name: float(mask[:, offsets[i] : offsets[i + 1]].any(axis=1).sum()) / rows\n        for i, s in enumerate(specs)\n    }\n\n\ndef fill_stats(\n    mask: np.ndarray, specs: Sequence[IdListFeatureSpec]\n) -> dict[str, tuple[float, float, float]]:\n    offsets = slot_offsets(specs)\n    rows = max(mask.shape[0], 1)\n    out = {}\n    for i, s in enumerate(specs):\n        m = mask[:, offsets[i] : offsets[i + 1]]\n        counts = m.sum(axis=1)\n        out[s.feature_name] = (\n            float((counts > 0).sum()) / rows,\n            float((counts >= s.k).sum()) / rows,\n            float(counts.sum()) / (rows * s.k),\n        )\n    return out\n\n\ndef fill_warnings(stats: dict[str, tuple[float, float, float]]) -> list[str]:\n    out = []\n    for name, (nonempty, full, _) in stats.items():\n        if full > 0.95:\n            out.append(\n                f\"{name}: full for {full:.0%} of users; k caps the list, consider raising it\"\n            )\n        if nonempty < 0.05:\n            out.append(f\"{name}: non-empty for only {nonempty:.1%} of users; consider dropping it\")\n    return out\n",
+      "source_digest": "992d9d93987b4c9d24f9f0ee52325334a8a1c6c91d2a9b90e2bfb8457a52d0c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "bdsm/runtime/sequence_cache.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 17,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n_ZSTD_MAGIC = b\"\\x28\\xb5\\x2f\\xfd\"\n_ARROW_MAGIC = b\"ARROW1\"\n\n_PROTO_FIELD_EXTRACTORS = {\n    \"action_name\": lambda ua: int(ua.actionInfo.actionName),\n    \"engagement_time_ms\": lambda ua: int(ua.actionInfo.engagementTimeMs),\n    \"tweet_id\": lambda ua: int(ua.tweetInfo.tweetId),\n    \"author_id\": lambda ua: int(ua.tweetInfo.authorId),\n    \"dwell_time\": lambda ua: ua.actionInfo.userActionMeta.dwellTime,\n    \"product_surface\": lambda ua: int(ua.actionInfo.userActionMeta.productSurface),\n    \"client_app_id\": lambda ua: int(ua.actionInfo.userActionMeta.clientAppId),\n    \"is_author_followed_by_user\": lambda ua: bool(ua.tweetInfo.isAuthorFollowedByUser),\n    \"favorite_count\": lambda ua: int(ua.tweetInfo.favCount),\n    \"retweet_count\": lambda ua: int(ua.tweetInfo.retweetCount),\n    \"reply_count\": lambda ua: int(ua.tweetInfo.replyCount),\n    \"quote_count\": lambda ua: int(ua.tweetInfo.quoteCount),\n    \"has_media\": lambda ua: bool(ua.tweetInfo.tweetBoolFeatures.has_media),\n    \"promoted_id\": lambda ua: int(ua.tweetInfo.promotedId),\n    \"post_language_code\": lambda ua: int(ua.tweetInfo.languageCode),\n    \"quoting_author_id\": lambda ua: int(ua.tweetInfo.quotingAuthorId),\n    \"quoted_author_id\": lambda ua: int(ua.tweetInfo.quotedAuthorId),\n    \"in_reply_to_author_id\": lambda ua: int(ua.tweetInfo.inReplyToAuthorId),\n    \"retweeting_author_id\": lambda ua: int(ua.tweetInfo.retweetingAuthorId),\n    \"engaging_ip_country_code\": lambda ua: int(ua.actionInfo.userActionMeta.engagingIpCountryCode),\n",
+      "source_digest": "67aee7338d3b67eafdb8886c489b71c05d1816d6726850fcbf1b075890c87d40",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "bdsm/rust/abuse-v3-features/src/lib.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 282,
+      "end_line": 306,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let sl = sl.as_any().downcast_ref::<StructArray>().unwrap();\n    let n = take;\n\n    Ok(UserArrowFeatures {\n        n,\n        action_name: get_i32(sl, \"action_name\"),\n        tweet_id: get_i64(sl, \"tweet_id\"),\n        author_id: get_i64(sl, \"author_id\"),\n        engagement_time_ms: get_i64(sl, \"engagement_time_ms\"),\n        dwell_time: get_i32(sl, \"dwell_time\"),\n        product_surface: get_i32(sl, \"product_surface\"),\n        client_app_id: get_i32(sl, \"client_app_id\"),\n        is_following: get_bool(sl, \"is_author_followed_by_user\"),\n        fav_count: get_i64(sl, \"favorite_count\"),\n        rt_count: get_i64(sl, \"retweet_count\"),\n        reply_count: get_i64(sl, \"reply_count\"),\n        quote_count: get_i64(sl, \"quote_count\"),\n        view_count: get_i64(sl, \"view_count\"),\n        has_media: get_bool(sl, \"has_media\"),\n        language_code: get_i32(sl, \"post_language_code\"),\n        promoted_id: get_i64(sl, \"promoted_id\"),\n        tweet_position: get_i32(sl, \"tweet_position\"),\n        first_video_duration: get_i64(sl, \"first_video_duration_ms\"),\n        quoting_author_id: get_i64(sl, \"quoting_author_id\"),\n        quoted_author_id: get_i64(sl, \"quoted_author_id\"),\n",
+      "source_digest": "3c255b254d6dd90b2a346c50dc930df8f0a7080b26f88e0a6d2c81903e778e63",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "home-mixer/models/candidate.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 322,
+      "end_line": 346,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                self.tweet_id\n            } else {\n                0\n            },\n            retweeting_author_id: if self.retweeted_user_id.is_some() {\n                self.author_id\n            } else {\n                0\n            },\n            quoted_tweet_id: self.quoted_tweet_id.unwrap_or(0),\n            quoted_author_id: self.quoted_user_id.unwrap_or(0),\n            in_reply_to_tweet_id: self.in_reply_to_tweet_id.unwrap_or(0),\n            is_author_followed_by_user: is_followed_by_viewer,\n            safety_label_mask: if self.retweeted_user_id.is_none()\n                && self.nsfw_author_phoenix.unwrap_or(false)\n            {\n                SAFETY_BIT_AUTHOR_NSFW\n            } else {\n                0\n            },\n            min_video_duration_ms: self.min_video_duration_ms.map(|ms| ms as u64).unwrap_or(0),\n            fav_count: self.fav_count.unwrap_or(0) as u64,\n            retweet_count: self.repost_count.unwrap_or(0) as u64,\n            quote_count: self.quote_count.unwrap_or(0) as u64,\n            reply_count: self.reply_count.unwrap_or(0) as u64,\n",
+      "source_digest": "2a4a73a1a55d7d9a85ae0016ccbd26924465e9837a7c5acd85c49d4f64ea76d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "phoenix/crates/common/xai-recsys/src/reply.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 466,
+      "end_line": 490,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut placement_filled = [0u64; REPLY_PLACEMENT_INT64_INDICES.len()];\n        for (j, candidate) in candidates.iter().enumerate() {\n            let base = j * n_post_int64;\n            self.candidate_int64_features[base + FIRST_VIDEO_DURATION_MS_SEQ] =\n                candidate.first_video_duration_ms.min(i32::MAX as u64) as i64;\n            video_filled += (candidate.first_video_duration_ms != 0) as u64;\n            let has_media = candidate\n                .tweet_bool_features\n                .as_ref()\n                .map(|b| b.has_media)\n                .unwrap_or(false);\n            self.candidate_int64_features[base + REPLY_HAS_MEDIA_INT64_INDEX] = has_media as i64;\n            followed_filled += candidate.is_author_followed_by_user as u64;\n            has_media_filled += has_media as u64;\n            let author_follower_count = reply.author_follower_count(candidate.author_id);\n            follower_filled += (author_follower_count != 0) as u64;\n            self.candidate_int64_features[base + REPLY_AUTHOR_FOLLOWER_COUNT_INT64_INDEX] =\n                author_follower_count.min(i32::MAX as u64) as i64;\n            let negfb = extras\n                .negfb_total_count\n                .get(&candidate.tweet_id)\n                .copied()\n                .unwrap_or(0);\n            negfb_filled += (negfb != 0) as u64;\n            self.candidate_int64_features[base + REPLY_NEGFB_TOTAL_COUNT_INT64_INDEX] =\n",
+      "source_digest": "560aadf81b3b4262cc50cbacc27b0835889335dc0a7e3aea94327305c6d8e65c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "phoenix/crates/common/xai-recsys/src/reply.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 496,
+      "end_line": 520,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .unwrap_or(0);\n            focal_follows_filled += (focal_follows != 0) as u64;\n            self.candidate_int64_features[base + REPLY_FOCAL_AUTHOR_FOLLOWS_INT64_INDEX] =\n                focal_follows;\n            let values =\n                extras.placement_with(&focal_author_reply, &self_reply, candidate.tweet_id);\n            for (k, &index) in REPLY_PLACEMENT_INT64_INDICES.iter().enumerate() {\n                placement_filled[k] += (values[k] != 0) as u64;\n                self.candidate_int64_features[base + index] = values[k];\n            }\n        }\n        let followed_label = if candidate_set.user_id != 0 {\n            \"is_author_followed_logged_in\"\n        } else {\n            \"is_author_followed_guest\"\n        };\n        for (feature, filled) in [\n            (\"first_video_duration_ms\", video_filled),\n            (followed_label, followed_filled),\n            (\"has_media\", has_media_filled),\n            (\"author_follower_count\", follower_filled),\n            (\"negfb_total_count\", negfb_filled),\n            (\"focal_author_follows\", focal_follows_filled),\n        ] {\n            record_candidate_fill(feature, filled, candidates_to_process as u64);\n",
+      "source_digest": "1f93832f3dded75fb3c9f3dff589a4e38c24c77ededcc00932d4580220a823a8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "phoenix/crates/common/xai-recsys/src/reply.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 498,
+      "end_line": 522,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.candidate_int64_features[base + REPLY_FOCAL_AUTHOR_FOLLOWS_INT64_INDEX] =\n                focal_follows;\n            let values =\n                extras.placement_with(&focal_author_reply, &self_reply, candidate.tweet_id);\n            for (k, &index) in REPLY_PLACEMENT_INT64_INDICES.iter().enumerate() {\n                placement_filled[k] += (values[k] != 0) as u64;\n                self.candidate_int64_features[base + index] = values[k];\n            }\n        }\n        let followed_label = if candidate_set.user_id != 0 {\n            \"is_author_followed_logged_in\"\n        } else {\n            \"is_author_followed_guest\"\n        };\n        for (feature, filled) in [\n            (\"first_video_duration_ms\", video_filled),\n            (followed_label, followed_filled),\n            (\"has_media\", has_media_filled),\n            (\"author_follower_count\", follower_filled),\n            (\"negfb_total_count\", negfb_filled),\n            (\"focal_author_follows\", focal_follows_filled),\n        ] {\n            record_candidate_fill(feature, filled, candidates_to_process as u64);\n        }\n        for (feature, filled) in PLACEMENT_FEATURES.into_iter().zip(placement_filled) {\n",
+      "source_digest": "90702130d67c0bae7935a6935ef1f1d357140725c9d2de7a362bc04dcc979e67",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 628,
+      "end_line": 652,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|df| df.timezone as i16)\n            .unwrap_or(0);\n        let candidate_tz_enums = vec![cand_tz_enum; candidate_seq_len];\n        stamp_local_time_features(\n            &candidate_impr_ts,\n            &candidate_tz_enums,\n            &mut categorical_features,\n            n_post_cat,\n        );\n\n        let mut candidate_int64_features = vec![0i64; candidate_seq_len * n_post_int64];\n        let mut candidate_float_features = vec![0.0f32; candidate_seq_len * n_post_float];\n        let mut candidate_is_author_followed = vec![false; candidate_seq_len];\n        let mut candidate_is_author_following = vec![false; candidate_seq_len];\n        let mut candidate_is_stale_post = vec![false; candidate_seq_len];\n        let mut candidate_exact_phrase = vec![0i32; candidate_seq_len];\n        let mut candidate_bool_features = vec![false; candidate_seq_len * n_post_bool];\n\n        let stale_post_enabled = model_config.hash_table.enable_stale_post;\n        let stale_post_ttl_sec = if model_config.hash_table.enable_stale_post_30d {\n            STALE_POST_30D_TTL_SEC\n        } else {\n            STALE_POST_14D_TTL_SEC\n        };\n        for (j, candidate) in candidate_set\n",
+      "source_digest": "0eb0f80baf0208f14341f45006bc471b596161a073fea01f367505717864b1de",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 629,
+      "end_line": 653,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .unwrap_or(0);\n        let candidate_tz_enums = vec![cand_tz_enum; candidate_seq_len];\n        stamp_local_time_features(\n            &candidate_impr_ts,\n            &candidate_tz_enums,\n            &mut categorical_features,\n            n_post_cat,\n        );\n\n        let mut candidate_int64_features = vec![0i64; candidate_seq_len * n_post_int64];\n        let mut candidate_float_features = vec![0.0f32; candidate_seq_len * n_post_float];\n        let mut candidate_is_author_followed = vec![false; candidate_seq_len];\n        let mut candidate_is_author_following = vec![false; candidate_seq_len];\n        let mut candidate_is_stale_post = vec![false; candidate_seq_len];\n        let mut candidate_exact_phrase = vec![0i32; candidate_seq_len];\n        let mut candidate_bool_features = vec![false; candidate_seq_len * n_post_bool];\n\n        let stale_post_enabled = model_config.hash_table.enable_stale_post;\n        let stale_post_ttl_sec = if model_config.hash_table.enable_stale_post_30d {\n            STALE_POST_30D_TTL_SEC\n        } else {\n            STALE_POST_14D_TTL_SEC\n        };\n        for (j, candidate) in candidate_set\n            .candidates\n",
+      "source_digest": "a4e0f36835182a85d3b65a49f64885c67c40e5bec032bf6d112d443c3ba1b6d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 691,
+      "end_line": 715,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    .as_ref()\n                    .and_then(|a| a.product_keys.first().copied())\n                    .unwrap_or(0);\n                if n_post_int64 > FIRST_DPA_PRODUCT_KEY {\n                    candidate_int64_features[j * n_post_int64 + FIRST_DPA_PRODUCT_KEY] =\n                        hash_dpa_product_key(raw_key);\n                }\n                if n_post_int64 > FIRST_DPA_PRODUCT_KEY_HASH2 {\n                    candidate_int64_features[j * n_post_int64 + FIRST_DPA_PRODUCT_KEY_HASH2] =\n                        hash_dpa_product_key_2(raw_key);\n                }\n            }\n            candidate_is_author_followed[j] = candidate.is_author_followed_by_user;\n            candidate_is_author_following[j] = candidate\n                .author_info\n                .as_ref()\n                .and_then(|ai| ai.is_following_user)\n                .unwrap_or(false);\n            let lexical_match = candidate.search_lexical_match.as_ref();\n            candidate_exact_phrase[j] = exact_phrase_categorical(lexical_match);\n            stamp_matched_word_fraction(\n                &mut candidate_float_features,\n                n_post_float,\n                j,\n                lexical_match,\n",
+      "source_digest": "dd45afe001255ffd6dbcf4b546d614de538f21bb37797fd4b6d0fb427f7b8b75",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 692,
+      "end_line": 716,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    .and_then(|a| a.product_keys.first().copied())\n                    .unwrap_or(0);\n                if n_post_int64 > FIRST_DPA_PRODUCT_KEY {\n                    candidate_int64_features[j * n_post_int64 + FIRST_DPA_PRODUCT_KEY] =\n                        hash_dpa_product_key(raw_key);\n                }\n                if n_post_int64 > FIRST_DPA_PRODUCT_KEY_HASH2 {\n                    candidate_int64_features[j * n_post_int64 + FIRST_DPA_PRODUCT_KEY_HASH2] =\n                        hash_dpa_product_key_2(raw_key);\n                }\n            }\n            candidate_is_author_followed[j] = candidate.is_author_followed_by_user;\n            candidate_is_author_following[j] = candidate\n                .author_info\n                .as_ref()\n                .and_then(|ai| ai.is_following_user)\n                .unwrap_or(false);\n            let lexical_match = candidate.search_lexical_match.as_ref();\n            candidate_exact_phrase[j] = exact_phrase_categorical(lexical_match);\n            stamp_matched_word_fraction(\n                &mut candidate_float_features,\n                n_post_float,\n                j,\n                lexical_match,\n            );\n",
+      "source_digest": "318ed3f0f078e0cf86347cfc7617d60a3a7fa186fefd2c409ee47dc81a141dbf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 734,
+      "end_line": 758,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &mut categorical_features,\n            n_post_cat,\n            AUTHOR_IS_NSFW_CATEGORICAL_IDX,\n        );\n\n        stamp_bool_seq(\n            &candidate_is_stale_post,\n            &mut candidate_bool_features,\n            n_post_bool,\n            IS_STALE_POST14D,\n        );\n        stamp_bool_seq(\n            &candidate_is_author_followed,\n            &mut candidate_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ,\n        );\n        stamp_bool_seq(\n            &candidate_is_author_following,\n            &mut candidate_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWING_VIEWER_SEQ,\n        );\n\n        CandidateData {\n",
+      "source_digest": "41da3d755b6e3f5ae48f2c19515542448a1c4fa72766ee968e4b2a4a21f4dbb5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 740,
+      "end_line": 764,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &candidate_is_stale_post,\n            &mut candidate_bool_features,\n            n_post_bool,\n            IS_STALE_POST14D,\n        );\n        stamp_bool_seq(\n            &candidate_is_author_followed,\n            &mut candidate_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ,\n        );\n        stamp_bool_seq(\n            &candidate_is_author_following,\n            &mut candidate_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWING_VIEWER_SEQ,\n        );\n\n        CandidateData {\n            post_hashes: candidate_post_hashes,\n            auth_hashes: candidate_auth_hashes,\n            product_surfaces: candidate_product_surfaces,\n            embeddings: mm_embeddings_opt.unwrap_or_default(),\n            search_query_embeddings: candidate_search_query_embeddings,\n            categorical_features,\n",
+      "source_digest": "43f24e9c3e5913b85be3c885f741db6b5c677f47f2b94bcf303e4cfcac3c0cd0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 917,
+      "end_line": 941,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n\n        let n_post_int64 = model_config.hash_table.num_post_int64_features;\n        let mut history_post_hashes = vec![0i32; history_seq_len * num_item_hashes];\n        let mut history_auth_hashes = vec![0i32; history_seq_len * num_author_hashes];\n        let mut history_product_surfaces = vec![0i32; history_seq_len];\n        let mut history_actions = vec![false; history_seq_len * output_vocab_size];\n        let mut history_continuous_actions = vec![0.0f32; history_seq_len * num_continuous_actions];\n        let mut history_impr_ts = vec![0i32; history_seq_len];\n        let mut history_post_creation_ts_sec = vec![0i32; history_seq_len];\n        let mut history_tz_enums = vec![0i16; history_seq_len];\n        let mut history_author_is_nsfw = vec![0i32; history_seq_len];\n        let mut history_is_author_followed = vec![false; history_seq_len];\n        let mut history_is_author_following = vec![false; history_seq_len];\n        let mut history_post_ids = vec![0i64; history_seq_len];\n        let mut history_int64_features = vec![0i64; history_seq_len * n_post_int64];\n        let sid_num_levels = model_config.sid_num_levels;\n        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];\n\n        let _empty = Vec::new();\n        let agg_user_actions = match sequence {\n            Some(sequence) => match &sequence.user_actions_data {\n                Some(container) => match &container.data {\n                    Some(Data::OrderedAggregatedUserActionsList(list)) => {\n                        &list.aggregated_user_actions\n",
+      "source_digest": "b1b4c62d182aae6a2a58a1b1bb7c95059f8373627f4271036fa822c8f7211ff0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 918,
+      "end_line": 942,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        let n_post_int64 = model_config.hash_table.num_post_int64_features;\n        let mut history_post_hashes = vec![0i32; history_seq_len * num_item_hashes];\n        let mut history_auth_hashes = vec![0i32; history_seq_len * num_author_hashes];\n        let mut history_product_surfaces = vec![0i32; history_seq_len];\n        let mut history_actions = vec![false; history_seq_len * output_vocab_size];\n        let mut history_continuous_actions = vec![0.0f32; history_seq_len * num_continuous_actions];\n        let mut history_impr_ts = vec![0i32; history_seq_len];\n        let mut history_post_creation_ts_sec = vec![0i32; history_seq_len];\n        let mut history_tz_enums = vec![0i16; history_seq_len];\n        let mut history_author_is_nsfw = vec![0i32; history_seq_len];\n        let mut history_is_author_followed = vec![false; history_seq_len];\n        let mut history_is_author_following = vec![false; history_seq_len];\n        let mut history_post_ids = vec![0i64; history_seq_len];\n        let mut history_int64_features = vec![0i64; history_seq_len * n_post_int64];\n        let sid_num_levels = model_config.sid_num_levels;\n        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];\n\n        let _empty = Vec::new();\n        let agg_user_actions = match sequence {\n            Some(sequence) => match &sequence.user_actions_data {\n                Some(container) => match &container.data {\n                    Some(Data::OrderedAggregatedUserActionsList(list)) => {\n                        &list.aggregated_user_actions\n                    }\n",
+      "source_digest": "896fbddc4e62a895712b1b019a7c723078ad1ede3606e00760f7ef6caa2fe2da",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1054,
+      "end_line": 1078,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n                stamp_engagement_counts(\n                    &mut history_int64_features,\n                    n_post_int64,\n                    valid_entry_count,\n                    tweet_info.fav_count,\n                    tweet_info.reply_count,\n                    tweet_info.retweet_count,\n                    tweet_info.quote_count,\n                    tweet_info.view_count,\n                );\n\n                history_is_author_followed[valid_entry_count] =\n                    tweet_info.is_author_followed_by_user;\n                history_is_author_following[valid_entry_count] = tweet_info\n                    .author_info\n                    .as_ref()\n                    .and_then(|ai| ai.is_following_user)\n                    .unwrap_or(false);\n\n                valid_entry_count += 1;\n            }\n        }\n\n        if sid_num_levels > 0 {\n",
+      "source_digest": "1d0fdd8f1f2923e7dfc7c2a7ab81a5a2f42ced2819868b9c4fa18c05adbc3ca2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1055,
+      "end_line": 1079,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                stamp_engagement_counts(\n                    &mut history_int64_features,\n                    n_post_int64,\n                    valid_entry_count,\n                    tweet_info.fav_count,\n                    tweet_info.reply_count,\n                    tweet_info.retweet_count,\n                    tweet_info.quote_count,\n                    tweet_info.view_count,\n                );\n\n                history_is_author_followed[valid_entry_count] =\n                    tweet_info.is_author_followed_by_user;\n                history_is_author_following[valid_entry_count] = tweet_info\n                    .author_info\n                    .as_ref()\n                    .and_then(|ai| ai.is_following_user)\n                    .unwrap_or(false);\n\n                valid_entry_count += 1;\n            }\n        }\n\n        if sid_num_levels > 0 {\n            let present = (0..valid_entry_count)\n",
+      "source_digest": "8e595e9097bf726218ed8c4c6cee04a2f6598cc5274b6d74d1721c909e73f469",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1056,
+      "end_line": 1080,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    &mut history_int64_features,\n                    n_post_int64,\n                    valid_entry_count,\n                    tweet_info.fav_count,\n                    tweet_info.reply_count,\n                    tweet_info.retweet_count,\n                    tweet_info.quote_count,\n                    tweet_info.view_count,\n                );\n\n                history_is_author_followed[valid_entry_count] =\n                    tweet_info.is_author_followed_by_user;\n                history_is_author_following[valid_entry_count] = tweet_info\n                    .author_info\n                    .as_ref()\n                    .and_then(|ai| ai.is_following_user)\n                    .unwrap_or(false);\n\n                valid_entry_count += 1;\n            }\n        }\n\n        if sid_num_levels > 0 {\n            let present = (0..valid_entry_count)\n                .filter(|&i| history_semantic_ids[i * sid_num_levels] != 0)\n",
+      "source_digest": "ac36293eca96a000937020989eab7ffa6e8439b10b7d0d87f290774db5a5777a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1102,
+      "end_line": 1126,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &mut history_categorical_features,\n            n_post_cat,\n        );\n        stamp_i32_as_categorical(\n            &history_author_is_nsfw,\n            &mut history_categorical_features,\n            n_post_cat,\n            AUTHOR_IS_NSFW_CATEGORICAL_IDX,\n        );\n\n        let mut history_bool_features = vec![false; history_seq_len * n_post_bool];\n        stamp_bool_seq(\n            &history_is_author_followed,\n            &mut history_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ,\n        );\n        stamp_bool_seq(\n            &history_is_author_following,\n            &mut history_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWING_VIEWER_SEQ,\n        );\n\n        let request_ip = candidate_set\n",
+      "source_digest": "90d301098bbed13903d6da96762b6f9c21833fadd24775b38637aeebaade8d87",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1108,
+      "end_line": 1132,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            n_post_cat,\n            AUTHOR_IS_NSFW_CATEGORICAL_IDX,\n        );\n\n        let mut history_bool_features = vec![false; history_seq_len * n_post_bool];\n        stamp_bool_seq(\n            &history_is_author_followed,\n            &mut history_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ,\n        );\n        stamp_bool_seq(\n            &history_is_author_following,\n            &mut history_bool_features,\n            n_post_bool,\n            IS_AUTHOR_FOLLOWING_VIEWER_SEQ,\n        );\n\n        let request_ip = candidate_set\n            .device_feature\n            .as_ref()\n            .map(|df| &df.ip_address)\n            .filter(|ip| !ip.is_empty())\n            .map(|ip| parse_ipv4_to_u32(ip) as i64)\n            .unwrap_or(0);\n",
+      "source_digest": "4e76f255af89bc3485deca7ee45ad9e382414d26d4b25fd3b5bcd2fe200d9d47",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1257,
+      "end_line": 1281,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let n_post_int64 = model_config.hash_table.num_post_int64_features;\n        let mut history_post_hashes = vec![0i32; history_seq_len * num_item_hashes];\n        let mut history_auth_hashes = vec![0i32; history_seq_len * num_author_hashes];\n        let mut history_product_surfaces = vec![0i32; history_seq_len];\n        let mut history_actions = vec![false; history_seq_len * output_vocab_size];\n        let mut history_continuous_actions = vec![0.0f32; history_seq_len * num_continuous_actions];\n        let mut history_impr_ts = vec![0i32; history_seq_len];\n        let mut history_post_creation_ts_sec = vec![0i32; history_seq_len];\n        let mut history_tz_enums = vec![0i16; history_seq_len];\n        let mut history_web_conv_tracking_integration = vec![0i32; history_seq_len];\n        let mut history_post_ids = vec![0i64; history_seq_len];\n        let mut history_int64_features = vec![0i64; history_seq_len * n_post_int64];\n        let mut history_is_author_followed = vec![false; history_seq_len];\n        let mut history_is_author_following = vec![false; history_seq_len];\n        let sid_num_levels = model_config.sid_num_levels;\n        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];\n\n        let cursor = Cursor::new(columnar_bytes);\n        let mut reader = StreamReader::try_new(cursor, None)?;\n\n        let batch = match reader.next() {\n            Some(Ok(batch)) if batch.num_rows() > 0 => batch,\n            Some(Err(e)) => return Err(e),\n            _ => {\n                let user_features = Self::extract_user_features(\n",
+      "source_digest": "27e0d017a79e96dcd8646c513d90ea109eda903b6acf06b3449c50a2fab844d0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1258,
+      "end_line": 1282,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut history_post_hashes = vec![0i32; history_seq_len * num_item_hashes];\n        let mut history_auth_hashes = vec![0i32; history_seq_len * num_author_hashes];\n        let mut history_product_surfaces = vec![0i32; history_seq_len];\n        let mut history_actions = vec![false; history_seq_len * output_vocab_size];\n        let mut history_continuous_actions = vec![0.0f32; history_seq_len * num_continuous_actions];\n        let mut history_impr_ts = vec![0i32; history_seq_len];\n        let mut history_post_creation_ts_sec = vec![0i32; history_seq_len];\n        let mut history_tz_enums = vec![0i16; history_seq_len];\n        let mut history_web_conv_tracking_integration = vec![0i32; history_seq_len];\n        let mut history_post_ids = vec![0i64; history_seq_len];\n        let mut history_int64_features = vec![0i64; history_seq_len * n_post_int64];\n        let mut history_is_author_followed = vec![false; history_seq_len];\n        let mut history_is_author_following = vec![false; history_seq_len];\n        let sid_num_levels = model_config.sid_num_levels;\n        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];\n\n        let cursor = Cursor::new(columnar_bytes);\n        let mut reader = StreamReader::try_new(cursor, None)?;\n\n        let batch = match reader.next() {\n            Some(Ok(batch)) if batch.num_rows() > 0 => batch,\n            Some(Err(e)) => return Err(e),\n            _ => {\n                let user_features = Self::extract_user_features(\n                    &model_config.hash_table,\n",
+      "source_digest": "fe474cb28236da6fd79daa92ad4439d290df51fe9b7a5f246b3833801e227e22",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1402,
+      "end_line": 1426,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let col_web_conv_tracking_integration =\n            typed_column::<Int32Array>(&batch, WEB_CONV_TRACKING_INTEGRATION_SEQ_COLUMN);\n        let col_web_conv_time_on_site = [\n            (\n                WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ,\n                typed_column::<Int64Array>(&batch, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN),\n            ),\n            (\n                WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ,\n                typed_column::<Int64Array>(&batch, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN),\n            ),\n        ];\n        let col_is_author_followed_by_viewer =\n            typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ_COLUMN);\n        let col_is_author_following_viewer =\n            typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWING_VIEWER_SEQ_COLUMN);\n\n        let start_row = num_rows.saturating_sub(history_seq_len);\n        let mut valid_entry_count = 0;\n\n        for row_idx in start_row..num_rows {\n            let tweet_id = tweet_ids.map_or(0i64, |arr| arr.value(row_idx));\n            let author_id = author_ids.map_or(0i64, |arr| arr.value(row_idx));\n\n            if tweet_id == 0 || author_id == 0 {\n",
+      "source_digest": "df443932f99b9f496ed5619d3491efd42eb58345024ca982a9238575daaabbee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1404,
+      "end_line": 1428,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let col_web_conv_time_on_site = [\n            (\n                WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ,\n                typed_column::<Int64Array>(&batch, WEB_CONV_TIME_ON_SITE_INFERRED_MS_SEQ_COLUMN),\n            ),\n            (\n                WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ,\n                typed_column::<Int64Array>(&batch, WEB_CONV_TIME_ON_SITE_MEASURED_MS_SEQ_COLUMN),\n            ),\n        ];\n        let col_is_author_followed_by_viewer =\n            typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWED_BY_VIEWER_SEQ_COLUMN);\n        let col_is_author_following_viewer =\n            typed_column::<BooleanArray>(&batch, IS_AUTHOR_FOLLOWING_VIEWER_SEQ_COLUMN);\n\n        let start_row = num_rows.saturating_sub(history_seq_len);\n        let mut valid_entry_count = 0;\n\n        for row_idx in start_row..num_rows {\n            let tweet_id = tweet_ids.map_or(0i64, |arr| arr.value(row_idx));\n            let author_id = author_ids.map_or(0i64, |arr| arr.value(row_idx));\n\n            if tweet_id == 0 || author_id == 0 {\n                continue;\n            }\n",
+      "source_digest": "68474995d477d076f5a25be2c02fa5e776ee724981c12fb6588d372234b04624",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "phoenix/crates/common/xai-recsys/src/util.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1509,
+      "end_line": 1533,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                col_view_count.map_or(0, |arr| arr.value(row_idx)) as u64,\n            );\n            for (feature_idx, col) in col_web_conv_time_on_site {\n                if let Some(arr) = col\n                    && n_post_int64 > feature_idx\n                    && !arr.is_null(row_idx)\n                {\n                    history_int64_features[valid_entry_count * n_post_int64 + feature_idx] =\n                        arr.value(row_idx).max(0);\n                }\n            }\n\n            history_is_author_followed[valid_entry_count] = col_is_author_followed_by_viewer\n                .is_some_and(|arr| !arr.is_null(row_idx) && arr.value(row_idx));\n            history_is_author_following[valid_entry_count] = col_is_author_following_viewer\n                .is_some_and(|arr| !arr.is_null(row_idx) && arr.value(row_idx));\n\n            valid_entry_count += 1;\n        }\n\n        if sid_num_levels > 0 {\n            let present = (0..valid_entry_count)\n                .filter(|&i| history_semantic_ids[i * sid_num_levels] != 0)\n                .count() as u64;\n            record_sid_coverage(\"history\", present, valid_entry_count as u64);\n",
+      "source_digest": "4c96beef6658d80cfd6a5243d4ac8a9ff5604c19ec918fef3d607a874330402b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "bdsm/runtime/sequence_cache.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 17,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n_ZSTD_MAGIC = b\"\\x28\\xb5\\x2f\\xfd\"\n_ARROW_MAGIC = b\"ARROW1\"\n\n_PROTO_FIELD_EXTRACTORS = {\n    \"action_name\": lambda ua: int(ua.actionInfo.actionName),\n    \"engagement_time_ms\": lambda ua: int(ua.actionInfo.engagementTimeMs),\n    \"tweet_id\": lambda ua: int(ua.tweetInfo.tweetId),\n    \"author_id\": lambda ua: int(ua.tweetInfo.authorId),\n    \"dwell_time\": lambda ua: ua.actionInfo.userActionMeta.dwellTime,\n    \"product_surface\": lambda ua: int(ua.actionInfo.userActionMeta.productSurface),\n    \"client_app_id\": lambda ua: int(ua.actionInfo.userActionMeta.clientAppId),\n    \"is_author_followed_by_user\": lambda ua: bool(ua.tweetInfo.isAuthorFollowedByUser),\n    \"favorite_count\": lambda ua: int(ua.tweetInfo.favCount),\n    \"retweet_count\": lambda ua: int(ua.tweetInfo.retweetCount),\n    \"reply_count\": lambda ua: int(ua.tweetInfo.replyCount),\n    \"quote_count\": lambda ua: int(ua.tweetInfo.quoteCount),\n    \"has_media\": lambda ua: bool(ua.tweetInfo.tweetBoolFeatures.has_media),\n    \"promoted_id\": lambda ua: int(ua.tweetInfo.promotedId),\n    \"post_language_code\": lambda ua: int(ua.tweetInfo.languageCode),\n    \"quoting_author_id\": lambda ua: int(ua.tweetInfo.quotingAuthorId),\n    \"quoted_author_id\": lambda ua: int(ua.tweetInfo.quotedAuthorId),\n    \"in_reply_to_author_id\": lambda ua: int(ua.tweetInfo.inReplyToAuthorId),\n    \"retweeting_author_id\": lambda ua: int(ua.tweetInfo.retweetingAuthorId),\n    \"engaging_ip_country_code\": lambda ua: int(ua.actionInfo.userActionMeta.engagingIpCountryCode),\n",
+      "source_digest": "67aee7338d3b67eafdb8886c489b71c05d1816d6726850fcbf1b075890c87d40",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "bdsm/rust/abuse-v3-features/src/lib.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 282,
+      "end_line": 306,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let sl = sl.as_any().downcast_ref::<StructArray>().unwrap();\n    let n = take;\n\n    Ok(UserArrowFeatures {\n        n,\n        action_name: get_i32(sl, \"action_name\"),\n        tweet_id: get_i64(sl, \"tweet_id\"),\n        author_id: get_i64(sl, \"author_id\"),\n        engagement_time_ms: get_i64(sl, \"engagement_time_ms\"),\n        dwell_time: get_i32(sl, \"dwell_time\"),\n        product_surface: get_i32(sl, \"product_surface\"),\n        client_app_id: get_i32(sl, \"client_app_id\"),\n        is_following: get_bool(sl, \"is_author_followed_by_user\"),\n        fav_count: get_i64(sl, \"favorite_count\"),\n        rt_count: get_i64(sl, \"retweet_count\"),\n        reply_count: get_i64(sl, \"reply_count\"),\n        quote_count: get_i64(sl, \"quote_count\"),\n        view_count: get_i64(sl, \"view_count\"),\n        has_media: get_bool(sl, \"has_media\"),\n        language_code: get_i32(sl, \"post_language_code\"),\n        promoted_id: get_i64(sl, \"promoted_id\"),\n        tweet_position: get_i32(sl, \"tweet_position\"),\n        first_video_duration: get_i64(sl, \"first_video_duration_ms\"),\n        quoting_author_id: get_i64(sl, \"quoting_author_id\"),\n        quoted_author_id: get_i64(sl, \"quoted_author_id\"),\n",
+      "source_digest": "3c255b254d6dd90b2a346c50dc930df8f0a7080b26f88e0a6d2c81903e778e63",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "home-mixer/models/candidate.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 322,
+      "end_line": 346,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                self.tweet_id\n            } else {\n                0\n            },\n            retweeting_author_id: if self.retweeted_user_id.is_some() {\n                self.author_id\n            } else {\n                0\n            },\n            quoted_tweet_id: self.quoted_tweet_id.unwrap_or(0),\n            quoted_author_id: self.quoted_user_id.unwrap_or(0),\n            in_reply_to_tweet_id: self.in_reply_to_tweet_id.unwrap_or(0),\n            is_author_followed_by_user: is_followed_by_viewer,\n            safety_label_mask: if self.retweeted_user_id.is_none()\n                && self.nsfw_author_phoenix.unwrap_or(false)\n            {\n                SAFETY_BIT_AUTHOR_NSFW\n            } else {\n                0\n            },\n            min_video_duration_ms: self.min_video_duration_ms.map(|ms| ms as u64).unwrap_or(0),\n            fav_count: self.fav_count.unwrap_or(0) as u64,\n            retweet_count: self.repost_count.unwrap_or(0) as u64,\n            quote_count: self.quote_count.unwrap_or(0) as u64,\n            reply_count: self.reply_count.unwrap_or(0) as u64,\n",
+      "source_digest": "2a4a73a1a55d7d9a85ae0016ccbd26924465e9837a7c5acd85c49d4f64ea76d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fc29db37787f4531f68644a12f76a0d18852e72dac13ae8565051b66e61b7895",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "786fe237fb7dffd3c628763bc619a43f8bf230f5c51565ddf79eb6775cd34959",
+      "context_complete": true,
+      "task_id": "T-bb7d24adcf4352193408525372c13df732060b6c6cad18cd49bc44818c47f918",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6a6de2a70d61e2ed2d5389029731677539bd2b2f3923fdeeaa851569d7cf0302",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-e51b550aa81c97740771018aec0df29231a0061ac0793088a1807afe160550de",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f3502584ecdb1b2c50f4fbdcf8deb298335a7177e7487d6af42a907eddefa15b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-0b96ab3a2677ddc89b6bfb92bfbc567baedaf14a588d18c0bfe26af080550e56",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4b35661c27d88cba754da09243364118ab0f99258f559aa8fddd7657679a633b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-919361dcbd2f3ea2e6be109c921cce5c7d17574c672ae00693415faf89651cfb",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d6b6fa332a8b8885b753af27f3dd144ec3cc0cd4d6d179a6a08f544970649055",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-916b9d0c1489829a6711d45957550d3b32aa7c536240319d84fa25bd9811b081",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3d196b2723cb2710c29d4cc7f64a64d64bbc96e1488d2f4330fed46480a30488",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-758d5434c9f49894f672d890a75931edd47f9bc204dd3cc907698dc7755221f6",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-244e83ae6c2dd6e3e18c6279652987a1c109fd10da28cf83c24573e3ee368874",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-221bde58a1af7466da63e065d99aee06f8fa21a44aa76b339197d8766ac4bf55",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6a4f396b8e7e4315018f7218765207748b073f1b19403ddd699f03b4f4b104c8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-218e6335b6212d2beba89481afe0652bf84d222492aa495a7f076873a03cd239",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-deb65fbd8db1090e3195ea865eac9cb664490ce4c770243ecb060845c54e4663",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-f34394718d6ad937ec066f47a078ba1fed50df6c73995b9f59f251120b5d0c53",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ad2f1faa6cd7c49c02a236650d25681dd7bc78a420da851a20f50a1a6527d91c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-f693f059e9744a10016ca52e2d83f24ede17f8a4bd9193d3c49f4ad7e85cdecf",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ac63a44a575d3d48fee2d0c1fe70b7551c41c7b6eb0ba053107d1a8ca672fa74",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-21f39c992ec7134378eb1e071d6bba8dffaf32b21c5ae9a9ea199202847dacab",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-38d74d3c46956980d863e8b8eb0c0da5a2a36308434cc9dae6c8a760b43a0b0a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-23ef3e8ab97a698bc5abe8b442f0a7db9d7219ae445e00411db8d20fe636c0f2",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-96396e9b9f2d3cb66c0326a6e57555f34a3f5fa27a0791f14dabab2e59545bb8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-0a032cf544b009aa701a50e79d6ec849427637e07a195842b3f6195d18c9e6a8",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9eaa80bb18191e16a37f38174ae44058045e88f9ea86e0bf86aae7ff8e4df0bc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-d4609c8be7c026d1cc95fa75177de4daa1516bd6d355af294d516f9bdfc93302",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f8945c5007193112aac07fafeaad7a1bb8a60359e7afe0c0d670f38a45c0b00f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa25fbe3b5c85fb3eab4b0b338f54bc460f91c85101cd8bb1b5b619c6261ce9a",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a05a358c712d1c755014d828949a19f68d6b565066a831a69424f0aa20bea958",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-439259ed446ed85a7c0952da9d7a6b9dd19304d4fbed86092a7b968a4d6b9447",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a55e9523ef7152f486c88a72e4938296e0401eb0b63d99d62acb9e0c766e77fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-070891d92f3207c9314b139be69a35ee85abfc5dddae98d4c1dc02529eb840a1",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4e9f20612b8d4793692fe79dc6dcc24c22b3ec23741cb9442bb1f58b6ef37316",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-7cc5d7d46fa306458d656a76305f5ed07053fca7a229d9f0adf06857606a94ea",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-baa7598357c4ed9ac42eb78353f4c459d37e8c2ef0eed026ee5c146f01ffa73a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-aa6d293a24c015031109a3e1e52682301e888a297d2aad28967ef8200287bf2a",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-186dd59d1538a29e9a17664a0149464bbe353f90b2e0f27e9123ee3872501ec0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-eae1c5eb45ba53ea86c1d342c772bdb04ff2f907773b0e6fe770afaf4faefd45",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-40765a6a3ff834afa9b1ec196f496118d8039aa2289764052c35aa90274bbabb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-931b4c3dd7fcdd21992b8647a163c206d099b5808e0d3624e3849668411316d0",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a0bcb910ceca56fb8770220993b19c92fcd31210050efd8cf2923a5002380c05",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-b8c714f2e874fe1a2815163ecaf8b98d501d9a3e4beda234fda545ab0e02ac2f",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9bba8cb8fc4bfd51b8727ae3c4c7d6bf2e8aac7be79630d655cc9296c4e0f6c3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-f941122f6dd27d9623410df371e5b1361acf860c99a9565bdc40eeeddaf5fd69",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-280b91372fec9d4d05485afb32aa9c005f742be7b5856c206744eb4430798d51",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-ca34bb91fcaf3b93a118f39fad693dee13b7d496201930c30bf66da000348289",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9cebc3ba300769a89d3833de66682e649c065a34d36f37c89077bfc016acf02a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-0e2f14366f1180933f61bedcc9890a1d675fce22f3cb1141131e0d615a83d66a",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7bcdfd451e6266f0d6f1af4ea554d8f2c273a9490228f4c8deb53b1ebdf5cb9b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-416efd644ada5ea1aeb2ac2cfb6b572c87b72b205a138301fad0d1554762d5c0",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2e1a8d5275f31249f5d62c0ad1adbba242c5638983cdfbea6a9eeb29be6a5676",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-0539ce4d3ca69e7d92219059cbe64a90df48d4c59dbc3fc148eb7ce7f1fedea6",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/data/recsys/id_list_features.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ce9cd06c84b8840f0644eb5c1a15f5a76cef6b7fcc2c24f9fa54fb21938939a7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "IdListFamily",
+        "is_author",
+        "is_organic_post",
+        "family_of",
+        "default_k",
+        "feature_name_for",
+        "identity_for",
+        "source_cap"
+      ],
+      "context_complete": false,
+      "task_id": "T-b2a9c1d782dc6a290707d57527ca9cdd59178e20d153a181340931cf7e875c06",
+      "evidence_refs": [
+        "E29"
+      ]
+    }
+  ],
+  "task_id": "T-ec143f8c9b557dca0f0312cf3a80bd28a17ef467b49c265dfe1718defddb1743"
+}

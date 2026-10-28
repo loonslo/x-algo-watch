@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/testing.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-41be453aca06ae819f09c4988190902006e37c178f700383fe75db9a6dd02be6",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/testing.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 181,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport collections\nimport math\nimport os\nimport random\nimport socket\nimport subprocess\nimport sys\nfrom collections.abc import Callable, Mapping, Sequence\n\nimport jax\nimport jax.numpy as jnp\nimport numpy as np\nimport numpy.typing as npt\nimport pytest\nfrom jax.ad_checkpoint import print_saved_residuals\nfrom jax.sharding import Mesh\n\nfrom xrex.train.parallel_config import ParallelConfig\nfrom xrex.utils.gpu import GpuArch, gpu_arch\n\n\ndef free_port() -> int:\n    for _ in range(100):\n        port = random.randrange(10000, 30000)\n        with socket.socket() as sock:\n            try:\n                sock.bind((\"127.0.0.1\", port))\n            except OSError:\n                continue\n            return port\n    raise RuntimeError(\"No free test coordinator port\")\n\n\ndef visible_gpu_count() -> int:\n    if (visible := os.environ.get(\"CUDA_VISIBLE_DEVICES\")) is not None:\n        return len(visible.replace(\",\", \" \").split())\n    try:\n        gpu_indices = subprocess.run(\n            [\"nvidia-smi\", \"--query-gpu=index\", \"--format=csv,noheader\"],\n            capture_output=True,\n            text=True,\n            check=True,\n        ).stdout\n    except (OSError, subprocess.CalledProcessError):\n        return 0\n    return len(gpu_indices.split())\n\n\ndef run_python_processes(\n    args_by_process: Sequence[Sequence[str]],\n    timeout: float | None = None,\n    env: Mapping[str, str] | None = None,\n) -> None:\n    processes = [\n        subprocess.Popen(\n            [sys.executable, *args],\n            stdout=subprocess.PIPE,\n            stderr=subprocess.STDOUT,\n            text=True,\n            env=env,\n        )\n        for args in args_by_process\n    ]\n    outputs = [process.communicate(timeout=timeout)[0] for process in processes]\n    failures = [\n        f\"--- process {index}\\n{output[-6000:]}\"\n        for index, (process, output) in enumerate(zip(processes, outputs, strict=True))\n        if process.returncode\n    ]\n    assert not failures, \"\\n\".join(failures)\n\n\ndef run_on_cpu_devices(num_devices: int, check: Callable[[], None]) -> None:\n    env = {\n        **os.environ,\n        \"JAX_PLATFORMS\": \"cpu\",\n        \"XLA_FLAGS\": f\"{os.environ.get('XLA_FLAGS', '')} \"\n        f\"--xla_force_host_platform_device_count={num_devices}\",\n        \"PYTHONPATH\": os.pathsep.join(sys.path),\n    }\n    run_check = (\n        \"import importlib, sys; getattr(importlib.import_module(sys.argv[1]), sys.argv[2])()\"\n    )\n    run_python_processes([[\"-c\", run_check, check.__module__, check.__name__]], env=env)\n\n\ndef relative_error(got: npt.ArrayLike, want: npt.ArrayLike) -> float:\n    got, want = np.asarray(got, np.float64), np.asarray(want, np.float64)\n    return float(np.linalg.norm(got - want) / max(float(np.linalg.norm(want)), 1e-12))\n\n\ndef require_h100() -> None:\n    if jax.default_backend() != \"gpu\" or gpu_arch() != GpuArch.H100:\n        pytest.skip(\"Needs an H100\")\n\n\ndef trainer_mesh(expert: int = 1, data: int = 1, model: int = 1) -> Mesh:\n    sizes = dict.fromkeys(ParallelConfig().axis_names, 1) | {\n        \"expert\": expert,\n        \"data\": data,\n        \"model\": model,\n    }\n    devices = jax.devices()[: math.prod(sizes.values())]\n    return Mesh(np.array(devices).reshape(tuple(sizes.values())), tuple(sizes))\n\n\ndef assert_bitwise_equal(got, want) -> None:\n    for (path, want_leaf), got_leaf in zip(\n        jax.tree_util.tree_leaves_with_path(want), jax.tree.leaves(got), strict=True\n    ):\n        np.testing.assert_array_equal(\n            *(np.atleast_1d(np.asarray(x)).view(np.uint8) for x in (got_leaf, want_leaf)),\n            err_msg=jax.tree_util.keystr(path),\n        )\n\n\ndef assert_relative_errors_below(got, want, tolerance: float) -> None:\n    for (path, want_leaf), got_leaf in zip(\n        jax.tree_util.tree_leaves_with_path(want), jax.tree.leaves(got), strict=True\n    ):\n        error = relative_error(got_leaf, want_leaf)\n        assert error < tolerance, f\"{jax.tree_util.keystr(path)}: relative error {error:.1e}\"\n\n\ndef saved_residual_counts(fn: Callable, args, capsys) -> collections.Counter[str]:\n    print_saved_residuals(fn, *args)\n    return collections.Counter(line.split()[0] for line in capsys.readouterr().out.splitlines())\n\n\ndef home_like_transformer(fp8_gemms: str = \"off\"):\n    from xrex.models.attention import AttentionConfig\n    from xrex.models.remat import RematType\n    from xrex.models.transformer import FeedForwardConfig, TransformerConfig\n\n    return TransformerConfig(\n        attn_config=AttentionConfig(\n            key_size=32,\n            num_q_heads=10,\n            num_kv_heads=2,\n            causal=False,\n            qk_norm=True,\n            rotary=True,\n            qkv_merge=True,\n            attn_impl=\"jax_attn\",\n        ),\n        ffn_config=FeedForwardConfig(widening_factor=2),\n        emb_size=128,\n        num_layers=2,\n        sequence_len=256,\n        use_layer_stack=True,\n        unroll_layer_stack=True,\n        use_remat=True,\n        remat_policy=RematType.SAVE_H100_QKV_ATTN_FFN,\n        fp8_gemms=fp8_gemms,\n    )\n\n\ndef transformer_loss(config, mesh: Mesh, batch: int = 1):\n    import haiku as hk\n\n    from xrex.models.sharding_context import make_legacy_sharding_context\n    from xrex.models.transformer import Transformer\n\n    shape = (batch, config.sequence_len, config.emb_size)\n    embeddings = jax.random.normal(jax.random.PRNGKey(1), shape).astype(jnp.bfloat16)\n    cotangent = jax.random.normal(jax.random.PRNGKey(2), shape)\n\n    def forward(embeddings):\n        ones = jnp.ones(embeddings.shape[:2], jnp.int32)\n        transformer = Transformer(config, make_legacy_sharding_context(mesh))\n        return transformer(embeddings, mask=ones, segment_ids=ones).output\n\n    transformed = hk.transform(forward)\n\n    def loss(params, embeddings, cotangent):\n        out = transformed.apply(params, jax.random.PRNGKey(0), embeddings)\n        return jnp.sum(out.astype(jnp.float32) * cotangent)\n\n    return transformed, loss, embeddings, cotangent\n",
+      "source_digest": "ab3ccbd20bcc3f4b5c9d582fb3cd29858d2a468f538939c702f15c31fac0fffb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2400,
+      "end_line": 2424,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    f\"{self.seqpack_distribution.min_len}\"\n                )\n        if (\n            isinstance(self.model_config, RecsysAggregatedModelConfig)\n            and self.model_config.page_rl.enabled\n        ):\n            if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):\n                raise ValueError(\"page_rl needs a dataset with page_records=True\")\n            if self.seqpack_candidate_packing:\n                raise ValueError(\"page_rl does not support seqpack_candidate_packing\")\n\n        self._init_shmem_write_pool()\n        self._free_ports()\n        self._init_incremental_state()\n\n        assert isinstance(\n            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n        )\n        assert isinstance(self.dataset, PhoenixDataset)\n\n        if self.use_row_emb:\n            if not self.use_async_emb:\n                raise ValueError(\"use_row_emb requires use_async_emb=True\")\n            if self.emb_optim_config._active() != \"rowwise_adagrad\":\n                raise ValueError(\"use_row_emb requires the rowwise_adagrad embedding optimizer\")\n",
+      "source_digest": "527b156fd0c283e375ff655c5ec5a2bfc7308279a23b888ed8fb1e21488d885f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2759,
+      "end_line": 2783,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        def read(p: str) -> bytes | None:\n            return pathlib.Path(p).read_bytes() if p else None\n\n        creds = grpc.ssl_channel_credentials(\n            root_certificates=read(cc.copy_port_tls_ca),\n            private_key=read(cc.copy_port_tls_client_key),\n            certificate_chain=read(cc.copy_port_tls_client_cert),\n        )\n        options = ((\"grpc.ssl_target_name_override\", cc.copy_port_tls_server_name),)\n        return grpc.secure_channel(f\"127.0.0.1:{port}\", creds, options=options)\n\n    def _free_ports(self):\n        if port := self.checkpoint_config.copy_port:\n            for conn in psutil.net_connections(kind=\"inet\"):\n                if conn.laddr and (conn.laddr.port == port or conn.laddr.port == port + 1):\n                    try:\n                        process = psutil.Process(conn.pid)\n                        os.kill(process.pid, signal.SIGKILL)\n                    except psutil.NoSuchProcess:\n                        pass\n\n    def _init_shmem_write_pool(self) -> None:\n        self._shmem_write_pool = concurrent.futures.ThreadPoolExecutor(\n            max_workers=1, thread_name_prefix=\"ckpt-shmem-write\"\n",
+      "source_digest": "b36450aca0377a43dd9afde89bca3a2c97fe342869d8a4b33ad20eb33fa64a88",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2559,
+      "end_line": 2583,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ):\n            if not (isinstance(self.dataset, PhoenixDataset) and self.dataset.page_records):\n                raise ValueError(\"page_rl needs a dataset with page_records=True\")\n            if self.seqpack_candidate_packing:\n                raise ValueError(\"page_rl does not support seqpack_candidate_packing\")\n        if self.model_config.model_config.fp8_gemms != Fp8Gemms.OFF and not self.forward_only:\n            if not self.use_async_emb:\n                raise ValueError(\"fp8_gemms requires use_async_emb=True\")\n            if not self.enable_aot:\n                raise ValueError(\"fp8_gemms requires enable_aot=True\")\n\n        self._init_shmem_write_pool()\n        self._free_ports()\n        self._init_incremental_state()\n\n        assert isinstance(\n            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)\n        )\n        assert isinstance(self.dataset, PhoenixDataset)\n\n        if self.use_row_emb:\n            if not self.use_async_emb:\n                raise ValueError(\"use_row_emb requires use_async_emb=True\")\n            if self.emb_optim_config._active() != \"rowwise_adagrad\":\n                raise ValueError(\"use_row_emb requires the rowwise_adagrad embedding optimizer\")\n",
+      "source_digest": "44ae62a37a2278e5b54cfb6faceefe7d3285272ca57b836b3409a400553584aa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "phoenix/xrex/train/trainer_recsys.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 2918,
+      "end_line": 2942,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        def read(p: str) -> bytes | None:\n            return pathlib.Path(p).read_bytes() if p else None\n\n        creds = grpc.ssl_channel_credentials(\n            root_certificates=read(cc.copy_port_tls_ca),\n            private_key=read(cc.copy_port_tls_client_key),\n            certificate_chain=read(cc.copy_port_tls_client_cert),\n        )\n        options = ((\"grpc.ssl_target_name_override\", cc.copy_port_tls_server_name),)\n        return grpc.secure_channel(f\"127.0.0.1:{port}\", creds, options=options)\n\n    def _free_ports(self):\n        if port := self.checkpoint_config.copy_port:\n            for conn in psutil.net_connections(kind=\"inet\"):\n                if conn.laddr and (conn.laddr.port == port or conn.laddr.port == port + 1):\n                    try:\n                        process = psutil.Process(conn.pid)\n                        os.kill(process.pid, signal.SIGKILL)\n                    except psutil.NoSuchProcess:\n                        pass\n\n    def _init_shmem_write_pool(self) -> None:\n        self._shmem_write_pool = concurrent.futures.ThreadPoolExecutor(\n            max_workers=1, thread_name_prefix=\"ckpt-shmem-write\"\n",
+      "source_digest": "b36450aca0377a43dd9afde89bca3a2c97fe342869d8a4b33ad20eb33fa64a88",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/testing.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-41be453aca06ae819f09c4988190902006e37c178f700383fe75db9a6dd02be6",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "639b71e3def28a12b0c6bee3f46853337c3f4ed70fb31d75c3322fa4af3159a0",
+      "context_complete": true,
+      "task_id": "T-ef5f70f59cebdb32459b8fc03c48972f6c4321f6bae5aa174e7488972224d84b",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/testing.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4496b1245cb8fec39f393643b26e8e9fd077a018337d7767a3c23a0f36f39cfa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "free_port",
+        "visible_gpu_count",
+        "run_python_processes",
+        "run_on_cpu_devices",
+        "relative_error",
+        "require_h100",
+        "trainer_mesh",
+        "assert_bitwise_equal"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f669e79a24f2d7a0aa5b2dfa2714b362fa896588f91ddc8cb0f78e036fa506d",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/testing.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5ff60ca4d701649870792f4d8470da05a6be8a9d19597e2c0eb8fb8ca1d13f30",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "free_port",
+        "visible_gpu_count",
+        "run_python_processes",
+        "run_on_cpu_devices",
+        "relative_error",
+        "require_h100",
+        "trainer_mesh",
+        "assert_bitwise_equal"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ff29558cd418f66d0eeb65753fa544f377b8cda8350130648940b2e984fbea8",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/testing.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-506056df174745f9c1d2b95369b87fa8cea1db89a001e6f50ea6882945c114df",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "free_port",
+        "visible_gpu_count",
+        "run_python_processes",
+        "run_on_cpu_devices",
+        "relative_error",
+        "require_h100",
+        "trainer_mesh",
+        "assert_bitwise_equal"
+      ],
+      "context_complete": false,
+      "task_id": "T-f3439d830b7d719ffa15abf552431d2b41db635e78dad3340b603e2ea4d4fdc3",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/testing.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-b4f78f7a80019d30e0321e70075fe61adbfa8670ff7d937e306dbe73bc19100d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "free_port",
+        "visible_gpu_count",
+        "run_python_processes",
+        "run_on_cpu_devices",
+        "relative_error",
+        "require_h100",
+        "trainer_mesh",
+        "assert_bitwise_equal"
+      ],
+      "context_complete": false,
+      "task_id": "T-7820c31db3e7ed5efb32759c8b13f5302727f019b2776261ba08d317ac3c027b",
+      "evidence_refs": [
+        "E5"
+      ]
+    }
+  ],
+  "task_id": "T-cfb1a8e450e3267ae23f9fdf9b60eac63f28e98a1a40c00ac0fb769340febdfb"
+}

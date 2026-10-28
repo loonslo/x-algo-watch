@@ -1,0 +1,1179 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/safety_label_source/source.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-c986216194cfa505f5f1c112095f17c5a548f316b6942b7d4d389cf5ab39e220",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/safety_label_source",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 370,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::tweet_timestamp_ms;\nuse quanta::Clock;\nuse rustc_hash::FxHashMap;\nuse std::sync::Arc;\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\nuse tracing::info;\nuse xai_visibility_filtering_proto as vf_pb;\n\nuse super::expiring_cache::{ExpiringCache, Lookup};\nuse super::lookup::{LookupError, LookupResults, RemoteSource};\nuse super::metrics::{self, BatchStage, CacheResult, CacheTier};\n\nconst TTL: Duration = Duration::from_secs(10);\n\nfn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {\n    UNIX_EPOCH\n        .checked_add(Duration::from_millis(tweet_timestamp_ms(tweet_id)))\n        .is_none_or(|created_at| created_at > now)\n}\n\npub struct SafetyLabelSource {\n        cache: Option<ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>>,\n    remote: Arc<RemoteSource>,\n}\n\nimpl SafetyLabelSource {\n    pub(crate) fn new(remote: Arc<RemoteSource>, cache_capacity: Option<usize>) -> Self {\n        Self::with_clock(remote, cache_capacity, Clock::new())\n    }\n\n    fn with_clock(remote: Arc<RemoteSource>, cache_capacity: Option<usize>, clock: Clock) -> Self {\n        info!(\n            cache_capacity = cache_capacity.unwrap_or(0),\n            ttl_secs = TTL.as_secs(),\n            \"Local safety-label cache initialized (single pool, per-entry TTL)\"\n        );\n        Self {\n            cache: cache_capacity.map(|capacity| ExpiringCache::with_clock(capacity, clock)),\n            remote,\n        }\n    }\n\n    pub async fn get(\n        &self,\n        ids: &[u64],\n    ) -> FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {\n        let total = ids.len();\n        let mut results: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =\n            FxHashMap::with_capacity_and_hasher(total, Default::default());\n\n        let (local_misses, expired) = self.get_local(ids, &mut results);\n        let batch_size = local_misses.len();\n\n        let remote_results = self.remote.get(&local_misses).await;\n        self.backfill_local(remote_results, &mut results);\n\n        Self::emit_stats(total - batch_size, batch_size, expired);\n\n        results\n    }\n\n    fn get_local(\n        &self,\n        ids: &[u64],\n        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n    ) -> (Vec<u64>, usize) {\n        let Some(cache) = &self.cache else {\n            return (ids.to_vec(), 0);\n        };\n        let mut misses = Vec::with_capacity(ids.len());\n        let mut expired = 0;\n        for &tweet_id in ids {\n            match cache.get(&tweet_id) {\n                Lookup::Found(labels) => {\n                    results.insert(tweet_id, Ok(labels));\n                }\n                Lookup::Expired => {\n                    expired += 1;\n                    misses.push(tweet_id);\n                }\n                Lookup::NotFound => misses.push(tweet_id),\n            }\n        }\n        (misses, expired)\n    }\n\n    fn backfill_local(\n        &self,\n        remote_results: LookupResults,\n        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n    ) {\n        let wall_now = SystemTime::now();\n        for (id, result) in remote_results {\n            let result = result.map(Arc::new);\n            if let Some(cache) = &self.cache\n                && let Ok(label_map) = &result\n                && !is_future_dated(id, wall_now)\n            {\n                cache.insert(id, Arc::clone(label_map), TTL);\n            }\n            results.insert(id, result);\n        }\n    }\n\n    fn emit_stats(hits: usize, batch_size: usize, expired: usize) {\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Hit, hits);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Miss, batch_size - expired);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Expired, expired);\n        metrics::record_batch_size(BatchStage::LocalMiss, batch_size);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    use crate::safety_label_source::cached_value::tests::{\n        cached_value_found_mval, cached_value_not_found,\n    };\n    use crate::safety_label_source::codec::RawSafetyLabel;\n    use crate::safety_label_source::lookup::RemoteSource;\n    use crate::safety_label_source::manhattan::ManhattanSource;\n    use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};\n    use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};\n    use std::collections::HashMap;\n    use std::sync::atomic::{AtomicUsize, Ordering};\n    use tonic::async_trait;\n    use xai_cache::{KVCacheError, Key, Value};\n\n    struct FakeTwemcache {\n        results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        fetched_keys: Arc<AtomicUsize>,\n    }\n\n    #[async_trait]\n    impl CacheRead for FakeTwemcache {\n        async fn multi_get(\n            &self,\n            keys: &[Key],\n        ) -> HashMap<Key, std::result::Result<Option<Value>, KVCacheError>> {\n            self.fetched_keys.fetch_add(keys.len(), Ordering::SeqCst);\n            self.results.clone()\n        }\n    }\n\n    struct FakeLabelFetcher {\n        items: HashMap<i64, Vec<RawSafetyLabel>>,\n    }\n\n    #[async_trait]\n    impl ManhattanLabelFetcher for FakeLabelFetcher {\n        async fn fetch_labels(\n            &self,\n            tweet_ids: &[i64],\n        ) -> Result<Vec<FetchResult>, xai_manhattan::ManhattanError> {\n            Ok(tweet_ids\n                .iter()\n                .map(|id| Ok(self.items.get(id).cloned().unwrap_or_default()))\n                .collect())\n        }\n    }\n\n    struct FailingLabelFetcher;\n\n    #[async_trait]\n    impl ManhattanLabelFetcher for FailingLabelFetcher {\n        async fn fetch_labels(\n            &self,\n            _: &[i64],\n        ) -> Result<Vec<FetchResult>, xai_manhattan::ManhattanError> {\n            Err(xai_manhattan::ManhattanError::NativeProtocol(\n                \"manhattan unavailable\".into(),\n            ))\n        }\n    }\n\n    fn make_source_with_clock(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        mh_items: HashMap<i64, Vec<RawSafetyLabel>>,\n        clock: Clock,\n    ) -> SafetyLabelSource {\n        make_counting_source_with_clock(cache_results, mh_items, clock).0\n    }\n\n    fn make_counting_source(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        mh_items: HashMap<i64, Vec<RawSafetyLabel>>,\n    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {\n        make_counting_source_with_clock(cache_results, mh_items, Clock::new())\n    }\n\n    fn make_counting_source_with_clock(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        mh_items: HashMap<i64, Vec<RawSafetyLabel>>,\n        clock: Clock,\n    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {\n        make_counting_source_with_fetcher(\n            cache_results,\n            Arc::new(FakeLabelFetcher { items: mh_items }),\n            clock,\n            Some(1024),\n        )\n    }\n\n    fn make_counting_source_with_fetcher(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        fetcher: Arc<dyn ManhattanLabelFetcher>,\n        clock: Clock,\n        l1_capacity: Option<usize>,\n    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {\n        let remote_keys = Arc::new(AtomicUsize::new(0));\n        let twemcache = Arc::new(TwemcacheSource::with_cache(Arc::new(FakeTwemcache {\n            results: cache_results,\n            fetched_keys: Arc::clone(&remote_keys),\n        })));\n        let manhattan = Arc::new(ManhattanSource::new(fetcher));\n        let remote = Arc::new(RemoteSource::new(twemcache, manhattan));\n        (\n            SafetyLabelSource::with_clock(remote, l1_capacity, clock),\n            remote_keys,\n        )\n    }\n\n    fn l1_expiry(source: &SafetyLabelSource, tweet_id: u64) -> Option<quanta::Instant> {\n        source\n            .cache\n            .as_ref()\n            .and_then(|cache| cache.expiry_of(&tweet_id))\n    }\n\n    fn cache_key(tweet_id: u64) -> Key {\n        Key::new(format!(\"slm_{tweet_id}\").into_bytes()).unwrap()\n    }\n\n    fn tweet_id_created_at(created_at: SystemTime) -> u64 {\n        let since_epoch = created_at.duration_since(UNIX_EPOCH).unwrap();\n        let created_ms = since_epoch\n            .as_secs()\n            .checked_mul(1000)\n            .and_then(|secs_ms| secs_ms.checked_add(u64::from(since_epoch.subsec_millis())))\n            .unwrap();\n        created_ms.checked_sub(tweet_timestamp_ms(0)).unwrap() << 22\n    }\n\n    fn future_tweet_id() -> u64 {\n        tweet_id_created_at(SystemTime::now() + Duration::from_secs(60))\n    }\n\n    #[tokio::test]\n    async fn get_backfills_remote_successes_into_l1() {\n        let (source, remote_keys) = make_counting_source(\n            HashMap::from([(cache_key(42), Ok(Some(cached_value_found_mval())))]),\n            HashMap::new(),\n        );\n\n        let results1 = source.get(&[42]).await;\n        let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 1);\n        assert!(l1_expiry(&source, 42).is_some());\n\n        let results2 = source.get(&[42]).await;\n        assert!(Arc::ptr_eq(\n            results2.get(&42).unwrap().as_ref().unwrap(),\n            &first\n        ));\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 1);\n    }\n\n    #[tokio::test]\n    async fn get_never_backfills_a_remote_error_into_l1() {\n        let (source, remote_keys) = make_counting_source_with_fetcher(\n            HashMap::new(),\n            Arc::new(FailingLabelFetcher),\n            Clock::new(),\n            Some(1024),\n        );\n\n        let results1 = source.get(&[42]).await;\n        assert!(results1.get(&42).unwrap().is_err());\n        assert!(l1_expiry(&source, 42).is_none());\n\n        let results2 = source.get(&[42]).await;\n        assert!(results2.get(&42).unwrap().is_err());\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 2);\n    }\n\n    #[tokio::test]\n    async fn without_an_l1_every_read_goes_remote() {\n        let (source, remote_keys) = make_counting_source_with_fetcher(\n            HashMap::from([(cache_key(42), Ok(Some(cached_value_found_mval())))]),\n            Arc::new(FakeLabelFetcher {\n                items: HashMap::new(),\n            }),\n            Clock::new(),\n            None,\n        );\n\n        for _ in 0..2 {\n            assert!(source.get(&[42]).await.get(&42).unwrap().is_ok());\n        }\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 2);\n    }\n\n    #[tokio::test]\n    async fn get_does_not_backfill_future_tweet_id_into_l1() {\n        let tweet_id = future_tweet_id();\n        let source = make_counting_source(\n            HashMap::from([(cache_key(tweet_id), Ok(Some(cached_value_found_mval())))]),\n            HashMap::new(),\n        )\n        .0;\n\n        let results = source.get(&[tweet_id]).await;\n\n        assert!(results.get(&tweet_id).unwrap().is_ok());\n        assert!(l1_expiry(&source, tweet_id).is_none());\n    }\n\n    #[tokio::test]\n    async fn get_backfills_negative_cache_into_l1() {\n        let (source, remote_keys) = make_counting_source(\n            HashMap::from([(cache_key(42), Ok(Some(cached_value_not_found())))]),\n            HashMap::new(),\n        );\n\n        let results1 = source.get(&[42]).await;\n        assert!(\n            results1\n                .get(&42)\n                .unwrap()\n                .as_ref()\n                .unwrap()\n                .labels\n                .is_empty()\n        );\n        assert!(l1_expiry(&source, 42).is_some());\n\n        let results2 = source.get(&[42]).await;\n        assert!(\n            results2\n                .get(&42)\n                .unwrap()\n                .as_ref()\n                .unwrap()\n                .labels\n                .is_empty()\n        );\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 1);\n    }\n\n    #[tokio::test]\n    async fn expired_entry_is_refetched_and_restamped() {\n        let (clock, mock) = Clock::mock();\n        let tweet_id = tweet_id_created_at(SystemTime::now() - Duration::from_secs(60));\n        let source = make_source_with_clock(\n            HashMap::from([(cache_key(tweet_id), Ok(Some(cached_value_found_mval())))]),\n            HashMap::new(),\n            clock,\n        );\n\n        source.get(&[tweet_id]).await;\n        let first_expiry = l1_expiry(&source, tweet_id).expect(\"backfilled\");\n\n        mock.increment(TTL + Duration::from_secs(1));\n        source.get(&[tweet_id]).await;\n        let restamped = l1_expiry(&source, tweet_id).expect(\"re-backfilled\");\n\n        assert!(restamped > first_expiry);\n    }\n}\n",
+      "source_digest": "f9d33510950e7c516e3a5835a5db44cfc9ed3dfe7877939588210f4f8aa3a1c1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test",
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 510,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::tweet_timestamp_ms;\nuse quanta::Clock;\nuse rustc_hash::FxHashMap;\nuse std::sync::Arc;\nuse std::time::{Duration, SystemTime, UNIX_EPOCH};\nuse tracing::info;\nuse xai_visibility_filtering_proto as vf_pb;\n\nuse super::expiring_cache::{ExpiringCache, Lookup};\nuse super::lookup::{LookupError, LookupResults, RemoteSource};\nuse super::metrics::{self, BatchStage, CacheResult, CacheTier};\n\nconst TTL: Duration = Duration::from_secs(10);\n\nfn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {\n    UNIX_EPOCH\n        .checked_add(Duration::from_millis(tweet_timestamp_ms(tweet_id)))\n        .is_none_or(|created_at| created_at > now)\n}\n\nfn system_unix_ms() -> i64 {\n    let millis = SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .map(|duration| duration.as_millis())\n        .unwrap_or(0);\n    i64::try_from(millis).unwrap_or(i64::MAX)\n}\n\nfn label_is_live(expires_at_msec: Option<i64>, now_ms: i64) -> bool {\n    match expires_at_msec {\n        Some(expires_at_msec) => expires_at_msec.wrapping_sub(now_ms) > 0,\n        None => true,\n    }\n}\n\nfn drop_expired_labels(map: &vf_pb::SafetyLabelMap, now_ms: i64) -> vf_pb::SafetyLabelMap {\n    vf_pb::SafetyLabelMap {\n        labels: map\n            .labels\n            .iter()\n            .filter(|(_, label)| label_is_live(label.expires_at_msec, now_ms))\n            .map(|(id, label)| (*id, label.clone()))\n            .collect(),\n    }\n}\n\npub struct SafetyLabelSource {\n        cache: Option<ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>>,\n    remote: Arc<RemoteSource>,\n    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,\n}\n\nimpl SafetyLabelSource {\n    pub(crate) fn new(remote: Arc<RemoteSource>, cache_capacity: Option<usize>) -> Self {\n        Self::with_clock(remote, cache_capacity, Clock::new())\n    }\n\n    fn with_clock(remote: Arc<RemoteSource>, cache_capacity: Option<usize>, clock: Clock) -> Self {\n        Self::with_clocks(remote, cache_capacity, clock, Arc::new(system_unix_ms))\n    }\n\n    fn with_clocks(\n        remote: Arc<RemoteSource>,\n        cache_capacity: Option<usize>,\n        clock: Clock,\n        now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,\n    ) -> Self {\n        info!(\n            cache_capacity = cache_capacity.unwrap_or(0),\n            ttl_secs = TTL.as_secs(),\n            \"Local safety-label cache initialized (single pool, per-entry TTL)\"\n        );\n        Self {\n            cache: cache_capacity.map(|capacity| ExpiringCache::with_clock(capacity, clock)),\n            remote,\n            now_ms,\n        }\n    }\n\n    pub async fn get(\n        &self,\n        ids: &[u64],\n    ) -> FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {\n        let total = ids.len();\n        let mut results: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =\n            FxHashMap::with_capacity_and_hasher(total, Default::default());\n\n        let (local_misses, expired) = self.get_local(ids, &mut results);\n        let batch_size = local_misses.len();\n\n        let remote_results = self.remote.get(&local_misses).await;\n        self.backfill_local(remote_results, &mut results);\n\n        Self::emit_stats(total - batch_size, batch_size, expired);\n\n        let now_ms = (self.now_ms)();\n        let mut dropped = 0;\n        for labels in results.values_mut() {\n            let Ok(map) = labels else { continue };\n            if map\n                .labels\n                .values()\n                .any(|label| !label_is_live(label.expires_at_msec, now_ms))\n            {\n                let live = drop_expired_labels(map, now_ms);\n                dropped += map.labels.len() - live.labels.len();\n                *map = Arc::new(live);\n            }\n        }\n        metrics::record_expired_labels(dropped);\n\n        results\n    }\n\n    fn get_local(\n        &self,\n        ids: &[u64],\n        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n    ) -> (Vec<u64>, usize) {\n        let Some(cache) = &self.cache else {\n            return (ids.to_vec(), 0);\n        };\n        let mut misses = Vec::with_capacity(ids.len());\n        let mut expired = 0;\n        for &tweet_id in ids {\n            match cache.get(&tweet_id) {\n                Lookup::Found(labels) => {\n                    results.insert(tweet_id, Ok(labels));\n                }\n                Lookup::Expired => {\n                    expired += 1;\n                    misses.push(tweet_id);\n                }\n                Lookup::NotFound => misses.push(tweet_id),\n            }\n        }\n        (misses, expired)\n    }\n\n    fn backfill_local(\n        &self,\n        remote_results: LookupResults,\n        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n    ) {\n        let wall_now = SystemTime::now();\n        for (id, result) in remote_results {\n            let result = result.map(Arc::new);\n            if let Some(cache) = &self.cache\n                && let Ok(label_map) = &result\n                && !is_future_dated(id, wall_now)\n            {\n                cache.insert(id, Arc::clone(label_map), TTL);\n            }\n            results.insert(id, result);\n        }\n    }\n\n    fn emit_stats(hits: usize, batch_size: usize, expired: usize) {\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Hit, hits);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Miss, batch_size - expired);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Expired, expired);\n        metrics::record_batch_size(BatchStage::LocalMiss, batch_size);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    use crate::safety_label_source::cached_value::tests::{\n        cached_value_found_mval, cached_value_not_found,\n    };\n    use crate::safety_label_source::codec::RawSafetyLabel;\n    use crate::safety_label_source::lookup::RemoteSource;\n    use crate::safety_label_source::lookup::{LookupResults, ManhattanLookup, TwemcacheLookup};\n    use crate::safety_label_source::manhattan::ManhattanSource;\n    use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};\n    use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};\n    use crate::safety_label_source::types::TwemcacheOutcome;\n    use std::collections::HashMap;\n    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};\n    use tonic::async_trait;\n    use xai_cache::{KVCacheError, Key, Value};\n\n    struct FakeTwemcache {\n        results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        fetched_keys: Arc<AtomicUsize>,\n    }\n\n    #[async_trait]\n    impl CacheRead for FakeTwemcache {\n        async fn multi_get(\n            &self,\n            keys: &[Key],\n        ) -> HashMap<Key, std::result::Result<Option<Value>, KVCacheError>> {\n            self.fetched_keys.fetch_add(keys.len(), Ordering::SeqCst);\n            self.results.clone()\n        }\n    }\n\n    struct FakeLabelFetcher {\n        items: HashMap<i64, Vec<RawSafetyLabel>>,\n    }\n\n    #[async_trait]\n    impl ManhattanLabelFetcher for FakeLabelFetcher {\n        async fn fetch_labels(\n            &self,\n            tweet_ids: &[i64],\n        ) -> Result<Vec<FetchResult>, xai_manhattan::ManhattanError> {\n            Ok(tweet_ids\n                .iter()\n                .map(|id| Ok(self.items.get(id).cloned().unwrap_or_default()))\n                .collect())\n        }\n    }\n\n    struct FailingLabelFetcher;\n\n    #[async_trait]\n    impl ManhattanLabelFetcher for FailingLabelFetcher {\n        async fn fetch_labels(\n            &self,\n            _: &[i64],\n        ) -> Result<Vec<FetchResult>, xai_manhattan::ManhattanError> {\n            Err(xai_manhattan::ManhattanError::NativeProtocol(\n                \"manhattan unavailable\".into(),\n            ))\n        }\n    }\n\n    fn make_source_with_clock(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        mh_items: HashMap<i64, Vec<RawSafetyLabel>>,\n        clock: Clock,\n    ) -> SafetyLabelSource {\n        make_counting_source_with_clock(cache_results, mh_items, clock).0\n    }\n\n    fn make_counting_source(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        mh_items: HashMap<i64, Vec<RawSafetyLabel>>,\n    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {\n        make_counting_source_with_clock(cache_results, mh_items, Clock::new())\n    }\n\n    fn make_counting_source_with_clock(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        mh_items: HashMap<i64, Vec<RawSafetyLabel>>,\n        clock: Clock,\n    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {\n        make_counting_source_with_fetcher(\n            cache_results,\n            Arc::new(FakeLabelFetcher { items: mh_items }),\n            clock,\n            Some(1024),\n        )\n    }\n\n    fn make_counting_source_with_fetcher(\n        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,\n        fetcher: Arc<dyn ManhattanLabelFetcher>,\n        clock: Clock,\n        l1_capacity: Option<usize>,\n    ) -> (SafetyLabelSource, Arc<AtomicUsize>) {\n        let remote_keys = Arc::new(AtomicUsize::new(0));\n        let twemcache = Arc::new(TwemcacheSource::with_cache(Arc::new(FakeTwemcache {\n            results: cache_results,\n            fetched_keys: Arc::clone(&remote_keys),\n        })));\n        let manhattan = Arc::new(ManhattanSource::new(fetcher));\n        let remote = Arc::new(RemoteSource::new(twemcache, manhattan));\n        (\n            SafetyLabelSource::with_clock(remote, l1_capacity, clock),\n            remote_keys,\n        )\n    }\n\n    fn l1_expiry(source: &SafetyLabelSource, tweet_id: u64) -> Option<quanta::Instant> {\n        source\n            .cache\n            .as_ref()\n            .and_then(|cache| cache.expiry_of(&tweet_id))\n    }\n\n    fn cache_key(tweet_id: u64) -> Key {\n        Key::new(format!(\"slm_{tweet_id}\").into_bytes()).unwrap()\n    }\n\n    fn tweet_id_created_at(created_at: SystemTime) -> u64 {\n        let since_epoch = created_at.duration_since(UNIX_EPOCH).unwrap();\n        let created_ms = since_epoch\n            .as_secs()\n            .checked_mul(1000)\n            .and_then(|secs_ms| secs_ms.checked_add(u64::from(since_epoch.subsec_millis())))\n            .unwrap();\n        created_ms.checked_sub(tweet_timestamp_ms(0)).unwrap() << 22\n    }\n\n    fn future_tweet_id() -> u64 {\n        tweet_id_created_at(SystemTime::now() + Duration::from_secs(60))\n    }\n\n    #[tokio::test]\n    async fn get_backfills_remote_successes_into_l1() {\n        let (source, remote_keys) = make_counting_source(\n            HashMap::from([(cache_key(42), Ok(Some(cached_value_found_mval())))]),\n            HashMap::new(),\n        );\n\n        let results1 = source.get(&[42]).await;\n        let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 1);\n        assert!(l1_expiry(&source, 42).is_some());\n\n        let results2 = source.get(&[42]).await;\n        assert!(Arc::ptr_eq(\n            results2.get(&42).unwrap().as_ref().unwrap(),\n            &first\n        ));\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 1);\n    }\n\n    #[tokio::test]\n    async fn get_never_backfills_a_remote_error_into_l1() {\n        let (source, remote_keys) = make_counting_source_with_fetcher(\n            HashMap::new(),\n            Arc::new(FailingLabelFetcher),\n            Clock::new(),\n            Some(1024),\n        );\n\n        let results1 = source.get(&[42]).await;\n        assert!(results1.get(&42).unwrap().is_err());\n        assert!(l1_expiry(&source, 42).is_none());\n\n        let results2 = source.get(&[42]).await;\n        assert!(results2.get(&42).unwrap().is_err());\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 2);\n    }\n\n    #[tokio::test]\n    async fn without_an_l1_every_read_goes_remote() {\n        let (source, remote_keys) = make_counting_source_with_fetcher(\n            HashMap::from([(cache_key(42), Ok(Some(cached_value_found_mval())))]),\n            Arc::new(FakeLabelFetcher {\n                items: HashMap::new(),\n            }),\n            Clock::new(),\n            None,\n        );\n\n        for _ in 0..2 {\n            assert!(source.get(&[42]).await.get(&42).unwrap().is_ok());\n        }\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 2);\n    }\n\n    #[tokio::test]\n    async fn get_does_not_backfill_future_tweet_id_into_l1() {\n        let tweet_id = future_tweet_id();\n        let source = make_counting_source(\n            HashMap::from([(cache_key(tweet_id), Ok(Some(cached_value_found_mval())))]),\n            HashMap::new(),\n        )\n        .0;\n\n        let results = source.get(&[tweet_id]).await;\n\n        assert!(results.get(&tweet_id).unwrap().is_ok());\n        assert!(l1_expiry(&source, tweet_id).is_none());\n    }\n\n    #[tokio::test]\n    async fn get_backfills_negative_cache_into_l1() {\n        let (source, remote_keys) = make_counting_source(\n            HashMap::from([(cache_key(42), Ok(Some(cached_value_not_found())))]),\n            HashMap::new(),\n        );\n\n        let results1 = source.get(&[42]).await;\n        assert!(\n            results1\n                .get(&42)\n                .unwrap()\n                .as_ref()\n                .unwrap()\n                .labels\n                .is_empty()\n        );\n        assert!(l1_expiry(&source, 42).is_some());\n\n        let results2 = source.get(&[42]).await;\n        assert!(\n            results2\n                .get(&42)\n                .unwrap()\n                .as_ref()\n                .unwrap()\n                .labels\n                .is_empty()\n        );\n        assert_eq!(remote_keys.load(Ordering::SeqCst), 1);\n    }\n\n    #[tokio::test]\n    async fn expired_entry_is_refetched_and_restamped() {\n        let (clock, mock) = Clock::mock();\n        let tweet_id = tweet_id_created_at(SystemTime::now() - Duration::from_secs(60));\n        let source = make_source_with_clock(\n            HashMap::from([(cache_key(tweet_id), Ok(Some(cached_value_found_mval())))]),\n            HashMap::new(),\n            clock,\n        );\n\n        source.get(&[tweet_id]).await;\n        let first_expiry = l1_expiry(&source, tweet_id).expect(\"backfilled\");\n\n        mock.increment(TTL + Duration::from_secs(1));\n        source.get(&[tweet_id]).await;\n        let restamped = l1_expiry(&source, tweet_id).expect(\"re-backfilled\");\n\n        assert!(restamped > first_expiry);\n    }\n\n    fn proto_label(expires_at_msec: Option<i64>) -> vf_pb::SafetyLabel {\n        vf_pb::SafetyLabel {\n            expires_at_msec,\n            ..vf_pb::SafetyLabel::default()\n        }\n    }\n\n    struct HitMap {\n        map: vf_pb::SafetyLabelMap,\n        fetches: AtomicUsize,\n    }\n\n    #[async_trait]\n    impl TwemcacheLookup for HitMap {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {\n            self.fetches.fetch_add(ids.len(), Ordering::SeqCst);\n            ids.iter()\n                .map(|&id| (id, TwemcacheOutcome::Hit(self.map.clone())))\n                .collect()\n        }\n    }\n\n    struct EmptyManhattan;\n\n    #[async_trait]\n    impl ManhattanLookup for EmptyManhattan {\n        async fn get(&self, _: &[u64]) -> LookupResults {\n            FxHashMap::default()\n        }\n    }\n\n    fn label_ids(map: &vf_pb::SafetyLabelMap) -> Vec<i32> {\n        let mut ids: Vec<i32> = map.labels.keys().copied().collect();\n        ids.sort_unstable();\n        ids\n    }\n\n    #[tokio::test]\n    async fn a_cached_label_drops_out_after_it_expires_without_a_refetch() {\n        let now = Arc::new(AtomicI64::new(1_000));\n        let now_ms = Arc::clone(&now);\n        let hit = Arc::new(HitMap {\n            map: vf_pb::SafetyLabelMap {\n                labels: HashMap::from([\n                    (1, proto_label(None)),\n                    (2, proto_label(Some(1_000))),\n                    (3, proto_label(Some(5_000))),\n                ]),\n            },\n            fetches: AtomicUsize::new(0),\n        });\n        let source = SafetyLabelSource::with_clocks(\n            Arc::new(RemoteSource::new(\n                Arc::clone(&hit),\n                Arc::new(EmptyManhattan),\n            )),\n            Some(8),\n            Clock::new(),\n            Arc::new(move || now_ms.load(Ordering::Relaxed)),\n        );\n\n        let first = source.get(&[42]).await;\n        assert_eq!(\n            label_ids(first.get(&42).unwrap().as_ref().unwrap()),\n            vec![1, 3]\n        );\n        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);\n\n        now.store(5_000, Ordering::Relaxed);\n        let later = source.get(&[42]).await;\n        assert_eq!(\n            label_ids(later.get(&42).unwrap().as_ref().unwrap()),\n            vec![1]\n        );\n        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);\n\n        now.store(0, Ordering::Relaxed);\n        let rewound = source.get(&[42]).await;\n        assert_eq!(\n            label_ids(rewound.get(&42).unwrap().as_ref().unwrap()),\n            vec![1, 2, 3]\n        );\n        assert_eq!(hit.fetches.load(Ordering::SeqCst), 1);\n    }\n}\n",
+      "source_digest": "66836241cc5b53ea54acccf93a604121b98c99a89583d1a2f489baa3049da375",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test",
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1157,
+      "end_line": 1181,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n        #[cfg(test)]\n    pub(crate) fn with_breaker(\n        store: Option<Arc<dyn HoldStore>>,\n        breaker_failures: u32,\n        breaker_open: Duration,\n    ) -> Self {\n        Self::with_breaker_and_clock(store, breaker_failures, breaker_open, Arc::new(SystemClock))\n    }\n\n        #[cfg(test)]\n    pub(crate) fn with_clock(store: Option<Arc<dyn HoldStore>>, clock: Arc<dyn Clock>) -> Self {\n        Self::with_breaker_and_clock(store, BREAKER_FAILURES, DEFAULT_BREAKER_OPEN, clock)\n    }\n\n        fn with_breaker_and_clock(\n        store: Option<Arc<dyn HoldStore>>,\n        breaker_failures: u32,\n        breaker_open: Duration,\n        clock: Arc<dyn Clock>,\n    ) -> Self {\n        Self {\n            store,\n            clock,\n",
+      "source_digest": "c7dc0f316b02ac90b44bb3522f0e5396761b3e40833aee6fe75068e693974dad",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2655,
+      "end_line": 2679,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        gate.evaluate(&c, 11, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0);\n    }\n\n                            #[tokio::test]\n    async fn positive_cache_is_clamped_to_the_holds_expiry() {\n        let _serial = METRICS_LOCK.lock().await;\n        let clock = ManualClock::new();\n        let mut soon = hold(31, 310, 1);\n        soon.expires_at = clock.now_utc() + chrono::Duration::seconds(30);\n        let store = FakeHoldStore::new(vec![soon]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c = HoldGateConfig {\n            mode: GateMode::Enforce,\n            positive_cache_secs: 3_600,\n            ..HoldGateConfig::default()\n        };\n        assert_eq!(\n            gate.evaluate(&c, 31, TOPIC, &[TEMP]).await.skip_status,\n            Some(STATUS_HOLD_OVERTURNED)\n        );\n        assert_eq!(gate.cached_len(), 1);\n        assert_eq!(\n            gate.cached_ttl(31),\n",
+      "source_digest": "edad0a0a588414e66a4d07c2e15c9f339ef0eb83b9bd8f2458594ed35d77036e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2691,
+      "end_line": 2715,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n        let out = gate.evaluate(&c, 31, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2, \"re-probed once the hold expired\");\n        assert_eq!(\n            out.skip_status, None,\n            \"the re-probe's (expired) hold is dropped too\"\n        );\n        assert_eq!(gate.cached_snapshot(31), None, \"…and nothing is cached\");\n\n        let mut past = hold(32, 320, 1);\n        past.expires_at = clock.now_utc() - chrono::Duration::seconds(1);\n        let store = FakeHoldStore::new(vec![past]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0);\n\n        let store = FakeHoldStore::new(vec![hold(33, 330, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c60 = cfg(GateMode::Enforce);\n        assert_eq!(c60.positive_cache_secs, 60);\n        gate.evaluate(&c60, 33, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(33), Some(Duration::from_secs(60)));\n\n",
+      "source_digest": "cbe223d3777c00312931e1d15dca33db045c50bf1a4074e66c9b06e5344d6a80",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2698,
+      "end_line": 2722,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(gate.cached_snapshot(31), None, \"…and nothing is cached\");\n\n        let mut past = hold(32, 320, 1);\n        past.expires_at = clock.now_utc() - chrono::Duration::seconds(1);\n        let store = FakeHoldStore::new(vec![past]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0);\n\n        let store = FakeHoldStore::new(vec![hold(33, 330, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c60 = cfg(GateMode::Enforce);\n        assert_eq!(c60.positive_cache_secs, 60);\n        gate.evaluate(&c60, 33, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(33), Some(Duration::from_secs(60)));\n\n        let mut short = hold(34, 340, 30);\n        short.expires_at = clock.now_utc() + chrono::Duration::seconds(90);\n        let store = FakeHoldStore::new(vec![hold(34, 341, 30), short]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 34, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(34), Some(Duration::from_secs(90)));\n        assert_eq!(gate.cached_snapshot(34), Some((vec![341, 340], vec![])));\n",
+      "source_digest": "3c8d9a9b451f63eab29e1e71185dfee5af03ba306699e2d48ce543695285f4bd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2707,
+      "end_line": 2731,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(gate.cached_len(), 0);\n\n        let store = FakeHoldStore::new(vec![hold(33, 330, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c60 = cfg(GateMode::Enforce);\n        assert_eq!(c60.positive_cache_secs, 60);\n        gate.evaluate(&c60, 33, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(33), Some(Duration::from_secs(60)));\n\n        let mut short = hold(34, 340, 30);\n        short.expires_at = clock.now_utc() + chrono::Duration::seconds(90);\n        let store = FakeHoldStore::new(vec![hold(34, 341, 30), short]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 34, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(34), Some(Duration::from_secs(90)));\n        assert_eq!(gate.cached_snapshot(34), Some((vec![341, 340], vec![])));\n        assert_eq!(CACHE_MAX_WEIGHT, 100_000);\n    }\n\n                    #[tokio::test]\n    async fn positive_cache_entries_expire_by_ttl() {\n        let _serial = METRICS_LOCK.lock().await;\n        let mut one_sec = hold(41, 410, 30);\n        one_sec.expires_at = Utc::now() + chrono::Duration::seconds(1);\n        let store = FakeHoldStore::new(vec![one_sec, hold(42, 420, 30)]);\n",
+      "source_digest": "32aaa2be4b2d14be1f2370e65529cfe228d07aba61cb0fcc5f9de723fbdc66c9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2782,
+      "end_line": 2806,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n                                #[tokio::test]\n    async fn expired_holds_in_a_fresh_probe_result_are_dropped_and_counted() {\n        let _serial = METRICS_LOCK.lock().await;\n        let clock = ManualClock::new();\n        let mut expired = hold(1, 10, 1);\n        expired.expires_at = clock.now_utc() - chrono::Duration::seconds(5);\n        let mut expired_label = label_hold_row(1, 11, 1, SHR);\n        expired_label.expires_at = clock.now_utc() - chrono::Duration::seconds(1);\n        let store = FakeHoldStore::new(vec![expired.clone(), expired_label]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c = cfg_labels(GateMode::Enforce, &[SHR]);\n        let before = metrics::HOLD_GATE_EXPIRED_HOLD_TOTAL.get();\n        let before_not_held = counter(\"enforce\", \"not_held\");\n\n        let out = gate\n            .evaluate(&c, 1, TOPIC, &[TEMP, label_action(SHR)])\n            .await;\n        assert_eq!(\n            out.skip_status, None,\n            \"an expired suspend hold is not a hold\"\n        );\n        assert!(\n",
+      "source_digest": "461b5a7a7fe0f16ebf840a4676f898b854cb18665e6d95d86b5e698c7fbfad7f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4252,
+      "end_line": 4276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(out.strip_labels, vec![SHR.to_owned()]);\n        assert_eq!(\n            out.info[\"overturn_hold_label_hold_id\"], \"21\",\n            \"longest wins\"\n        );\n    }\n\n                        #[tokio::test]\n    async fn cache_entry_covers_only_the_labels_it_was_probed_for() {\n        let _serial = METRICS_LOCK.lock().await;\n        let clock = ManualClock::new();\n        let store = FakeHoldStore::new(vec![hold(1, 10, 30), label_hold_row(1, 11, 30, SHR)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c = cfg_labels(GateMode::Enforce, &[SHR]);\n\n        let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        assert_eq!(out.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(store.calls(), 1);\n        assert_eq!(store.label_requests(), vec![Vec::<String>::new()]);\n        assert_eq!(gate.cached_len(), 1);\n        let out = gate.evaluate(&c, 1, TOPIC, &[label_action(SHR)]).await;\n        assert_eq!(out.strip_labels, vec![SHR.to_owned()]);\n        assert_eq!(out.info[\"overturn_hold_label_hold_id\"], \"11\");\n        assert_eq!(\n            store.calls(),\n",
+      "source_digest": "8643bf07c81b306e2c06fd6bed7bf9efe58a3ec5f9fcdbade7509e5d8c2dd8f5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4293,
+      "end_line": 4317,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .await;\n        assert_eq!(out.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(store.calls(), 2, \"all three served from the cache\");\n        let c2 = cfg_labels(GateMode::Enforce, &[SHR, \"SpamMediumRecall\"]);\n        gate.evaluate(&c2, 1, TOPIC, &[label_action(\"SpamMediumRecall\")])\n            .await;\n        assert_eq!(store.calls(), 3);\n        gate.cache.invalidate(&1);\n        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 4);\n\n        let store = FakeHoldStore::new(vec![hold(5, 50, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let out = gate\n            .evaluate(&c, 5, TOPIC, &[TEMP, label_action(SHR)])\n            .await;\n        assert_eq!(out.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        let out = gate.evaluate(&c, 5, TOPIC, &[label_action(SHR)]).await;\n        assert!(out.strip_labels.is_empty());\n        assert_eq!(store.calls(), 1, \"covered by the [SHR] entry\");\n\n        let store = FakeHoldStore::new(vec![label_hold_row(6, 60, 30, SHR)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 6, TOPIC, &[label_action(SHR)]).await;\n        let out = gate.evaluate(&c, 6, TOPIC, &[TEMP]).await;\n",
+      "source_digest": "35df5a092e076c9a1566c1852832ced4ef7b3a670e0057e387a293f83932a4e6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4303,
+      "end_line": 4327,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        let store = FakeHoldStore::new(vec![hold(5, 50, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let out = gate\n            .evaluate(&c, 5, TOPIC, &[TEMP, label_action(SHR)])\n            .await;\n        assert_eq!(out.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        let out = gate.evaluate(&c, 5, TOPIC, &[label_action(SHR)]).await;\n        assert!(out.strip_labels.is_empty());\n        assert_eq!(store.calls(), 1, \"covered by the [SHR] entry\");\n\n        let store = FakeHoldStore::new(vec![label_hold_row(6, 60, 30, SHR)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 6, TOPIC, &[label_action(SHR)]).await;\n        let out = gate.evaluate(&c, 6, TOPIC, &[TEMP]).await;\n        assert_eq!(out.skip_status, None);\n        assert_eq!(store.calls(), 1);\n    }\n\n            #[tokio::test]\n    async fn label_probe_errors_follow_on_probe_error() {\n        let _serial = METRICS_LOCK.lock().await;\n        let store = FakeHoldStore::new(vec![label_hold_row(1, 10, 30, SHR)]);\n        store.set_fail(true);\n        let gate = HoldGate::new(Some(store.clone()));\n",
+      "source_digest": "a2c1b013caef1a87a6d08ceb025d218d21dcf1a96c09b5cf531805be29f3a674",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4336,
+      "end_line": 4360,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            ..c\n        };\n        let out = gate.evaluate(&c_skip, 1, TOPIC, &[label_action(SHR)]).await;\n        assert_eq!(out.skip_status, Some(STATUS_HOLD_LOOKUP_FAILED));\n        assert!(out.strip_labels.is_empty());\n    }\n\n                    #[tokio::test]\n    async fn empty_reprobe_after_coverage_miss_drops_the_stale_entry() {\n        let _serial = METRICS_LOCK.lock().await;\n        let clock = ManualClock::new();\n        let store = FakeHoldStore::new(vec![hold(1, 10, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c = cfg_labels(GateMode::Enforce, &[SHR]);\n        let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        assert_eq!(out.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(gate.cached_len(), 1);\n        store.set_holds(vec![]);\n        let out = gate.evaluate(&c, 1, TOPIC, &[label_action(SHR)]).await;\n        assert!(out.strip_labels.is_empty());\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0, \"stale positive entry dropped\");\n        let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        assert_eq!(out.skip_status, None);\n        assert_eq!(store.calls(), 3);\n",
+      "source_digest": "818b3b05a335030b299f9e922415c3a3e287599084118840ee24251fdd87d895",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4362,
+      "end_line": 4386,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        store.set_holds(vec![hold(1, 10, 30), label_hold_row(1, 11, 30, SHR)]);\n        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_len(), 1);\n        let out = gate.evaluate(&c, 1, TOPIC, &[label_action(SHR)]).await;\n        assert_eq!(out.strip_labels, vec![SHR.to_owned()]);\n        assert_eq!(gate.cached_len(), 1, \"replaced with the covered entry\");\n        assert_eq!(store.calls(), 5);\n    }\n\n                                    #[test]\n    fn cache_eviction_and_writes_are_compare_and_swap_on_probe_start() {\n        let clock = ManualClock::new();\n        let gate = HoldGate::with_clock(Some(FakeHoldStore::new(vec![])), clock.clone());\n        let shr = vec![SHR.to_owned()];\n        let t = |secs: u64| Duration::from_secs(secs);\n\n        let e_started = clock.now();\n        clock.advance(t(1));\n        let w_started = clock.now();\n        clock.advance(t(1));\n        gate.remember(1, vec![hold(1, 10, 30)], &shr, 60, w_started);\n        assert_eq!(gate.cached_snapshot(1), Some((vec![10], shr.clone())));\n        clock.advance(t(1));\n        gate.forget_if_older(1, e_started);\n        assert_eq!(\n",
+      "source_digest": "875239cbc17bd5595c1de31112ccbe972679eb2326027d50ed8060cdae3f8da2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/service.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3057,
+      "end_line": 3081,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    method.arg_field_id,\n                    method.request_type,\n                    &request,\n                    0,\n                )\n                .unwrap_or_else(|e| panic!(\"{} must encode: {e}\", action.name()));\n        }\n    }\n\n    #[test]\n    fn ais_outcome_failure_is_detected_as_permanent() {\n        let rejection = json!({\"success\": {\"outcome\": {\"failure\": {\"businessLogic\": {\n            \"reason\": \"Plugin(PluginHeader(xai-abuse-enforcement-service)) is not a supported SafetyLabelSource\"\n        }}}}});\n        assert!(!parse_ais_response(1, &rejection).success);\n        let err = classify_ais_failure(\"suspendUser\", \"rejected\", &rejection);\n        assert!(err.downcast_ref::<PermanentAisFailure>().is_some());\n\n        let ok = json!({\"success\": {\"outcome\": {\"success\": {\"actionId\": \"abc\"}}}});\n        assert!(parse_ais_response(1, &ok).success);\n\n        let garbage = json!({\"err\": \"timeout\"});\n        assert!(!parse_ais_response(1, &garbage).success);\n        let err = classify_ais_failure(\"suspendUser\", \"unexpected\", &garbage);\n        assert!(err.downcast_ref::<PermanentAisFailure>().is_none());\n",
+      "source_digest": "cfdeb57177141150d7b590a84ba6a47101160e40d5014555be3d86588ec6fdc9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 7,
+      "end_line": 31,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimport com.twitter.spam.botmaker_features.BotMakerFeatures;\nimport com.twitter.spam.botmaker_features.EnumExtractors;\nimport com.twitter.spam.botmaker_features.FeatureMapBuilder;\nimport com.twitter.spam.botmaker_features.FeatureMapExtractor;\nimport com.twitter.spam.rtf.thriftjava.ModelMetadataV1;\nimport com.twitter.spam.rtf.thriftjava.SafetyLabel;\nimport com.twitter.spam.rtf.thriftjava.ToolAction;\nimport com.twitter.spam.rtf.thriftjava.TweetSafetyLabelEvent;\n\nimport static com.twitter.botmaker.FeatureModifier.OPTIONAL;\nimport static com.twitter.botmaker.FeatureModifier.REQUIRED;\nimport static com.twitter.spam.rtf.thriftjava.SafetyLabelSource._Fields.BOT_MAKER_ACTION;\nimport static com.twitter.spam.rtf.thriftjava.SafetyLabelSource._Fields.TOOL_ACTION;\n\npublic class FeaturesOfTweetSafetyLabelEvent extends FeatureMapExtractor {\n  private final TweetSafetyLabelEvent event;\n\n  public FeaturesOfTweetSafetyLabelEvent(TweetSafetyLabelEvent event) {\n    this.event = Preconditions.checkNotNull(event);\n  }\n\n  \u0040Override\n  public void apply(FeatureMapBuilder builder) throws Exception {\n    builder\n",
+      "source_digest": "6cf2a0c6adcf2a4df87d59882ebf1d20ba49e2c7ec12ba97244bccb5eb1bda9d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 8,
+      "end_line": 32,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import com.twitter.spam.botmaker_features.BotMakerFeatures;\nimport com.twitter.spam.botmaker_features.EnumExtractors;\nimport com.twitter.spam.botmaker_features.FeatureMapBuilder;\nimport com.twitter.spam.botmaker_features.FeatureMapExtractor;\nimport com.twitter.spam.rtf.thriftjava.ModelMetadataV1;\nimport com.twitter.spam.rtf.thriftjava.SafetyLabel;\nimport com.twitter.spam.rtf.thriftjava.ToolAction;\nimport com.twitter.spam.rtf.thriftjava.TweetSafetyLabelEvent;\n\nimport static com.twitter.botmaker.FeatureModifier.OPTIONAL;\nimport static com.twitter.botmaker.FeatureModifier.REQUIRED;\nimport static com.twitter.spam.rtf.thriftjava.SafetyLabelSource._Fields.BOT_MAKER_ACTION;\nimport static com.twitter.spam.rtf.thriftjava.SafetyLabelSource._Fields.TOOL_ACTION;\n\npublic class FeaturesOfTweetSafetyLabelEvent extends FeatureMapExtractor {\n  private final TweetSafetyLabelEvent event;\n\n  public FeaturesOfTweetSafetyLabelEvent(TweetSafetyLabelEvent event) {\n    this.event = Preconditions.checkNotNull(event);\n  }\n\n  \u0040Override\n  public void apply(FeatureMapBuilder builder) throws Exception {\n    builder\n        .putValue(REQUIRED, BotMakerFeatures.tweetId, event.getTweetId())\n",
+      "source_digest": "7eb7c3f11f7f9f65705505b24a739ccce844db0cadd77ce7d292ef2c7df22605",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      }\n\n      if (label.isSetModel_metadata() && label.getModel_metadata().getModelMetadataV1() != null) {\n        ModelMetadataV1 metadata = label.getModel_metadata().getModelMetadataV1();\n\n        builder\n            .putValue(OPTIONAL, BotMakerFeatures.modelVersion,\n                metadata.isSetVersion() ? metadata.getVersion() : null)\n            .putValue(\n                OPTIONAL, BotMakerFeatures.calibratedLanguage, metadata.getCalibratedLanguage());\n      }\n\n      if (label.isSetSafetyLabelSource()) {\n        if (label.getSafetyLabelSource().getSetField() == TOOL_ACTION) {\n          ToolAction toolAction = label.getSafetyLabelSource().getToolAction();\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.actorLdap, toolAction.getActorLdap())\n              .putExtractor(OPTIONAL, BotMakerFeatures.tool,\n                  toolAction.isSetAgentTool()\n                      ? new EnumExtractors.Name<>(toolAction.getAgentTool()) : null);\n        }\n\n        if (label.getSafetyLabelSource().getSetField() == BOT_MAKER_ACTION) {\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.botId,\n",
+      "source_digest": "0fd046a9022b11ef55589acec13d86a3eff94972ea060e750cb092de8fdc7309",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 53,
+      "end_line": 77,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n      if (label.isSetModel_metadata() && label.getModel_metadata().getModelMetadataV1() != null) {\n        ModelMetadataV1 metadata = label.getModel_metadata().getModelMetadataV1();\n\n        builder\n            .putValue(OPTIONAL, BotMakerFeatures.modelVersion,\n                metadata.isSetVersion() ? metadata.getVersion() : null)\n            .putValue(\n                OPTIONAL, BotMakerFeatures.calibratedLanguage, metadata.getCalibratedLanguage());\n      }\n\n      if (label.isSetSafetyLabelSource()) {\n        if (label.getSafetyLabelSource().getSetField() == TOOL_ACTION) {\n          ToolAction toolAction = label.getSafetyLabelSource().getToolAction();\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.actorLdap, toolAction.getActorLdap())\n              .putExtractor(OPTIONAL, BotMakerFeatures.tool,\n                  toolAction.isSetAgentTool()\n                      ? new EnumExtractors.Name<>(toolAction.getAgentTool()) : null);\n        }\n\n        if (label.getSafetyLabelSource().getSetField() == BOT_MAKER_ACTION) {\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.botId,\n                  label.getSafetyLabelSource().getBotMakerAction().getRuleId());\n",
+      "source_digest": "cecca0f7ab78627b49f24da45948c0fe3d8892b683adc37d6a70fd82d849dbd4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 54,
+      "end_line": 78,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      if (label.isSetModel_metadata() && label.getModel_metadata().getModelMetadataV1() != null) {\n        ModelMetadataV1 metadata = label.getModel_metadata().getModelMetadataV1();\n\n        builder\n            .putValue(OPTIONAL, BotMakerFeatures.modelVersion,\n                metadata.isSetVersion() ? metadata.getVersion() : null)\n            .putValue(\n                OPTIONAL, BotMakerFeatures.calibratedLanguage, metadata.getCalibratedLanguage());\n      }\n\n      if (label.isSetSafetyLabelSource()) {\n        if (label.getSafetyLabelSource().getSetField() == TOOL_ACTION) {\n          ToolAction toolAction = label.getSafetyLabelSource().getToolAction();\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.actorLdap, toolAction.getActorLdap())\n              .putExtractor(OPTIONAL, BotMakerFeatures.tool,\n                  toolAction.isSetAgentTool()\n                      ? new EnumExtractors.Name<>(toolAction.getAgentTool()) : null);\n        }\n\n        if (label.getSafetyLabelSource().getSetField() == BOT_MAKER_ACTION) {\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.botId,\n                  label.getSafetyLabelSource().getBotMakerAction().getRuleId());\n        }\n",
+      "source_digest": "61b39367ab5c6a7c2b224b98f43c4ae54a6b420a576decfa753330d8605ca83b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 62,
+      "end_line": 82,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "      }\n\n      if (label.isSetSafetyLabelSource()) {\n        if (label.getSafetyLabelSource().getSetField() == TOOL_ACTION) {\n          ToolAction toolAction = label.getSafetyLabelSource().getToolAction();\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.actorLdap, toolAction.getActorLdap())\n              .putExtractor(OPTIONAL, BotMakerFeatures.tool,\n                  toolAction.isSetAgentTool()\n                      ? new EnumExtractors.Name<>(toolAction.getAgentTool()) : null);\n        }\n\n        if (label.getSafetyLabelSource().getSetField() == BOT_MAKER_ACTION) {\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.botId,\n                  label.getSafetyLabelSource().getBotMakerAction().getRuleId());\n        }\n      }\n    }\n  }\n}\n",
+      "source_digest": "c3d70054b602568975bfeb51ac77c153e02d0e251938cf0ac311b93825818960",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "botmaker/scarecrow_features/src/main/java/com/twitter/scarecrow/features/FeaturesOfTweetSafetyLabelEvent.java",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 65,
+      "end_line": 82,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if (label.getSafetyLabelSource().getSetField() == TOOL_ACTION) {\n          ToolAction toolAction = label.getSafetyLabelSource().getToolAction();\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.actorLdap, toolAction.getActorLdap())\n              .putExtractor(OPTIONAL, BotMakerFeatures.tool,\n                  toolAction.isSetAgentTool()\n                      ? new EnumExtractors.Name<>(toolAction.getAgentTool()) : null);\n        }\n\n        if (label.getSafetyLabelSource().getSetField() == BOT_MAKER_ACTION) {\n          builder\n              .putValue(OPTIONAL, BotMakerFeatures.botId,\n                  label.getSafetyLabelSource().getBotMakerAction().getRuleId());\n        }\n      }\n    }\n  }\n}\n",
+      "source_digest": "9203a9d766638b4f6eaee29c77e33755758f98f2fcea7207c4d40e979fbaa473",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "home-mixer/models/brand_safety.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 15,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::collections::HashMap;\nuse xai_ads_injection_proto::ads_injected_timeline::SafetyLabelType as AuthorLabel;\nuse xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelSource, SafetyLabelType};\n\n#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n#[repr(i32)]\npub enum BrandSafetyVerdict {\n    #[default]\n    Unspecified = 0,\n    Safe = 1,\n    LowRisk = 2,\n    MediumRisk = 3,\n    HighRisk = 4,\n}\n\n",
+      "source_digest": "1a83926cc4b673fa1d9d7bd81cc69687fd9420237ac3d5336dc11f49a732e7ca",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "home-mixer/models/brand_safety.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 192,
+      "end_line": 216,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub fn worst_verdict(a: &BrandSafetyVerdict, b: &BrandSafetyVerdict) -> BrandSafetyVerdict {\n    if *a as i32 >= *b as i32 {\n        *a\n    } else {\n        *b\n    }\n}\n\npub(crate) fn botmaker_rule_id_from(label: &SafetyLabel) -> Option<i64> {\n    label.safety_label_source.as_ref().and_then(|src| {\n        if let SafetyLabelSource::BotMakerAction(action) = src {\n            Some(action.rule_id)\n        } else {\n            None\n        }\n    })\n}\n\npub(crate) fn botmaker_rule_category(rule_id: i64) -> &'static str {\n    match rule_id {\n        1000..=1099 => \"Content\",\n        1100..=1199 => \"ContentLimited\",\n        1200..=1399 => \"Safety\",\n",
+      "source_digest": "eca8c5db87c2dd34f9c4515358e3ed3a3dbf34dcf93aee4a978544f261fcea7e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "visibility-filtering-client/tweet_safety_label.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2,
+      "end_line": 26,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::metrics::{ClientRpc, RequestMetrics};\nuse std::collections::HashMap;\nuse std::time::{Duration, Instant};\nuse tonic::codec::CompressionEncoding;\nuse tonic::{async_trait, Status};\nuse tracing::warn;\nuse xai_safety_label_store::types::SafetyLabelMap;\nuse xai_visibility_filtering_proto as vf_pb;\nuse xai_visibility_filtering_proto::visibility_filtering_service_client::VisibilityFilteringServiceClient;\nuse xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};\nuse xai_x_thrift::tweet_safety_label::{\n    AgentTool, BotMakerAction, GrokAnnotationAction, GrokAnnotationSource, SafetyLabel,\n    SafetyLabelSource, SafetyLabelType, ToolAction,\n};\n\nconst DEFAULT_TIMEOUT_MS: u64 = 200;\nconst DEFAULT_MAX_BATCH_SIZE: usize = 50;\n\npub const LATENCY_VM_METRIC: &str = \"vf_client_get_safety_labels_latency_ms_vm\";\npub const BATCH_LATENCY_VM_METRIC: &str = \"vf_client_get_safety_labels_batch_latency_ms_vm\";\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub enum SafetyLabelFailure {\n    LookupFailed,\n    BatchFailed,\n",
+      "source_digest": "03d3198f01b68b6db018b7bd81b72f76a92b1af78ecebf82129cbd6f140a1fe5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "visibility-filtering-client/tweet_safety_label.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 142,
+      "end_line": 166,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        } else {\n            Some(\n                label\n                    .applicable_users\n                    .iter()\n                    .map(|&uid| PerspectivalUser::new(uid))\n                    .collect(),\n            )\n        },\n        holdback_experiment: label.holdback_experiment,\n        source: label.source.clone(),\n        safety_label_source: label.safety_label_source.as_ref().map(|src| match src {\n            vf_pb::safety_label::SafetyLabelSource::BotmakerAction(a) => {\n                SafetyLabelSource::BotMakerAction(BotMakerAction::new(a.rule_id))\n            }\n            vf_pb::safety_label::SafetyLabelSource::ToolAction(a) => SafetyLabelSource::ToolAction(\n                ToolAction::new(AgentTool::from(a.agent_tool), a.actor_ldap.clone()),\n            ),\n            vf_pb::safety_label::SafetyLabelSource::GrokAnnotationAction(a) => {\n                SafetyLabelSource::GrokAnnotationAction(GrokAnnotationAction::new(\n                    GrokAnnotationSource::from(a.source),\n                ))\n            }\n        }),\n        created_at_msec: label.created_at_msec,\n",
+      "source_digest": "075f259abfff3de10a9face1231d869781989d5568494639e47a1cdfbe0b8428",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "visibility-filtering-client/tweet_safety_label.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 143,
+      "end_line": 167,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(\n                label\n                    .applicable_users\n                    .iter()\n                    .map(|&uid| PerspectivalUser::new(uid))\n                    .collect(),\n            )\n        },\n        holdback_experiment: label.holdback_experiment,\n        source: label.source.clone(),\n        safety_label_source: label.safety_label_source.as_ref().map(|src| match src {\n            vf_pb::safety_label::SafetyLabelSource::BotmakerAction(a) => {\n                SafetyLabelSource::BotMakerAction(BotMakerAction::new(a.rule_id))\n            }\n            vf_pb::safety_label::SafetyLabelSource::ToolAction(a) => SafetyLabelSource::ToolAction(\n                ToolAction::new(AgentTool::from(a.agent_tool), a.actor_ldap.clone()),\n            ),\n            vf_pb::safety_label::SafetyLabelSource::GrokAnnotationAction(a) => {\n                SafetyLabelSource::GrokAnnotationAction(GrokAnnotationAction::new(\n                    GrokAnnotationSource::from(a.source),\n                ))\n            }\n        }),\n        created_at_msec: label.created_at_msec,\n        expires_at_msec: label.expires_at_msec,\n",
+      "source_digest": "86ea67505a88886295a13b62f342abfe768105105872310849e5c6989749b13b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1157,
+      "end_line": 1181,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n        #[cfg(test)]\n    pub(crate) fn with_breaker(\n        store: Option<Arc<dyn HoldStore>>,\n        breaker_failures: u32,\n        breaker_open: Duration,\n    ) -> Self {\n        Self::with_breaker_and_clock(store, breaker_failures, breaker_open, Arc::new(SystemClock))\n    }\n\n        #[cfg(test)]\n    pub(crate) fn with_clock(store: Option<Arc<dyn HoldStore>>, clock: Arc<dyn Clock>) -> Self {\n        Self::with_breaker_and_clock(store, BREAKER_FAILURES, DEFAULT_BREAKER_OPEN, clock)\n    }\n\n        fn with_breaker_and_clock(\n        store: Option<Arc<dyn HoldStore>>,\n        breaker_failures: u32,\n        breaker_open: Duration,\n        clock: Arc<dyn Clock>,\n    ) -> Self {\n        Self {\n            store,\n            clock,\n",
+      "source_digest": "c7dc0f316b02ac90b44bb3522f0e5396761b3e40833aee6fe75068e693974dad",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2655,
+      "end_line": 2679,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        gate.evaluate(&c, 11, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0);\n    }\n\n                            #[tokio::test]\n    async fn positive_cache_is_clamped_to_the_holds_expiry() {\n        let _serial = METRICS_LOCK.lock().await;\n        let clock = ManualClock::new();\n        let mut soon = hold(31, 310, 1);\n        soon.expires_at = clock.now_utc() + chrono::Duration::seconds(30);\n        let store = FakeHoldStore::new(vec![soon]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c = HoldGateConfig {\n            mode: GateMode::Enforce,\n            positive_cache_secs: 3_600,\n            ..HoldGateConfig::default()\n        };\n        assert_eq!(\n            gate.evaluate(&c, 31, TOPIC, &[TEMP]).await.skip_status,\n            Some(STATUS_HOLD_OVERTURNED)\n        );\n        assert_eq!(gate.cached_len(), 1);\n        assert_eq!(\n            gate.cached_ttl(31),\n",
+      "source_digest": "edad0a0a588414e66a4d07c2e15c9f339ef0eb83b9bd8f2458594ed35d77036e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2691,
+      "end_line": 2715,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n        let out = gate.evaluate(&c, 31, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2, \"re-probed once the hold expired\");\n        assert_eq!(\n            out.skip_status, None,\n            \"the re-probe's (expired) hold is dropped too\"\n        );\n        assert_eq!(gate.cached_snapshot(31), None, \"…and nothing is cached\");\n\n        let mut past = hold(32, 320, 1);\n        past.expires_at = clock.now_utc() - chrono::Duration::seconds(1);\n        let store = FakeHoldStore::new(vec![past]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0);\n\n        let store = FakeHoldStore::new(vec![hold(33, 330, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c60 = cfg(GateMode::Enforce);\n        assert_eq!(c60.positive_cache_secs, 60);\n        gate.evaluate(&c60, 33, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(33), Some(Duration::from_secs(60)));\n\n",
+      "source_digest": "cbe223d3777c00312931e1d15dca33db045c50bf1a4074e66c9b06e5344d6a80",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2698,
+      "end_line": 2722,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(gate.cached_snapshot(31), None, \"…and nothing is cached\");\n\n        let mut past = hold(32, 320, 1);\n        past.expires_at = clock.now_utc() - chrono::Duration::seconds(1);\n        let store = FakeHoldStore::new(vec![past]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        gate.evaluate(&c, 32, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2);\n        assert_eq!(gate.cached_len(), 0);\n\n        let store = FakeHoldStore::new(vec![hold(33, 330, 30)]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        let c60 = cfg(GateMode::Enforce);\n        assert_eq!(c60.positive_cache_secs, 60);\n        gate.evaluate(&c60, 33, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(33), Some(Duration::from_secs(60)));\n\n        let mut short = hold(34, 340, 30);\n        short.expires_at = clock.now_utc() + chrono::Duration::seconds(90);\n        let store = FakeHoldStore::new(vec![hold(34, 341, 30), short]);\n        let gate = HoldGate::with_clock(Some(store.clone()), clock.clone());\n        gate.evaluate(&c, 34, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.cached_ttl(34), Some(Duration::from_secs(90)));\n        assert_eq!(gate.cached_snapshot(34), Some((vec![341, 340], vec![])));\n",
+      "source_digest": "3c8d9a9b451f63eab29e1e71185dfee5af03ba306699e2d48ce543695285f4bd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c986216194cfa505f5f1c112095f17c5a548f316b6942b7d4d389cf5ab39e220",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "cac56afec57c0585925be23d0d224a3504afa301ba4a98fe68cb8339e5b9bffa",
+      "context_complete": true,
+      "task_id": "T-024a2c6204d41e8ab2ab3022ae057a08856183c8a2ed2292698ad3f5e12c5efa",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1628de39bf3bc359b9c9c08eb98691af2afbe4dc5a6e7683214714912a4e5c0f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-c467fa70b57a67969a5bbc537de853e74f117405c616369b27e33a0f248f2249",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e733b84a6b7ab577896dfd5525eaf5b0be9bee52d87cbaeca8fe5ad318e1f7af",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-94c33d43a47abe338bcf33eea279fb4b676e159a7d0483be3d890345c611679c",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d5e98899cb5d9db48c679ef52b976f05f49b3830472391e092ec26ff45a31bd9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-031c7c5d213b09f84713e2a970a314258b1d6ec68a6d20df9b7551069ce78e28",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f6536850af99f6199bb6be083c6df0f6c7b6cf3c8b0bf8316f009fee367b9467",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-40a186ba02800100237efaa219dc4672bd3f4074a56b08f2b8b2c11e43606d86",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0488f01dc479293f9c161ea95275f93ecf25b4999c7cf2419affe2e18852055f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-42dee108a8386f525d529f24ecea471256a0c32b2d870c53ef7ffbb373e573a8",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-895ba7051935d264c394398908a7b13d15fdf7eedef3f469695b6f3bd652fd24",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-e45cbcb19f9f147bd1ec051b4486a0c34164d6d6e29a156fe7aab3d90b1c8119",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ae5c5b2d5d0653b1ca121081acf89d1b3b805950b41d2a76903b9ef807e18673",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-9b4ffdccdbbdc9bce41697b3c387a089a0b93d89db0508dc0b1a4d1606bf2d83",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4d69d4e7d07c200836fffe642137c57c13c44ef5bebd46922818b55c4567fb99",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-04735faf9a595f1ae685bff12c184f127fc70889586d2ee8b298d8319fa60c57",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b30e79680a7360069d42ded0b365ff329064f91855951fccebb6ad973953afb7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-5cbd80b2c4bceb9991c4dbb2cef2ede8cc7e27b3ec1f4eca30409e5ef05f9f21",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-33264a506a7bad2c5ac58e18f5628190c4886c32e12e6a4f7086e89f231ba6f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-29791fa52bff3a5a1189247b798987b0970b4935f17a5f6feb866c3cc6c2a40e",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-45e7014191cefd43edc5c5c6ca51ee641b0e597da2e769d122e26e68e2304e65",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-64bb1e36ac20e22fbaf0c5a79cd8fcec205c74caa5f05be091ecc3a774041297",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9dfe899919f81871b1c8e4483dd68f4fc67bcd8c3d66701a8b2c6a6f81d24d05",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-2f0f808cde9b51fce62e7a8941f0670f58c8a7b3b48c987aca0b6207febbd04f",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6db12bea1e6f106b742ca66a4cac692683af97637a6088a58b9e08e9fde8d548",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-0adaff06a1bfc0b1c3977fde3fde948314a1706c5916f67c277b3067a9a9ebb5",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-13534887b66ac8f7c5b3024dce539d1e961755f25a0aec9e93cabf2ef2485870",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-974a62dfbbebbb3ffbe4bfe5af006fe8e594239c6283d9df76e27d785eec9d2b",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-905d61b4117ebbcf7b6da54291e0b9f54f624d5838f6ff493b520a365726c2cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-e6373243d5e961be86c5cb11f15c63a623fa8858788d9073e341ae05ac211224",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7eed4cf8662f1cd76b8b2f2b5a75d602ba20ad530276723dc98a1fb89d6a4d75",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-d27f0a011828df44420a29bfc8c7281653e45fb3ca6aeddbc2e13496b770dfbe",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ade0f292cd1d861e791c49f9c1563fb16895f59f4537df5751f5ccf0ab4184ff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-e17fe34da31505e005b5c0381c6de268ed81e80efad605b951457ac5c9516637",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ee0358b0af792797f3bd6c1132f5b3d58d41744c8c2695a5ad03cba13aee20c0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-b71418223097b92e7524d9275c183487b2cc35811a2ceb509e47d5a47fbf87d6",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3f050006da8156d8796c4e55e0ac60d80f60afdfe14d54c50fdd2fb0658d4b05",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-d324809f7ca27c7540629e8904559d85594b0b27f97f157b979657cf9f71d4bc",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-265b9282b8c8e4aa93aca9b70b256cfc5248ffc1ffd14b49ee4e78da1c47d1ba",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-49a857d49de749d5c12d6d7d9b533ccd725671fa6301f117d648b0f8aa69d4e7",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3c9a6c96fec3232740ea50112d16bfe6407d777339913230d911046fa5e06a8d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-3b94f2713b18e9d39212aaaecde61575bf209f0a1369f14c1c278158ed5f9e7b",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-eac0602b9a82c15f830161c334923bba48c1b2b6d8cdc63e0d808c40cb5a5ae5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-1b683e1445d2a1f06492e1275f95d6cfb17d98a84507986b501713c9f20c6292",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c0cc8c8ae10a58c0f3460457b75ce67d5e164387ae85e558aaae25bcecbfeb2b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-201be5da6195579293e003f42ff13800789278f96fdd58694dd8ccf3aa25343c",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-da4e4ab45eb29579c659a487c9602e3edda9e2b919f05745e16201ad7f48e315",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-a098146d7524f300915113b1cc564f935e501f1dd5a2102eade1da938b3193fe",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b2aab25b986acb361ea6a1483a9b8d3100b406c2bc67acaf14d11f4995d59f92",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-23cc5258ea4461c7b64c7ba1f172b1982179db0d9f9e0fa699b97c5efb7b0a0a",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5493ff956b3015603c70c378abeb60ea0d301e8092891fb478257d875fe35b8a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-25058df66d7b230679abe47349289cdf4eb9bd8ef5934ea2bad5a45b7e4b09fd",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2bdaa12f84a1b76a32c06d0d16c8cc71c5dffa5728eb499068a3b24520f26525",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-56389ed390724aad731c30bc2fbbdf7580b57ccf470086b4dc1b6d218fab31ca",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f4509ed73f29b9a3a37a9287832b65a15840366da478d3ef0a858febcc06bdb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "is_future_dated",
+        "system_unix_ms",
+        "label_is_live",
+        "drop_expired_labels",
+        "SafetyLabelSource",
+        "with_clock",
+        "with_clocks",
+        "proto_label"
+      ],
+      "context_complete": false,
+      "task_id": "T-84e05b8c1c346d6e6579d3c6f33ebde774a4bb23a21a6cf324f58cfa4902f37a",
+      "evidence_refs": [
+        "E30"
+      ]
+    }
+  ],
+  "task_id": "T-5819303dcd8206f131f8f8539a71f35122757e1de9f2c36f480800f3740372d9"
+}

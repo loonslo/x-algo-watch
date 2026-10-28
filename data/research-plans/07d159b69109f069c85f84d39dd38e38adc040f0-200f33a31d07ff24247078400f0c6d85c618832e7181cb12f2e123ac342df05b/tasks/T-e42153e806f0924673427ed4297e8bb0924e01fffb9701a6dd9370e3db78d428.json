@@ -1,0 +1,1941 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/models/value_heads.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-3d5e87331cb490e620c9960d81613b83755e7af9fb8f76f685114b1bce712d52",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/models/value_heads.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 362,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport dataclasses\nimport functools\nimport math\n\nimport jax\nimport jax.numpy as jnp\nfrom jax.scipy.special import ndtr\n\nfrom xrex.data.recsys.ads_head_masking import EARLY_RELABEL_STREAM_ID\n\nPURCHASE_VALUE_METRIC_PREFIX = \"purchase-value_delayed_website_clicked\"\nPURCHASE_VALUE_VT_METRIC_PREFIX = \"purchase-value_delayed_website\"\nPURCHASE_VALUE_EMA_KEY = \"purchase_value\"\n\nVALUE_EMA_STATE_SIZE = 10\n\n\n\u0040dataclasses.dataclass(frozen=True)\nclass ValueBinTable:\n    edges: tuple[float, ...]\n    values: tuple[float, ...]\n    prior: tuple[float, ...]\n    smoothing: float\n\n    \u0040property\n    def num_bins(self) -> int:\n        return len(self.edges) + 1\n\n    \u0040property\n    def log_prior(self) -> list[float]:\n        return [math.log(q) for q in self.prior]\n\n    def validate(self, name: str) -> None:\n        edges = self.edges\n        if (\n            len(edges) < 2\n            or any(not math.isfinite(e) or e <= 0 for e in edges)\n            or any(b <= a for a, b in zip(edges, edges[1:]))\n        ):\n            raise ValueError(f\"{name}_bin_edges must be >= 2 positive increasing ratios\")\n        if len(self.values) != self.num_bins or any(\n            not math.isfinite(v) or v <= 0 for v in self.values\n        ):\n            raise ValueError(f\"{name}_bin_values needs one positive value per bin\")\n        if (\n            len(self.prior) != self.num_bins\n            or any(not math.isfinite(q) or q <= 0 for q in self.prior)\n            or abs(sum(self.prior) - 1.0) > 1e-3\n        ):\n            raise ValueError(f\"{name}_bin_prior must be positive per bin and sum to 1\")\n        if not math.isfinite(self.smoothing) or self.smoothing < 0:\n            raise ValueError(f\"{name}_bin_smoothing must be finite and nonnegative\")\n\n    def targets(self, ratio: jax.Array) -> jax.Array:\n        return value_bin_targets(ratio, self.edges, self.smoothing)\n\n    def readout(self, logits: jax.Array) -> jax.Array:\n        return value_bin_readout(logits, self.values)\n\n\ndef value_bin_targets(ratio: jax.Array, edges: tuple[float, ...], smoothing: float) -> jax.Array:\n    edges_arr = jnp.asarray(edges, dtype=jnp.float32)\n    num_bins = edges_arr.shape[0] + 1\n    r = ratio.astype(jnp.float32)\n    if smoothing == 0:\n        return jax.nn.one_hot(jnp.searchsorted(edges_arr, r, side=\"right\"), num_bins)\n    log_edges = jnp.log(edges_arr)\n    sigma = smoothing * (log_edges[-1] - log_edges[0]) / (num_bins - 2)\n    cdf = ndtr((log_edges - jnp.log(r)[..., None]) / sigma)\n    zeros = jnp.zeros_like(cdf[..., :1])\n    return jnp.diff(jnp.concatenate([zeros, cdf, zeros + 1.0], axis=-1), axis=-1)\n\n\ndef value_bin_readout(logits: jax.Array, values: tuple[float, ...]) -> jax.Array:\n    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)\n    return jnp.sum(probs * jnp.asarray(values, dtype=jnp.float32), axis=-1)\n\n\ndef fit_value_bin_table(\n    labels: jax.Array, edges: tuple[float, ...], smoothing: float\n) -> tuple[jax.Array, jax.Array]:\n    y = jnp.asarray(labels, dtype=jnp.float32)\n    t = value_bin_targets(y, edges, smoothing)\n    mass = jnp.sum(t, axis=0)\n    values = jnp.sum(t * y[:, None], axis=0) / jnp.maximum(mass, 1e-12)\n    return values, mass / y.shape[0]\n\n\ndef value_valid_mask(\n    label_valid: jax.Array,\n    padding_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    sample_source: jax.Array,\n    has_click: jax.Array,\n    keeper_mask: jax.Array,\n    lanes: tuple[int, ...] = (EARLY_RELABEL_STREAM_ID,),\n    include_view_through: bool = False,\n) -> jax.Array:\n    in_lane = functools.reduce(\n        jnp.logical_or, [sample_source == lane for lane in lanes], jnp.zeros_like(padding_mask)\n    )\n    clicked = has_click.astype(jnp.bool_) | include_view_through\n    kept = keeper_mask.astype(jnp.bool_) | include_view_through\n    return (\n        label_valid.astype(jnp.bool_)\n        & padding_mask.astype(jnp.bool_)\n        & ~negative_sample_mask.astype(jnp.bool_)\n        & in_lane\n        & clicked\n        & kept\n    )\n\n\ndef value_valid_weights(\n    ratio: jax.Array,\n    baseline: jax.Array,\n    valid_mask: jax.Array,\n    raw_weights: jax.Array | None,\n) -> tuple[jax.Array, jax.Array]:\n    ratio = ratio.astype(jnp.float32)\n    baseline = baseline.astype(jnp.float32)\n    valid = (\n        valid_mask.astype(jnp.bool_)\n        & jnp.isfinite(ratio)\n        & (ratio > 0)\n        & jnp.isfinite(baseline)\n        & (baseline > 0)\n    )\n    weights = jnp.ones_like(ratio) if raw_weights is None else raw_weights.astype(jnp.float32)\n    valid = valid & jnp.isfinite(weights) & (weights > 0)\n    return valid, jnp.where(valid, weights, 0.0)\n\n\ndef value_sums_key(metric_prefix: str) -> str:\n    return f\"_{metric_prefix}-sums\"\n\n\ndef value_binned_sums_key(metric_prefix: str) -> str:\n    return f\"_{metric_prefix}-binned-sums\"\n\n\ndef _trained_loss(\n    loss_sum: jax.Array, row_denominator: jax.Array, loss_denominator: jax.Array | None\n) -> jax.Array:\n    if loss_denominator is None:\n        return loss_sum / row_denominator\n    return loss_sum / (loss_denominator.astype(jnp.float32) + 1e-10)\n\n\ndef value_ratio_stats(sums: jax.Array, metric_prefix: str) -> dict[str, jax.Array]:\n    denominator = jnp.where(sums[4] > 0, sums[4], 1.0)\n    return {\n        f\"{metric_prefix}-loss\": sums[0] / denominator,\n        f\"{metric_prefix}-valid-count\": sums[5],\n        f\"{metric_prefix}-weight-sum\": sums[4],\n        f\"{metric_prefix}-ratio-mae\": sums[1] / denominator,\n        f\"{metric_prefix}-target-ratio\": sums[2] / denominator,\n        f\"{metric_prefix}-baseline-mean-usd\": sums[3] / denominator,\n        f\"{metric_prefix}-usd-mae\": sums[7] / denominator,\n        f\"{metric_prefix}-calib\": sums[8] / (sums[2] + 1e-12),\n    }\n\n\ndef value_ratio_loss_compute(\n    raw_ratio: jax.Array,\n    pred_ratio: jax.Array,\n    baseline_mean_usd: jax.Array,\n    valid_mask: jax.Array,\n    metric_prefix: str,\n    delta: float = 1.0,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n    loss_denominator: jax.Array | None = None,\n) -> tuple[jax.Array, dict[str, jax.Array]]:\n    if not 0 < delta < float(\"inf\"):\n        raise ValueError(\"value head Huber delta must be finite and positive\")\n    ratio = raw_ratio.astype(jnp.float32)\n    baseline = baseline_mean_usd.astype(jnp.float32)\n    pred = pred_ratio.astype(jnp.float32)\n    valid, weights = value_valid_weights(ratio, baseline, valid_mask, raw_weights)\n    target = jnp.where(valid, ratio, 0.0)\n    error = jnp.where(valid, jnp.where(valid, pred, 0.0) - target, 0.0)\n    abs_error = jnp.abs(error)\n    quadratic = jnp.minimum(abs_error, delta)\n    errors = 0.5 * quadratic**2 + delta * (abs_error - quadratic)\n    weight_sum = jnp.sum(weights)\n    if normalizer is None:\n        normalizer = weight_sum\n    row_denominator = jnp.where(normalizer > 0, normalizer, 1.0)\n    loss = _trained_loss(jnp.sum(errors * weights), row_denominator, loss_denominator)\n    usd_abs_error = abs_error * jnp.where(valid, baseline, 0.0)\n    sums = jnp.stack(\n        [\n            jnp.sum(errors * weights),\n            jnp.sum(abs_error * weights),\n            jnp.sum(target * weights),\n            jnp.sum(jnp.where(valid, baseline, 0.0) * weights),\n            weight_sum,\n            jnp.sum(valid).astype(jnp.float32),\n            jnp.sum(jnp.abs(1.0 - target) * weights),\n            jnp.sum(usd_abs_error * weights),\n            jnp.sum(jnp.where(valid, pred, 0.0) * weights),\n        ]\n    )\n    stats = value_ratio_stats(sums, metric_prefix)\n    stats[value_sums_key(metric_prefix)] = sums\n    return loss, stats\n\n\ndef value_binned_stats(sums: jax.Array, metric_prefix: str) -> dict[str, jax.Array]:\n    denominator = jnp.where(sums[4] > 0, sums[4], 1.0)\n    return {\n        f\"{metric_prefix}-binned-ce\": sums[0] / denominator,\n        f\"{metric_prefix}-binned-entropy\": sums[1] / denominator,\n        f\"{metric_prefix}-binned-top-prob\": sums[2] / denominator,\n        f\"{metric_prefix}-binned-overflow-prob\": sums[3] / denominator,\n    }\n\n\ndef value_binned_loss_compute(\n    raw_ratio: jax.Array,\n    bin_logits: jax.Array,\n    baseline_mean_usd: jax.Array,\n    valid_mask: jax.Array,\n    bins: ValueBinTable,\n    metric_prefix: str,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n    loss_denominator: jax.Array | None = None,\n) -> tuple[jax.Array, dict[str, jax.Array]]:\n    ratio = raw_ratio.astype(jnp.float32)\n    baseline = baseline_mean_usd.astype(jnp.float32)\n    valid, weights = value_valid_weights(ratio, baseline, valid_mask, raw_weights)\n    targets = bins.targets(jnp.where(valid, ratio, 1.0))\n    log_probs = jax.nn.log_softmax(bin_logits.astype(jnp.float32), axis=-1)\n    ce = jnp.where(valid, -jnp.sum(targets * log_probs, axis=-1), 0.0)\n    weight_sum = jnp.sum(weights)\n    if normalizer is None:\n        normalizer = weight_sum\n    row_denominator = jnp.where(normalizer > 0, normalizer, 1.0)\n    loss = _trained_loss(jnp.sum(ce * weights), row_denominator, loss_denominator)\n    probs = jnp.exp(log_probs)\n    entropy = jnp.where(valid, -jnp.sum(probs * log_probs, axis=-1), 0.0)\n    top_prob = jnp.where(valid, jnp.max(probs, axis=-1), 0.0)\n    overflow_prob = jnp.where(valid, probs[..., -1], 0.0)\n    sums = jnp.stack(\n        [\n            jnp.sum(ce * weights),\n            jnp.sum(entropy * weights),\n            jnp.sum(top_prob * weights),\n            jnp.sum(overflow_prob * weights),\n            weight_sum,\n        ]\n    )\n    stats = value_binned_stats(sums, metric_prefix)\n    stats[value_binned_sums_key(metric_prefix)] = sums\n    return loss, stats\n\n\ndef value_head_loss_compute(\n    raw_ratio: jax.Array,\n    baseline_mean_usd: jax.Array,\n    valid_mask: jax.Array,\n    metric_prefix: str,\n    *,\n    pred_ratio: jax.Array,\n    bin_logits: jax.Array | None = None,\n    bins: ValueBinTable | None = None,\n    huber_delta: float = 1.0,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n    loss_denominator: jax.Array | None = None,\n) -> tuple[jax.Array, dict[str, jax.Array]]:\n    loss, stats = value_ratio_loss_compute(\n        raw_ratio,\n        pred_ratio,\n        baseline_mean_usd,\n        valid_mask,\n        metric_prefix,\n        delta=huber_delta,\n        raw_weights=raw_weights,\n        normalizer=normalizer,\n        loss_denominator=loss_denominator,\n    )\n    if bins is None:\n        return loss, stats\n    if bin_logits is None:\n        raise ValueError(f\"{metric_prefix}: a binned value head needs its bin logits\")\n    loss, binned_stats = value_binned_loss_compute(\n        raw_ratio,\n        bin_logits,\n        baseline_mean_usd,\n        valid_mask,\n        bins,\n        metric_prefix,\n        raw_weights,\n        normalizer=normalizer,\n        loss_denominator=loss_denominator,\n    )\n    stats.update(binned_stats)\n    return loss, stats\n\n\ndef value_head_stats(sums: dict[str, jax.Array], metric_prefix: str) -> dict[str, jax.Array]:\n    stats = value_ratio_stats(sums[value_sums_key(metric_prefix)], metric_prefix)\n    binned = sums.get(value_binned_sums_key(metric_prefix))\n    if binned is not None:\n        stats.update(value_binned_stats(binned, metric_prefix))\n    return stats\n\n\ndef value_smoothed_stats(\n    sums: jax.Array,\n    slice_count: jax.Array,\n    rce_ema: dict[str, jax.Array],\n    batch_size: jax.Array,\n    smoothing_windows: tuple[int, ...],\n    ema_key: str,\n    metric_prefix: str,\n) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:\n    batch_stat = jnp.concatenate([sums, slice_count.astype(jnp.float32)[None]])\n    a = jnp.minimum(1.0, batch_size / jnp.array(smoothing_windows, dtype=jnp.float32))[:, None]\n    old = jnp.stack(\n        [\n            rce_ema.get(f\"{ema_key}/{ws}\", jnp.zeros((VALUE_EMA_STATE_SIZE,), dtype=jnp.float32))\n            for ws in smoothing_windows\n        ]\n    )\n    raw_updated = (1.0 - a) * old + a * batch_stat[None, :]\n    updated = jnp.where(\n        jnp.isnan(raw_updated),\n        jnp.where(jnp.isnan(old), batch_stat[None, :], old),\n        raw_updated,\n    )\n    weight = jnp.maximum(updated[:, 4], 1e-12)\n    has_labels = updated[:, 5] > 0\n    stats: dict[str, jax.Array] = {}\n    new_ema: dict[str, jax.Array] = {}\n    for i, ws in enumerate(smoothing_windows):\n        new_ema[f\"{ema_key}/{ws}\"] = updated[i]\n        prefix = f\"{metric_prefix}-smoothed\"\n        for name, col in (\n            (\"loss\", 0),\n            (\"ratio-mae\", 1),\n            (\"target-ratio\", 2),\n            (\"baseline-mean-usd\", 3),\n            (\"usd-mae\", 7),\n        ):\n            stats[f\"{prefix}-{name}-{ws}\"] = jnp.where(\n                has_labels[i], updated[i, col] / weight[i], 0.0\n            )\n        stats[f\"{prefix}-mae-vs-prior-{ws}\"] = jnp.where(\n            updated[i, 6] > 0, updated[i, 1] / jnp.maximum(updated[i, 6], 1e-12), 0.0\n        )\n        stats[f\"{prefix}-calib-{ws}\"] = jnp.where(\n            updated[i, 2] > 0, updated[i, 8] / jnp.maximum(updated[i, 2], 1e-12), 0.0\n        )\n        stats[f\"{prefix}-ratio-valid-{ws}\"] = updated[i, 5] / jnp.maximum(updated[i, 9], 1.0)\n        stats[f\"{prefix}-valid-count-{ws}\"] = updated[i, 5]\n    return stats, new_ema\n",
+      "source_digest": "e3e2c7a131aa8739b8758dcaaff44aef7a990e30a65990c738429da2849130b8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1575,
+      "end_line": 1599,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .chain(snap.unreadable.keys().cloned())\n            .collect();\n        page_managed.sort();\n        PodActionControlView {\n            loaded: snap.loaded_at.is_some(),\n            snapshot_age_ms: self.snapshot_age_ms(),\n            stale: self.is_stale(),\n            records: snap.records.len(),\n            page_managed,\n        }\n    }\n\n            pub fn validate(\n        req: &ActionControlPutRequest,\n        seen: &[ActionControlSeen],\n    ) -> Result<(), SetError> {\n        let bad = |code: &'static str, msg: String| Err(SetError::Invalid(code, msg));\n        if !valid_name(&req.head) {\n            return bad(\n                \"invalid_head\",\n                format!(\"head must be 1-{MAX_NAME_LEN} characters of [A-Za-z0-9_.:\u0040-]\"),\n            );\n        }\n        if req.classifier.as_deref().is_some_and(|c| !valid_name(c)) {\n            return bad(\n",
+      "source_digest": "56a8deac71f976be76e4da74a8c16eed813f2f504fccfa06c3e16e62166b68fd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1863,
+      "end_line": 1887,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        now_ms: i64,\n        cfg: &ControlConfig,\n        safety: &SafetyChecksByEntity,\n        deadline: Instant,\n    ) -> Result<SetOutcome, SetError> {\n        if cfg.ignore_store {\n            return Err(SetError::Ignored);\n        }\n        let seen = self\n            .scan_seen()\n            .await\n            .map_err(|e| SetError::Store(format!(\"the seen list could not be read: {e}\")))?;\n        Self::validate(&req, &seen)?;\n        levels::validate_confidence(&req, now_ms)?;\n        if req.mode == ControlMode::Rows || req.confidence.is_some() {\n            return self\n                .set_rows(req, who, key_id, now_ms, cfg, safety, &seen, deadline)\n                .await;\n        }\n        let is_rows = |stored: Option<(Option<ActionControlRecord>, u64)>| {\n            stored.is_some_and(|(r, _)| r.is_some_and(|r| r.mode == ControlMode::Rows))\n        };\n        let head_lkey = lkey_for(req.entity_type, &req.head, None, None);\n        let classifier_lkey = req\n            .classifier\n",
+      "source_digest": "295915b33752e8e1c22f03f609278d1c1e0a542eb242d821d93aaf378a0fc057",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1864,
+      "end_line": 1888,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        cfg: &ControlConfig,\n        safety: &SafetyChecksByEntity,\n        deadline: Instant,\n    ) -> Result<SetOutcome, SetError> {\n        if cfg.ignore_store {\n            return Err(SetError::Ignored);\n        }\n        let seen = self\n            .scan_seen()\n            .await\n            .map_err(|e| SetError::Store(format!(\"the seen list could not be read: {e}\")))?;\n        Self::validate(&req, &seen)?;\n        levels::validate_confidence(&req, now_ms)?;\n        if req.mode == ControlMode::Rows || req.confidence.is_some() {\n            return self\n                .set_rows(req, who, key_id, now_ms, cfg, safety, &seen, deadline)\n                .await;\n        }\n        let is_rows = |stored: Option<(Option<ActionControlRecord>, u64)>| {\n            stored.is_some_and(|(r, _)| r.is_some_and(|r| r.mode == ControlMode::Rows))\n        };\n        let head_lkey = lkey_for(req.entity_type, &req.head, None, None);\n        let classifier_lkey = req\n            .classifier\n            .as_deref()\n",
+      "source_digest": "88fac359692caa1df532dafae3d863c112f304e4e4c14c973778ba72013f5897",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 527,
+      "end_line": 551,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return bad(\n                \"invalid_override\",\n                \"an evidence override belongs on a live low, mid or high row\".into(),\n            );\n        }\n        if let Some(p) = confidence::override_problem(ov, now_ms) {\n            return bad(\"invalid_override\", p);\n        }\n    }\n    Ok(())\n}\n\npub(super) fn validate_confidence(\n    req: &ActionControlPutRequest,\n    now_ms: i64,\n) -> Result<(), SetError> {\n    let bad = |code: &'static str, msg: String| Err(SetError::Invalid(code, msg));\n    if req.confidence.is_some() && req.band.is_some() {\n        return bad(\n            \"invalid_scope\",\n            \"a record is keyed by band or by row, not both\".into(),\n        );\n    }\n    if req.rows.is_some() && req.mode != ControlMode::Rows {\n        return bad(\n",
+      "source_digest": "3decef695b0544a79c37959d991f7fadd9a5534eabdb8a249a43338ea077ee52",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 767,
+      "end_line": 791,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                updated_by: who.to_owned(),\n                key_id: key_id.to_owned(),\n                updated_at_ms: now_ms,\n                version,\n                write_nonce: new_nonce(),\n                confidence: row,\n                evidence: evidence.map(Box::new),\n                evidence_override: evidence_override.map(Box::new),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n",
+      "source_digest": "2fc6ec7b6a28c25b01a984ce727b41c6ff4034f301922059f5bffe7a04a0e903",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 772,
+      "end_line": 796,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                confidence: row,\n                evidence: evidence.map(Box::new),\n                evidence_override: evidence_override.map(Box::new),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n",
+      "source_digest": "852248695631d0fbe05fefe325150f2e773856751dd73ada95a2473695850ec7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 773,
+      "end_line": 797,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                evidence: evidence.map(Box::new),\n                evidence_override: evidence_override.map(Box::new),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n                            s.actions.clone(),\n",
+      "source_digest": "98b9b01a301057f6757f7732ba059580e1b5e3b0eafc759fefa4bccf9d8fbed8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 774,
+      "end_line": 798,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                evidence_override: evidence_override.map(Box::new),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n                            s.actions.clone(),\n                            s.evidence.clone(),\n",
+      "source_digest": "067813670ae3c4add496ee0524f9a1356770d6472f0f28766fff56f542616d89",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 576,
+      "end_line": 600,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .any(|e| e.field_id == 4 && e.name == \"aisException\"),\n            \"schema must declare aisException as result field 4: {:?}\",\n            method\n                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n",
+      "source_digest": "626e27dd1c67571c93fd741c953a769803a4d1a7969f0cdfca90af8d4dfc6780",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 579,
+      "end_line": 603,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n        let decoded = t\n            .decode_method_response(&bytes, &method)\n            .expect(\"declared aisException must decode, not hard-fail\");\n",
+      "source_digest": "546305a603835b236e946ce930937ccf33b6b4995294acf6091441e6f3af4be0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 728,
+      "end_line": 752,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if !cfg.page_keys.contains(key_id) {\n            return Err(RunError::Forbidden(\n                \"not_page_key\",\n                format!(\"key {key_id} is not one of this service's page keys\"),\n            ));\n        }\n        let Some(who) = who else {\n            return Err(RunError::Forbidden(\n                \"person_required\",\n                \"the X-Updated-By header must name the signed-in person\".into(),\n            ));\n        };\n        validate_start(&req, cfg, now_ms)?;\n        if let Some(existing) = self\n            .stored(&req.run_id)\n            .await\n            .map_err(|e| RunError::Store(e.to_string()))?\n        {\n            if same_run(&existing, &req) {\n                let stop = self\n                    .stop_marker(&req.run_id)\n                    .await\n                    .map_err(|e| RunError::Store(e.to_string()))?;\n                let never_ran = stop.as_ref().is_some_and(|s| s.start_conflict)\n                    || (!started(&existing)\n",
+      "source_digest": "160c740d483df804705abd55f0395a5bf16350c43578f77ed1c7ae162a891f56",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1214,
+      "end_line": 1238,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        let written = self.write(&next).await?;\n        if change == Change::Resume\n            && hold.is_some()\n            && let Err(e) = self.store.delete(HOLD_PKEY, run_id).await\n        {\n            warn!(run_id, \"backfill run hold delete after resume failed: {e}\");\n        }\n        Ok(written)\n    }\n}\n\nfn validate_start(\n    req: &BackfillRunStartRequest,\n    cfg: &BackfillConfig,\n    now_ms: i64,\n) -> Result<(), RunError> {\n    let bad = |code: &'static str, detail: String| Err(RunError::Invalid(code, detail));\n    if req.confirm.as_deref() != Some(CONFIRM_WORD) {\n        return bad(\n            \"confirm_required\",\n            format!(\"starting a run needs confirm: \\\"{CONFIRM_WORD}\\\"\"),\n        );\n    }\n    if !valid_run_id(&req.run_id) {\n",
+      "source_digest": "cde3fe37739f62c54b831677a3c7c4c1312626447416caec225e09f9bb554b85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/validate_rules_yaml.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 19,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::process::ExitCode;\n\nuse xai_abuse_enforcement_service::rules::CompiledRules;\n\nfn main() -> ExitCode {\n    let Some(path) = std::env::args().nth(1) else {\n        eprintln!(\"usage: validate-rules-yaml <path-to-rules.yaml>\");\n        return ExitCode::FAILURE;\n    };\n    let src = match std::fs::read_to_string(&path) {\n        Ok(s) => s,\n        Err(e) => {\n            eprintln!(\"error: cannot read {path}: {e}\");\n            return ExitCode::FAILURE;\n        }\n    };\n    match CompiledRules::from_yaml(&src) {\n        Ok(compiled) => {\n            let ids: Vec<&str> = compiled.rule_ids().collect();\n",
+      "source_digest": "f33917b111b67bd40b326c636ca713dd69a5365411d5b37e42e2ebd34ee3771d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 474,
+      "end_line": 498,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .put_with_ttl(pkey, value.to_vec(), deadline)\n            .await\n        {\n            Ok(()) => true,\n            Err(e) => {\n                warn!(\"Manhattan dedup update failed: {e}\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                false\n            }\n        }\n    }\n\n                                                                        pub async fn invalidate(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        claim_nonce: Option<u64>,\n    ) {\n        let pkey = Self::pkey(entity_type, entity_id);\n        match self.slot_view(&pkey).await {\n            SlotView::Held(meta) => {\n                if meta.kind == HeldKind::Outcome {\n                    info!(\n                        pkey,\n                        held_class = meta.class,\n",
+      "source_digest": "65d057f1e6bfbccc1a5b06239e24cffa5398ab0771825c2a69151d59cda560ab",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 487,
+      "end_line": 511,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        claim_nonce: Option<u64>,\n    ) {\n        let pkey = Self::pkey(entity_type, entity_id);\n        match self.slot_view(&pkey).await {\n            SlotView::Held(meta) => {\n                if meta.kind == HeldKind::Outcome {\n                    info!(\n                        pkey,\n                        held_class = meta.class,\n                        \"dedup: invalidate left terminal outcome in place\"\n                    );\n                    return;\n                }\n                if claim_nonce.is_none() || meta.nonce != claim_nonce {\n                    info!(pkey, \"dedup: invalidate left foreign claim in place\");\n                    return;\n                }\n                if self\n                    .restore_displaced(&pkey, &meta, claim_nonce, \"invalidate\")\n                    .await\n                {\n                    return;\n",
+      "source_digest": "796230e044298423b4d730d41f1512d37852b72886891bc059e239ed7e076e7a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 492,
+      "end_line": 516,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let pkey = Self::pkey(entity_type, entity_id);\n        match self.slot_view(&pkey).await {\n            SlotView::Held(meta) => {\n                if meta.kind == HeldKind::Outcome {\n                    info!(\n                        pkey,\n                        held_class = meta.class,\n                        \"dedup: invalidate left terminal outcome in place\"\n                    );\n                    return;\n                }\n                if claim_nonce.is_none() || meta.nonce != claim_nonce {\n                    info!(pkey, \"dedup: invalidate left foreign claim in place\");\n                    return;\n                }\n                if self\n                    .restore_displaced(&pkey, &meta, claim_nonce, \"invalidate\")\n                    .await\n                {\n                    return;\n                }\n            }\n            SlotView::Empty => {}\n            SlotView::Unknown => return,\n        }\n",
+      "source_digest": "383050d4ccf949aff66358d0dcb4436a8810f50459f28d38c929b5a4b2042d16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 496,
+      "end_line": 520,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    info!(\n                        pkey,\n                        held_class = meta.class,\n                        \"dedup: invalidate left terminal outcome in place\"\n                    );\n                    return;\n                }\n                if claim_nonce.is_none() || meta.nonce != claim_nonce {\n                    info!(pkey, \"dedup: invalidate left foreign claim in place\");\n                    return;\n                }\n                if self\n                    .restore_displaced(&pkey, &meta, claim_nonce, \"invalidate\")\n                    .await\n                {\n                    return;\n                }\n            }\n            SlotView::Empty => {}\n            SlotView::Unknown => return,\n        }\n        if let Err(e) = self.store.delete(&pkey).await {\n            warn!(\"Manhattan dedup delete failed: {e}\");\n            crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n        }\n",
+      "source_digest": "392f1c7be5d2e2c77cb1f99bac55c6c38736f4a83589c5a8b407751e6a2aeb77",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 583,
+      "end_line": 607,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: &[u8],\n        acted_class: u8,\n        claim_nonce: Option<u64>,\n    );\n    async fn update_skip(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        value: &[u8],\n        acted_class: u8,\n        claim_nonce: Option<u64>,\n    );\n    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>);\n}\n\n#[async_trait::async_trait]\nimpl DedupSlot for ManhattanDedupCache {\n    async fn try_insert(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        incoming_class: u8,\n    ) -> DedupCheck {\n        ManhattanDedupCache::try_insert(self, entity_type, entity_id, incoming_class).await\n    }\n",
+      "source_digest": "76150df2f1d568624a0be1b8b477baf196f4729e1b1d017cea18137248befbd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 640,
+      "end_line": 664,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        claim_nonce: Option<u64>,\n    ) {\n        ManhattanDedupCache::update_skip(\n            self,\n            entity_type,\n            entity_id,\n            value,\n            acted_class,\n            claim_nonce,\n        )\n        .await\n    }\n    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>) {\n        ManhattanDedupCache::invalidate(self, entity_type, entity_id, claim_nonce).await\n    }\n}\n\n#[cfg(test)]\npub(crate) mod test_support {\n    use std::collections::HashMap;\n    use std::sync::Mutex;\n\n    use super::*;\n\n                            type Slot = (u8, bool, Option<u64>);\n",
+      "source_digest": "a7008f1658f1af7ad75fa459578adabdeb2acdfbc6819003f8b3158bb9e59e24",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 641,
+      "end_line": 665,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) {\n        ManhattanDedupCache::update_skip(\n            self,\n            entity_type,\n            entity_id,\n            value,\n            acted_class,\n            claim_nonce,\n        )\n        .await\n    }\n    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>) {\n        ManhattanDedupCache::invalidate(self, entity_type, entity_id, claim_nonce).await\n    }\n}\n\n#[cfg(test)]\npub(crate) mod test_support {\n    use std::collections::HashMap;\n    use std::sync::Mutex;\n\n    use super::*;\n\n                            type Slot = (u8, bool, Option<u64>);\n\n",
+      "source_digest": "e21a138b06285281292123f62b1ded16a384c3ed65612f3099a3ae615cd7914d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 768,
+      "end_line": 792,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        async fn update_skip(&self, et: EntityType, id: i64, _v: &[u8], class: u8, n: Option<u64>) {\n            let key = (et.as_str().to_owned(), id);\n            let mut slots = self.slots.lock().unwrap();\n            let kept = self.own_carry(&slots, &key, n).unwrap_or(CLASS_NONE);\n            slots.insert(key, (kept, false, None));\n            drop(slots);\n            self.log(format!(\n                \"update_skip(class={class},own_claim={})\",\n                n.is_some()\n            ));\n        }\n\n        async fn invalidate(&self, et: EntityType, id: i64, n: Option<u64>) {\n            let key = (et.as_str().to_owned(), id);\n            let mut slots = self.slots.lock().unwrap();\n            if let Some(c) = self.own_carry(&slots, &key, n) {\n                slots.insert(key, (c, false, None));\n            } else if let Some((_, true, held)) = slots.get(&key)\n                && n.is_some()\n                && *held == n\n            {\n                slots.remove(&key);\n            }\n            drop(slots);\n            self.log(format!(\"invalidate(own_claim={})\", n.is_some()));\n",
+      "source_digest": "3343b64fe480bca0463b9c710269b21875fe348e7f02331a8027e32949bc634f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 780,
+      "end_line": 804,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        async fn invalidate(&self, et: EntityType, id: i64, n: Option<u64>) {\n            let key = (et.as_str().to_owned(), id);\n            let mut slots = self.slots.lock().unwrap();\n            if let Some(c) = self.own_carry(&slots, &key, n) {\n                slots.insert(key, (c, false, None));\n            } else if let Some((_, true, held)) = slots.get(&key)\n                && n.is_some()\n                && *held == n\n            {\n                slots.remove(&key);\n            }\n            drop(slots);\n            self.log(format!(\"invalidate(own_claim={})\", n.is_some()));\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn zstd_json(v: serde_json::Value) -> Vec<u8> {\n        zstd::encode_all(v.to_string().as_bytes(), 3).unwrap()\n    }\n\n",
+      "source_digest": "b4c36c1814156b87a3a8dcff049c61abc01fbaf50b43ee491761cdca6f2cd97a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1118,
+      "end_line": 1142,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        {\n            DedupCheck::ClassBypass {\n                held_class: CLASS_LABEL,\n                claim_nonce: Some(n),\n            } => n,\n            other => panic!(\"expected a bypass over the label, got {other:?}\"),\n        }\n    }\n\n    #[tokio::test]\n    async fn own_bypass_skip_restores_the_held_bytes_with_their_remaining_lifetime() {\n        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;\n        for invalidate in [false, true] {\n            let (store, cache, held, exp) = cache_holding_a_label();\n            let nonce = bypass(&cache).await;\n            store.take_puts();\n            if invalidate {\n                cache.invalidate(EntityType::User, USER, Some(nonce)).await;\n            } else {\n                cache\n                    .update_skip(EntityType::User, USER, b\"skip\", CLASS_NONE, Some(nonce))\n                    .await;\n            }\n            let puts = store.take_puts();\n            assert_eq!(puts.len(), 1, \"one restore write ({invalidate})\");\n",
+      "source_digest": "81bc48bb7a302e5ccf4db63db5dab230a27a2ecead88cc914e039c38b61e6439",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1122,
+      "end_line": 1146,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            } => n,\n            other => panic!(\"expected a bypass over the label, got {other:?}\"),\n        }\n    }\n\n    #[tokio::test]\n    async fn own_bypass_skip_restores_the_held_bytes_with_their_remaining_lifetime() {\n        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;\n        for invalidate in [false, true] {\n            let (store, cache, held, exp) = cache_holding_a_label();\n            let nonce = bypass(&cache).await;\n            store.take_puts();\n            if invalidate {\n                cache.invalidate(EntityType::User, USER, Some(nonce)).await;\n            } else {\n                cache\n                    .update_skip(EntityType::User, USER, b\"skip\", CLASS_NONE, Some(nonce))\n                    .await;\n            }\n            let puts = store.take_puts();\n            assert_eq!(puts.len(), 1, \"one restore write ({invalidate})\");\n            let (pkey, bytes, deadline) = &puts[0];\n            assert_eq!(pkey, \"7\");\n            assert_eq!(bytes, &held, \"the original bytes, not the skip\");\n            assert!(\n",
+      "source_digest": "d25329da98c64940c1187d88de96d769c74b0affebb8b263501f45835bb548d8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1652,
+      "end_line": 1676,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .chain(snap.unreadable.keys().cloned())\n            .collect();\n        page_managed.sort();\n        PodActionControlView {\n            loaded: snap.loaded_at.is_some(),\n            snapshot_age_ms: self.snapshot_age_ms(),\n            stale: self.is_stale(),\n            records: snap.records.len(),\n            page_managed,\n        }\n    }\n\n            pub fn validate(\n        req: &ActionControlPutRequest,\n        seen: &[ActionControlSeen],\n    ) -> Result<(), SetError> {\n        let bad = |code: &'static str, msg: String| Err(SetError::Invalid(code, msg));\n        if !valid_name(&req.head) {\n            return bad(\n                \"invalid_head\",\n                format!(\"head must be 1-{MAX_NAME_LEN} characters of [A-Za-z0-9_.:\u0040-]\"),\n            );\n        }\n        if req.classifier.as_deref().is_some_and(|c| !valid_name(c)) {\n            return bad(\n",
+      "source_digest": "56a8deac71f976be76e4da74a8c16eed813f2f504fccfa06c3e16e62166b68fd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1983,
+      "end_line": 2007,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        now_ms: i64,\n        cfg: &ControlConfig,\n        safety: &SafetyChecksByEntity,\n        deadline: Instant,\n    ) -> Result<SetOutcome, SetError> {\n        if cfg.ignore_store {\n            return Err(SetError::Ignored);\n        }\n        let seen = self\n            .scan_seen()\n            .await\n            .map_err(|e| SetError::Store(format!(\"the seen list could not be read: {e}\")))?;\n        Self::validate(&req, &seen)?;\n        levels::validate_confidence(&req, now_ms)?;\n        if req.mode == ControlMode::Rows || req.confidence.is_some() {\n            return self\n                .set_rows(req, who, key_id, now_ms, cfg, safety, &seen, deadline)\n                .await;\n        }\n        let is_rows = |stored: Option<(Option<ActionControlRecord>, u64)>| {\n            stored.is_some_and(|(r, _)| r.is_some_and(|r| r.mode == ControlMode::Rows))\n        };\n        let head_lkey = lkey_for(req.entity_type, &req.head, None, None);\n        let classifier_lkey = req\n            .classifier\n",
+      "source_digest": "295915b33752e8e1c22f03f609278d1c1e0a542eb242d821d93aaf378a0fc057",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1984,
+      "end_line": 2008,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        cfg: &ControlConfig,\n        safety: &SafetyChecksByEntity,\n        deadline: Instant,\n    ) -> Result<SetOutcome, SetError> {\n        if cfg.ignore_store {\n            return Err(SetError::Ignored);\n        }\n        let seen = self\n            .scan_seen()\n            .await\n            .map_err(|e| SetError::Store(format!(\"the seen list could not be read: {e}\")))?;\n        Self::validate(&req, &seen)?;\n        levels::validate_confidence(&req, now_ms)?;\n        if req.mode == ControlMode::Rows || req.confidence.is_some() {\n            return self\n                .set_rows(req, who, key_id, now_ms, cfg, safety, &seen, deadline)\n                .await;\n        }\n        let is_rows = |stored: Option<(Option<ActionControlRecord>, u64)>| {\n            stored.is_some_and(|(r, _)| r.is_some_and(|r| r.mode == ControlMode::Rows))\n        };\n        let head_lkey = lkey_for(req.entity_type, &req.head, None, None);\n        let classifier_lkey = req\n            .classifier\n            .as_deref()\n",
+      "source_digest": "88fac359692caa1df532dafae3d863c112f304e4e4c14c973778ba72013f5897",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 691,
+      "end_line": 715,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return bad(\"invalid_override\", p);\n        }\n    }\n    if rollout_bp.is_some_and(|bp| bp > ROLLOUT_ALL_BP) {\n        return bad(\n            \"invalid_rollout\",\n            format!(\"the {r} row's rollout is 0 to {ROLLOUT_ALL_BP} basis points (0% to 100%)\"),\n        );\n    }\n    Ok(())\n}\n\npub(super) fn validate_confidence(\n    req: &ActionControlPutRequest,\n    now_ms: i64,\n) -> Result<(), SetError> {\n    let bad = |code: &'static str, msg: String| Err(SetError::Invalid(code, msg));\n    if req.confidence.is_some() && req.band.is_some() {\n        return bad(\n            \"invalid_scope\",\n            \"a record is keyed by band or by row, not both\".into(),\n        );\n    }\n    if req.rows.is_some() && req.mode != ControlMode::Rows {\n        return bad(\n",
+      "source_digest": "8c582ee3b1a745edd4aa6a16ea5c531fee9e1116875b1f5f33a5bb341d2dad86",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 956,
+      "end_line": 980,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                updated_at_ms: now_ms,\n                version,\n                write_nonce: new_nonce(),\n                confidence: row,\n                evidence: evidence.map(Box::new),\n                evidence_override: evidence_override.map(Box::new),\n                admit_unlisted_labels: false,\n                rollout_bp: rollout_bp.filter(|&bp| bp < ROLLOUT_ALL_BP),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n",
+      "source_digest": "7569e80fea72c6d07a7ad7871d745b299ad2f2449082b35c48bf16253f342aec",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 961,
+      "end_line": 985,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                evidence_override: evidence_override.map(Box::new),\n                admit_unlisted_labels: false,\n                rollout_bp: rollout_bp.filter(|&bp| bp < ROLLOUT_ALL_BP),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n",
+      "source_digest": "7eec42f0ae1736951f6904c2560162b4dcb056c9e9e4c495838efc369f55909f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 962,
+      "end_line": 986,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                admit_unlisted_labels: false,\n                rollout_bp: rollout_bp.filter(|&bp| bp < ROLLOUT_ALL_BP),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n                            s.actions.clone(),\n",
+      "source_digest": "9a9a0f09125ac2d7e26ead81dd0d0af553d2ea9926e9592b44ad11a167880301",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control/levels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 963,
+      "end_line": 987,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                rollout_bp: rollout_bp.filter(|&bp| bp < ROLLOUT_ALL_BP),\n            };\n            rec.v = rec.schema_version();\n            rec\n        };\n        let targets: Vec<LevelRow> = match req.confidence {\n            Some(row) => vec![row],\n            None if leaving => Vec::new(),\n            None => LevelRow::ALL.to_vec(),\n        };\n        let mut writes: Vec<RowWrite> = Vec::with_capacity(targets.len());\n        let mut befores: Vec<Option<ActionControlRecord>> = Vec::with_capacity(targets.len());\n        for row in targets {\n            let lkey = level_lkey(entity, &req.head, classifier, row);\n            let prior = self.get_raw(&lkey).await?;\n            let version = prior.as_deref().map(raw_version);\n            let before = prior.as_deref().and_then(|b| parse_record(b).ok());\n            let (setting, expected) = if moving {\n                let s = req.rows.as_ref().and_then(|rows| rows.get(row));\n                (\n                    s.map(|s| {\n                        (\n                            s.mode,\n                            s.actions.clone(),\n                            s.evidence.clone(),\n",
+      "source_digest": "4928fc8e96ec723790ff30cacbdde53ca22653eff98573769b1212269f30c693",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 576,
+      "end_line": 600,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .any(|e| e.field_id == 4 && e.name == \"aisException\"),\n            \"schema must declare aisException as result field 4: {:?}\",\n            method\n                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n",
+      "source_digest": "626e27dd1c67571c93fd741c953a769803a4d1a7969f0cdfca90af8d4dfc6780",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 579,
+      "end_line": 603,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                .exceptions\n                .iter()\n                .map(|e| (e.field_id, e.name))\n                .collect::<Vec<_>>()\n        );\n\n        let exception_type = \"com.twitter.agenttools.ais.thriftscala.AISException\";\n        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n        let decoded = t\n            .decode_method_response(&bytes, &method)\n            .expect(\"declared aisException must decode, not hard-fail\");\n",
+      "source_digest": "546305a603835b236e946ce930937ccf33b6b4995294acf6091441e6f3af4be0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 727,
+      "end_line": 751,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if !cfg.page_keys.contains(key_id) {\n            return Err(RunError::Forbidden(\n                \"not_page_key\",\n                format!(\"key {key_id} is not one of this service's page keys\"),\n            ));\n        }\n        let Some(who) = who else {\n            return Err(RunError::Forbidden(\n                \"person_required\",\n                \"the X-Updated-By header must name the signed-in person\".into(),\n            ));\n        };\n        validate_start(&req, cfg, now_ms)?;\n        if let Some(existing) = self\n            .stored(&req.run_id)\n            .await\n            .map_err(|e| RunError::Store(e.to_string()))?\n        {\n            if same_run(&existing, &req) {\n                let stop = self\n                    .stop_marker(&req.run_id)\n                    .await\n                    .map_err(|e| RunError::Store(e.to_string()))?;\n                let never_ran = stop.as_ref().is_some_and(|s| s.start_conflict)\n                    || (!started(&existing)\n",
+      "source_digest": "160c740d483df804705abd55f0395a5bf16350c43578f77ed1c7ae162a891f56",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1229,
+      "end_line": 1253,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        let written = self.write(&next).await?;\n        if change == Change::Resume\n            && hold.is_some()\n            && let Err(e) = self.store.delete(HOLD_PKEY, run_id).await\n        {\n            warn!(run_id, \"backfill run hold delete after resume failed: {e}\");\n        }\n        Ok(written)\n    }\n}\n\nfn validate_start(\n    req: &BackfillRunStartRequest,\n    cfg: &BackfillConfig,\n    now_ms: i64,\n) -> Result<(), RunError> {\n    let bad = |code: &'static str, detail: String| Err(RunError::Invalid(code, detail));\n    if req.confirm.as_deref() != Some(CONFIRM_WORD) {\n        return bad(\n            \"confirm_required\",\n            format!(\"starting a run needs confirm: \\\"{CONFIRM_WORD}\\\"\"),\n        );\n    }\n    if !valid_run_id(&req.run_id) {\n",
+      "source_digest": "cde3fe37739f62c54b831677a3c7c4c1312626447416caec225e09f9bb554b85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/validate_rules_yaml.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 19,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::process::ExitCode;\n\nuse xai_abuse_enforcement_service::rules::CompiledRules;\n\nfn main() -> ExitCode {\n    let Some(path) = std::env::args().nth(1) else {\n        eprintln!(\"usage: validate-rules-yaml <path-to-rules.yaml>\");\n        return ExitCode::FAILURE;\n    };\n    let src = match std::fs::read_to_string(&path) {\n        Ok(s) => s,\n        Err(e) => {\n            eprintln!(\"error: cannot read {path}: {e}\");\n            return ExitCode::FAILURE;\n        }\n    };\n    match CompiledRules::from_yaml(&src) {\n        Ok(compiled) => {\n            let ids: Vec<&str> = compiled.rule_ids().collect();\n",
+      "source_digest": "f33917b111b67bd40b326c636ca713dd69a5365411d5b37e42e2ebd34ee3771d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 474,
+      "end_line": 498,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .put_with_ttl(pkey, value.to_vec(), deadline)\n            .await\n        {\n            Ok(()) => true,\n            Err(e) => {\n                warn!(\"Manhattan dedup update failed: {e}\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                false\n            }\n        }\n    }\n\n                                                                        pub async fn invalidate(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        claim_nonce: Option<u64>,\n    ) {\n        let pkey = Self::pkey(entity_type, entity_id);\n        match self.slot_view(&pkey).await {\n            SlotView::Held(meta) => {\n                if meta.kind == HeldKind::Outcome {\n                    info!(\n                        pkey,\n                        held_class = meta.class,\n",
+      "source_digest": "65d057f1e6bfbccc1a5b06239e24cffa5398ab0771825c2a69151d59cda560ab",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 487,
+      "end_line": 511,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        claim_nonce: Option<u64>,\n    ) {\n        let pkey = Self::pkey(entity_type, entity_id);\n        match self.slot_view(&pkey).await {\n            SlotView::Held(meta) => {\n                if meta.kind == HeldKind::Outcome {\n                    info!(\n                        pkey,\n                        held_class = meta.class,\n                        \"dedup: invalidate left terminal outcome in place\"\n                    );\n                    return;\n                }\n                if claim_nonce.is_none() || meta.nonce != claim_nonce {\n                    info!(pkey, \"dedup: invalidate left foreign claim in place\");\n                    return;\n                }\n                if self\n                    .restore_displaced(&pkey, &meta, claim_nonce, \"invalidate\")\n                    .await\n                {\n                    return;\n",
+      "source_digest": "796230e044298423b4d730d41f1512d37852b72886891bc059e239ed7e076e7a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 492,
+      "end_line": 516,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let pkey = Self::pkey(entity_type, entity_id);\n        match self.slot_view(&pkey).await {\n            SlotView::Held(meta) => {\n                if meta.kind == HeldKind::Outcome {\n                    info!(\n                        pkey,\n                        held_class = meta.class,\n                        \"dedup: invalidate left terminal outcome in place\"\n                    );\n                    return;\n                }\n                if claim_nonce.is_none() || meta.nonce != claim_nonce {\n                    info!(pkey, \"dedup: invalidate left foreign claim in place\");\n                    return;\n                }\n                if self\n                    .restore_displaced(&pkey, &meta, claim_nonce, \"invalidate\")\n                    .await\n                {\n                    return;\n                }\n            }\n            SlotView::Empty => {}\n            SlotView::Unknown => return,\n        }\n",
+      "source_digest": "383050d4ccf949aff66358d0dcb4436a8810f50459f28d38c929b5a4b2042d16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 496,
+      "end_line": 520,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    info!(\n                        pkey,\n                        held_class = meta.class,\n                        \"dedup: invalidate left terminal outcome in place\"\n                    );\n                    return;\n                }\n                if claim_nonce.is_none() || meta.nonce != claim_nonce {\n                    info!(pkey, \"dedup: invalidate left foreign claim in place\");\n                    return;\n                }\n                if self\n                    .restore_displaced(&pkey, &meta, claim_nonce, \"invalidate\")\n                    .await\n                {\n                    return;\n                }\n            }\n            SlotView::Empty => {}\n            SlotView::Unknown => return,\n        }\n        if let Err(e) = self.store.delete(&pkey).await {\n            warn!(\"Manhattan dedup delete failed: {e}\");\n            crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n        }\n",
+      "source_digest": "392f1c7be5d2e2c77cb1f99bac55c6c38736f4a83589c5a8b407751e6a2aeb77",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 583,
+      "end_line": 607,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: &[u8],\n        acted_class: u8,\n        claim_nonce: Option<u64>,\n    );\n    async fn update_skip(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        value: &[u8],\n        acted_class: u8,\n        claim_nonce: Option<u64>,\n    );\n    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>);\n}\n\n#[async_trait::async_trait]\nimpl DedupSlot for ManhattanDedupCache {\n    async fn try_insert(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        incoming_class: u8,\n    ) -> DedupCheck {\n        ManhattanDedupCache::try_insert(self, entity_type, entity_id, incoming_class).await\n    }\n",
+      "source_digest": "76150df2f1d568624a0be1b8b477baf196f4729e1b1d017cea18137248befbd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 640,
+      "end_line": 664,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        claim_nonce: Option<u64>,\n    ) {\n        ManhattanDedupCache::update_skip(\n            self,\n            entity_type,\n            entity_id,\n            value,\n            acted_class,\n            claim_nonce,\n        )\n        .await\n    }\n    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>) {\n        ManhattanDedupCache::invalidate(self, entity_type, entity_id, claim_nonce).await\n    }\n}\n\n#[cfg(test)]\npub(crate) mod test_support {\n    use std::collections::HashMap;\n    use std::sync::Mutex;\n\n    use super::*;\n\n                            type Slot = (u8, bool, Option<u64>);\n",
+      "source_digest": "a7008f1658f1af7ad75fa459578adabdeb2acdfbc6819003f8b3158bb9e59e24",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 641,
+      "end_line": 665,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) {\n        ManhattanDedupCache::update_skip(\n            self,\n            entity_type,\n            entity_id,\n            value,\n            acted_class,\n            claim_nonce,\n        )\n        .await\n    }\n    async fn invalidate(&self, entity_type: EntityType, entity_id: i64, claim_nonce: Option<u64>) {\n        ManhattanDedupCache::invalidate(self, entity_type, entity_id, claim_nonce).await\n    }\n}\n\n#[cfg(test)]\npub(crate) mod test_support {\n    use std::collections::HashMap;\n    use std::sync::Mutex;\n\n    use super::*;\n\n                            type Slot = (u8, bool, Option<u64>);\n\n",
+      "source_digest": "e21a138b06285281292123f62b1ded16a384c3ed65612f3099a3ae615cd7914d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 768,
+      "end_line": 792,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        async fn update_skip(&self, et: EntityType, id: i64, _v: &[u8], class: u8, n: Option<u64>) {\n            let key = (et.as_str().to_owned(), id);\n            let mut slots = self.slots.lock().unwrap();\n            let kept = self.own_carry(&slots, &key, n).unwrap_or(CLASS_NONE);\n            slots.insert(key, (kept, false, None));\n            drop(slots);\n            self.log(format!(\n                \"update_skip(class={class},own_claim={})\",\n                n.is_some()\n            ));\n        }\n\n        async fn invalidate(&self, et: EntityType, id: i64, n: Option<u64>) {\n            let key = (et.as_str().to_owned(), id);\n            let mut slots = self.slots.lock().unwrap();\n            if let Some(c) = self.own_carry(&slots, &key, n) {\n                slots.insert(key, (c, false, None));\n            } else if let Some((_, true, held)) = slots.get(&key)\n                && n.is_some()\n                && *held == n\n            {\n                slots.remove(&key);\n            }\n            drop(slots);\n            self.log(format!(\"invalidate(own_claim={})\", n.is_some()));\n",
+      "source_digest": "3343b64fe480bca0463b9c710269b21875fe348e7f02331a8027e32949bc634f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 780,
+      "end_line": 804,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        async fn invalidate(&self, et: EntityType, id: i64, n: Option<u64>) {\n            let key = (et.as_str().to_owned(), id);\n            let mut slots = self.slots.lock().unwrap();\n            if let Some(c) = self.own_carry(&slots, &key, n) {\n                slots.insert(key, (c, false, None));\n            } else if let Some((_, true, held)) = slots.get(&key)\n                && n.is_some()\n                && *held == n\n            {\n                slots.remove(&key);\n            }\n            drop(slots);\n            self.log(format!(\"invalidate(own_claim={})\", n.is_some()));\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn zstd_json(v: serde_json::Value) -> Vec<u8> {\n        zstd::encode_all(v.to_string().as_bytes(), 3).unwrap()\n    }\n\n",
+      "source_digest": "b4c36c1814156b87a3a8dcff049c61abc01fbaf50b43ee491761cdca6f2cd97a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1118,
+      "end_line": 1142,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        {\n            DedupCheck::ClassBypass {\n                held_class: CLASS_LABEL,\n                claim_nonce: Some(n),\n            } => n,\n            other => panic!(\"expected a bypass over the label, got {other:?}\"),\n        }\n    }\n\n    #[tokio::test]\n    async fn own_bypass_skip_restores_the_held_bytes_with_their_remaining_lifetime() {\n        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;\n        for invalidate in [false, true] {\n            let (store, cache, held, exp) = cache_holding_a_label();\n            let nonce = bypass(&cache).await;\n            store.take_puts();\n            if invalidate {\n                cache.invalidate(EntityType::User, USER, Some(nonce)).await;\n            } else {\n                cache\n                    .update_skip(EntityType::User, USER, b\"skip\", CLASS_NONE, Some(nonce))\n                    .await;\n            }\n            let puts = store.take_puts();\n            assert_eq!(puts.len(), 1, \"one restore write ({invalidate})\");\n",
+      "source_digest": "81bc48bb7a302e5ccf4db63db5dab230a27a2ecead88cc914e039c38b61e6439",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1122,
+      "end_line": 1146,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            } => n,\n            other => panic!(\"expected a bypass over the label, got {other:?}\"),\n        }\n    }\n\n    #[tokio::test]\n    async fn own_bypass_skip_restores_the_held_bytes_with_their_remaining_lifetime() {\n        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;\n        for invalidate in [false, true] {\n            let (store, cache, held, exp) = cache_holding_a_label();\n            let nonce = bypass(&cache).await;\n            store.take_puts();\n            if invalidate {\n                cache.invalidate(EntityType::User, USER, Some(nonce)).await;\n            } else {\n                cache\n                    .update_skip(EntityType::User, USER, b\"skip\", CLASS_NONE, Some(nonce))\n                    .await;\n            }\n            let puts = store.take_puts();\n            assert_eq!(puts.len(), 1, \"one restore write ({invalidate})\");\n            let (pkey, bytes, deadline) = &puts[0];\n            assert_eq!(pkey, \"7\");\n            assert_eq!(bytes, &held, \"the original bytes, not the skip\");\n            assert!(\n",
+      "source_digest": "d25329da98c64940c1187d88de96d769c74b0affebb8b263501f45835bb548d8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3d5e87331cb490e620c9960d81613b83755e7af9fb8f76f685114b1bce712d52",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "1caa4c3b43003f48ac370aff07904b956a50bf8a13512d934d2b4c28fd7b4745",
+      "context_complete": true,
+      "task_id": "T-4c4efeb24d8db1ba75d170e984324ad474c9cbded4aa6517cac6b0b5c09a3e18",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fa111d4458b1f9f499078ec2c745e8f82c2942a141a1b5407cbf6bbc10a62873",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a6611f1b642765ea874140758b4457c1d25ad4373eef6d9ba02834d8c86525b",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ffce861eee2b9b4653b33ece7304257b2cd214f979a1669e5850122ad228d3c8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-9c423a7f88c238c64af3f82315423c71395f237821495082fb1301c41fe9c26b",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d5372dc035e5b14cbc71fb055f99e6daf0844c790da9bdcae64c287fcc816661",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-ca97f0e5ca90c9c9e6004f9f835e3f0d957e2a656b15098b0b48e392438ee288",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ac49bb3015781f6dbcfdd3e6a805c3389f4af43fdc362ede0417191f5ad6a3cb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-a4fb4fddd559c97a3d8b925c63312c6b1f73e358846d2b8ad29930fff1267794",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-522e9c005bdd87a12d15443a486236b469a9632b484cb0dd534850177ea78b75",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-beb74fbdf738383a835be79e10f7e8a60e5c05de8453696b7dc3ae11b34cb314",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2242f96e85ad79cadbf0d2f24bebb4a949e3aac0db84ee0a88b60610133a263b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-ed84ff2ae8839109d6b5d0bd0d52efb2d04debefb023e88ea204665e843b6942",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f04ab13e791a7d49a95488eea7b52ca262b1bae040f282e4d1d3e5ba8ceb4ea8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec1ca40126b6fa0fd7389278d9ea3ec64f892fd35112178fdbea5efcdcff343a",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-653877f06c6e476f63ec8f366fd4d5903870d795bc9a5b55f54592c3492f1ce1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-1094d95458c3bcb0e5872fb6ed8c1737fa73b2b6e88020eda1df7eabecf19382",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0672c04518293470f84e28a9c0d8783644b12733d422d7573909f421a471e56f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-47256f47bf6834210059f9ac8e2a1dc97111d44e28cb3f71301e3bf6a5579cde",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c66ab824caf494d14b34d6494d95ed961f4818b33b487ef9176f3a287fdc94ef",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-db8838514392a7860ff3b7a32364f326bc44a252c12654ee978ad86e0348c6d6",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-06cfb046aaa4facb67afade900933fbfcd1830201d11017461905848e62d8d43",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-d932ac93012743c37f3f55e600c287c89149eee141db066bee22fc134132feaf",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d4840fdd7e8eacd85e7e01d0af0c51fed21b2c9aac9fc5d3c3443d9535acd063",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-2f110b589fe94a4d82b462f86c504ffb72acb8733d0cd99b715ae16933319414",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-76004db8bb4060b0eae3ae941fac1edcf645a859f60aefe9b1c324db2ba442e9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-e61b9c498e19a7492030c6d8a9026aa7ec8b5d6014b8dc5ca4b4f4f3639738e6",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e2c82d79a99af549c25347524fc10cb0b3155622d4f324ebb6ccae4195f90dc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-2671cad76df6424a0fff0c1f5521bc9c9d07cf57088f2eff780d772684f0c1f7",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab4801ec5fff79634b803af25cdec4260b8dc7f8ca48d164a03e55f3fd544091",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-9df986b144a04d6d0f77be8bf948b68530fee35e38ab994766dbad951736f815",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-03984743ffcf03aeb1ed76cba6e142d7da3348775f66367bdcb94eed4bd58eee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-02672e54ab06c341cee4f825519318cb4dd2764707a8be366c78d2f6a45d4bb4",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9c950819168420c89de00e77aa9fcc8e1ac135f64f522efb7db3d32181f41f80",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-a86fdc180d88af359e689db35630f247a1d75a1ed0a3d3144266ac73a6d8697e",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8d2f010861850a65b1d612b8803c3cd069da185def9a445a86b273b8d11cb4e7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-a1c42c329582563d9114023df3b7afa8a7b54be7925a622627e66e814b7ce9bf",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dfd0662266ddf89c4c64c59a02085adc13c839cfdf5edede306f9022b2900206",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-ac2d72782a009f138aceffbe6a68612fd39c4dd72745d755102df318e51c0e7d",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-585bb0d8fcc559937b2ac05fa3a58c8d168d0fdc0ab94b68c623a725adc34c84",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-7e5076e35e181d3f143da9dab91d6940575c0eab71148050d06bb4cad58100a7",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5c6b78b5c6253c87dcc1fef7709e00a3def89b427933a5495f643fc586299a21",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-78e115066ecc9b1134a81992d1677e8812f85b8935d063ac624a0b9d4eb48b3d",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6c568f6ed45dbdf68cc5e6c4215a44ecac3932fc8c0a259af64029ee825e4763",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-359a3807fbf0131cd4ff7af1bf8d617e77e3cffa0680c9a5260fd2ce150c764e",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-38ca90ddcc2fd935d5c8c9776c9d499f23d25f90d2aebadc51c4f16ae13f3959",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-fd7b0c4062b45d47a4045eab0430bbeb668d7aa33907049f8108437bbafb3172",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-be94b85087b0f39201be3cda9fd55b820ef75f11a26bfeecc35aa4ec3d2f1380",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-9d2928d18c186af1a2f847a2af5b6afce4dc4156a2a77acce2a9eb45d119e475",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-de8f4fc0a68bd2d5711f5248e1b99be12dcadafd8be4c5ba456e2b164d21c0f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-eee0b1509356dc4be177e9a9f7ae4896c414615d14ac69c378ef6a6f338204cb",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e14736d2f0eac17869f29ed2eb928d9cde0e6bf75393cf227fe21c6f2f171434",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-69396c22dd5aef3fb7fd61b33f53667b520f74e16d465b55e4ecccc9dc1ac535",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8c9132665267a0ea888e95c0476873e8c0d20091f6caef73102b3b56754f0342",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-5bde07b90096a8caf1f37b0032709bf6ec8bf2757320dcd0969ac65c99874bc1",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-011f1cde420bf25ee2942f96545d48104e05f50ea90883fc48511d7a9f1a247b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-899b80a135375c41da435844d11162d70d2f81156112738db4bcb5058761463f",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f3c9818292ab0e54109d89efe632199f340733de2f1a5b288d92bfbd9a48634b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-a1565fc486a6a9300f834941aa2dbb77ffc9d6caadcf4dac9190ed52a48eb3c1",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0f717ed93dd36eed20b921544890c11006334a9a0860d509fcd771b5faabce95",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-3ebf87c9d149879e2786c7660e2df1fe1ad25cd6b35438905fcbcf38cab7eb76",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7e9090957f01f2291e5a33a7c1bc4ce4ff531c750aca5e3267b978883b04b6ce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-d4a71493895d2d9c86e184a6f993e53fbf541702e1f70344d3980be85a51b368",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-488c320c0a88194c51d4a6209667e6b34fd5bc9a3b7dbbf4fdb9671984a31f0c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-7a26c009cd8d3a57c10fdf6a405ff024181f07f748a368ad3f29d130a5bfc86c",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3ddb720abd96d4e5cdb1ed100120711fe590d972bb1deb51757bc86e82d71ba7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-baedcaa7a55e8ca06286b98ec6b1d4394a884d705d7e67cc9928fa7c4562f433",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9a26b87a3c5666e96251f1e6d53822ac9dfb784ce386b72abae3e4787f45aad0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-c840b9218f4aa5dd49063de85c3ed0c9d23ba9fbef56a359727554e91c9174e3",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d6bcd3787c5315747cc72554d238c70979433fe2843b8887602d84fbdfde414b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-2a471a3ec41e25db223b68817294331470a85ec7b4eccfee8103c2758f8a23fc",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-13644c2c995cc91ceefae71e242ab3f902d991f6ba6f066ff6ef870fbe2559a1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-24b8712cf4fcf816a36b3ae0579573a51e0ffa0a87bba9a9f117e6bc0c4d2893",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-827517beb368d1457266b1e96c0a9b970e9198fd2f3c0d79202259267b59b614",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-cb9d6fb5dac1520f36fe88d06aaf80c86581124750e7764a8a07efe68667754d",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5950d27e4ada94baeb2738ff33a68d379dc398dbdf352cb2c8b99c4aa808f39d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-4c47a91ac22ba7cb4ea2b8e2dcb19b9935354571a44212ab5f0237086cc530e5",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4730ee78929cf4e5139d576d0bb594717e03ad61b0ce1e34b4811cf830011ecf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-42792e548a6ab667ddc4b680dd8220efd5b8f921fbef6e5e72511d0eb0925773",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-24ef43649a6520139599eef0ddf205f2f8aec89b6f10aa10a41eb9c50309974d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-88869dd32ee2bee85810a6e48e4cee952c8abd7b536edf490271c8d6fb052171",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0b850415cc015c4939bcaeee3b362673b3cb82657346e721ad3886786b47a27b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-897b046c25057f5cad06ebfcdc5683fa8b43ce95f46dacae1e71b7aa22885674",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-42237c565c126f927206c6fd22c8bca1066efbdb591c29157b4382d5ec1f6137",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-ae05d9bb3a0eb9d39eb42de0e01a50b12d95528366fb83f4f1559d377c5ef4a9",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8cde113e853f2337243ffde291824167b4410b6296f11b08d36030884e462856",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-9aef625d9e5647c2a77caad5b8e003e34ae4d0c056a5c15ac8eaaadfe4f0f0c0",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-facd5016375cd5470f9fa2ccafe0f873980f682f7688705fce7371e2c33d16c3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-ab537c39bb4ff7708275408d91d8c488368a8417b41347be6c5972645ee77050",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-91aee495476dc3cbfacbbb947196b6f56250170a977891a79daffc34fc4c3064",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-4b43ee6953ac0aa5c7c9277eeaced5bc7bda42fe2bf9cb1c40a30a596885c04c",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8627735878f3e2bc9b971f3eabb0b568b26b837ba279e20716ee8daf26246942",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-77dbd19a4e9fe04ac0e37a3f93b6bb5a7957cf28e3abad5eae2c65b6a657c850",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab00c6f67c337b8fb86d9994cd519a79409c3f9368a9499057db2417df400343",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-c91a9f6a63b0d81441e16632b97f3527c35980237fcc413102e4be9c013bac43",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/value_heads.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2116de1ed6f01c2998b6b5394189196112a0d34b08477e2a58ad58ee579414b4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "ValueBinTable",
+        "num_bins",
+        "log_prior",
+        "validate",
+        "targets",
+        "readout",
+        "value_bin_targets",
+        "value_bin_readout"
+      ],
+      "context_complete": false,
+      "task_id": "T-b5c8dcc96b4421c2e2ed5952b0d0254d325dda35f3ef67dd47da978b5d5e0a5b",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-e42153e806f0924673427ed4297e8bb0924e01fffb9701a6dd9370e3db78d428"
+}

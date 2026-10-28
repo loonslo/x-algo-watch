@@ -1,0 +1,1482 @@
+{
+  "schema_version": 1,
+  "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-af13e4c8516ba13a7f9749825a75f9ef8252e7ea7549995de17f726fcec82489",
+  "change_scope": "changed_file",
+  "mechanism_group": "abuse-enforcement-service/service-lib",
+  "evidence": {
+    "E1": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 257,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use std::sync::Arc;\n\nuse anyhow::{anyhow, bail, Context, Result};\nuse reqwest::Client;\nuse serde_json::{json, Map, Value};\nuse std::time::Duration;\nuse tracing::{info, warn};\n\nconst HTTP_TIMEOUT: Duration = Duration::from_secs(30);\n\n#[derive(Clone)]\npub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n    write_lock: Arc<tokio::sync::Mutex<()>>,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v1\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n            write_lock: Arc::new(tokio::sync::Mutex::new(())),\n        }\n    }\n\n    pub async fn get_feature(&self, feature_key: &str) -> Result<Value> {\n        let url = format!(\"{}/features/{}\", self.api_base, feature_key);\n        let resp = self\n            .client\n            .get(&url)\n            .bearer_auth(&self.api_key)\n            .send()\n            .await\n            .with_context(|| format!(\"GET {url}\"))?\n            .error_for_status()\n            .with_context(|| format!(\"GET {url} returned non-2xx\"))?;\n        let body: Value = resp\n            .json()\n            .await\n            .with_context(|| format!(\"decoding {url}\"))?;\n        body.get(\"feature\")\n            .cloned()\n            .ok_or_else(|| anyhow!(\"GET {url} response missing 'feature' field\"))\n    }\n\n    pub async fn get_env_value(&self, feature_key: &str, environment: &str) -> Result<Value> {\n        let feature = self.get_feature(feature_key).await?;\n        parse_env_value(&feature, environment)\n    }\n\n    pub async fn set_env_value(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        value: Value,\n    ) -> Result<Value> {\n        let feature = self.get_feature(feature_key).await?;\n        let body = build_env_update_body(&feature, environment, &value)?;\n\n        let url = format!(\"{}/features/{}\", self.api_base, feature_key);\n        let resp = self\n            .client\n            .post(&url)\n            .bearer_auth(&self.api_key)\n            .json(&body)\n            .send()\n            .await\n            .with_context(|| format!(\"POST {url}\"))?;\n\n        let status = resp.status();\n        if !status.is_success() {\n            let body_text = resp.text().await.unwrap_or_default();\n            warn!(\"POST {url} -> {status} body={body_text}\");\n            bail!(\"GrowthBook POST {url} failed: {status} {body_text}\");\n        }\n        info!(\"GrowthBook set_env_value ok (feature={feature_key} env={environment})\");\n        Ok(value)\n    }\n\n    pub async fn set_env_field(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        field: &str,\n        value: Value,\n    ) -> Result<Value> {\n        let _guard = self.write_lock.lock().await;\n        let current = self.get_env_value(feature_key, environment).await?;\n        let Value::Object(mut current_obj) = current else {\n            bail!(\n                \"environment '{}' value is not a JSON object — can't patch field '{}'\",\n                environment,\n                field\n            );\n        };\n        current_obj.insert(field.to_string(), value);\n        let new_value = Value::Object(current_obj);\n        self.set_env_value(feature_key, environment, new_value.clone())\n            .await?;\n        Ok(new_value)\n    }\n}\n\nfn parse_env_value(feature: &Value, environment: &str) -> Result<Value> {\n    let env = feature\n        .get(\"environments\")\n        .and_then(|e| e.get(environment))\n        .ok_or_else(|| anyhow!(\"environment '{}' not found in feature\", environment))?;\n    let rules = env\n        .get(\"rules\")\n        .and_then(|r| r.as_array())\n        .ok_or_else(|| anyhow!(\"no rules in environment '{}'\", environment))?;\n    let first = rules\n        .first()\n        .ok_or_else(|| anyhow!(\"rules array is empty in environment '{}'\", environment))?;\n    let raw = first.get(\"value\").cloned().unwrap_or(Value::Null);\n\n    if let Value::String(s) = &raw {\n        serde_json::from_str(s).map_err(|e| {\n            anyhow!(\n                \"rule value for environment '{}' is not valid JSON: {}\",\n                environment,\n                e\n            )\n        })\n    } else {\n        Ok(raw)\n    }\n}\n\nfn build_env_update_body(feature: &Value, environment: &str, new_value: &Value) -> Result<Value> {\n    let env = feature\n        .get(\"environments\")\n        .and_then(|e| e.get(environment))\n        .ok_or_else(|| anyhow!(\"environment '{}' not found in feature\", environment))?;\n    let mut rules = env\n        .get(\"rules\")\n        .and_then(|r| r.as_array())\n        .cloned()\n        .ok_or_else(|| anyhow!(\"no rules in environment '{}'\", environment))?;\n    if rules.is_empty() {\n        bail!(\"rules array is empty in environment '{}'\", environment);\n    }\n\n    let encoded = serde_json::to_string(new_value)?;\n    if let Some(obj) = rules[0].as_object_mut() {\n        obj.insert(\"value\".to_string(), Value::String(encoded));\n    } else {\n        bail!(\n            \"first rule in environment '{}' is not a JSON object\",\n            environment\n        );\n    }\n\n    let enabled = env.get(\"enabled\").and_then(|v| v.as_bool()).unwrap_or(true);\n\n    let mut env_obj = Map::new();\n    env_obj.insert(\"enabled\".to_string(), json!(enabled));\n    env_obj.insert(\"rules\".to_string(), Value::Array(rules));\n\n    Ok(json!({\n        \"environments\": {\n            environment: Value::Object(env_obj),\n        }\n    }))\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn sample_feature() -> Value {\n        json!({\n            \"id\": \"xai_abuse_enforcement_service_config\",\n            \"environments\": {\n                \"production\": {\n                    \"enabled\": true,\n                    \"rules\": [\n                        {\n                            \"type\": \"force\",\n                            \"value\": \"{\\\"dry_run\\\":false,\\\"max_enforcements_per_day\\\":600000}\",\n                            \"id\": \"abc\"\n                        }\n                    ]\n                },\n                \"staging\": {\n                    \"enabled\": false,\n                    \"rules\": []\n                }\n            }\n        })\n    }\n\n    #[test]\n    fn parse_env_value_decodes_json_string() {\n        let v = parse_env_value(&sample_feature(), \"production\").unwrap();\n        assert_eq!(v[\"dry_run\"], json!(false));\n        assert_eq!(v[\"max_enforcements_per_day\"], json!(600000));\n    }\n\n    #[test]\n    fn parse_env_value_errors_on_missing_environment() {\n        let err = parse_env_value(&sample_feature(), \"nonexistent\").unwrap_err();\n        assert!(err.to_string().contains(\"nonexistent\"));\n    }\n\n    #[test]\n    fn parse_env_value_errors_on_empty_rules() {\n        let err = parse_env_value(&sample_feature(), \"staging\").unwrap_err();\n        assert!(err.to_string().contains(\"empty\"));\n    }\n\n    #[test]\n    fn build_env_update_body_encodes_value_as_json_string() {\n        let body = build_env_update_body(\n            &sample_feature(),\n            \"production\",\n            &json!({\"dry_run\": true, \"max_enforcements_per_day\": 100}),\n        )\n        .unwrap();\n        let stored_value = &body[\"environments\"][\"production\"][\"rules\"][0][\"value\"];\n        assert!(matches!(stored_value, Value::String(_)));\n        let s = stored_value.as_str().unwrap();\n        let parsed: Value = serde_json::from_str(s).unwrap();\n        assert_eq!(parsed[\"dry_run\"], json!(true));\n        assert_eq!(parsed[\"max_enforcements_per_day\"], json!(100));\n    }\n\n    #[test]\n    fn build_env_update_body_preserves_enabled_and_rule_metadata() {\n        let body = build_env_update_body(&sample_feature(), \"production\", &json!({\"any\": \"value\"}))\n            .unwrap();\n        assert_eq!(body[\"environments\"][\"production\"][\"enabled\"], json!(true));\n        assert_eq!(\n            body[\"environments\"][\"production\"][\"rules\"][0][\"id\"],\n            json!(\"abc\")\n        );\n        assert_eq!(\n            body[\"environments\"][\"production\"][\"rules\"][0][\"type\"],\n            json!(\"force\")\n        );\n    }\n\n    #[test]\n    fn build_env_update_body_errors_on_missing_environment() {\n        let err = build_env_update_body(&sample_feature(), \"missing\", &json!({})).unwrap_err();\n        assert!(err.to_string().contains(\"missing\"));\n    }\n}\n",
+      "source_digest": "a53d66fc0f71c95abb45959c2e91a8f81824c0070f17c870508372d99e0688dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 484,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use anyhow::{anyhow, bail, Context, Result};\nuse reqwest::{Client, Method, StatusCode};\nuse serde_json::{json, Value};\nuse std::time::Duration;\nuse tracing::{info, warn};\nuse xai_abuse_enforcement_types::config::ConfigPendingReview;\n\nconst HTTP_TIMEOUT: Duration = Duration::from_secs(10);\n\nconst APP_URL: &str = \"https://app.growthbook.io\";\n\n#[derive(Debug, thiserror::Error)]\n#[error(\"{0}\")]\npub struct Rejected(String);\n\npub fn is_rejected(e: &anyhow::Error) -> bool {\n    e.chain().any(|c| c.is::<Rejected>())\n}\n\n#[derive(Clone)]\npub struct GrowthBookWriter {\n    api_base: String,\n    api_key: String,\n    client: Client,\n}\n\nimpl GrowthBookWriter {\n    pub fn new(api_host: &str, api_key: String) -> Self {\n        let api_base = format!(\"{}/api/v2\", api_host.trim_end_matches('/'));\n        let client = Client::builder()\n            .timeout(HTTP_TIMEOUT)\n            .build()\n            .expect(\"reqwest client builder should succeed with defaults\");\n        Self {\n            api_base,\n            api_key,\n            client,\n        }\n    }\n\n    pub async fn propose_value(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        note: &str,\n        value: Value,\n    ) -> Result<ConfigPendingReview> {\n        self.propose(feature_key, environment, note, |_| Ok(value))\n            .await\n    }\n\n    pub async fn propose_field(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        note: &str,\n        field: &str,\n        value: Value,\n    ) -> Result<ConfigPendingReview> {\n        self.propose(feature_key, environment, note, |current| {\n            let Value::Object(mut obj) = current else {\n                return Err(Rejected(format!(\n                    \"environment '{environment}' value is not a JSON object — can't patch field '{field}'\"\n                ))\n                .into());\n            };\n            obj.insert(field.to_owned(), value);\n            Ok(Value::Object(obj))\n        })\n        .await\n    }\n\n    async fn propose(\n        &self,\n        feature_key: &str,\n        environment: &str,\n        note: &str,\n        edit: impl FnOnce(Value) -> Result<Value>,\n    ) -> Result<ConfigPendingReview> {\n        let created = self\n            .call(\n                Method::POST,\n                &format!(\"/features/{feature_key}/revisions\"),\n                json!({\"title\": note, \"comment\": note}),\n                false,\n            )\n            .await?;\n        let revision = created\n            .get(\"revision\")\n            .ok_or_else(|| anyhow!(\"create draft response missing 'revision'\"))?;\n        let version = revision\n            .get(\"version\")\n            .and_then(Value::as_i64)\n            .ok_or_else(|| anyhow!(\"create draft response missing 'revision.version'\"))?;\n        let revision_path = format!(\"/features/{feature_key}/revisions/{version}\");\n        let edited = async {\n            let (rule_id, current) = env_rule(revision, environment)?;\n            let value = serde_json::to_string(&edit(current)?)?;\n            self.call(\n                Method::PUT,\n                &format!(\"{revision_path}/rules/{rule_id}\"),\n                json!({\"rule\": {\"value\": value}}),\n                true,\n            )\n            .await?;\n            self.call(\n                Method::POST,\n                &format!(\"{revision_path}/request-review\"),\n                json!({\"comment\": note}),\n                false,\n            )\n            .await\n        }\n        .await;\n        if let Err(e) = edited {\n            let discarded = self\n                .call(\n                    Method::POST,\n                    &format!(\"{revision_path}/discard\"),\n                    json!({}),\n                    false,\n                )\n                .await;\n            return Err(match discarded {\n                Ok(_) => e.context(format!(\"draft revision {version} was discarded\")),\n                Err(d) => e.context(format!(\n                    \"draft revision {version} is left behind (discard failed: {d:#})\"\n                )),\n            });\n        }\n        info!(\"GrowthBook draft {version} awaits review (feature={feature_key} env={environment})\");\n        Ok(ConfigPendingReview {\n            status: \"pending_review\".into(),\n            feature: feature_key.to_owned(),\n            revision: version,\n            environment: environment.to_owned(),\n            url: format!(\"{APP_URL}/features/{feature_key}?v={version}\"),\n        })\n    }\n\n    async fn call(\n        &self,\n        method: Method,\n        path: &str,\n        body: Value,\n        sends_the_edit: bool,\n    ) -> Result<Value> {\n        let url = format!(\"{}{path}\", self.api_base);\n        let resp = self\n            .client\n            .request(method.clone(), &url)\n            .bearer_auth(&self.api_key)\n            .json(&body)\n            .send()\n            .await\n            .with_context(|| format!(\"{method} {url}\"))?;\n        let status = resp.status();\n        let text = resp.text().await.unwrap_or_default();\n        if status != StatusCode::OK {\n            warn!(\"{method} {url} -> {status} body={text}\");\n            let message = format!(\"GrowthBook {method} {url} failed: {status} {text}\");\n            if sends_the_edit\n                && matches!(\n                    status,\n                    StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY\n                )\n            {\n                return Err(Rejected(message).into());\n            }\n            bail!(message);\n        }\n        serde_json::from_str(&text).with_context(|| format!(\"decoding {method} {url}\"))\n    }\n}\n\nfn env_rule(revision: &Value, environment: &str) -> Result<(String, Value)> {\n    let rules = revision\n        .get(\"rules\")\n        .and_then(Value::as_array)\n        .ok_or_else(|| anyhow!(\"draft has no rules array\"))?;\n    let only_env = |r: &&Value| {\n        r.get(\"type\").and_then(Value::as_str) == Some(\"force\")\n            && r.get(\"allEnvironments\").and_then(Value::as_bool) != Some(true)\n            && r.get(\"environments\") == Some(&json!([environment]))\n    };\n    let matching: Vec<&Value> = rules.iter().filter(only_env).collect();\n    let [rule] = matching.as_slice() else {\n        bail!(\n            \"expected exactly one force rule scoped to environment '{environment}' alone, found {}\",\n            matching.len()\n        );\n    };\n    let id = rule\n        .get(\"id\")\n        .and_then(Value::as_str)\n        .ok_or_else(|| anyhow!(\"environment '{environment}' rule has no id\"))?;\n    let raw = rule.get(\"value\").cloned().unwrap_or(Value::Null);\n    let value = match &raw {\n        Value::String(s) => serde_json::from_str(s).map_err(|e| {\n            anyhow!(\"rule value for environment '{environment}' is not valid JSON: {e}\")\n        })?,\n        _ => raw,\n    };\n    Ok((id.to_owned(), value))\n}\n\n#[cfg(test)]\npub(crate) mod test_support {\n    use serde_json::{json, Value};\n    use wiremock::matchers::{method, path};\n    use wiremock::{Mock, MockServer, ResponseTemplate};\n\n    pub(crate) const FEATURE: &str = \"xai_abuse_enforcement_service_config\";\n    pub(crate) const VERSION: i64 = 83;\n\n    pub(crate) fn draft() -> Value {\n        json!({\"revision\": {\n            \"version\": VERSION,\n            \"status\": \"draft\",\n            \"rules\": [\n                {\"id\": \"fr_prod\", \"type\": \"force\", \"allEnvironments\": false,\n                 \"environments\": [\"production\"],\n                 \"value\": \"{\\\"dry_run\\\":false,\\\"max_user_enforcements_per_day\\\":600000}\"},\n                {\"id\": \"fr_stg\", \"type\": \"force\", \"allEnvironments\": false,\n                 \"environments\": [\"staging\"], \"value\": \"{\\\"dry_run\\\":true}\"},\n            ],\n        }})\n    }\n\n    pub(crate) async fn growthbook(draft: Value) -> MockServer {\n        let server = MockServer::start().await;\n        mount_growthbook(&server, draft).await;\n        server\n    }\n\n    pub(crate) async fn mount_growthbook(server: &MockServer, draft: Value) {\n        let base = format!(\"/api/v2/features/{FEATURE}/revisions\");\n        for (verb, tail) in [\n            (\"POST\", String::new()),\n            (\"PUT\", format!(\"/{VERSION}/rules/fr_prod\")),\n            (\"PUT\", format!(\"/{VERSION}/rules/fr_stg\")),\n            (\"POST\", format!(\"/{VERSION}/request-review\")),\n            (\"POST\", format!(\"/{VERSION}/discard\")),\n        ] {\n            Mock::given(method(verb))\n                .and(path(format!(\"{base}{tail}\")))\n                .respond_with(ResponseTemplate::new(200).set_body_json(draft.clone()))\n                .mount(server)\n                .await;\n        }\n    }\n\n    pub(crate) async fn requests(server: &MockServer) -> Vec<(String, String, Value)> {\n        server\n            .received_requests()\n            .await\n            .unwrap_or_default()\n            .iter()\n            .map(|r| {\n                (\n                    r.method.to_string(),\n                    r.url.path().to_owned(),\n                    serde_json::from_slice(&r.body).unwrap_or(Value::Null),\n                )\n            })\n            .collect()\n    }\n\n    pub(crate) async fn assert_never_published(server: &MockServer) {\n        for (verb, p, _) in requests(server).await {\n            assert!(!p.ends_with(\"/publish\"), \"{verb} {p} publishes\");\n            assert!(\n                !(verb == \"POST\" && p == format!(\"/api/v2/features/{FEATURE}\")),\n                \"{verb} {p} updates the feature directly\"\n            );\n            assert!(\n                p.starts_with(&format!(\"/api/v2/features/{FEATURE}/revisions\")),\n                \"{verb} {p} is outside the draft endpoints\"\n            );\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::test_support::*;\n    use super::*;\n    use wiremock::matchers::{method, path};\n    use wiremock::{Mock, MockServer, ResponseTemplate};\n\n    fn writer(server: &MockServer) -> GrowthBookWriter {\n        GrowthBookWriter::new(&server.uri(), \"secret_test\".into())\n    }\n\n    fn base() -> String {\n        format!(\"/api/v2/features/{FEATURE}/revisions\")\n    }\n\n    #[tokio::test]\n    async fn replace_drafts_the_env_rule_and_requests_review() {\n        let server = growthbook(draft()).await;\n        let out = writer(&server)\n            .propose_value(FEATURE, \"staging\", \"note\", json!({\"dry_run\": false}))\n            .await\n            .unwrap();\n        assert_eq!(\n            out,\n            ConfigPendingReview {\n                status: \"pending_review\".into(),\n                feature: FEATURE.into(),\n                revision: VERSION,\n                environment: \"staging\".into(),\n                url: format!(\"https://app.growthbook.io/features/{FEATURE}?v={VERSION}\"),\n            }\n        );\n        let got = requests(&server).await;\n        let calls: Vec<(&str, &str)> = got\n            .iter()\n            .map(|(m, p, _)| (m.as_str(), p.as_str()))\n            .collect();\n        assert_eq!(\n            calls,\n            vec![\n                (\"POST\", base().as_str()),\n                (\"PUT\", format!(\"{}/{VERSION}/rules/fr_stg\", base()).as_str()),\n                (\n                    \"POST\",\n                    format!(\"{}/{VERSION}/request-review\", base()).as_str()\n                ),\n            ]\n        );\n        assert_eq!(got[0].2, json!({\"title\": \"note\", \"comment\": \"note\"}));\n        assert_eq!(got[1].2, json!({\"rule\": {\"value\": \"{\\\"dry_run\\\":false}\"}}));\n        assert_eq!(got[2].2, json!({\"comment\": \"note\"}));\n        let all = server.received_requests().await.unwrap();\n        assert!(all\n            .iter()\n            .all(|r| r.headers.get(\"authorization\").unwrap() == \"Bearer secret_test\"));\n        assert_never_published(&server).await;\n    }\n\n    #[tokio::test]\n    async fn field_patch_merges_onto_the_drafts_env_value() {\n        let server = growthbook(draft()).await;\n        writer(&server)\n            .propose_field(FEATURE, \"production\", \"note\", \"dry_run\", json!(true))\n            .await\n            .unwrap();\n        let got = requests(&server).await;\n        assert_eq!(got[1].1, format!(\"{}/{VERSION}/rules/fr_prod\", base()));\n        let sent: Value =\n            serde_json::from_str(got[1].2[\"rule\"][\"value\"].as_str().unwrap()).unwrap();\n        assert_eq!(\n            sent,\n            json!({\"dry_run\": true, \"max_user_enforcements_per_day\": 600000})\n        );\n        assert_never_published(&server).await;\n    }\n\n    #[tokio::test]\n    async fn no_rule_for_the_env_alone_discards_the_draft() {\n        let shared = json!({\"revision\": {\"version\": VERSION, \"rules\": [\n            {\"id\": \"fr_all\", \"type\": \"force\", \"allEnvironments\": true, \"environments\": [],\n             \"value\": \"{}\"},\n            {\"id\": \"fr_both\", \"type\": \"force\", \"allEnvironments\": false,\n             \"environments\": [\"staging\", \"production\"], \"value\": \"{}\"},\n        ]}});\n        let two = json!({\"revision\": {\"version\": VERSION, \"rules\": [\n            {\"id\": \"a\", \"type\": \"force\", \"allEnvironments\": false,\n             \"environments\": [\"staging\"], \"value\": \"{}\"},\n            {\"id\": \"b\", \"type\": \"force\", \"allEnvironments\": false,\n             \"environments\": [\"staging\"], \"value\": \"{}\"},\n        ]}});\n        for (draft, want) in [(shared, \"found 0\"), (two, \"found 2\")] {\n            let server = growthbook(draft).await;\n            let err = writer(&server)\n                .propose_value(FEATURE, \"staging\", \"note\", json!({}))\n                .await\n                .unwrap_err();\n            let msg = format!(\"{err:#}\");\n            assert!(msg.contains(want), \"{msg}\");\n            assert!(msg.contains(\"discarded\"), \"{msg}\");\n            let calls: Vec<String> = requests(&server)\n                .await\n                .into_iter()\n                .map(|(m, p, _)| format!(\"{m} {p}\"))\n                .collect();\n            assert_eq!(\n                calls,\n                vec![\n                    format!(\"POST {}\", base()),\n                    format!(\"POST {}/{VERSION}/discard\", base()),\n                ]\n            );\n            assert_never_published(&server).await;\n        }\n    }\n\n    #[tokio::test]\n    async fn patching_a_non_object_value_discards_the_draft() {\n        let scalar = json!({\"revision\": {\"version\": VERSION, \"rules\": [\n            {\"id\": \"fr_stg\", \"type\": \"force\", \"allEnvironments\": false,\n             \"environments\": [\"staging\"], \"value\": \"7\"},\n        ]}});\n        let server = growthbook(scalar).await;\n        let err = writer(&server)\n            .propose_field(FEATURE, \"staging\", \"note\", \"dry_run\", json!(true))\n            .await\n            .unwrap_err();\n        assert!(format!(\"{err:#}\").contains(\"not a JSON object\"), \"{err:#}\");\n        assert!(is_rejected(&err), \"the patch can't apply: the edit's fault\");\n        let last = requests(&server).await.pop().unwrap();\n        assert_eq!(last.1, format!(\"{}/{VERSION}/discard\", base()));\n    }\n\n    #[tokio::test]\n    async fn a_failed_step_discards_the_draft() {\n        for (failing, rejected) in [\n            ((\"PUT\", format!(\"/{VERSION}/rules/fr_stg\")), true),\n            ((\"POST\", format!(\"/{VERSION}/request-review\")), false),\n        ] {\n            let server = MockServer::start().await;\n            Mock::given(method(failing.0))\n                .and(path(format!(\"{}{}\", base(), failing.1)))\n                .respond_with(ResponseTemplate::new(400).set_body_string(\"schema says no\"))\n                .with_priority(1)\n                .mount(&server)\n                .await;\n            mount_growthbook(&server, draft()).await;\n            let err = writer(&server)\n                .propose_value(FEATURE, \"staging\", \"note\", json!({}))\n                .await\n                .unwrap_err();\n            let msg = format!(\"{err:#}\");\n            assert!(\n                msg.contains(\"400\") && msg.contains(\"schema says no\"),\n                \"{msg}\"\n            );\n            assert!(msg.contains(\"discarded\"), \"{msg}\");\n            assert_eq!(is_rejected(&err), rejected, \"{msg}\");\n            let last = requests(&server).await.pop().unwrap();\n            assert_eq!(last.1, format!(\"{}/{VERSION}/discard\", base()));\n            assert_never_published(&server).await;\n        }\n    }\n\n    #[tokio::test]\n    async fn a_failed_discard_says_the_draft_is_left_behind() {\n        let server = MockServer::start().await;\n        let no_rules = json!({\"revision\": {\"version\": VERSION, \"rules\": []}});\n        Mock::given(method(\"POST\"))\n            .and(path(base()))\n            .respond_with(ResponseTemplate::new(200).set_body_json(no_rules))\n            .mount(&server)\n            .await;\n        let err = writer(&server)\n            .propose_value(FEATURE, \"staging\", \"note\", json!({}))\n            .await\n            .unwrap_err();\n        let msg = format!(\"{err:#}\");\n        assert!(msg.contains(\"left behind\"), \"{msg}\");\n    }\n\n    #[tokio::test]\n    async fn a_failed_or_held_create_stops_there() {\n        for status in [500, 400, 202] {\n            let server = MockServer::start().await;\n            Mock::given(method(\"POST\"))\n                .and(path(base()))\n                .respond_with(ResponseTemplate::new(status).set_body_json(\n                    json!({\"confirmation\": {\"id\": \"c1\", \"status\": \"pending\"}, \"message\": \"held\"}),\n                ))\n                .mount(&server)\n                .await;\n            let err = writer(&server)\n                .propose_value(FEATURE, \"staging\", \"note\", json!({}))\n                .await\n                .unwrap_err();\n            assert!(format!(\"{err:#}\").contains(&status.to_string()), \"{err:#}\");\n            assert!(!is_rejected(&err), \"{status}\");\n            assert_eq!(requests(&server).await.len(), 1, \"{status}\");\n        }\n    }\n}\n",
+      "source_digest": "d0dd410a96aa06b6daa89e5e09b88be304b975b77847bcafb0be25cbf27c3ec9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test",
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 231,
+      "end_line": 255,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 255,
+      "end_line": 279,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 257,
+      "end_line": 281,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 325,
+      "end_line": 349,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 430,
+      "end_line": 454,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n",
+      "source_digest": "c7c734b954066febeddb84c77d5a8584db6cb3657e4778f388a6bb24d30ecc10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 610,
+      "end_line": 634,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    entity: EntityType,\n    factory: bool,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n",
+      "source_digest": "00f2b1bd8014f68d98f3f186ff7acfad81b0909cd4ec308a8fd9bc9d002dabf2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 611,
+      "end_line": 635,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    factory: bool,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n",
+      "source_digest": "e0bef38852ec6fb8879b46e8782b5b841a65e5e334c4f6fc6e2390bb79b141b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 613,
+      "end_line": 637,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n",
+      "source_digest": "9bce26244ea648814061c78826542c2b9b0119f452db7cd24a465f50424ea0ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 616,
+      "end_line": 640,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n",
+      "source_digest": "c99c45777580071bfa5d0f258a7c88bed27e71e5d7a1c6bfb50323d4f3915e4e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 619,
+      "end_line": 643,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n",
+      "source_digest": "1b7af6c62e21d501ba3694ed8d72fb78a2642f3c013fc1a85488212d36cd9f1f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 623,
+      "end_line": 647,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n",
+      "source_digest": "d36d292644f3809c7f225932bffa98822f082b5700111a3fec53f9730df91747",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 626,
+      "end_line": 650,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n                None\n            };\n            let mode = if forced.is_some() {\n",
+      "source_digest": "a93659313ffd7bde11a3d32461cb5f281ac6a3d3f9d1c40ee40d1299664b947a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 700,
+      "end_line": 724,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\ntype SeenWrite = (&'static str, String, Vec<u8>);\n\nfn seen_guard_key(pkey: &str, lkey: &str) -> String {\n    if pkey == SEEN_PKEY {\n        lkey.to_owned()\n    } else {\n        format!(\"{pkey}:{lkey}\")\n    }\n}\n\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n",
+      "source_digest": "a439c6af21729cbf87f96a1947a1daca60a62afa614fa1bc01372dfedf008526",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 701,
+      "end_line": 725,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\ntype SeenWrite = (&'static str, String, Vec<u8>);\n\nfn seen_guard_key(pkey: &str, lkey: &str) -> String {\n    if pkey == SEEN_PKEY {\n        lkey.to_owned()\n    } else {\n        format!(\"{pkey}:{lkey}\")\n    }\n}\n\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n        PageAction::SpamHighRecall { lifetime }\n",
+      "source_digest": "335983b74693f856fe80ebccab10ac4ed8ff6a73414ff9b6845783b438a3e8f4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 729,
+      "end_line": 753,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        _ => None,\n    }\n}\n\npub fn harsher_because(\n    before: Option<&ActionControlRecord>,\n    after: &ActionControlRecord,\n    rules_specs: Option<&[Value]>,\n) -> Vec<String> {\n    let before_mode = before.map_or(ControlMode::Rules, |b| b.mode);\n    let before_actions: &[PageAction] = before.map_or(&[], |b| &b.actions);\n    let mut why = Vec::new();\n    match (before_mode, after.mode) {\n        (ControlMode::Live, ControlMode::Live) => {}\n        (_, ControlMode::Live) => why.push(\"turns the scope live\".to_owned()),\n        (ControlMode::Recording, ControlMode::Rules) => {\n            why.push(\"hands the scope back to the GrowthBook rules, which act\".to_owned())\n        }\n        (ControlMode::Live, ControlMode::Rules) => {\n            let page = action_specs_value(&page_specs(before_actions));\n            let page = page.as_array().map(Vec::as_slice).unwrap_or_default();\n            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n                _ => why.push(\n",
+      "source_digest": "c8963163cdefe732a410b222259ce23ce1e7fc4ca8e0725bde1844545c7f840e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 759,
+      "end_line": 783,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n",
+      "source_digest": "1d0e31535b9f27deb3b853ba55702298ee9ca8c2c8bf37dcfb23b40149c3d9a4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 183,
+      "end_line": 207,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 242,
+      "end_line": 266,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 251,
+      "end_line": 275,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 266,
+      "end_line": 290,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 268,
+      "end_line": 292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 336,
+      "end_line": 360,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-af13e4c8516ba13a7f9749825a75f9ef8252e7ea7549995de17f726fcec82489",
+      "change_scope": "changed_file",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "8a6dd05b54407a5efed50e765f914871349ecc7deebc619b8231b14019c9960b",
+      "context_complete": true,
+      "task_id": "T-44c8d9a8b5160ffd0292a5aa2a217d254179d55d54917186b513ad1756797c0c",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f4bd6c4e44b203e7db9f4a0f23b5fe65c5e824c5b1724768864f55879fca1a4a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-a3f7a0e1508fb5c84f800c7a0fbb9499f6be69fe0eac7e461dc199b39d203acb",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-335faa2cc2ce9d7cfbe059b6d302fa2f52b5fa3ff6dcff9619372b0842aaece6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-ec3c607241355f480fce64d6b135246fc7a6435a0eb4b749487bf0b99b9245fa",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-14929b7d27ee1c77a8e4934762375ada8f4269789428f7e20ef69cd38ae5bbff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-c38ce0602e0e48baa166a90502a88632c9dff384d3b9253abcc0715ce2dc3382",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-64abada8c773a2798a6d314c7cf77ece299a25105df64c7ef9a83c0049002b65",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-86b10bcc50f712440445c092378980b68f3681ce448ddf923e27ea5babb7aea6",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-945e098ee2f0c45a0d4a31a0c748520727785f9a87f30ebb9ba1929f476631b6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-0482f8f0e8189b417716f9b80869f4e768e567da64a5406243f1e4d1bee6d8ee",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4d6034260ebbb158437b24f6d3ef742e5f8cd29793ba0526568998812649925d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-79a47deb6d0cb332bba3c1fadbe646482b1334b871b297427a8938378882aa83",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2b344f1d1b7e020b134375692494046f89d59a0368613dec81caf0ae526dea17",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-152004c6a6480d32ff619882c9209eebfdcad52eb36689ee7f11e738878bf6c3",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c57ee55ea86f3fe43adf1aceafeb84bec82aa4a5b8703797b143021e69a23a92",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-d85525a46977e2c6f59ba19cf2f816b868d71da80972c50497e1f95e7c08b5f8",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2a06e517216f2e7e6f1932ceac593cbf8b48adc206b798302a5f40cb363adb78",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-deb9b9928564ec81224fd009c187eca50e053add2685fbbb41877496d9a69d62",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4b4bcca300d9ac7b7af93f6ce31f9f5161361ebcd0b5906021bd7b95d1cce326",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-f5fd740c74227521a9f11d8b8410068f623e8d696d1f91ba351e9524410b1d2e",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e83c05269d3b007927daf3d41893e009f8f34ca7a48206272abee41f1e1b78d5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-3062200d67fd4816c8399c84d72e7d1223a2ccb13840b6d567d20209a1c3d4ee",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2c800d5fbf8f52c0e22de5398f46672b66f1148bbc0c4415ace2fa6b635acdd7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-75a51e9e2d0a5f688727a1835549fff24771580b7d3c1f16b5abf3e3d11a6d61",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-04fe611fdae9988dc772f73a40a4e6cded80651e0d7ee8d69961d38b47fabcc1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-42f0bc9857ed9caa552ec35479c61f3b2489085ddca1d2909f7b87e8fdc9f3f2",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7f0ca5fe27c745c1e332a018cd8914865d6be95af7814ae4a2027dfb14d5835f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-9d806f4569e2c37fc6fd61c937502887638e9f5a88e45cc467603830dc363fb4",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0a688cf2a0b1c00863d6ef89d11e91058ed65330b5a07e2fb13331e332f5feec",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-ed00d7b0aea33a0fe4029804061b570c4b5a7ee340fd4a6f371e4548b6feff68",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-93a6313abc58c6d9187650fe31178f0565ac2e52c6e79d7dafe8750bf0957fe8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-dd7737c0c12522087c160ae94ea86410bd4e3a4da0674bc6d67c550fc8252968",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e07208ed09e3d97d90660caa09549e3e89033131db33a1726db7f6b7512019f9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-9de38f2df40b8d88d32e2975c3db65e04d07e75addd969a41cd77a77ee4fd7de",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-709146c697a4181149bebc8c0afbbfa4cff70b72f19dfcdaed4b015b56dc343c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-3de86f377ef44fc36e97842010fba1e3aa679e8d2814a49e06387ed51025a1ce",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a2f47c2229ce973c59e93b5f9e6c4847ac69ca7f043dd60161604b6407050686",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-01afe24cfbb707e39a538ab0e63efa5793f66293d4f6b9ef0d704ff043c85e6a",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab5003c2723bfe49884f0cddb50b898d75f25737b9354bad413fbd7f4584c195",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-511cdcd48ca7c8b5c7916a32836fd76f0931eb377383244482ae27d2c7541b81",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c55090fd9e48978d02157af5ee44663e0be16e1f457f0abb5eeb1c7c3789aec1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-111b7a2a2a03602c2b1a7b54ea47336ad4c52cc41661abadac84776f8907016f",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-88494417c57bd777f8d19c97811bb5c99731e3ee824abd1bb50889f1051eeb35",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-5578a38f15c19bb0d303875fac53db7366fd1d797d854a73af4a66b63d8caa4d",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a87ce17b8d8e7cb5d2fd30e349f3d7b9d55762376560258df8082017c26cdcdd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-329cb258c1e624f2b7ea48cd2c56ab00962084501a4f2c779c2afa31f502cea8",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6c0802e5936a1e17b802e46dcad2cf6389dd089162c706b9adac270ae914c72e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-05feb668851fe39ea80e83a4248ad802a06e85c0b03d877befc441a0ccc4b800",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a8c32b78884f0acddde9067360865749caca1c74b0fab05ebb033b3e29a8e956",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-b0e96a64f153d4f36c20e429444958ce95984d7af291d151799d741b6b450067",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-286ad1fb1fcfb78ad2e253e2fe9e08c300e1ed71bec43368dda45ddd6f03e5fc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-3c2224d8565e0bfb17b942088330452cc3c94fe80ee8f4d5b59ff7b03368126a",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-726c063e9e3739ae6e079e4e1fabd0a9909ea17ae8e842924fdeced0c5a2aa1f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-a5af426421a22f113bd897701135a0f3a4b7525c3091cc9ec9ef10cc39a37265",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b2ffacea68958d8da767511faf454dfb3559e770f1e5cbcc75b629d3dfb701df",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-25e2a4e94bfdf8dfe5ac62021d03124cf37cbfd89ce1ef7baad2aaef787108cb",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4523c29c83e7358059a3b20f91b4bbeba2a3eaa2a23239e1d011f5725091b107",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-23c0ccddb4f65935e284fdc3d02512c19aa6d1ce1a056b09d9a41872b93f6a18",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5c0d2b28e3f43b080e27ba5d9a7a9bbb58eed4c701a94bc0afc039e8829c8175",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-e17a7f51fa2dcddfcb69c4052fef8b76d562308e385fbb6ee93023cf09d7510c",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39ae94696ab304cf7a16ba22e374691f63339cc184d90d18f3db476ab590f59b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-0f12bf54dcdda43332dab2249625a547a7afef99fefa662e3c1a29604308d5dd",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-392f1ba5dc20f26b0ca9eaf573974646f9be9465c2099182197f5cace23cda9d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-3e5e798f7eeded20aa5649a965a432337a640575d96cab2f9553e6bd2374cf97",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c1f7eca81ad13b4320ef1f6bf477ad64ebb05442f0fd1aefa99cc6490f2bb952",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-e5f047e0209c01bfbc9e8819db7ce868098a2087b82c4cad1d1fdba45393f600",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-febd5a0f4a93859a231aef1fea66a80860e619211a959b2573adb53d1a287d3c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-0535b0f8a34826d8d51cad143e350edf241c0b39e57b212ba28b65f2282b2776",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-80450c21d842b6ba3fb46c1f3f0fcd148c65d5b1bdcc6a2b1bee7e4eec5f0b49",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-a33da179b20e19d4ff6ff6a155bd62f3184fd84633fb76688e68415975c6ac41",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "abuse-enforcement-service/service-lib/src/growthbook_writer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dca3b92213886408e35a25a2f15ae734fc9aab004885838f3d0b4e5544cb4203",
+      "change_scope": "supporting_context",
+      "mechanism_group": "abuse-enforcement-service/service-lib",
+      "query_symbols": [
+        "Rejected",
+        "is_rejected",
+        "GrowthBookWriter",
+        "new",
+        "get_feature",
+        "propose_value",
+        "get_env_value",
+        "propose_field"
+      ],
+      "context_complete": false,
+      "task_id": "T-23ca0638abe2cbc764313f70c5a7da7aac74fc98c7001e427a0c25ae6271154a",
+      "evidence_refs": [
+        "E38"
+      ]
+    }
+  ],
+  "task_id": "T-b0c435f16beed29e2e5d8b20f93f8e77af68d80c2b5d2faceb57757fb7955bb2"
+}

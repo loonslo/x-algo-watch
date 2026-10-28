@@ -1,0 +1,1079 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/safety_label_source/metrics.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-707f41dcf2761a7a29c944a21f520942d5b184b9da2a58347a421b150b9f6c59",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/safety_label_source",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 164,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};\n\nuse super::types::{FailureKind, FallbackReason, LabelSource};\n\nconst LOOKUP_TWEET_IDS: &str = \"safety_labels_lookup_tweet_ids\";\nconst FAILURES: &str = \"safety_labels_lookup_failures\";\nconst SOURCE_REQUESTS: &str = \"safety_labels_source_requests\";\nconst SOURCE_LATENCY_MS: &str = \"safety_labels_source_latency_ms\";\nconst CACHE_KEYS: &str = \"safety_labels_cache_keys\";\nconst MANHATTAN_KEYS: &str = \"safety_labels_manhattan_keys\";\nconst CACHE_FALLBACK_KEYS: &str = \"safety_labels_cache_fallback_keys\";\nconst BATCH_SIZE: &str = \"safety_labels_lookup_batch_size\";\nconst CACHE_WARM_KEYS: &str = \"safety_labels_cache_warm_keys\";\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum SourceOutcome {\n    Success,\n    Failure,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum CacheTier {\n    Local,\n    Twemcache,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum CacheResult {\n    Hit,\n    NotFound,\n    Miss,\n    Expired,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum ManhattanResult {\n    Success,\n    Failed,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum BatchStage {\n    Request,\n    LocalMiss,\n    ManhattanFallback,\n}\n\npub(crate) fn record_lookup_tweet_ids(success: usize, failed: usize) {\n    incr_nonzero(LOOKUP_TWEET_IDS, &[(\"result\", \"success\")], success as u64);\n    incr_nonzero(LOOKUP_TWEET_IDS, &[(\"result\", \"failed\")], failed as u64);\n}\n\npub(crate) fn record_lookup_failures(kind: FailureKind, count: usize) {\n    incr_nonzero(FAILURES, &[(\"kind\", kind.into())], count as u64);\n}\n\npub(crate) fn record_source_request(source: LabelSource, outcome: SourceOutcome, elapsed_ms: f64) {\n    incr(\n        SOURCE_REQUESTS,\n        &[(\"source\", source.into()), (\"outcome\", outcome.into())],\n        1,\n    );\n    observe_vm(SOURCE_LATENCY_MS, &[(\"source\", source.into())], elapsed_ms);\n}\n\npub(crate) fn record_cache_keys(tier: CacheTier, result: CacheResult, count: usize) {\n    incr_nonzero(\n        CACHE_KEYS,\n        &[(\"tier\", tier.into()), (\"result\", result.into())],\n        count as u64,\n    );\n}\n\npub(crate) fn record_manhattan_keys(result: ManhattanResult, count: usize) {\n    incr_nonzero(MANHATTAN_KEYS, &[(\"result\", result.into())], count as u64);\n}\n\npub(crate) fn record_cache_fallback_keys(\n    source: LabelSource,\n    reason: FallbackReason,\n    count: usize,\n) {\n    incr_nonzero(\n        CACHE_FALLBACK_KEYS,\n        &[(\"source\", source.into()), (\"reason\", reason.into())],\n        count as u64,\n    );\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum WarmKeyResult {\n    EligibleMiss,\n    Enqueued,\n    DroppedChannelFull,\n    FetchIssued,\n    FetchFailed,\n}\n\npub(crate) fn record_cache_warm_keys(result: WarmKeyResult, count: usize) {\n    incr_nonzero(CACHE_WARM_KEYS, &[(\"result\", result.into())], count as u64);\n}\n\npub(crate) fn record_batch_size(stage: BatchStage, size: usize) {\n    observe(\n        BATCH_SIZE,\n        &[(\"stage\", stage.into())],\n        size as f64,\n        HistogramBuckets::Bucket50To500,\n    );\n}\n\nfn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if count > 0 {\n        incr(metric, labels, count);\n    }\n}\n\nfn incr(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.incr(metric, labels, count);\n    }\n}\n\nfn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: HistogramBuckets) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.observe(metric, labels, value, buckets);\n    }\n}\n\nfn observe_vm(metric: &str, labels: &[(&str, &str)], value: f64) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.observe_vm(metric, labels, value);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use std::fs;\n    use std::path::Path;\n\n    use xai_visibility_filtering::tweet_safety_label::{\n        BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,\n    };\n\n    #[test]\n    fn dashboard_generator_pins_the_get_safety_labels_vm_latency_metrics() {\n        let cargo = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/scripts/dashboard.py\");\n        let ws = \"crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py\";\n        let path = if Path::new(cargo).exists() { cargo } else { ws };\n        let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!(\"read {path}: {e}\"));\n        for pin in [\n            format!(\"VF_CLIENT_LATENCY_VM_METRIC = \\\"{LATENCY_VM_METRIC}\\\"\"),\n            format!(\"VF_CLIENT_BATCH_LATENCY_VM_METRIC = \\\"{BATCH_LATENCY_VM_METRIC}\\\"\"),\n        ] {\n            assert!(dashboard.contains(&pin), \"dashboard.py is missing `{pin}`\");\n        }\n    }\n}\n",
+      "source_digest": "05340717f769fe1f7d632b3da44960173b919e26e2d73d411c76aa8e6e98aa8c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 169,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};\n\nuse super::types::{FailureKind, FallbackReason, LabelSource};\n\nconst LOOKUP_TWEET_IDS: &str = \"safety_labels_lookup_tweet_ids\";\nconst FAILURES: &str = \"safety_labels_lookup_failures\";\nconst SOURCE_REQUESTS: &str = \"safety_labels_source_requests\";\nconst SOURCE_LATENCY_MS: &str = \"safety_labels_source_latency_ms\";\nconst CACHE_KEYS: &str = \"safety_labels_cache_keys\";\nconst MANHATTAN_KEYS: &str = \"safety_labels_manhattan_keys\";\nconst CACHE_FALLBACK_KEYS: &str = \"safety_labels_cache_fallback_keys\";\nconst BATCH_SIZE: &str = \"safety_labels_lookup_batch_size\";\nconst CACHE_WARM_KEYS: &str = \"safety_labels_cache_warm_keys\";\npub const EXPIRED_LABELS: &str = \"safety_labels_expired_labels\";\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum SourceOutcome {\n    Success,\n    Failure,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum CacheTier {\n    Local,\n    Twemcache,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum CacheResult {\n    Hit,\n    NotFound,\n    Miss,\n    Expired,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum ManhattanResult {\n    Success,\n    Failed,\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum BatchStage {\n    Request,\n    LocalMiss,\n    ManhattanFallback,\n}\n\npub(crate) fn record_lookup_tweet_ids(success: usize, failed: usize) {\n    incr_nonzero(LOOKUP_TWEET_IDS, &[(\"result\", \"success\")], success as u64);\n    incr_nonzero(LOOKUP_TWEET_IDS, &[(\"result\", \"failed\")], failed as u64);\n}\n\npub(crate) fn record_lookup_failures(kind: FailureKind, count: usize) {\n    incr_nonzero(FAILURES, &[(\"kind\", kind.into())], count as u64);\n}\n\npub(crate) fn record_source_request(source: LabelSource, outcome: SourceOutcome, elapsed_ms: f64) {\n    incr(\n        SOURCE_REQUESTS,\n        &[(\"source\", source.into()), (\"outcome\", outcome.into())],\n        1,\n    );\n    observe_vm(SOURCE_LATENCY_MS, &[(\"source\", source.into())], elapsed_ms);\n}\n\npub(crate) fn record_cache_keys(tier: CacheTier, result: CacheResult, count: usize) {\n    incr_nonzero(\n        CACHE_KEYS,\n        &[(\"tier\", tier.into()), (\"result\", result.into())],\n        count as u64,\n    );\n}\n\npub(crate) fn record_manhattan_keys(result: ManhattanResult, count: usize) {\n    incr_nonzero(MANHATTAN_KEYS, &[(\"result\", result.into())], count as u64);\n}\n\npub(crate) fn record_cache_fallback_keys(\n    source: LabelSource,\n    reason: FallbackReason,\n    count: usize,\n) {\n    incr_nonzero(\n        CACHE_FALLBACK_KEYS,\n        &[(\"source\", source.into()), (\"reason\", reason.into())],\n        count as u64,\n    );\n}\n\n#[derive(Clone, Copy, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum WarmKeyResult {\n    EligibleMiss,\n    Enqueued,\n    DroppedChannelFull,\n    FetchIssued,\n    FetchFailed,\n}\n\npub(crate) fn record_cache_warm_keys(result: WarmKeyResult, count: usize) {\n    incr_nonzero(CACHE_WARM_KEYS, &[(\"result\", result.into())], count as u64);\n}\n\npub(crate) fn record_expired_labels(count: usize) {\n    incr_nonzero(EXPIRED_LABELS, &[], count as u64);\n}\n\npub(crate) fn record_batch_size(stage: BatchStage, size: usize) {\n    observe(\n        BATCH_SIZE,\n        &[(\"stage\", stage.into())],\n        size as f64,\n        HistogramBuckets::Bucket50To500,\n    );\n}\n\nfn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if count > 0 {\n        incr(metric, labels, count);\n    }\n}\n\nfn incr(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.incr(metric, labels, count);\n    }\n}\n\nfn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: HistogramBuckets) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.observe(metric, labels, value, buckets);\n    }\n}\n\nfn observe_vm(metric: &str, labels: &[(&str, &str)], value: f64) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.observe_vm(metric, labels, value);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use std::fs;\n    use std::path::Path;\n\n    use xai_visibility_filtering::tweet_safety_label::{\n        BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,\n    };\n\n    #[test]\n    fn dashboard_generator_pins_the_get_safety_labels_vm_latency_metrics() {\n        let cargo = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/scripts/dashboard.py\");\n        let ws = \"crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py\";\n        let path = if Path::new(cargo).exists() { cargo } else { ws };\n        let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!(\"read {path}: {e}\"));\n        for pin in [\n            format!(\"VF_CLIENT_LATENCY_VM_METRIC = \\\"{LATENCY_VM_METRIC}\\\"\"),\n            format!(\"VF_CLIENT_BATCH_LATENCY_VM_METRIC = \\\"{BATCH_LATENCY_VM_METRIC}\\\"\"),\n        ] {\n            assert!(dashboard.contains(&pin), \"dashboard.py is missing `{pin}`\");\n        }\n    }\n}\n",
+      "source_digest": "722edff619bb7b5b5b67ff92c8f3ca7bd0d6b138e489ba8d14bd28cdaadf8fd6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "visibility-filtering/evaluate_tweets.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 93,
+      "end_line": 117,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    async fn handle_inner(\n        &self,\n        req: vf_pb::EvaluateTweetsRequest,\n        twitter_context: Option<TwitterContextViewer>,\n    ) -> Result<vf_pb::EvaluateTweetsResponse, Status> {\n        let level = ThriftLevel(req.safety_level);\n        if !ThriftLevel::ENUM_VALUES.contains(&level) {\n            return Err(Status::invalid_argument(\"unknown safety level\"));\n        }\n        let Some(safety_level) = SafetyLevel::from_thrift(level) else {\n            return Err(Status::unimplemented(\"safety level has no Rust policy\"));\n        };\n        ft_metrics::record_batch_size(BATCH_SIZE, req.tweets.len());\n        let judges_quote_entries = matches!(\n            safety_level.spec().quote_entries,\n            QuoteEntries::Judged { .. }\n        );\n        let entries: Vec<Entry> = req\n            .tweets\n            .iter()\n            .map(|tweet| {\n                let placement = match &tweet.quote_context {\n                    None => Placement::Standalone,\n                    Some(quote) if judges_quote_entries => Placement::InnerQuoted {\n                        outer: TweetId(quote.outer_tweet_id),\n",
+      "source_digest": "d933a7eeef223e5de0e7657347cc0ffe1e145ea6f4afb1db2e32663b66679cb6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "visibility-filtering/filter_tweets.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 85,
+      "end_line": 109,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        })\n        .await\n    }\n\n    async fn handle_inner(\n        &self,\n        request: Request<vf_pb::VisibilityFilterRequest>,\n        entered: tokio::time::Instant,\n        grpc_timeout: Option<Duration>,\n    ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {\n        let context = crate::hydration::request_context(entered, grpc_timeout);\n        let req = request.into_inner();\n        ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());\n        let viewer_id = normalize_viewer_id(req.viewer_id);\n        ft_metrics::record_viewer_state(req.viewer_id, viewer_id);\n\n        let Some(safety_level) = SafetyLevel::from_proto(req.safety_level()) else {\n            return Err(Status::unimplemented(\"safety level has no Rust policy\"));\n        };\n        let candidates: Vec<PlacedCandidate> = req\n            .tweets\n            .iter()\n            .map(|t| {\n                PlacedCandidate::standalone(RawCandidate {\n                    tweet_id: TweetId(t.tweet_id),\n",
+      "source_digest": "7358aa87af67ca37c931d4c97e439453584bcff7cc6e45ccb749482a7724d843",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 37,
+      "end_line": 61,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    async fn handle_inner(\n        &self,\n        request: Request<vf_pb::GetSafetyLabelsRequest>,\n    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {\n        let req = request.into_inner();\n\n        let unique_ids: Vec<u64> = req\n            .tweet_ids\n            .into_iter()\n            .collect::<FxHashSet<_>>()\n            .into_iter()\n            .collect();\n        metrics::record_batch_size(BatchStage::Request, unique_ids.len());\n\n        let resolved = self.safety_label_source.get(&unique_ids).await;\n        let outcome = GetSafetyLabelsOutcome::try_from_resolved(resolved, unique_ids.len())?;\n        let failed_count = outcome.failure_count();\n\n        metrics::record_lookup_tweet_ids(outcome.success_count(), failed_count);\n        for (kind, &count) in &outcome.failures {\n            metrics::record_lookup_failures(kind, count);\n        }\n\n        Ok(Response::new(CachedGetSafetyLabelsResponse {\n            results: outcome.results,\n",
+      "source_digest": "8efa19faad91cd54a4b3542db62c88b9e7476aba32a7c75ba8796e2f775d9586",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "visibility-filtering/hydration/execute.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 21,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};\nuse crate::hydration::decode::author::{AuthorColumn, DecodedAuthor};\nuse crate::hydration::decode::tweet::{PureCoreColumn, TweetRowColumn};\nuse crate::hydration::decode::viewer::DecodedViewer;\nuse crate::hydration::fallback_cache::{Column, FallbackCache, FallbackCaches};\nuse crate::hydration::hydrator::Edge;\nuse crate::hydration::inventory::Source;\nuse crate::hydration::metrics::{\n    self, record_batch_size, record_expanded_batch, record_flock_missing_keys,\n    record_keyed_hydrator_request, record_request_country, record_viewer_country,\n    record_viewer_not_age_verified, record_viewer_state,\n};\nuse crate::hydration::plan::Group;\nuse crate::hydration::sources::{Answered, Sources};\nuse crate::hydration::store::{CallRequest, Landing, Store};\nuse crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator};\nuse crate::models::{\n    ArticleLifecycle, CommunityModeration, PureCore, TweetFeatures, Viewer, ViewerAge,\n};\nuse crate::params::CountryList;\nuse crate::rules::SafetyLevel;\n",
+      "source_digest": "6757603cb9feb36e58b843cdaa97b46e666281a661ec6f71282dff88e2e2accb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "visibility-filtering/hydration/execute.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn send<'p>(\n        &'p self,\n        mut call: CallRequest<'p>,\n        sources: &'p dyn Sources,\n        fallback_caches: &'p FallbackCaches,\n    ) -> Option<InFlight<'p>> {\n        let tweet_cache = fallback_caches.tweets.as_ref();\n        let author_cache = fallback_caches.authors.as_ref();\n        let level = self.level();\n        let group = call.group;\n        let (client, method) = group.label();\n        if let Some(size) = call.batch_size {\n            record_batch_size(&client, size);\n        }\n        if !call.is_first {\n            record_expanded_batch(&client, &method, call.key_count);\n        }\n        let timed = Timed {\n            client,\n            method,\n            level,\n            ceiling: group.ceiling(),\n            candidate_count_by_claimed_key: mem::take(&mut call.candidate_count_by_claimed_key),\n        };\n        let in_flight: InFlight<'p> = match group.source {\n",
+      "source_digest": "c3e7cfebacb899ff80ef6823547864d67cc5f55944f5030080151ee5edf1bda5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "visibility-filtering/hydration/metrics.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 255,
+      "end_line": 279,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": ") {\n    incr_nonzero(\n        FLOCK_MISSING_KEYS,\n        &[\n            (\"client\", client),\n            (\"method\", method),\n            (\"safety_level\", safety_level.into()),\n        ],\n        keys as u64,\n    );\n}\n\npub(crate) fn record_batch_size(client: &str, candidate_count: usize) {\n    observe(\n        HYDRATOR_BATCH_SIZE,\n        &[(\"client\", client)],\n        candidate_count as f64,\n        HistogramBuckets::Bucket50To500,\n    );\n}\n\npub(crate) fn record_expanded_batch(client: &str, method: &str, keys: usize) {\n    let labels = [(\"client\", client), (\"method\", method)];\n    incr(HYDRATOR_EXPANDED_BATCHES, &labels, 1);\n    incr_nonzero(HYDRATOR_EXPANDED_KEYS, &labels, keys as u64);\n",
+      "source_digest": "83606a663c00b68fa13c74793220d216d1be44505e995dfa3926a12d3fe654f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "visibility-filtering/metrics.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 354,
+      "end_line": 378,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n    }\n}\n\nimpl Drop for RequestMetricsGuard {\n    fn drop(&mut self) {\n        if let Some(sr) = global_stats_receiver() {\n            self.emit(&*sr, self.start.elapsed());\n        }\n    }\n}\n\npub(crate) fn record_batch_size(metric: &str, size: usize) {\n    observe(metric, &[], size as f64, HistogramBuckets::Bucket50To500);\n}\n\npub(crate) fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if count > 0 {\n        incr(metric, labels, count);\n    }\n}\n\nfn incr(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.incr(metric, labels, count);\n",
+      "source_digest": "d3c5c852dad9ab490ddeda941d69498440b5d69c085e555c80b8e99869e3d914",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 106,
+      "end_line": 130,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n\n        for (reason, count) in fallback_counts {\n            metrics::record_cache_fallback_keys(LabelSource::Twemcache, reason, count);\n        }\n\n        if let Some(warmer) = &self.warmer\n            && !warm_ids.is_empty()\n        {\n            warmer.warm(warm_ids);\n        }\n\n        metrics::record_batch_size(BatchStage::ManhattanFallback, fallback_ids.len());\n        let mut manhattan_results = self.manhattan.get(&fallback_ids).await;\n        for tweet_id in fallback_ids {\n            match manhattan_results.remove(&tweet_id) {\n                Some(ManhattanOutcome::Resolved(label_map)) => {\n                    results.insert(tweet_id, Ok(label_map));\n                }\n                Some(ManhattanOutcome::Failure(failure)) => {\n                    results.insert(tweet_id, Err(failure));\n                }\n                None => {\n                    results.insert(\n                        tweet_id,\n",
+      "source_digest": "88449c7669dac39c6bff21abf90f612d13362c018d143e3791cb175959d2a88f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 97,
+      "end_line": 121,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                && !is_future_dated(id, wall_now)\n            {\n                cache.insert(id, Arc::clone(label_map), TTL);\n            }\n            results.insert(id, result);\n        }\n    }\n\n    fn emit_stats(hits: usize, batch_size: usize, expired: usize) {\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Hit, hits);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Miss, batch_size - expired);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Expired, expired);\n        metrics::record_batch_size(BatchStage::LocalMiss, batch_size);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    use crate::safety_label_source::cached_value::tests::{\n        cached_value_found_mval, cached_value_not_found,\n    };\n    use crate::safety_label_source::codec::RawSafetyLabel;\n    use crate::safety_label_source::lookup::RemoteSource;\n",
+      "source_digest": "d130437d6356f3ec8a16412814c2f7f84e292b6e60a66ee517079a618bda7912",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 64,
+      "end_line": 88,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        Arc::new(Self { tx })\n    }\n\n    #[cfg(test)]\n    pub(crate) fn without_drain_task(capacity: usize) -> (Self, mpsc::Receiver<Vec<u64>>) {\n        let (tx, rx) = mpsc::channel(capacity);\n        (Self { tx }, rx)\n    }\n}\n\nimpl Warmer for CacheWarmer {\n    fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n",
+      "source_digest": "f27db5d6fdb484121c49aa775e2aa18356534f09a85cc289b8d0652a117d47d0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 70,
+      "end_line": 94,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        (Self { tx }, rx)\n    }\n}\n\nimpl Warmer for CacheWarmer {\n    fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n",
+      "source_digest": "5e34320885c3b83c2027ecc6d9c1cbcbfd4ad56b445c4c87cc73088d5f868a4e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 71,
+      "end_line": 95,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nimpl Warmer for CacheWarmer {\n    fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n",
+      "source_digest": "dab2b921b12f3da97345416977c32b24ee9214b1ca7e2a41fad33e7d3183f0a2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 87,
+      "end_line": 111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n        }\n        for chunk in ids.chunks(WARM_FETCH_MAX_KEYS) {\n            let failed = fetcher.fetch(chunk).await;\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchIssued, chunk.len());\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchFailed, failed);\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeFetcher {\n        batches: Mutex<Vec<Vec<u64>>>,\n",
+      "source_digest": "0db974e9508397731b31667f57cea4fc10cb004c7e15850fff4d988a49f14132",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 88,
+      "end_line": 112,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "async fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n        }\n        for chunk in ids.chunks(WARM_FETCH_MAX_KEYS) {\n            let failed = fetcher.fetch(chunk).await;\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchIssued, chunk.len());\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchFailed, failed);\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeFetcher {\n        batches: Mutex<Vec<Vec<u64>>>,\n    }\n",
+      "source_digest": "b7e2c166fe446d3cebc5de650a9783da683c95805b0cc5b4e274c0344c93a275",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "visibility-filtering/evaluate_tweets.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 87,
+      "end_line": 111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    async fn handle_inner(\n        &self,\n        req: vf_pb::EvaluateTweetsRequest,\n        twitter_context: Option<TwitterContextViewer>,\n    ) -> Result<vf_pb::EvaluateTweetsResponse, Status> {\n        let level = ThriftLevel(req.safety_level);\n        if !ThriftLevel::ENUM_VALUES.contains(&level) {\n            return Err(Status::invalid_argument(\"unknown safety level\"));\n        }\n        let Some(safety_level) = SafetyLevel::from_thrift(level) else {\n            return Err(Status::unimplemented(\"safety level has no Rust policy\"));\n        };\n        ft_metrics::record_batch_size(BATCH_SIZE, req.tweets.len());\n        let judges_quote_entries = matches!(\n            safety_level.spec().quote_entries,\n            QuoteEntries::Judged { .. }\n        );\n        let entries: Vec<Entry> = req\n            .tweets\n            .iter()\n            .map(|tweet| {\n                let placement = match &tweet.quote_context {\n                    None => Placement::Standalone,\n                    Some(quote) if judges_quote_entries => Placement::InnerQuoted {\n                        outer: TweetId(quote.outer_tweet_id),\n",
+      "source_digest": "d933a7eeef223e5de0e7657347cc0ffe1e145ea6f4afb1db2e32663b66679cb6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "visibility-filtering/filter_tweets.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 87,
+      "end_line": 111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        })\n        .await\n    }\n\n    async fn handle_inner(\n        &self,\n        request: Request<vf_pb::VisibilityFilterRequest>,\n        entered: tokio::time::Instant,\n        grpc_timeout: Option<Duration>,\n    ) -> Result<Response<vf_pb::VisibilityFilterResponse>, Status> {\n        let context = crate::hydration::request_context(entered, grpc_timeout);\n        let req = request.into_inner();\n        ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());\n        let viewer_id = normalize_viewer_id(req.viewer_id);\n        ft_metrics::record_viewer_state(req.viewer_id, viewer_id);\n\n        let Some(safety_level) = SafetyLevel::from_proto(req.safety_level()) else {\n            return Err(Status::unimplemented(\"safety level has no Rust policy\"));\n        };\n        let candidates: Vec<PlacedCandidate> = req\n            .tweets\n            .iter()\n            .map(|t| {\n                PlacedCandidate::standalone(RawCandidate {\n                    tweet_id: TweetId(t.tweet_id),\n",
+      "source_digest": "7358aa87af67ca37c931d4c97e439453584bcff7cc6e45ccb749482a7724d843",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 37,
+      "end_line": 61,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    async fn handle_inner(\n        &self,\n        request: Request<vf_pb::GetSafetyLabelsRequest>,\n    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {\n        let req = request.into_inner();\n\n        let unique_ids: Vec<u64> = req\n            .tweet_ids\n            .into_iter()\n            .collect::<FxHashSet<_>>()\n            .into_iter()\n            .collect();\n        metrics::record_batch_size(BatchStage::Request, unique_ids.len());\n\n        let resolved = self.safety_label_source.get(&unique_ids).await;\n        let (response, failure_counts) =\n            CachedGetSafetyLabelsResponse::try_from_resolved(resolved, unique_ids.len())?;\n\n        metrics::record_lookup_tweet_ids(response.results.len(), response.failed_ids.len());\n        for (kind, &count) in &failure_counts {\n            metrics::record_lookup_failures(kind, count);\n        }\n\n        Ok(Response::new(response))\n    }\n",
+      "source_digest": "4472e23a9f8140b82a9bb79c9ff6ef813c93bd131fcd2adccb455b0b7ba999dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "visibility-filtering/hydration/execute.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 22,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use crate::hydration::batch::{Hydrated, HydrationBatch, RawHydrationBatch};\nuse crate::hydration::decode::author::{AuthorColumn, DecodedActor, DecodedAuthor};\nuse crate::hydration::decode::tweet::{PureCoreColumn, TweetRowColumn};\nuse crate::hydration::decode::viewer::DecodedViewer;\nuse crate::hydration::fallback_cache::{Column, FallbackCache, FallbackCaches};\nuse crate::hydration::fetcher::Owner;\nuse crate::hydration::hydrator::Edge;\nuse crate::hydration::inventory::Source;\nuse crate::hydration::metrics::{\n    self, record_batch_size, record_expanded_batch, record_flock_missing_keys,\n    record_keyed_hydrator_request, record_request_country, record_viewer_country,\n    record_viewer_not_age_verified, record_viewer_state,\n};\nuse crate::hydration::plan::Group;\nuse crate::hydration::sources::{Expired, Sources};\nuse crate::hydration::store::{CallRequest, Landing, Store};\nuse crate::hydration::{Hydration, HydrationPlan, HydrationRequest, Hydrator};\nuse crate::models::{\n    ArticleLifecycle, CommunityModeration, PureCore, TweetFeatures, Viewer, ViewerAge,\n};\nuse crate::params::CountryList;\nuse crate::rules::SafetyLevel;\n",
+      "source_digest": "b2f90e80c6decc29873dcd45013442a238199ffa6bfc3d2893ba27041ffe9a9f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "visibility-filtering/hydration/execute.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 246,
+      "end_line": 270,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        fallback_caches: &'p FallbackCaches,\n    ) -> Option<InFlight<'p>> {\n        let group = call.group;\n        let owner = group.fetcher.owner;\n        let tweet_cache = fallback_caches.tweets.as_ref();\n        let author_cache = fallback_caches\n            .authors\n            .as_ref()\n            .filter(|_| owner == Owner::Request);\n        let level = self.level();\n        let (client, method) = group.label();\n        if let Some(size) = call.batch_size {\n            record_batch_size(&client, size);\n        }\n        if !call.is_first {\n            record_expanded_batch(&client, &method, call.key_count);\n        }\n        let timed = Timed {\n            client,\n            method,\n            level,\n            ceiling: group.ceiling(),\n            candidate_count_by_claimed_key: mem::take(&mut call.candidate_count_by_claimed_key),\n        };\n        let in_flight: InFlight<'p> = match group.fetcher.source {\n",
+      "source_digest": "26341d7cd548cd0a9ccde65d12dc82219521464385515e916d444357df8f1357",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "visibility-filtering/hydration/metrics.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 263,
+      "end_line": 287,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": ") {\n    incr_nonzero(\n        FLOCK_MISSING_KEYS,\n        &[\n            (\"client\", client),\n            (\"method\", method),\n            (\"safety_level\", safety_level.into()),\n        ],\n        keys as u64,\n    );\n}\n\npub(crate) fn record_batch_size(client: &str, candidate_count: usize) {\n    observe(\n        HYDRATOR_BATCH_SIZE,\n        &[(\"client\", client)],\n        candidate_count as f64,\n        HistogramBuckets::Bucket50To500,\n    );\n}\n\npub(crate) fn record_expanded_batch(client: &str, method: &str, keys: usize) {\n    let labels = [(\"client\", client), (\"method\", method)];\n    incr(HYDRATOR_EXPANDED_BATCHES, &labels, 1);\n    incr_nonzero(HYDRATOR_EXPANDED_KEYS, &labels, keys as u64);\n",
+      "source_digest": "83606a663c00b68fa13c74793220d216d1be44505e995dfa3926a12d3fe654f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "visibility-filtering/metrics.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 400,
+      "end_line": 424,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        incr(\n            NOTIFICATION_RESULTS,\n            &[\n                (\"notification_type\", notification_type),\n                (\"outcome\", outcome),\n                (\"reason\", reason),\n            ],\n            count,\n        );\n    }\n}\n\npub(crate) fn record_batch_size(metric: &str, size: usize) {\n    observe(metric, &[], size as f64, HistogramBuckets::Bucket50To500);\n}\n\npub(crate) fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if count > 0 {\n        incr(metric, labels, count);\n    }\n}\n\nfn incr(metric: &str, labels: &[(&str, &str)], count: u64) {\n    if let Some(sr) = global_stats_receiver() {\n        sr.incr(metric, labels, count);\n",
+      "source_digest": "a63d0e05430814d824f19f0f92997bd635617f086f92da30bc71b68f03ca10d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 106,
+      "end_line": 130,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n\n        for (reason, count) in fallback_counts {\n            metrics::record_cache_fallback_keys(LabelSource::Twemcache, reason, count);\n        }\n\n        if let Some(warmer) = &self.warmer\n            && !warm_ids.is_empty()\n        {\n            warmer.warm(warm_ids);\n        }\n\n        metrics::record_batch_size(BatchStage::ManhattanFallback, fallback_ids.len());\n        let mut manhattan_results = self.manhattan.get(&fallback_ids).await;\n        for tweet_id in fallback_ids {\n            let result = manhattan_results.remove(&tweet_id).unwrap_or_else(|| {\n                Err(LookupError::new(\n                    FailureKind::ManhattanFetch,\n                    \"missing from MH response\",\n                ))\n            });\n            results.insert(tweet_id, result);\n        }\n\n        results\n",
+      "source_digest": "50a4f57acb6330ba486c718852499b4d1b2a6400a716e401d7bf82487cb76965",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 98,
+      "end_line": 122,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        for labels in results.values_mut() {\n            let Ok(map) = labels else { continue };\n            if map\n                .labels\n                .values()\n                .any(|label| !label_is_live(label.expires_at_msec, now_ms))\n            {\n                let live = drop_expired_labels(map, now_ms);\n                dropped += map.labels.len() - live.labels.len();\n                *map = Arc::new(live);\n            }\n        }\n        metrics::record_expired_labels(dropped);\n\n        results\n    }\n\n    fn get_local(\n        &self,\n        ids: &[u64],\n        results: &mut FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n    ) -> (Vec<u64>, usize) {\n        let Some(cache) = &self.cache else {\n            return (ids.to_vec(), 0);\n        };\n",
+      "source_digest": "0e162d8853f24971670637261e5278b38046d621780e02d28f213c4eb6e650e7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "visibility-filtering/safety_label_source/source.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 150,
+      "end_line": 174,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                && !is_future_dated(id, wall_now)\n            {\n                cache.insert(id, Arc::clone(label_map), TTL);\n            }\n            results.insert(id, result);\n        }\n    }\n\n    fn emit_stats(hits: usize, batch_size: usize, expired: usize) {\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Hit, hits);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Miss, batch_size - expired);\n        metrics::record_cache_keys(CacheTier::Local, CacheResult::Expired, expired);\n        metrics::record_batch_size(BatchStage::LocalMiss, batch_size);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    use crate::safety_label_source::cached_value::tests::{\n        cached_value_found_mval, cached_value_not_found,\n    };\n    use crate::safety_label_source::codec::RawSafetyLabel;\n    use crate::safety_label_source::lookup::RemoteSource;\n",
+      "source_digest": "d130437d6356f3ec8a16412814c2f7f84e292b6e60a66ee517079a618bda7912",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 58,
+      "end_line": 82,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (tx, rx) = mpsc::channel(WARM_CHANNEL_CAPACITY);\n        tokio::spawn(drain(rx, fetcher));\n        Arc::new(Self { tx })\n    }\n\n    #[cfg(test)]\n    pub(crate) fn without_drain_task(capacity: usize) -> (Self, mpsc::Receiver<Vec<u64>>) {\n        let (tx, rx) = mpsc::channel(capacity);\n        (Self { tx }, rx)\n    }\n\n    pub(crate) fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n",
+      "source_digest": "acd8d46efe0cb5cb498cab10c43c9111c4bf57cac81351bbffc197c2a845f1fc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 64,
+      "end_line": 88,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub(crate) fn without_drain_task(capacity: usize) -> (Self, mpsc::Receiver<Vec<u64>>) {\n        let (tx, rx) = mpsc::channel(capacity);\n        (Self { tx }, rx)\n    }\n\n    pub(crate) fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n",
+      "source_digest": "98b712c620ddee932b0b9bba9e7d769b2958ea58b60101801501b7ebe08f1b6a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 65,
+      "end_line": 89,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (tx, rx) = mpsc::channel(capacity);\n        (Self { tx }, rx)\n    }\n\n    pub(crate) fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n",
+      "source_digest": "c99e398b5cbc8d1c9c24e1a8bed9beb4623ec6ba52d1479fb5d80851a3c22681",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 81,
+      "end_line": 105,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n        }\n        for chunk in ids.chunks(WARM_FETCH_MAX_KEYS) {\n            let failed = fetcher.fetch(chunk).await;\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchIssued, chunk.len());\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchFailed, failed);\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeFetcher {\n        batches: Mutex<Vec<Vec<u64>>>,\n",
+      "source_digest": "0db974e9508397731b31667f57cea4fc10cb004c7e15850fff4d988a49f14132",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 82,
+      "end_line": 106,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "async fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n        }\n        for chunk in ids.chunks(WARM_FETCH_MAX_KEYS) {\n            let failed = fetcher.fetch(chunk).await;\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchIssued, chunk.len());\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchFailed, failed);\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeFetcher {\n        batches: Mutex<Vec<Vec<u64>>>,\n    }\n",
+      "source_digest": "b7e2c166fe446d3cebc5de650a9783da683c95805b0cc5b4e274c0344c93a275",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-707f41dcf2761a7a29c944a21f520942d5b184b9da2a58347a421b150b9f6c59",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "ab37e6b3d30fd417164a4509e753d419c1f3a2ac3dc70d2cb0ebd10633150e88",
+      "context_complete": true,
+      "task_id": "T-6fe2d6d0278361768c0ab51b611274be900776b4d78fcb402a07cd6a91cd1239",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-613f0a80269ecb81688dea8415290e70841cfdc12ec019016e35ad3a575a1620",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-0c01b74f8cd31dc0a3da1994bd38683ad953e0e14a9615f655700f7384d725d2",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5fae3e67d78a6b88a0b651980443cfeaa0791ab39ffc6db6360a3afb277f83de",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-b98a2a57d0855f0c0d628fcd2f57dc6acdcdddbd0ab96f905640c5ce68cf6e47",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-560437ccfffb8dccbdb74d4c0105c7ffecb7e108e76e14818c0ea37026e9262a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-b095017acc16efebec881627d22da322b238fcd08b3ab2542b7f5e388bd50262",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca3b0ab613fc897553b54af85506ff2cb8408b155fb5f6409f5294f06f4ab7fc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-976166956f40eb6496ab0f8efe7def936753e0efbe22854877b1263f10fb803b",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b7281666b0a47dab6497ebdf143f0afe48326e0fee4ead1ddb1b51daa12fa4e9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-1d47951c70f7df8ebc2316cb60d5c2c606c064064b9c93db452362b428f30cbc",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c1909b92517221904446212dddda978a3a9279ef37cff29eaa8dc50b114febbd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-01682184260979d7d9f891a9fe4964cccc78af371b435c26276d2518191635ca",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d7e607a9df60569bb8d393159dd33f8f3d25eff994bff4c801dea65531b31bd4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-bee96add97b7c2f2e89da5c387d85b0bf3697bd358e2b402eb9d8aa05d0f2baf",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ee2fd2ed7ed2ead3254c346926c8f1a259c0494e6249110cc180ab59f42ac9e6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-d388186cb2b3d8a054d00b948cc533bcd9eac346dd1a7c6e085556f8e428f1be",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7809fe5dc97752d379f7491debe1d814cc6e057f6bffcfa609e39eef622d2001",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-b8dff38a990a3c87ea8d1254133c81ce3238d31ce67be11648d59826c23b349d",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-29a1b645a840a80d13a75a4bcd7b53eb197a7994082805a13fc841fd1991b404",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-b628dc53b1aeddeace42cca0ebcd0fea6fc71ea2bd9e69799df9af0ebca0deb6",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bb0e419f8b5bcd2c29432c2366a1936d3ae137f6ef2f392c09b994587916875d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-7cf471763c4eb56213f3805448ac43dd0ee5277b717ab3bd81b551135dfe5c2c",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4080f119d78fbf1225a113d10a362bfbbb6cb7723fb60eb6a727da9b0021323f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-8d64b2c3d31509ebc9862dcb182727a9507536e36b839dd9e6f5f914af228ee4",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4175bd625e4edf0c018d03e4d115c14697dbe059d17289b4447bedbb439ba5c9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-7e7308cdc65b7db783524964c54ce5f26caa306c9661b462f650453177137866",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6d86a2f09ce7d1fb89c02abce3a21e32b44ea936b1e74c4acff61126968309af",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-89270f4b521a9019e785427e87b95e6a3e7831590089139a076029c13578e9c9",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ee44d24559bd14ba22971bd4189b606df62305759b8268695141e8acd14db4b9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-1f5b0aef20b5bd4718fbbef6fbe7c37bb38b50e7685c5e712af16300fc8504e1",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9a3cd5114bb8f5db587191afd2c48a5c4e095a6cc22ca59b3997853e6577d3e0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-5d227f51342de97bd34ab6c14e5dcda2946ba9260e26207f99080f794a1bfb95",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d509b05e39b47470751220ee1088d804d1ae1dea9112f90c626a22fa17963e1e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-96786753b391b610cdd6e5c4e2f1b9931f6020123cea136320906f2d72f84bbd",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bbd5c7789f51cffe52903e380b5b453419170a060d9b8eb7dbdb4b6f99fb90e0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-3a22a64b1a9a0742963fb712b5f23c76986e4ba9e7337e2ffde08edf4d0788fd",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ed0b8206814729eca00d8ff310cb9bc6d90752853a62b4105f98e2245f31a983",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-cd96a8c13192603c4cb21e0260227772f64b97aee3959f11083325448b42d41b",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-76fdd4b4e9df41b845d6ac0b3f3de7186a5ac63b3f6abbb79cde17b3cb4482a8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-32708343949855f0cfb27c8f471a4c89eafbd84c096b3df063ee8cffdabaa6f8",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-46918dcdcf1749105e7045ef092b4cce00ebdca512871fc7eea92356955578e6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-19672fe5755bb3daa6ab979ca74384d698168614bd9c938a009018e5be85b09b",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-86a2102e7bd0c075f33de5d263ed36cfac672096ebd9786e5752175081e4f974",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-c428055add64eb3e19645d81972cb72b6cb1532ab06636353fdbbf6c7b6cfde5",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3941ef4eac52104144abcee064282c34b986e77167d1edccd3c5c514b032c4bb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-0321e086929fe33472d4fc8aeb167b960afdbf1c8520275f45d07dc31c6c4dff",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0f9f65c089f949c2bf7ed49ca1774df48f6840ba19269ccb868b9e3f75fb26f4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-77d4a255c8cefa445809b3d469089ba281174ae3c52b2e27cf762d054d912791",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f902ded5608ecb51183a7d99fd933001039a40794f3dadc3218ddc06b42e632e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-20ff00f4c5f254b73be84599238607b15a90ec54a6bb3beeb7c550a18006eb49",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c6fd287b0b621a54be925afe8fffd434a4aadf94fdf6505160aca6776f350266",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-863b413777e689258c02345a3b53c458e0aebd4015f32630e94e03ca9baec2be",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c7a3b7fa5b3f903bd15aa9dca51cbe12aa672850c6a78a4166591c2e01977322",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-42c4163add81396fa68de1f557eb4c600856453aa9d69f008ae69a56da5753fd",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dbd9c2e5f289d1494421a1f959d359c061c022593976077f67f3c4e4852188d6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-58b91fca6100ce6e84147adc6395905a33a545b8ac9bfd5d0359efea0ed491eb",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/metrics.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b2c04444823255359056b1af6ac75b8cfbc7c30879f7ff39e4d15e0294d8fcf3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "record_cache_warm_keys",
+        "record_expired_labels",
+        "record_batch_size"
+      ],
+      "context_complete": false,
+      "task_id": "T-39001ee01705a1bde5a9480ffbf034a731b8c3cf1a4bf0ecb69b08ce7a913c42",
+      "evidence_refs": [
+        "E31"
+      ]
+    }
+  ],
+  "task_id": "T-e6783c8ea4025d53e3dce33907d1a4bffc990432ff0a0f01a9f851b186967753"
+}

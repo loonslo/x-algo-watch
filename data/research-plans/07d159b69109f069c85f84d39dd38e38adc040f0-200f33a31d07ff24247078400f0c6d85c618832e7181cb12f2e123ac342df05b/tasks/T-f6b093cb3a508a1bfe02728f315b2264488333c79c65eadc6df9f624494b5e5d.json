@@ -1,0 +1,1805 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-10dcfaf23a3e3faf93f22cfed473906b70221380fef874fe5bbf9a8df2da3375",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 198,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport argparse\nimport os\nimport random\nimport sys\n\nimport numpy as np\nimport pyarrow.compute as pc\nimport pyarrow.parquet as pq\n\nsys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))\n\nfrom xrex.data.recsys import history_id_lists as hil\nfrom xrex.data.recsys import id_list_features as ilf\nfrom xrex.data.recsys import id_list_presets as presets\nfrom xrex.data.recsys.constants import action_type_map_raw\n\nRECORDS = \"/data/phoenix/kafka/ads/phoenix_training_records\"\nSIDECARS = \"/data/phoenix/kafka/ads/list_features_backfill/list_features\"\n\n\ndef _col(rb, name, n, dtype):\n    values = pc.list_flatten(rb.column(name).combine_chunks())\n    if values.null_count:\n        values = values.fill_null(False if dtype is np.bool_ else 0)\n    return values.to_numpy(zero_copy_only=False).reshape(n, -1).astype(dtype)\n\n\ndef history_counts(files: list[str], specs) -> np.ndarray:\n    big = tuple(ilf.IdListFeatureSpec(s.name, 2000) for s in specs if s.is_history)\n    bits = hil.ActionBits.for_vocab(action_type_map_raw, 256)\n    out = []\n    for f in files:\n        t = pq.read_table(f)\n        n = t.num_rows\n        actions = (\n            pc.list_flatten(pc.list_flatten(t.column(\"actionNameMultiHotSeqSeq\").combine_chunks()))\n            .to_numpy(zero_copy_only=False)\n            .reshape(n, -1, 256)\n        )\n        pad = _col(t, \"paddingMask\", n, np.bool_)\n        new = _col(t, \"newEventMask\", n, np.bool_)\n        imp = _col(t, \"impressedTimeMsSeq\", n, np.int64)\n        served = (\n            _col(t, \"servedTimeMsSeq\", n, np.int64) if \"servedTimeMsSeq\" in t.schema.names else None\n        )\n        cont = (\n            pc.list_flatten(\n                pc.list_flatten(t.column(\"continuousActionValuesSeqSeq\").combine_chunks())\n            )\n            .to_numpy(zero_copy_only=False)\n            .reshape(n, -1, 8)\n        )\n        arrays = hil.HistoryArrays(\n            actions=actions,\n            author_ids=_col(t, \"authorIdSeq\", n, np.int64),\n            tweet_ids=_col(t, \"tweetIdSeq\", n, np.int64),\n            promoted_ids=_col(t, \"promotedIdSeq\", n, np.int64),\n            impressed_ms=imp,\n            request_ms=hil.request_time_ms(imp, served, pad & new, pad & ~new),\n            history_mask=pad & ~new,\n            dwell_secs=cont[:, :, hil.DWELL_TIME_SLOT].astype(np.float32),\n        )\n        ids, mask = ilf.empty_arrays(n, big)\n        hil.fill(ids, mask, big, arrays, bits)\n        offsets = ilf.slot_offsets(big)\n        out.append(\n            np.stack([mask[:, offsets[i] : offsets[i + 1]].sum(axis=1) for i in range(len(big))], 1)\n        )\n    return np.concatenate(out) if out else np.zeros((0, len(big)), np.int64)\n\n\ndef hydrator_counts(files: list[str], specs) -> np.ndarray:\n    hyd = [s for s in specs if not s.is_history]\n    out = []\n    for f in files:\n        col = pq.read_table(f, columns=[ilf.COLUMN]).column(0).combine_chunks()\n        n = len(col)\n        structs = pc.list_flatten(col)\n        names = structs.field(\"name\").to_numpy(zero_copy_only=False)\n        lens = (\n            pc.list_value_length(structs.field(\"ids\")).fill_null(0).to_numpy(zero_copy_only=False)\n        )\n        row_of = np.repeat(\n            np.arange(n), pc.list_value_length(col).fill_null(0).to_numpy(zero_copy_only=False)\n        )\n        counts = np.zeros((n, len(hyd)), np.int64)\n        for j, s in enumerate(hyd):\n            sel = names == s.name\n            counts[row_of[sel], j] = lens[sel]\n        out.append(counts)\n    return np.concatenate(out) if out else np.zeros((0, len(hyd)), np.int64)\n\n\ndef propose_k(counts: np.ndarray, cap: int | None, max_k: int) -> int:\n    nonempty = float((counts > 0).mean()) if counts.size else 0.0\n    q = 95 if nonempty < 0.5 else 90\n    k = int(np.percentile(counts, q)) if counts.size else 0\n    k = max(5, int(5 * round(k / 5)))\n    k = min(k, max_k)\n    if cap is not None:\n        k = min(k, cap)\n    return k\n\n\ndef main() -> None:\n    ap = argparse.ArgumentParser(\n        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter\n    )\n    ap.add_argument(\"--records\", default=RECORDS)\n    ap.add_argument(\n        \"--sidecars\", default=SIDECARS, help=\"list-features sidecar root; '' to skip hydrator lists\"\n    )\n    ap.add_argument(\"--min-batch\", type=int, required=True)\n    ap.add_argument(\"--max-batch\", type=int, required=True)\n    ap.add_argument(\"--batch-step\", type=int, default=200)\n    ap.add_argument(\"--partitions\", default=\"0,64,128,192\")\n    ap.add_argument(\n        \"--specs\", default=None, help=\"id_list_features string; default: id_list_presets.ALL_LISTS\"\n    )\n    ap.add_argument(\n        \"--max-k\",\n        type=int,\n        default=50,\n        help=\"cap for proposed k (dense lists are capped by design)\",\n    )\n    args = ap.parse_args()\n\n    specs = (\n        ilf.parse_specs(args.specs)\n        if args.specs\n        else ilf.parse_specs(presets.ADS_ID_LIST_FEATURES_ALL)\n    )\n    parts = [int(p) for p in args.partitions.split(\",\")]\n    batches = range(args.min_batch, args.max_batch + 1, args.batch_step)\n    rec_files = [\n        f\"{args.records}/partition={p}/{b // 2000}/batch_{b}.parquet\"\n        for b in batches\n        for p in parts\n    ]\n    rec_files = [f for f in rec_files if os.path.exists(f)]\n    random.Random(0).shuffle(rec_files)\n    hist_specs = [s for s in specs if s.is_history]\n    hyd_specs = [s for s in specs if not s.is_history]\n\n    rows: dict[str, tuple[np.ndarray, int | None]] = {}\n    if hist_specs:\n        counts = history_counts(rec_files, specs)\n        for j, s in enumerate(hist_specs):\n            rows[s.feature_name] = (counts[:, j], None)\n    if hyd_specs and args.sidecars:\n        side_files = [\n            f\"{args.sidecars}/partition={p}/{b // 2000}/batch_{b}.list_features.parquet\"\n            for b in batches\n            for p in parts\n        ]\n        side_files = [f for f in side_files if os.path.exists(f)]\n        if not side_files:\n            print(\n                f\"no sidecars in [{args.min_batch}, {args.max_batch}] under {args.sidecars}; hydrator lists skipped\"\n            )\n        else:\n            counts = hydrator_counts(side_files, specs)\n            for j, s in enumerate(hyd_specs):\n                rows[s.feature_name] = (counts[:, j], ilf.source_cap(s.name))\n\n    print(\n        f\"records files {len(rec_files)} | users (records) {sum(len(v[0]) for n, v in rows.items() if n.startswith('hist_')) // max(len(hist_specs), 1)}\"\n    )\n    print(\n        f\"{'feature':54s} {'k':>3s} {'>=1':>6s} {'full':>6s} {'fill':>5s} {'p50':>5s} {'p90':>5s} {'p99':>5s} {'propose':>7s}\"\n    )\n    by_feature = {s.feature_name: s for s in specs}\n    changes = {}\n    for name, (c, cap) in rows.items():\n        s = by_feature[name]\n        if c.size == 0:\n            continue\n        k = s.k\n        prop = propose_k(c, cap, args.max_k)\n        print(\n            f\"{name:54s} {k:>3d} {(c > 0).mean() * 100:>5.1f}% {(c >= k).mean() * 100:>5.1f}% \"\n            f\"{np.minimum(c, k).mean() / k * 100:>4.0f}% {np.percentile(c, 50):>5.0f} {np.percentile(c, 90):>5.0f} \"\n            f\"{np.percentile(c, 99):>5.0f} {prop:>7d}{'  *' if prop != k else ''}\"\n        )\n        if prop != k:\n            changes[s.identity] = prop\n    if changes:\n        print(\"\\nproposed with_k overrides (identity -> k):\")\n        for ident, k in changes.items():\n            print(f'    \"{ident}\": {k},')\n\n\nif __name__ == \"__main__\":\n    main()\n",
+      "source_digest": "2061d396e0eef28debc24e0487246f3b3a3492b0369d881e8fd578f36b92b05f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "fn admin_ui_public_dir() -> PathBuf {\n    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n",
+      "source_digest": "140148b0487122750972c8176b105883aa85c856c14c9352bacc2ae86cdf54a0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 21,
+      "end_line": 45,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n",
+      "source_digest": "f62351ae4fd21b06d5a8ab2e93eaf42134bc3cb0d0b3403e2353c307610bd6f7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 64,
+      "end_line": 88,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .client\n            .get(self.tenant.clone(), [MH_PKEY], [lkey.as_str()])\n            .await\n        {\n            Ok(v) => v?,\n            Err(e) => {\n                warn!(\"Manhattan allowlist GET failed: {e}\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                return None;\n            }\n        };\n        let entry: AllowlistEntry = serde_json::from_slice(item.value().as_bytes()).ok()?;\n        let ttl_secs = crate::manhattan::remaining_ttl_secs(\n            item.expires_at()\n                .map(|d| d.timestamp_nanos_opt().unwrap_or(0) as u64),\n        );\n        Some((entry, ttl_secs))\n    }\n\n    pub async fn add_entity(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        ttl_secs: u64,\n        entry: &AllowlistEntry,\n",
+      "source_digest": "070e3b2db3b9f4f5d51d596e625950191cb292a4566eb7e25f326b8943447efe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 143,
+      "end_line": 167,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        let mut records = Vec::with_capacity(items.len());\n        for item in items {\n            let Some(id_bytes) = item.lkey().into_byte_vecs().into_iter().next() else {\n                continue;\n            };\n            let Ok(user_id) = std::str::from_utf8(&id_bytes)\n                .unwrap_or_default()\n                .parse::<i64>()\n            else {\n                continue;\n            };\n            let ttl_secs = crate::manhattan::remaining_ttl_secs(\n                item.expires_at()\n                    .map(|d| d.timestamp_nanos_opt().unwrap_or(0) as u64),\n            );\n            if let Ok(entry) = serde_json::from_slice::<AllowlistEntry>(item.value().as_bytes()) {\n                records.push(AllowlistRecord {\n                    user_id,\n                    added_by: entry.added_by,\n                    reason: entry.reason,\n                    added_at: entry.added_at,\n                    ttl_secs,\n                });\n            }\n",
+      "source_digest": "66683cd938bd6a8765d122330e764bc9b799f33f58c71779c0dbb5a7293ff5f2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/api_doc.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 23,
+      "end_line": 47,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub error: String,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct DryRunStatus {\n    pub dry_run: bool,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct RateLimitStats {\n    pub used: u64,\n    pub cap: u64,\n    pub remaining: u64,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct AllowlistDeleteResponse {\n    pub user_id: i64,\n    pub removed: bool,\n}\n\n#[derive(OpenApi)]\n#[openapi(\n    modifiers(&SecurityAddon),\n    paths(\n",
+      "source_digest": "1daacad277d75f523f94607051af31a0590a2783404eed161dc1b22e9b6b8704",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 850,
+      "end_line": 874,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    assert_eq!(\n        statuses,\n        vec![\n            backfill::STATUS_ALREADY_FINISHED.to_owned(),\n            \"success\".to_owned()\n        ]\n    );\n    assert_eq!(b.ais.take().len(), 1);\n    assert_eq!(b.run_tickets(), 1);\n}\n\n#[tokio::test(flavor = \"multi_thread\", worker_threads = 4)]\nasync fn two_pods_share_the_budget_exactly_from_a_cold_start() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let b = bed(run_config(false, 1), vec![]).await;\n    let rec = put_running(\n        &b.backfill_store,\n        RUN,\n        BB1.0,\n        vec![LIVENESS],\n        vec![LevelRow::Missing],\n    );\n    let mut pod2 = b.ctx.clone();\n    pod2.backfill = pod_backfill(&b, b.claims.clone(), \"pod-2\").await;\n    let decide = |ctx: EnforcementCtx, account: Account, nonce: i64| {\n",
+      "source_digest": "9caef38cfa1861594f24884d969c3e8d03d170335b44ed11899c075ecdf3d7ac",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 12,
+      "end_line": 36,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(long = \"pod-url\", required = true)]\n    pod_urls: Vec<String>,\n    #[arg(long)]\n    updated_by: String,\n    #[arg(long, default_value = \"ACTION_CONTROL_TOKEN\")]\n    token_env: String,\n    #[arg(long)]\n    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n",
+      "source_digest": "933a67eaa86e46d6b5b5d85c2c83fdf431a5a9760a4b5ae31e2231039178024a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 13,
+      "end_line": 37,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pod_urls: Vec<String>,\n    #[arg(long)]\n    updated_by: String,\n    #[arg(long, default_value = \"ACTION_CONTROL_TOKEN\")]\n    token_env: String,\n    #[arg(long)]\n    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n",
+      "source_digest": "01a731c11904aa426dc2a1f51af3f7173168d45a6533ad6ce151d60fbcf68152",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/validate_rules_yaml.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 17,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::process::ExitCode;\n\nuse xai_abuse_enforcement_service::rules::CompiledRules;\n\nfn main() -> ExitCode {\n    let Some(path) = std::env::args().nth(1) else {\n        eprintln!(\"usage: validate-rules-yaml <path-to-rules.yaml>\");\n        return ExitCode::FAILURE;\n    };\n    let src = match std::fs::read_to_string(&path) {\n        Ok(s) => s,\n        Err(e) => {\n            eprintln!(\"error: cannot read {path}: {e}\");\n            return ExitCode::FAILURE;\n        }\n    };\n    match CompiledRules::from_yaml(&src) {\n",
+      "source_digest": "02bef21b97a5370a189d33a8c196813ea7e6a5262b3dd081abf30039dd1b4caa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/config.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 119,
+      "end_line": 143,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(\n        long,\n        default_value = \"xai-abuse-enforcement-service.prod\",\n        env = \"GIZMODUCK_CLIENT_ID\"\n    )]\n    pub gizmoduck_client_id: String,\n\n    #[arg(\n        long,\n        default_value = \"platform-manipulation/isHighPageRankV2.User\",\n        env = \"HIGH_PAGE_RANK_COLUMN\"\n    )]\n    pub high_page_rank_column: String,\n\n    #[arg(\n        long,\n        default_value = \"platform-manipulation/isGreyBadge.User\",\n        env = \"GREY_BADGE_COLUMN\"\n    )]\n    pub grey_badge_column: String,\n\n    #[arg(\n        long,\n        default_value = \"user_activity/uas_by_client.User\",\n        env = \"UAS_COLUMN\"\n",
+      "source_digest": "8c35e04899ee615b35b997c2131cd76a35f11b01d496b8bcb74eb7c54e6ab711",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/config.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 126,
+      "end_line": 150,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(\n        long,\n        default_value = \"platform-manipulation/isHighPageRankV2.User\",\n        env = \"HIGH_PAGE_RANK_COLUMN\"\n    )]\n    pub high_page_rank_column: String,\n\n    #[arg(\n        long,\n        default_value = \"platform-manipulation/isGreyBadge.User\",\n        env = \"GREY_BADGE_COLUMN\"\n    )]\n    pub grey_badge_column: String,\n\n    #[arg(\n        long,\n        default_value = \"user_activity/uas_by_client.User\",\n        env = \"UAS_COLUMN\"\n    )]\n    pub uas_column: String,\n\n    #[arg(long, env = \"GROWTHBOOK_URL\")]\n    pub growthbook_url: Option<String>,\n\n    #[arg(long, env = \"GROWTHBOOK_KEY\")]\n",
+      "source_digest": "1371116363154a14cac58c645dd67f7c4039a47ede63a68708d5514d7f6d2036",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/config.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 133,
+      "end_line": 157,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(\n        long,\n        default_value = \"platform-manipulation/isGreyBadge.User\",\n        env = \"GREY_BADGE_COLUMN\"\n    )]\n    pub grey_badge_column: String,\n\n    #[arg(\n        long,\n        default_value = \"user_activity/uas_by_client.User\",\n        env = \"UAS_COLUMN\"\n    )]\n    pub uas_column: String,\n\n    #[arg(long, env = \"GROWTHBOOK_URL\")]\n    pub growthbook_url: Option<String>,\n\n    #[arg(long, env = \"GROWTHBOOK_KEY\")]\n    pub growthbook_key: Option<String>,\n\n    #[arg(\n        long,\n        default_value = \"https://api.growthbook.io\",\n        env = \"GROWTHBOOK_ADMIN_API_HOST\"\n    )]\n",
+      "source_digest": "2f3b3d2fb7d08845d7c1770abf40e16c6bc4ff1c3fd409d5e4a6fa8749e10764",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        class,\n        kind,\n        nonce,\n        displaced,\n    }\n}\n\nfn carried_class(meta: &HeldMeta, now_secs: u64) -> u8 {\n    if meta.kind != HeldKind::Placeholder {\n        return CLASS_NONE;\n    }\n    match (\n        displaced_remaining_secs(&meta.displaced, now_secs),\n        meta.displaced.as_ref(),\n    ) {\n        (Some(_), Some((bytes, _))) => held_entry_meta(bytes).class,\n        _ => CLASS_NONE,\n    }\n}\n\nfn fencing_class(meta: &HeldMeta, now_secs: u64) -> u8 {\n    match meta.kind {\n        HeldKind::Outcome => meta.class,\n        HeldKind::Placeholder => carried_class(meta, now_secs),\n    }\n",
+      "source_digest": "25c1d08a81d9389ee4f2734b69df7f6a300ba8cd4bfe649c0e1ac161bd5053ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 104,
+      "end_line": 128,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                && carried_class(meta, now_secs) > writer_class\n        }\n    }\n}\n\nfn now_secs() -> u64 {\n    std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn displaced_remaining_secs(displaced: &Option<(Vec<u8>, u64)>, now_secs: u64) -> Option<u64> {\n    match displaced {\n        Some((_, exp)) if *exp > now_secs => Some(exp - now_secs),\n        _ => None,\n    }\n}\n\nfn hex_encode(bytes: &[u8]) -> String {\n    use std::fmt::Write;\n    bytes\n        .iter()\n        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {\n            let _ = write!(out, \"{b:02x}\");\n",
+      "source_digest": "f2fb5fdd7dc4beb0676f8e9a41d4a90b9294e652f8abc13510a9db395834789a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 380,
+      "end_line": 404,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        pkey: &str,\n        meta: &HeldMeta,\n        writer_nonce: Option<u64>,\n        op: &str,\n    ) -> bool {\n        if meta.kind != HeldKind::Placeholder\n            || writer_nonce.is_none()\n            || meta.nonce != writer_nonce\n        {\n            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n",
+      "source_digest": "ae62a8dae20ca745ed141e4fe0faa1eb8bd1fc0ac6a3c12f10681adb31f66e3f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 386,
+      "end_line": 410,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if meta.kind != HeldKind::Placeholder\n            || writer_nonce.is_none()\n            || meta.nonce != writer_nonce\n        {\n            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n                .with_label_values(&[op])\n                .inc();\n        } else {\n            warn!(\n                pkey,\n                op, \"dedup: displaced-hold restore PUT failed; claim left in place (over-hold)\"\n",
+      "source_digest": "7aaa0a389623cfa1a8d522ea554af941196b8d6462796536affcc168ad1f4422",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 387,
+      "end_line": 411,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            || writer_nonce.is_none()\n            || meta.nonce != writer_nonce\n        {\n            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n                .with_label_values(&[op])\n                .inc();\n        } else {\n            warn!(\n                pkey,\n                op, \"dedup: displaced-hold restore PUT failed; claim left in place (over-hold)\"\n            );\n",
+      "source_digest": "0cc0777710ecac73857018882f5929a6accc2fbd334ed0b082126315ae30b100",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 390,
+      "end_line": 414,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n                .with_label_values(&[op])\n                .inc();\n        } else {\n            warn!(\n                pkey,\n                op, \"dedup: displaced-hold restore PUT failed; claim left in place (over-hold)\"\n            );\n        }\n        true\n    }\n",
+      "source_digest": "cb98c912a4c332e204c9a4ce91c24d189010f6de037cb6d63d68e6a1e5bc1301",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 519,
+      "end_line": 543,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n        }\n    }\n\n                pub async fn get_with_ttl(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n    ) -> Option<(Vec<u8>, i64)> {\n        let pkey = Self::pkey(entity_type, entity_id);\n        match self.store.get(&pkey).await {\n            Ok(Some(entry)) => {\n                let ttl_secs = crate::manhattan::remaining_ttl_secs(\n                    entry\n                        .expires_at\n                        .map(|d| d.timestamp_nanos_opt().unwrap_or(0) as u64),\n                );\n                Some((entry.bytes, ttl_secs))\n            }\n            Ok(None) => None,\n            Err(e) => {\n                warn!(\"Manhattan dedup get failed: {e}\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                None\n            }\n",
+      "source_digest": "54a8583273d4b84beb08453a1107cd9df07afa09d7af6ca1f77f25eea0f34721",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 897,
+      "end_line": 921,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    #[test]\n    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n",
+      "source_digest": "2d0d9fe315317d344ee0120acd7fb2898af052f153b9907ea953044dedd03b20",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 899,
+      "end_line": 923,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[test]\n    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n",
+      "source_digest": "c8ff6d81e655a8fd6705f0ec5b2880d01202f7c0dcf18e6faadc491f18c80866",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 900,
+      "end_line": 924,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n            class,\n",
+      "source_digest": "b9016cb26d2f13c55fda13385631c9e9b9ec3f331044b5288ac59587d6332723",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 901,
+      "end_line": 925,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n            class,\n            kind: HeldKind::Outcome,\n",
+      "source_digest": "2cc2dacae208f339c801207219df73e1a97f0893b17f0c2afc8f824c72a4f2d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 902,
+      "end_line": 926,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n            class,\n            kind: HeldKind::Outcome,\n            nonce: None,\n",
+      "source_digest": "e65fd72f164e3f6cb330587fb1b89eadb3cb904e62f5107cb12d1a5a6d89bf81",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "fn admin_ui_public_dir() -> PathBuf {\n    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n",
+      "source_digest": "140148b0487122750972c8176b105883aa85c856c14c9352bacc2ae86cdf54a0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 21,
+      "end_line": 45,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    if let Ok(dir) =\n        std::env::var(\"DIOXUS_PUBLIC_PATH\").or_else(|_| std::env::var(\"ADMIN_UI_PUBLIC_DIR\"))\n    {\n        return PathBuf::from(dir);\n    }\n    std::env::current_exe()\n        .ok()\n        .and_then(|p| p.parent().map(|d| d.join(\"public\")))\n        .unwrap_or_else(|| PathBuf::from(\"public\"))\n}\n\n#[tokio::main]\nasync fn main() -> anyhow::Result<()> {\n    init_runtime_globals();\n\n    let cfg = Config::parse();\n    let (state, cfg) = build_state(cfg).await?;\n\n    let api_keys = ApiKeys::from_config(&cfg)?;\n    if api_keys.is_empty() {\n        tracing::warn!(\n            \"API_KEYS_JSON is empty — every request to the protected admin \\\n             endpoints (/api/action, /api/config*, /api/allowlist*) will return \\\n             401. The admin UI calls those routes directly from the browser, so \\\n             every UI write will also be rejected with 401 until a key map is set.\"\n",
+      "source_digest": "f62351ae4fd21b06d5a8ab2e93eaf42134bc3cb0d0b3403e2353c307610bd6f7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 64,
+      "end_line": 88,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .client\n            .get(self.tenant.clone(), [MH_PKEY], [lkey.as_str()])\n            .await\n        {\n            Ok(v) => v?,\n            Err(e) => {\n                warn!(\"Manhattan allowlist GET failed: {e}\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                return None;\n            }\n        };\n        let entry: AllowlistEntry = serde_json::from_slice(item.value().as_bytes()).ok()?;\n        let ttl_secs = crate::manhattan::remaining_ttl_secs(\n            item.expires_at()\n                .map(|d| d.timestamp_nanos_opt().unwrap_or(0) as u64),\n        );\n        Some((entry, ttl_secs))\n    }\n\n    pub async fn add_entity(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n        ttl_secs: u64,\n        entry: &AllowlistEntry,\n",
+      "source_digest": "070e3b2db3b9f4f5d51d596e625950191cb292a4566eb7e25f326b8943447efe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/allowlist.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 143,
+      "end_line": 167,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        let mut records = Vec::with_capacity(items.len());\n        for item in items {\n            let Some(id_bytes) = item.lkey().into_byte_vecs().into_iter().next() else {\n                continue;\n            };\n            let Ok(user_id) = std::str::from_utf8(&id_bytes)\n                .unwrap_or_default()\n                .parse::<i64>()\n            else {\n                continue;\n            };\n            let ttl_secs = crate::manhattan::remaining_ttl_secs(\n                item.expires_at()\n                    .map(|d| d.timestamp_nanos_opt().unwrap_or(0) as u64),\n            );\n            if let Ok(entry) = serde_json::from_slice::<AllowlistEntry>(item.value().as_bytes()) {\n                records.push(AllowlistRecord {\n                    user_id,\n                    added_by: entry.added_by,\n                    reason: entry.reason,\n                    added_at: entry.added_at,\n                    ttl_secs,\n                });\n            }\n",
+      "source_digest": "66683cd938bd6a8765d122330e764bc9b799f33f58c71779c0dbb5a7293ff5f2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/api_doc.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 23,
+      "end_line": 47,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub error: String,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct DryRunStatus {\n    pub dry_run: bool,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct RateLimitStats {\n    pub used: u64,\n    pub cap: u64,\n    pub remaining: u64,\n}\n\n#[derive(Debug, Clone, Serialize, ToSchema)]\npub struct RulesResponse {\n    pub user: crate::rules::RuleStatus,\n    pub post: crate::rules::RuleStatus,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]\npub struct AllowlistDeleteResponse {\n    pub user_id: i64,\n    pub removed: bool,\n",
+      "source_digest": "fedb10406fb41fc385d6c580438c67b660c5fc56fc07638253d59221f377205c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 942,
+      "end_line": 966,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    assert_eq!(\n        statuses,\n        vec![\n            backfill::STATUS_ALREADY_FINISHED.to_owned(),\n            \"success\".to_owned()\n        ]\n    );\n    assert_eq!(b.ais.take().len(), 1);\n    assert_eq!(b.run_tickets(), 1);\n}\n\n#[tokio::test(flavor = \"multi_thread\", worker_threads = 4)]\nasync fn two_pods_share_the_budget_exactly_from_a_cold_start() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let b = bed(run_config(false, 1), vec![]).await;\n    let rec = put_running(\n        &b.backfill_store,\n        RUN,\n        BB1.0,\n        vec![LIVENESS],\n        vec![LevelRow::Missing],\n    );\n    let mut pod2 = b.ctx.clone();\n    pod2.backfill = pod_backfill(&b, b.claims.clone(), \"pod-2\").await;\n    let decide = |ctx: EnforcementCtx, account: Account, nonce: i64| {\n",
+      "source_digest": "9caef38cfa1861594f24884d969c3e8d03d170335b44ed11899c075ecdf3d7ac",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 12,
+      "end_line": 36,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(long = \"pod-url\", required = true)]\n    pod_urls: Vec<String>,\n    #[arg(long)]\n    updated_by: String,\n    #[arg(long, default_value = \"ACTION_CONTROL_TOKEN\")]\n    token_env: String,\n    #[arg(long)]\n    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n",
+      "source_digest": "933a67eaa86e46d6b5b5d85c2c83fdf431a5a9760a4b5ae31e2231039178024a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 13,
+      "end_line": 37,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pod_urls: Vec<String>,\n    #[arg(long)]\n    updated_by: String,\n    #[arg(long, default_value = \"ACTION_CONTROL_TOKEN\")]\n    token_env: String,\n    #[arg(long)]\n    apply: bool,\n    #[arg(long, default_value_t = 60)]\n    verify_timeout_secs: u64,\n}\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let args = Args::parse();\n    let token = std::env::var(&args.token_env)\n        .with_context(|| format!(\"set {} to the service's bearer key\", args.token_env))?;\n    let http = reqwest::Client::builder()\n        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n",
+      "source_digest": "01a731c11904aa426dc2a1f51af3f7173168d45a6533ad6ce151d60fbcf68152",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/validate_rules_yaml.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 17,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "use std::process::ExitCode;\n\nuse xai_abuse_enforcement_service::rules::CompiledRules;\n\nfn main() -> ExitCode {\n    let Some(path) = std::env::args().nth(1) else {\n        eprintln!(\"usage: validate-rules-yaml <path-to-rules.yaml>\");\n        return ExitCode::FAILURE;\n    };\n    let src = match std::fs::read_to_string(&path) {\n        Ok(s) => s,\n        Err(e) => {\n            eprintln!(\"error: cannot read {path}: {e}\");\n            return ExitCode::FAILURE;\n        }\n    };\n    match CompiledRules::from_yaml(&src) {\n",
+      "source_digest": "02bef21b97a5370a189d33a8c196813ea7e6a5262b3dd081abf30039dd1b4caa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/config.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 119,
+      "end_line": 143,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(\n        long,\n        default_value = \"xai-abuse-enforcement-service.prod\",\n        env = \"GIZMODUCK_CLIENT_ID\"\n    )]\n    pub gizmoduck_client_id: String,\n\n    #[arg(\n        long,\n        default_value = \"platform-manipulation/isHighPageRankV2.User\",\n        env = \"HIGH_PAGE_RANK_COLUMN\"\n    )]\n    pub high_page_rank_column: String,\n\n    #[arg(\n        long,\n        default_value = \"platform-manipulation/isGreyBadge.User\",\n        env = \"GREY_BADGE_COLUMN\"\n    )]\n    pub grey_badge_column: String,\n\n    #[arg(\n        long,\n        default_value = \"user_activity/uas_by_client.User\",\n        env = \"UAS_COLUMN\"\n",
+      "source_digest": "8c35e04899ee615b35b997c2131cd76a35f11b01d496b8bcb74eb7c54e6ab711",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/config.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 126,
+      "end_line": 150,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(\n        long,\n        default_value = \"platform-manipulation/isHighPageRankV2.User\",\n        env = \"HIGH_PAGE_RANK_COLUMN\"\n    )]\n    pub high_page_rank_column: String,\n\n    #[arg(\n        long,\n        default_value = \"platform-manipulation/isGreyBadge.User\",\n        env = \"GREY_BADGE_COLUMN\"\n    )]\n    pub grey_badge_column: String,\n\n    #[arg(\n        long,\n        default_value = \"user_activity/uas_by_client.User\",\n        env = \"UAS_COLUMN\"\n    )]\n    pub uas_column: String,\n\n    #[arg(long, env = \"GROWTHBOOK_URL\")]\n    pub growthbook_url: Option<String>,\n\n    #[arg(long, env = \"GROWTHBOOK_KEY\")]\n",
+      "source_digest": "1371116363154a14cac58c645dd67f7c4039a47ede63a68708d5514d7f6d2036",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/config.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 133,
+      "end_line": 157,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[arg(\n        long,\n        default_value = \"platform-manipulation/isGreyBadge.User\",\n        env = \"GREY_BADGE_COLUMN\"\n    )]\n    pub grey_badge_column: String,\n\n    #[arg(\n        long,\n        default_value = \"user_activity/uas_by_client.User\",\n        env = \"UAS_COLUMN\"\n    )]\n    pub uas_column: String,\n\n    #[arg(long, env = \"GROWTHBOOK_URL\")]\n    pub growthbook_url: Option<String>,\n\n    #[arg(long, env = \"GROWTHBOOK_KEY\")]\n    pub growthbook_key: Option<String>,\n\n    #[arg(\n        long,\n        default_value = \"https://api.growthbook.io\",\n        env = \"GROWTHBOOK_ADMIN_API_HOST\"\n    )]\n",
+      "source_digest": "2f3b3d2fb7d08845d7c1770abf40e16c6bc4ff1c3fd409d5e4a6fa8749e10764",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        class,\n        kind,\n        nonce,\n        displaced,\n    }\n}\n\nfn carried_class(meta: &HeldMeta, now_secs: u64) -> u8 {\n    if meta.kind != HeldKind::Placeholder {\n        return CLASS_NONE;\n    }\n    match (\n        displaced_remaining_secs(&meta.displaced, now_secs),\n        meta.displaced.as_ref(),\n    ) {\n        (Some(_), Some((bytes, _))) => held_entry_meta(bytes).class,\n        _ => CLASS_NONE,\n    }\n}\n\nfn fencing_class(meta: &HeldMeta, now_secs: u64) -> u8 {\n    match meta.kind {\n        HeldKind::Outcome => meta.class,\n        HeldKind::Placeholder => carried_class(meta, now_secs),\n    }\n",
+      "source_digest": "25c1d08a81d9389ee4f2734b69df7f6a300ba8cd4bfe649c0e1ac161bd5053ba",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 104,
+      "end_line": 128,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                && carried_class(meta, now_secs) > writer_class\n        }\n    }\n}\n\nfn now_secs() -> u64 {\n    std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn displaced_remaining_secs(displaced: &Option<(Vec<u8>, u64)>, now_secs: u64) -> Option<u64> {\n    match displaced {\n        Some((_, exp)) if *exp > now_secs => Some(exp - now_secs),\n        _ => None,\n    }\n}\n\nfn hex_encode(bytes: &[u8]) -> String {\n    use std::fmt::Write;\n    bytes\n        .iter()\n        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {\n            let _ = write!(out, \"{b:02x}\");\n",
+      "source_digest": "f2fb5fdd7dc4beb0676f8e9a41d4a90b9294e652f8abc13510a9db395834789a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 380,
+      "end_line": 404,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        pkey: &str,\n        meta: &HeldMeta,\n        writer_nonce: Option<u64>,\n        op: &str,\n    ) -> bool {\n        if meta.kind != HeldKind::Placeholder\n            || writer_nonce.is_none()\n            || meta.nonce != writer_nonce\n        {\n            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n",
+      "source_digest": "ae62a8dae20ca745ed141e4fe0faa1eb8bd1fc0ac6a3c12f10681adb31f66e3f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 386,
+      "end_line": 410,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if meta.kind != HeldKind::Placeholder\n            || writer_nonce.is_none()\n            || meta.nonce != writer_nonce\n        {\n            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n                .with_label_values(&[op])\n                .inc();\n        } else {\n            warn!(\n                pkey,\n                op, \"dedup: displaced-hold restore PUT failed; claim left in place (over-hold)\"\n",
+      "source_digest": "7aaa0a389623cfa1a8d522ea554af941196b8d6462796536affcc168ad1f4422",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 387,
+      "end_line": 411,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            || writer_nonce.is_none()\n            || meta.nonce != writer_nonce\n        {\n            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n                .with_label_values(&[op])\n                .inc();\n        } else {\n            warn!(\n                pkey,\n                op, \"dedup: displaced-hold restore PUT failed; claim left in place (over-hold)\"\n            );\n",
+      "source_digest": "0cc0777710ecac73857018882f5929a6accc2fbd334ed0b082126315ae30b100",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 390,
+      "end_line": 414,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return false;\n        }\n        let Some(remaining) = displaced_remaining_secs(&meta.displaced, now_secs()) else {\n            return false;\n        };\n        let (bytes, _) = meta\n            .displaced\n            .as_ref()\n            .expect(\"displaced_remaining_secs implies displaced\");\n        if self.update_with_ttl(pkey, bytes, remaining).await {\n            info!(\n                pkey,\n                op, remaining, \"dedup: restored displaced hold (bypassing decision did not act)\"\n            );\n            crate::metrics::DEDUP_DISPLACED_RESTORED_TOTAL\n                .with_label_values(&[op])\n                .inc();\n        } else {\n            warn!(\n                pkey,\n                op, \"dedup: displaced-hold restore PUT failed; claim left in place (over-hold)\"\n            );\n        }\n        true\n    }\n",
+      "source_digest": "cb98c912a4c332e204c9a4ce91c24d189010f6de037cb6d63d68e6a1e5bc1301",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 519,
+      "end_line": 543,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n        }\n    }\n\n                pub async fn get_with_ttl(\n        &self,\n        entity_type: EntityType,\n        entity_id: i64,\n    ) -> Option<(Vec<u8>, i64)> {\n        let pkey = Self::pkey(entity_type, entity_id);\n        match self.store.get(&pkey).await {\n            Ok(Some(entry)) => {\n                let ttl_secs = crate::manhattan::remaining_ttl_secs(\n                    entry\n                        .expires_at\n                        .map(|d| d.timestamp_nanos_opt().unwrap_or(0) as u64),\n                );\n                Some((entry.bytes, ttl_secs))\n            }\n            Ok(None) => None,\n            Err(e) => {\n                warn!(\"Manhattan dedup get failed: {e}\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                None\n            }\n",
+      "source_digest": "54a8583273d4b84beb08453a1107cd9df07afa09d7af6ca1f77f25eea0f34721",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 897,
+      "end_line": 921,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    #[test]\n    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n",
+      "source_digest": "2d0d9fe315317d344ee0120acd7fb2898af052f153b9907ea953044dedd03b20",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 899,
+      "end_line": 923,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[test]\n    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n",
+      "source_digest": "c8ff6d81e655a8fd6705f0ec5b2880d01202f7c0dcf18e6faadc491f18c80866",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 900,
+      "end_line": 924,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n            class,\n",
+      "source_digest": "b9016cb26d2f13c55fda13385631c9e9b9ec3f331044b5288ac59587d6332723",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 901,
+      "end_line": 925,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n            class,\n            kind: HeldKind::Outcome,\n",
+      "source_digest": "2cc2dacae208f339c801207219df73e1a97f0893b17f0c2afc8f824c72a4f2d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 902,
+      "end_line": 926,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n    }\n\n    #[test]\n    fn claim_nonces_are_distinct() {\n        assert_ne!(claim_nonce(), claim_nonce());\n    }\n\n        fn outcome_meta(class: u8) -> HeldMeta {\n        HeldMeta {\n            class,\n            kind: HeldKind::Outcome,\n            nonce: None,\n",
+      "source_digest": "e65fd72f164e3f6cb330587fb1b89eadb3cb904e62f5107cb12d1a5a6d89bf81",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-10dcfaf23a3e3faf93f22cfed473906b70221380fef874fe5bbf9a8df2da3375",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "83e542d11c07f2d1e39c6c6f3434cbae1c5bbd4c4ccbfb6ba1e2339474991b12",
+      "context_complete": true,
+      "task_id": "T-b1231f9e2e5c8b85090e02e0a9238339e3a5eda0960cf83ee3fa1799f91a1923",
+      "evidence_refs": [
+        "E1"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0ba5bc6e2c64e6fd8fcd3f8714b1bb243711b8cb65988cc3996b89381dd103a2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-3e5c35aad88cf293b0423273775e83be74431ebd0ad31839a5d2d78a108705d7",
+      "evidence_refs": [
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2089d5749b9f160218d0200edc63fa4ea6d37c5c7c8b61f31bdc0cd1e17ce989",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-0ea8953ac44f5a1bcabdf2fec6b61060bd03c7c8e8a6155854fabda50a2ca761",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8cb31ad582e624a1007647c1511d31e3adc6b63d6c233b494b00a9cdc4ba97a9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-3bb2d6f7f48d1d33a7a3196743cf32034189e772e87176cf61cc696d6d9975a9",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-743d26e00310ec76cac839573299cf0dfbc89d7c0108dcdc9380a63c59baa109",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-34088716a1a2dc90fe50aff8c4601e3dd41f5a75d60b5437ea3237fd893c354e",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-38da08821fb65dd9839cd976af7482330aaae6765cb47e0d5083c292e19d387f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-1ee8bba5e7a3d66a4020440644da7b3dd676cfc05f7eba0d17cff7e8a57ad927",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1da2e353003351c69247c14182d0e215d5d4744bad15969bbfe4bc4389d8f586",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-6e431309b8478c4b51fdf969ae886a662dd559f0da619193eca1f4f7ca5a0c58",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-191a366d2fbf083e7bec0c6b5b032c0a5805354b830e5889429be2e440a6c516",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-45f80630aa6b22529569b43cd74f3f3497eda17adb53cdc74234bca40de5ebf0",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d6aad04962dcf51984c1b608520d7fceaa489e327f91f4692e4a4564764497c1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-929a87fd710bc8efad266ce827c3e9cb55e449412eaf5f4d90080aa36a1cfe6a",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dd61e024587bfecaebb372cdeb25203282d64b58f0220148a57cc21056282e7e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c7cc0fe22d20939008b0fc7e55990f9ea967150f9af85131bcb644162d2cf1b",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-36e420614418e6ba5ea33d088d5dbede7db6dac37eead35f7aa30b3627b50db0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-3f55362daefbfa2971d642c604f7dcc7c099550a95ff2f6f392f23e0b281af02",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8d1321155a179bcd0aa800de8ad6e8cab690ff158bfa4bbd6c0c3f8b92fecbe4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-abfba2c967aa9fdfc717471227c232cf7b614f37283c0f607df14251800c1907",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ad122312d2f8150c2096cf8fe003286bc46cd2cdd7c462f71541b7817486b871",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-e347ea3634285171d96bfddb491a1101ed998313f6423c48f423b34a30a9c34b",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7e4bacfe6ae3bf62c7375421ab9422bea5a1b03009983e4f0b7386b81b6c1967",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-edd21e127afc89c810d3ea7f1889eb4effd9167f05eb9d655594044afdc7d4b7",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-37655da511b8867a7693d4a60808217954c6013452a6468595db66d7b2de735c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-bc8b97ed61cd3e91fbb56687fa876fced2a657d7272686a7c552f99fbeb274e6",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cb1491bdf7711f2cf31b7627e0163ab4c0d096f2abfabc93d8b6cbeb1ce25b08",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-fb4fa22a525fc7d50059f35453c28dc5cdee53ee3d55ed37c96523d04c502588",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-99fdd1b54ac90776361d73c93ffc9128bc63491d45c56612aa04effa55e1aeba",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-a7bb2ce1eb596fac3ec29af96cabe1948514cacc924d940e4e5951f3bffc0d07",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-23ca36f78a3ece03437c7fda16ab22f4a197648c6864d86107a0d2ccf366588e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-7214dcfd453883f95b3aa6afa81f5783b25d05e70af96e72aeaf8359c3231e44",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-44353f650fdec171237d82463c20df7cd8729c31cc9fc7a5a2da0dbbc5bdbbbb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-cf6d6ed36e2679e3b115f1d23b8b03cf78c2b3dd0c097e9e66534af43c2a2cb5",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b8c40f64b7d8b157d1b409ec1ae40e3f9fd93c08035fe3407d5544fde54c2334",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-00725bbf6883c9a3cadb6d68d689234cf1489d4bcca075d7e030a0e4fad84faa",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dfed171145131693a9b2cdea223ce6ab97cde80ffbad82efef8a07264c9f505a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-f6981090cbd17c2b9660e0be3685f037f810ab5cd841d747a539df6251fd6e32",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fa845b192c368c4213b4f3cb21132068ed5fbb7ae84c7ee72f7dcae330ffdf66",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-6a5727ed47d213dadd15d8ccd7f97ff1c7921137a6731db7435267ffd83720f0",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-81db71eeadff5a30963c3f1a4cb81a44adac27879f4a32dd2797ace83e2a39de",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-f9985e3a927a5fb7397fd7316f79654678c83b5eac13e509b168da1e487d5470",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-572b2649a8be832f32f81834d92905e39459ed1492bf954fb467c7344e7be6c2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-d9517a611712a614b5ef44c76e44a1b6360b2949ea2b2e719f5039839d48c780",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-706a08f0f79a9385e739a7c40dc576fe623709a6bcb6b6b082b7be0112112e51",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-06973e4b387f94b4d70ad0e736f3a309f4d5c5f060eee2132e3f3a5b2d30fbff",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1f57ba8242369dd2318fd8127f8c18a58d2dc17dbfffa905532c5e316c313549",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-a0f821faae7c775e3c8b0d065ba7c21161e8486e1febbf34469f1f7deca5aea5",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-00aa75939003016e5f0061786b145a7deb0d61281702db449cb1b66d35090fdb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-9b6e184df5e6a04267577d680c713ac7e1d1e0b28738573a36bb13ef931b66f9",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7e6776836db6de0680fd069d210f2a97597e0e99ac80e4791daa8cc4648b1159",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-86cf133c5f496301daae76977767b8fffa8a9277fa3b7fb455ca1546c21d0db4",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-53a74149553d66b956b8a67c73033f126192a5ee9f1432cbf8a871bcdbce0e3d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-ce0d1cdac8c1208231f4842599fda56d976ed9247dfd564fc24ddc5884512e88",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dc5b1903c10b939d8b8a6ce9cb3e579e85c124dae50439ca754a898772426f21",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-7b069a4821e372c0e8cdec31946834a05d17f4334ca584ac90f0d4f77d86f978",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6bd1f1555bc2094837306e132c8600f993989b51f4d480ad2401833966741288",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-88f834d592ff4e3e349122abee9993f87ec3506decfed7a0042dddcaf3fcbe4b",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6a324df7f1e620a7b088e06218096610a306e101a2bb72fb06b42455c5f4eef1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-20e0ee169454eb0d9b2676f834556b4b7270d9e3559e0bd911642f6d36e6244a",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b557804541efc9fc62286ec8a39449737c0a6090d16070d1db4e04b8f9129e2f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a327d38d5256e2b1a552252b8727275ce19968738caf8edbe43ce4d92984e4a",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b7f1a3238f5950460976852fbf7a85be55a6772b59da6bf9150cb0e394da1d2c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-58a13129ff75e8e90bea55d8902ca4e2fdaba3508f5be8de15df62259c9ac964",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3c385f96cfbc2cd1db50e6b760f2edc1e74145842debf576e19aaed80fb78783",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-bec658b7671301ab0a7af25572db25e290c56d0f24d894079a6eb28c0407d575",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-83b4a3c45ad3ae7824758a8af0f399ff60b0d0a3ea4cffc54fd21c9f3d260171",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-a89f2bfc1b67ad1306758adc0a81ecd56754da42c74fd0762ba0a1a604e96f0d",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-109abfa16e08e8ab0cc45c9f4c418e3e1fd0344ba7b79e358f742fc2d5e94f6b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-402d1d05ba2939fcb5fc273c2726bc12c62ff13ac006b2ff939a64f9c76d63e2",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-38e08acd7f806c13641a728e8d3b9c6e852a99bb59a0676eebc89d2a9754d5a8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-fd559c24c6aef25f7953cc713d1ee92616cab29d2d623b71bae96357b9063dc8",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7e19ad42207320713aa6dc43cd2f0960548132c67d1ab3d0123d209c20783033",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-8fffb68230854a3571f0e38555f18f22c85878e1eba83f655d3a96f1700f33ae",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9e036d6d87820bbb7d1d25d2bcc5f461e7563d352595887d5ede09d01a63b841",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-09b5e4cda8f791ad041b84af98cf60d009b4a12bc34fa2ae3a3bdef15ffa2481",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e37967a8c2395d1222af33691ae8842906aec9aa99375d6c5faa440a12ce3bfd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-5580b00fd5f4b6b18ac7707264197bd0748d11b0d5fb0bdf5adc3fa9fcef8ebb",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ac563aed998a2ac251e91c4e74f3ff1e1df811bb34dc2007a16c86e66c4de4f8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-2affc1df0663af0d7476d418f77822a11cb8031ed22172fda25f5e36991c1113",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-71d806593268d9ceb705bb038afbe44303405769d56817ed74d3bd7d0ca94573",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-103e7d611e1890559f993d9ffb7595fda1d2c3672f25d1fca5b80474646be761",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f74707b3893a1870ee67510bf155f4217fe5558a2de3b0858b1cb9f91d308521",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-0ca0504aad5e99444501ab57af516011b2809d776d475dc4327518db11322fb9",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e61b29ff0d4d0ba1907c7ce8a5bdf603fb76c6ceee5791be45da4f6d45ecfa08",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-09aba44bf871157e053a5277d9657de0c0dffc527728ceddce70ff8502105150",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7c658836e739eda7daec8119ec59809e596292864fa469f22e4f011e32f9c68e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-30420ff7334261366227d0252ec3fef12c3f5154bc8754066e52f355af7ac2a9",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1506af85d87c982aae51a9826ce3de1551f3ca5396f4dd54b24861231a9bfe6d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-552cf9b7476d4897f414c5164d8ac74e10a4f6bedf7643b84d458aafede79005",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-980c240371e6cc8fd0e55517426dabe76b131bfb071ee45742dd5a6cb166f6e2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-181a3ae7ae745d694d621a9c15e48ca3c0aed528e148f147f44d2f4c06890a15",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39c4003bb18515d37c4c5ed057c79443df790e737397db5a82ca2a181b89e65b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "_col",
+        "history_counts",
+        "hydrator_counts",
+        "propose_k",
+        "main"
+      ],
+      "context_complete": false,
+      "task_id": "T-34cbae94277676fb7953267e213d936a0fa2519019b8feb2de7f71409500080e",
+      "evidence_refs": [
+        "E49"
+      ]
+    }
+  ],
+  "task_id": "T-f6b093cb3a508a1bfe02728f315b2264488333c79c65eadc6df9f624494b5e5d"
+}

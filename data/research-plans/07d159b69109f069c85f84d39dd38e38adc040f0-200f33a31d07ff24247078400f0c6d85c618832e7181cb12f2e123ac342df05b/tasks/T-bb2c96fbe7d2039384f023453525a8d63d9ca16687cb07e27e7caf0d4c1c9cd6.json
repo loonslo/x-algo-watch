@@ -1,0 +1,1880 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/get_safety_labels.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-2177cd054ca7e9b6f83b3bb4cfeec4b3114b29b7858f447f8886f25d56eab3a1",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 320,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::caller_identity::Endpoint;\nuse crate::safety_label_source::metrics::{self, BatchStage};\nuse crate::safety_label_source::types::FailureKind;\nuse crate::safety_label_source::{LookupError, SafetyLabelSource};\nuse enum_map::EnumMap;\nuse prost::bytes::BufMut;\nuse prost::encoding::{hash_map, message, uint64};\nuse rustc_hash::{FxHashMap, FxHashSet};\nuse std::collections::HashMap;\nuse std::sync::Arc;\nuse tonic::codec::{Codec, EncodeBuf, Encoder};\nuse tonic::{Request, Response, Status};\nuse tonic_prost::ProstDecoder;\nuse xai_visibility_filtering_proto as vf_pb;\n\npub struct GetSafetyLabelsEndpoint {\n    safety_label_source: Arc<SafetyLabelSource>,\n}\n\nimpl GetSafetyLabelsEndpoint {\n    pub fn new(safety_label_source: Arc<SafetyLabelSource>) -> Self {\n        Self {\n            safety_label_source,\n        }\n    }\n\n    pub async fn handle(\n        &self,\n        request: Request<vf_pb::GetSafetyLabelsRequest>,\n    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {\n        crate::metrics::observe_request(Endpoint::GetSafetyLabels, request, |request, _| {\n            self.handle_inner(request)\n        })\n        .await\n    }\n\n    async fn handle_inner(\n        &self,\n        request: Request<vf_pb::GetSafetyLabelsRequest>,\n    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {\n        let req = request.into_inner();\n\n        let unique_ids: Vec<u64> = req\n            .tweet_ids\n            .into_iter()\n            .collect::<FxHashSet<_>>()\n            .into_iter()\n            .collect();\n        metrics::record_batch_size(BatchStage::Request, unique_ids.len());\n\n        let resolved = self.safety_label_source.get(&unique_ids).await;\n        let outcome = GetSafetyLabelsOutcome::try_from_resolved(resolved, unique_ids.len())?;\n        let failed_count = outcome.failure_count();\n\n        metrics::record_lookup_tweet_ids(outcome.success_count(), failed_count);\n        for (kind, &count) in &outcome.failures {\n            metrics::record_lookup_failures(kind, count);\n        }\n\n        Ok(Response::new(CachedGetSafetyLabelsResponse {\n            results: outcome.results,\n            failed_ids: outcome.failed_ids,\n        }))\n    }\n}\n\n#[derive(Debug)]\npub(crate) struct CachedGetSafetyLabelsResponse {\n    results: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,\n    failed_ids: Vec<u64>,\n}\n\nimpl CachedGetSafetyLabelsResponse {\n    fn encode(&self, buf: &mut impl BufMut) {\n        hash_map::encode(\n            uint64::encode,\n            uint64::encoded_len,\n            |tag, label_map: &Arc<vf_pb::SafetyLabelMap>, buf| {\n                message::encode(tag, &**label_map, buf);\n            },\n            |tag, label_map: &Arc<vf_pb::SafetyLabelMap>| message::encoded_len(tag, &**label_map),\n            1,\n            &self.results,\n            buf,\n        );\n        uint64::encode_packed(2, &self.failed_ids, buf);\n    }\n}\n\n#[derive(Clone, Copy)]\npub(crate) struct GetSafetyLabelsCodec;\n\nimpl Codec for GetSafetyLabelsCodec {\n    type Encode = CachedGetSafetyLabelsResponse;\n    type Decode = vf_pb::GetSafetyLabelsRequest;\n    type Encoder = Self;\n    type Decoder = ProstDecoder<vf_pb::GetSafetyLabelsRequest>;\n\n    fn encoder(&mut self) -> Self {\n        *self\n    }\n\n    fn decoder(&mut self) -> Self::Decoder {\n        ProstDecoder::default()\n    }\n}\n\nimpl Encoder for GetSafetyLabelsCodec {\n    type Item = CachedGetSafetyLabelsResponse;\n    type Error = Status;\n\n    fn encode(\n        &mut self,\n        response: CachedGetSafetyLabelsResponse,\n        buf: &mut EncodeBuf<'_>,\n    ) -> Result<(), Status> {\n        response.encode(buf);\n        Ok(())\n    }\n}\n\n#[derive(Debug)]\npub(crate) struct GetSafetyLabelsOutcome {\n    requested_count: usize,\n    pub(crate) results: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,\n    pub(crate) failed_ids: Vec<u64>,\n    pub(crate) failures: EnumMap<FailureKind, usize>,\n}\n\nimpl GetSafetyLabelsOutcome {\n    pub(crate) fn try_from_resolved(\n        resolved: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n        requested_count: usize,\n    ) -> Result<Self, Status> {\n        let mut results = HashMap::with_capacity(resolved.len());\n        let mut failed_ids = Vec::new();\n        let mut failures = EnumMap::default();\n\n        for (id, lookup_result) in resolved {\n            match lookup_result {\n                Ok(label_map) => {\n                    results.insert(id, label_map);\n                }\n                Err(e) => {\n                    failed_ids.push(id);\n                    failures[e.kind] += 1;\n                }\n            }\n        }\n\n        failed_ids.sort_unstable();\n\n        let result = Self {\n            requested_count,\n            results,\n            failed_ids,\n            failures,\n        };\n\n        if result.accounted_count() != result.requested_count {\n            return Err(Status::internal(format!(\n                \"GetSafetyLabels invariant violation: requested={} accounted={}\",\n                result.requested_count,\n                result.accounted_count()\n            )));\n        }\n\n        Ok(result)\n    }\n\n    pub(crate) fn success_count(&self) -> usize {\n        self.results.len()\n    }\n\n    pub(crate) fn failure_count(&self) -> usize {\n        self.failed_ids.len()\n    }\n\n    fn accounted_count(&self) -> usize {\n        self.results.len() + self.failed_ids.len()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use prost::Message;\n    use tonic::Code;\n\n    fn labels_with_entry(type_id: i32) -> vf_pb::SafetyLabelMap {\n        vf_pb::SafetyLabelMap {\n            labels: HashMap::from([(\n                type_id,\n                vf_pb::SafetyLabel {\n                    score: Some(0.5),\n                    applicable_users: Vec::new(),\n                    holdback_experiment: None,\n                    source: None,\n                    created_at_msec: None,\n                    expires_at_msec: None,\n                    applicable_countries: Vec::new(),\n                    safety_label_source: None,\n                },\n            )]),\n        }\n    }\n\n    #[test]\n    fn try_from_resolved_reports_partial_failure() {\n        let outcome = GetSafetyLabelsOutcome::try_from_resolved(\n            FxHashMap::from_iter([\n                (1, Ok(Arc::new(labels_with_entry(11)))),\n                (4, Ok(Arc::new(labels_with_entry(44)))),\n                (\n                    2,\n                    Err(LookupError::new(FailureKind::ManhattanDecode, \"decode\")),\n                ),\n                (\n                    3,\n                    Err(LookupError::new(FailureKind::ManhattanFetch, \"mh down\")),\n                ),\n            ]),\n            4,\n        )\n        .unwrap();\n\n        assert_eq!(outcome.success_count(), 2);\n        assert_eq!(outcome.results.len(), 2);\n        assert_eq!(outcome.failed_ids, vec![2, 3]);\n        assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 1);\n        assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 1);\n        assert_eq!(outcome.failure_count(), 2);\n    }\n\n    fn prod_shaped_label_map(id: u64) -> vf_pb::SafetyLabelMap {\n        let label_count = 3 + i32::try_from(id % 4).unwrap();\n        vf_pb::SafetyLabelMap {\n            labels: (0..label_count)\n                .map(|i| {\n                    let msec = (1_i64 << 40) + i64::from(i);\n                    let label = vf_pb::SafetyLabel {\n                        score: Some(f64::from(i) / 7.0),\n                        applicable_users: Vec::new(),\n                        holdback_experiment: None,\n                        source: Some(format!(\"botmaker_rule_source_{id:04}_{i:02}\")),\n                        created_at_msec: Some(msec),\n                        expires_at_msec: Some(msec + (1 << 30)),\n                        applicable_countries: if i % 3 == 0 {\n                            vec![\"us\".to_owned(), \"de\".to_owned()]\n                        } else {\n                            Vec::new()\n                        },\n                        safety_label_source: Some(\n                            vf_pb::safety_label::SafetyLabelSource::BotmakerAction(\n                                vf_pb::BotmakerAction { rule_id: msec },\n                            ),\n                        ),\n                    };\n                    (i * 7 + 1, label)\n                })\n                .collect(),\n        }\n    }\n\n    #[test]\n    fn cached_response_encodes_the_generated_bytes() {\n        let hasher = std::hash::RandomState::new();\n        let cases = [\n            (\"empty\", Vec::new(), Vec::new()),\n            (\"failed only\", Vec::new(), vec![3, 1 << 40]),\n            (\n                \"empty label map\",\n                vec![(5, vf_pb::SafetyLabelMap::default())],\n                Vec::new(),\n            ),\n            (\"id zero\", vec![(0, prod_shaped_label_map(0))], Vec::new()),\n            (\"single\", vec![(7, prod_shaped_label_map(7))], vec![8]),\n            (\n                \"multi\",\n                (1..=50)\n                    .map(|id| (id, prod_shaped_label_map(id)))\n                    .chain([(51, vf_pb::SafetyLabelMap::default())])\n                    .collect(),\n                vec![52, 53],\n            ),\n        ];\n        for (name, label_maps, failed_ids) in cases {\n            let mut generated = HashMap::with_hasher(hasher.clone());\n            let mut cached = HashMap::with_hasher(hasher.clone());\n            for (id, label_map) in label_maps {\n                cached.insert(id, Arc::new(label_map.clone()));\n                generated.insert(id, label_map);\n            }\n            let generated_bytes = vf_pb::GetSafetyLabelsResponse {\n                results: generated,\n                failed_ids: failed_ids.clone(),\n            }\n            .encode_to_vec();\n            let mut cached_bytes = Vec::new();\n            CachedGetSafetyLabelsResponse {\n                results: cached,\n                failed_ids,\n            }\n            .encode(&mut cached_bytes);\n            assert_eq!(cached_bytes, generated_bytes, \"{name}\");\n        }\n    }\n\n    #[test]\n    fn try_from_resolved_rejects_missing_ids() {\n        let status = GetSafetyLabelsOutcome::try_from_resolved(\n            FxHashMap::from_iter([(7, Ok(Arc::new(labels_with_entry(22))))]),\n            2,\n        )\n        .unwrap_err();\n\n        assert_eq!(status.code(), Code::Internal);\n        assert!(status.message().contains(\"requested=2 accounted=1\"));\n    }\n}\n",
+      "source_digest": "e39e37b67427bb88ea9a9d2ee5098cff32c3a8f57a51545821efd8665d4c444d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 291,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::caller_identity::Endpoint;\nuse crate::safety_label_source::metrics::{self, BatchStage};\nuse crate::safety_label_source::types::FailureKind;\nuse crate::safety_label_source::{LookupError, SafetyLabelSource};\nuse enum_map::EnumMap;\nuse prost::bytes::BufMut;\nuse prost::encoding::{hash_map, message, uint64};\nuse rustc_hash::{FxHashMap, FxHashSet};\nuse std::collections::HashMap;\nuse std::sync::Arc;\nuse tonic::codec::{Codec, EncodeBuf, Encoder};\nuse tonic::{Request, Response, Status};\nuse tonic_prost::ProstDecoder;\nuse xai_visibility_filtering_proto as vf_pb;\n\npub struct GetSafetyLabelsEndpoint {\n    safety_label_source: Arc<SafetyLabelSource>,\n}\n\nimpl GetSafetyLabelsEndpoint {\n    pub fn new(safety_label_source: Arc<SafetyLabelSource>) -> Self {\n        Self {\n            safety_label_source,\n        }\n    }\n\n    pub async fn handle(\n        &self,\n        request: Request<vf_pb::GetSafetyLabelsRequest>,\n    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {\n        crate::metrics::observe_request(Endpoint::GetSafetyLabels, request, |request, _| {\n            self.handle_inner(request)\n        })\n        .await\n    }\n\n    async fn handle_inner(\n        &self,\n        request: Request<vf_pb::GetSafetyLabelsRequest>,\n    ) -> Result<Response<CachedGetSafetyLabelsResponse>, Status> {\n        let req = request.into_inner();\n\n        let unique_ids: Vec<u64> = req\n            .tweet_ids\n            .into_iter()\n            .collect::<FxHashSet<_>>()\n            .into_iter()\n            .collect();\n        metrics::record_batch_size(BatchStage::Request, unique_ids.len());\n\n        let resolved = self.safety_label_source.get(&unique_ids).await;\n        let (response, failure_counts) =\n            CachedGetSafetyLabelsResponse::try_from_resolved(resolved, unique_ids.len())?;\n\n        metrics::record_lookup_tweet_ids(response.results.len(), response.failed_ids.len());\n        for (kind, &count) in &failure_counts {\n            metrics::record_lookup_failures(kind, count);\n        }\n\n        Ok(Response::new(response))\n    }\n}\n\n#[derive(Debug)]\npub(crate) struct CachedGetSafetyLabelsResponse {\n    results: HashMap<u64, Arc<vf_pb::SafetyLabelMap>>,\n    failed_ids: Vec<u64>,\n}\n\nimpl CachedGetSafetyLabelsResponse {\n    fn try_from_resolved(\n        resolved: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,\n        requested_count: usize,\n    ) -> Result<(Self, EnumMap<FailureKind, usize>), Status> {\n        let mut results = HashMap::with_capacity(resolved.len());\n        let mut failed_ids = Vec::new();\n        let mut failures = EnumMap::default();\n\n        for (id, lookup_result) in resolved {\n            match lookup_result {\n                Ok(label_map) => {\n                    results.insert(id, label_map);\n                }\n                Err(e) => {\n                    failed_ids.push(id);\n                    failures[e.kind] += 1;\n                }\n            }\n        }\n\n        failed_ids.sort_unstable();\n\n        let accounted_count = results.len() + failed_ids.len();\n        if accounted_count != requested_count {\n            return Err(Status::internal(format!(\n                \"GetSafetyLabels invariant violation: requested={requested_count} accounted={accounted_count}\"\n            )));\n        }\n\n        Ok((\n            Self {\n                results,\n                failed_ids,\n            },\n            failures,\n        ))\n    }\n\n    fn encode(&self, buf: &mut impl BufMut) {\n        hash_map::encode(\n            uint64::encode,\n            uint64::encoded_len,\n            |tag, label_map: &Arc<vf_pb::SafetyLabelMap>, buf| {\n                message::encode(tag, &**label_map, buf);\n            },\n            |tag, label_map: &Arc<vf_pb::SafetyLabelMap>| message::encoded_len(tag, &**label_map),\n            1,\n            &self.results,\n            buf,\n        );\n        uint64::encode_packed(2, &self.failed_ids, buf);\n    }\n}\n\n#[derive(Clone, Copy)]\npub(crate) struct GetSafetyLabelsCodec;\n\nimpl Codec for GetSafetyLabelsCodec {\n    type Encode = CachedGetSafetyLabelsResponse;\n    type Decode = vf_pb::GetSafetyLabelsRequest;\n    type Encoder = Self;\n    type Decoder = ProstDecoder<vf_pb::GetSafetyLabelsRequest>;\n\n    fn encoder(&mut self) -> Self {\n        *self\n    }\n\n    fn decoder(&mut self) -> Self::Decoder {\n        ProstDecoder::default()\n    }\n}\n\nimpl Encoder for GetSafetyLabelsCodec {\n    type Item = CachedGetSafetyLabelsResponse;\n    type Error = Status;\n\n    fn encode(\n        &mut self,\n        response: CachedGetSafetyLabelsResponse,\n        buf: &mut EncodeBuf<'_>,\n    ) -> Result<(), Status> {\n        response.encode(buf);\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use prost::Message;\n    use tonic::Code;\n\n    fn labels_with_entry(type_id: i32) -> vf_pb::SafetyLabelMap {\n        vf_pb::SafetyLabelMap {\n            labels: HashMap::from([(\n                type_id,\n                vf_pb::SafetyLabel {\n                    score: Some(0.5),\n                    applicable_users: Vec::new(),\n                    holdback_experiment: None,\n                    source: None,\n                    created_at_msec: None,\n                    expires_at_msec: None,\n                    applicable_countries: Vec::new(),\n                    safety_label_source: None,\n                },\n            )]),\n        }\n    }\n\n    #[test]\n    fn try_from_resolved_reports_partial_failure() {\n        let (response, failure_counts) = CachedGetSafetyLabelsResponse::try_from_resolved(\n            FxHashMap::from_iter([\n                (1, Ok(Arc::new(labels_with_entry(11)))),\n                (4, Ok(Arc::new(labels_with_entry(44)))),\n                (\n                    2,\n                    Err(LookupError::new(FailureKind::ManhattanDecode, \"decode\")),\n                ),\n                (\n                    3,\n                    Err(LookupError::new(FailureKind::ManhattanFetch, \"mh down\")),\n                ),\n            ]),\n            4,\n        )\n        .unwrap();\n\n        assert_eq!(response.results.len(), 2);\n        assert_eq!(response.failed_ids, vec![2, 3]);\n        assert_eq!(failure_counts[FailureKind::ManhattanFetch], 1);\n        assert_eq!(failure_counts[FailureKind::ManhattanDecode], 1);\n    }\n\n    fn prod_shaped_label_map(id: u64) -> vf_pb::SafetyLabelMap {\n        let label_count = 3 + i32::try_from(id % 4).unwrap();\n        vf_pb::SafetyLabelMap {\n            labels: (0..label_count)\n                .map(|i| {\n                    let msec = (1_i64 << 40) + i64::from(i);\n                    let label = vf_pb::SafetyLabel {\n                        score: Some(f64::from(i) / 7.0),\n                        applicable_users: Vec::new(),\n                        holdback_experiment: None,\n                        source: Some(format!(\"botmaker_rule_source_{id:04}_{i:02}\")),\n                        created_at_msec: Some(msec),\n                        expires_at_msec: Some(msec + (1 << 30)),\n                        applicable_countries: if i % 3 == 0 {\n                            vec![\"us\".to_owned(), \"de\".to_owned()]\n                        } else {\n                            Vec::new()\n                        },\n                        safety_label_source: Some(\n                            vf_pb::safety_label::SafetyLabelSource::BotmakerAction(\n                                vf_pb::BotmakerAction { rule_id: msec },\n                            ),\n                        ),\n                    };\n                    (i * 7 + 1, label)\n                })\n                .collect(),\n        }\n    }\n\n    #[test]\n    fn cached_response_encodes_the_generated_bytes() {\n        let hasher = std::hash::RandomState::new();\n        let cases = [\n            (\"empty\", Vec::new(), Vec::new()),\n            (\"failed only\", Vec::new(), vec![3, 1 << 40]),\n            (\n                \"empty label map\",\n                vec![(5, vf_pb::SafetyLabelMap::default())],\n                Vec::new(),\n            ),\n            (\"id zero\", vec![(0, prod_shaped_label_map(0))], Vec::new()),\n            (\"single\", vec![(7, prod_shaped_label_map(7))], vec![8]),\n            (\n                \"multi\",\n                (1..=50)\n                    .map(|id| (id, prod_shaped_label_map(id)))\n                    .chain([(51, vf_pb::SafetyLabelMap::default())])\n                    .collect(),\n                vec![52, 53],\n            ),\n        ];\n        for (name, label_maps, failed_ids) in cases {\n            let mut generated = HashMap::with_hasher(hasher.clone());\n            let mut cached = HashMap::with_hasher(hasher.clone());\n            for (id, label_map) in label_maps {\n                cached.insert(id, Arc::new(label_map.clone()));\n                generated.insert(id, label_map);\n            }\n            let generated_bytes = vf_pb::GetSafetyLabelsResponse {\n                results: generated,\n                failed_ids: failed_ids.clone(),\n            }\n            .encode_to_vec();\n            let mut cached_bytes = Vec::new();\n            CachedGetSafetyLabelsResponse {\n                results: cached,\n                failed_ids,\n            }\n            .encode(&mut cached_bytes);\n            assert_eq!(cached_bytes, generated_bytes, \"{name}\");\n        }\n    }\n\n    #[test]\n    fn try_from_resolved_rejects_missing_ids() {\n        let status = CachedGetSafetyLabelsResponse::try_from_resolved(\n            FxHashMap::from_iter([(7, Ok(Arc::new(labels_with_entry(22))))]),\n            2,\n        )\n        .unwrap_err();\n\n        assert_eq!(status.code(), Code::Internal);\n        assert!(status.message().contains(\"requested=2 accounted=1\"));\n    }\n}\n",
+      "source_digest": "1e1d31de57d002fb136d682b57784be9290937bc06949b9a088e581710f004c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 189,
+      "end_line": 213,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[tokio::test]\nasync fn admission_strips_the_prefix_and_an_old_image_drops_it() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let b = bed(vec![], false).await;\n    let mut p = b.processor();\n    p.labels = HashSet::from([label.clone()]);\n    let prefixed = format!(\"dry_run__{label}\");\n    let msg = |labels: &[&str]| xai_kafka::KafkaMessage {\n        topic: p.topic.clone(),\n        payload: Some(bb1(labels, Account::Clean).encode_to_vec()),\n        ..Default::default()\n    };\n    p.process_batch(&[msg(&[&prefixed])]).await.unwrap();\n    let outcomes = std::mem::take(&mut *b.outcomes.lock().unwrap());\n    assert_eq!(outcomes.len(), 1, \"admitted\");\n    assert_eq!(outcomes[0].status, \"dry_run\");\n    assert_eq!(outcomes[0].info[\"dry_run_source\"], \"producer\");\n    assert!(b.ais.take().is_empty());\n    assert!(!p.labels.contains(&prefixed));\n    p.process_batch(&[msg(&[\"unsubscribed\"])]).await.unwrap();\n    assert!(\n        b.outcomes.lock().unwrap().is_empty(),\n",
+      "source_digest": "7b68a4b5ca194e723b950dcc9fae466a6a6b3f48dbd38740f1bf391eda0644bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 211,
+      "end_line": 235,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n\n        let response_bytes = match self.mux.call_raw(&payload).await {\n            Ok(b) => {\n                record_ais_metrics(&meta.thrift_method_name, \"ok\", labels, start.elapsed());\n",
+      "source_digest": "bff87e0d1d6e1696be289abac5ffd5d32cee7202f386f21ae83263428dd78151",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 219,
+      "end_line": 243,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n\n        let response_bytes = match self.mux.call_raw(&payload).await {\n            Ok(b) => {\n                record_ais_metrics(&meta.thrift_method_name, \"ok\", labels, start.elapsed());\n                b\n            }\n            Err(e) => {\n                record_ais_metrics(&meta.thrift_method_name, \"error\", labels, start.elapsed());\n                return Err(anyhow::anyhow!(\n                    \"AIS thriftmux {} failed: {e}\",\n                    meta.thrift_method_name\n                ));\n",
+      "source_digest": "6d86d10690f5c343be8ea9178a0afda8b38397e052b359d7ccb61160c1b0c247",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 473,
+      "end_line": 497,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                || t.lookup_method(\"ActionIntakeService\", \"intakeAction\")\n                    .is_some()\n        );\n        assert!(\n            t.lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n                .is_some()\n                || t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\")\n                    .is_some()\n        );\n    }\n\n    #[test]\n    fn encode_suspend_user_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction\");\n        let body = json!({\n            \"actorHeader\": {\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}},\n            \"action\": {\n                \"suspendUser\": {\n                    \"userId\": 42,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n",
+      "source_digest": "ee5fafb59aa7f97a11920d5309db47c24438af10e17b591578be84e446cebb18",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 493,
+      "end_line": 517,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"action\": {\n                \"suspendUser\": {\n                    \"userId\": 42,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": [\"note\"]\n                }\n            },\n            \"tool\": \"RtpPlugin\",\n            \"auditHeader\": {\"note\": \"test\"}\n        });\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n",
+      "source_digest": "44f615c823c0d36051272c84123eba6b02c0f2a103886bcc4d2c48f9262c467f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 501,
+      "end_line": 525,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"tool\": \"RtpPlugin\",\n            \"auditHeader\": {\"note\": \"test\"}\n        });\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n",
+      "source_digest": "9cb5acee6bfd22cb719c97653d829b01e13bc09d914084b0b850eea0f365b926",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 504,
+      "end_line": 528,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n",
+      "source_digest": "0d4d485629fb7c94c96daf754b034e28e3fbd4ab968c7f1e982b1b15ee77e1a8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 510,
+      "end_line": 534,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n            json!({\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}}),\n            vec![\n                json!({\"suspendUser\": {\n                    \"userId\": 1,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n",
+      "source_digest": "c085b27fd8459b2bb09bbdffc361f9e4aef8105effcbe89275784f4e934e7b4f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 536,
+      "end_line": 560,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }}),\n                json!({\"bounceViaSelection\": {\n                    \"target\": {\"user\": {\"userId\": 1}},\n                    \"tags\": [],\n                    \"uncheckedTags\": [\"FAKE\"],\n                    \"bounceActor\": {\"simpleService\": {\"serviceName\": \"xai-abuse-enforcement-service\"}}\n                }}),\n            ],\n            \"RtpPlugin\",\n            Some(\"audit\"),\n        );\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode multiEntity\");\n        assert!(\n            bytes.len() > 32,\n            \"encoded multi payload too small: {}\",\n            bytes.len()\n",
+      "source_digest": "9fea4e1d7a56f7839fed0f17c312c48b6f1ec6910a48b5f08ab21ffe193e81d4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 544,
+      "end_line": 568,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"RtpPlugin\",\n            Some(\"audit\"),\n        );\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode multiEntity\");\n        assert!(\n            bytes.len() > 32,\n            \"encoded multi payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn thrift_ais_exception_validation_failed_is_permanent() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n",
+      "source_digest": "7c585807b19573159cf6947e88859bcc47e0ebfe954067089a669509570cb8d6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 547,
+      "end_line": 571,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode multiEntity\");\n        assert!(\n            bytes.len() > 32,\n            \"encoded multi payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn thrift_ais_exception_validation_failed_is_permanent() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction in schema\");\n\n",
+      "source_digest": "fde362d5e039c599479b25eb9484e2d3293f7e967d810f53e855a43000597b22",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 586,
+      "end_line": 610,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n        let decoded = t\n            .decode_method_response(&bytes, &method)\n            .expect(\"declared aisException must decode, not hard-fail\");\n\n        assert!(\n            decoded.get(\"aisException\").is_some(),\n            \"expected {{aisException: …}}, got {decoded}\"\n        );\n        assert_eq!(\n            decoded\n",
+      "source_digest": "1366763137132d09ee2fe82922a892a75162e67c72ea2369d878f7067a3515c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 587,
+      "end_line": 611,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n        let decoded = t\n            .decode_method_response(&bytes, &method)\n            .expect(\"declared aisException must decode, not hard-fail\");\n\n        assert!(\n            decoded.get(\"aisException\").is_some(),\n            \"expected {{aisException: …}}, got {decoded}\"\n        );\n        assert_eq!(\n            decoded\n                .pointer(\"/aisException/underlyingDetails/exceptionClass\")\n",
+      "source_digest": "15766c804df1e9dfee9477b85a8e99060b688791b8134bde72600478fd1d5290",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 111,
+      "end_line": 135,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn displaced_remaining_secs(displaced: &Option<(Vec<u8>, u64)>, now_secs: u64) -> Option<u64> {\n    match displaced {\n        Some((_, exp)) if *exp > now_secs => Some(exp - now_secs),\n        _ => None,\n    }\n}\n\nfn hex_encode(bytes: &[u8]) -> String {\n    use std::fmt::Write;\n    bytes\n        .iter()\n        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {\n            let _ = write!(out, \"{b:02x}\");\n            out\n        })\n}\n\nfn hex_decode(s: &str) -> Option<Vec<u8>> {\n    if !s.len().is_multiple_of(2) {\n        return None;\n",
+      "source_digest": "5278ad9b0a9c1dbe7069ae4f643348502a77d47f9818be14756d9499b590664c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 315,
+      "end_line": 339,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pkey: &str,\n        acted_class: u8,\n        displaced: Option<(&[u8], u64)>,\n    ) -> Option<u64> {\n        let ts = std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .unwrap_or_default()\n            .as_secs();\n        let nonce = claim_nonce();\n        let mut initial =\n            serde_json::json!({ \"ts\": ts, \"acted_class\": acted_class, \"nonce\": nonce });\n        if let Some((bytes, exp)) = displaced {\n            initial[\"displaced\"] = serde_json::Value::String(hex_encode(bytes));\n            initial[\"displaced_exp\"] = serde_json::Value::from(exp);\n        }\n        let deadline = crate::manhattan::ttl_nanos_from_secs(self.ttl_secs);\n        match self\n            .store\n            .put_with_ttl(pkey, initial.to_string().into_bytes(), deadline)\n            .await\n        {\n            Ok(()) => Some(nonce),\n            Err(e) => {\n                error!(\"Manhattan dedup put failed: {e}; allowing enforcement\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n",
+      "source_digest": "144b5eeb3a31c40840cb7c3eb650e04e0d33cb358222a8f61ca4a61e7092c064",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 790,
+      "end_line": 814,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            drop(slots);\n            self.log(format!(\"invalidate(own_claim={})\", n.is_some()));\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn zstd_json(v: serde_json::Value) -> Vec<u8> {\n        zstd::encode_all(v.to_string().as_bytes(), 3).unwrap()\n    }\n\n            fn held_action_class(raw: &[u8]) -> u8 {\n        held_entry_meta(raw).class\n    }\n\n    #[test]\n    fn held_class_reads_acted_class_field() {\n        for class in [CLASS_NONE, CLASS_LABEL, CLASS_CHALLENGE, CLASS_SUSPEND] {\n            let entry = serde_json::json!({ \"status\": \"success\", \"acted_class\": class });\n            assert_eq!(held_action_class(&zstd_json(entry.clone())), class);\n            assert_eq!(held_action_class(entry.to_string().as_bytes()), class);\n",
+      "source_digest": "ffbc4dae9e4e9c0453b4cd92ce6690c5edddec677df062cb8293cddfed89a469",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 867,
+      "end_line": 891,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!((meta.class, meta.kind), (CLASS_SUSPEND, HeldKind::Outcome));\n    }\n\n    #[test]\n    fn bypass_claim_roundtrips_nonce_and_displaced_hold() {\n        let displaced_entry = zstd_json(serde_json::json!({\n            \"status\": \"success\", \"acted_class\": CLASS_LABEL, \"topic\": \"t\"\n        }));\n        let claim = serde_json::json!({\n            \"ts\": 1,\n            \"acted_class\": CLASS_SUSPEND,\n            \"nonce\": 42u64,\n            \"displaced\": hex_encode(&displaced_entry),\n            \"displaced_exp\": 2_000_000_000u64,\n        });\n        let meta = held_entry_meta(claim.to_string().as_bytes());\n        assert_eq!(\n            (meta.class, meta.kind),\n            (CLASS_SUSPEND, HeldKind::Placeholder)\n        );\n        assert_eq!(meta.nonce, Some(42));\n        let (bytes, exp) = meta.displaced.expect(\"displaced hold must roundtrip\");\n        assert_eq!(exp, 2_000_000_000);\n        let restored = held_entry_meta(&bytes);\n        assert_eq!(\n",
+      "source_digest": "2b2db516ac371ec7ba2c49b9f011fa354175179d62ce0dcb357fa97e60def9ac",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 890,
+      "end_line": 914,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let restored = held_entry_meta(&bytes);\n        assert_eq!(\n            (restored.class, restored.kind),\n            (CLASS_LABEL, HeldKind::Outcome)\n        );\n        let bad = serde_json::json!({ \"ts\": 1, \"displaced\": \"zz\", \"displaced_exp\": 5u64 });\n        assert_eq!(held_entry_meta(bad.to_string().as_bytes()).displaced, None);\n    }\n\n    #[test]\n    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n",
+      "source_digest": "e24c000c2d5fd9cb38c21f6240e9be1c795575fe93ee0a3d67aaf60b52487e69",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1171,
+      "end_line": 1195,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[tokio::test]\n    async fn an_expired_carry_is_not_restored() {\n        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;\n        let store = Arc::new(MemStore::default());\n        let cache = ManhattanDedupCache::with_store(store.clone(), TTL, SKIP_TTL);\n        let carried =\n            zstd_json(serde_json::json!({ \"status\": \"success\", \"acted_class\": CLASS_LABEL }));\n        let now = now_secs();\n        let claim = serde_json::json!({\n            \"ts\": now,\n            \"acted_class\": CLASS_SUSPEND,\n            \"nonce\": 42u64,\n            \"displaced\": hex_encode(&carried),\n            \"displaced_exp\": now - 10,\n        });\n        store.set(\n            \"7\",\n            claim.to_string().into_bytes(),\n            (now + TTL) as i64 * NANOS,\n        );\n        cache\n            .update_skip(EntityType::User, USER, b\"skip\", CLASS_NONE, Some(42))\n            .await;\n        let puts = store.take_puts();\n        assert_eq!(puts.len(), 1);\n",
+      "source_digest": "d855ef0091233d761401ba7ef2e90e5d2bfd8a5b98f0ff71b6ed1eac5346a259",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 9,
+      "end_line": 33,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        other => format!(\"UnknownLabel({other})\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use xai_abuse_thrift_codec::{Transcoder, SCHEMA_AIS};\n\n    #[test]\n    fn names_match_the_ais_label_enum() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let encode = |label: serde_json::Value| {\n            t.encode_call(\n                \"intakeAction\",\n                \"\",\n                1,\n                \"com.twitter.agenttools.common.labels.thriftscala.LabelIdType\",\n                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n",
+      "source_digest": "75345b99f95451b854684b81e3dffc53ab0399bcdde11f51689f4e71dfdcd34f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 10,
+      "end_line": 34,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use xai_abuse_thrift_codec::{Transcoder, SCHEMA_AIS};\n\n    #[test]\n    fn names_match_the_ais_label_enum() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let encode = |label: serde_json::Value| {\n            t.encode_call(\n                \"intakeAction\",\n                \"\",\n                1,\n                \"com.twitter.agenttools.common.labels.thriftscala.LabelIdType\",\n                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n                encode(serde_json::json!(name)).unwrap(),\n",
+      "source_digest": "531e2d540ee5327fdf2bd3b5000097b6545422ec42ebfed64ccecc80e9423339",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 22,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            t.encode_call(\n                \"intakeAction\",\n                \"\",\n                1,\n                \"com.twitter.agenttools.common.labels.thriftscala.LabelIdType\",\n                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n                encode(serde_json::json!(name)).unwrap(),\n                encode(serde_json::json!(ordinal)).unwrap(),\n                \"{name} is not LabelValue {ordinal} in the AIS schema\"\n            );\n        }\n        assert!(encode(serde_json::json!(\"ClientEventPhoenixSkipp\")).is_err());\n    }\n}\n",
+      "source_digest": "813a1e6b966c98c7137477369ca0b0d4f4c6b22d57defe696f35d487d940d1f9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 23,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"intakeAction\",\n                \"\",\n                1,\n                \"com.twitter.agenttools.common.labels.thriftscala.LabelIdType\",\n                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n                encode(serde_json::json!(name)).unwrap(),\n                encode(serde_json::json!(ordinal)).unwrap(),\n                \"{name} is not LabelValue {ordinal} in the AIS schema\"\n            );\n        }\n        assert!(encode(serde_json::json!(\"ClientEventPhoenixSkipp\")).is_err());\n    }\n}\n",
+      "source_digest": "4c7f5b5d0485441247e08625b0ca8c87aa1daa0ad7f656d66bc9ee9cba5726c9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 27,
+      "end_line": 41,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n                encode(serde_json::json!(name)).unwrap(),\n                encode(serde_json::json!(ordinal)).unwrap(),\n                \"{name} is not LabelValue {ordinal} in the AIS schema\"\n            );\n        }\n        assert!(encode(serde_json::json!(\"ClientEventPhoenixSkipp\")).is_err());\n    }\n}\n",
+      "source_digest": "c92142bda92c24f27132b297e1422db048721fb0c2f529199a63aaf7ab1fee90",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 465,
+      "end_line": 489,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[tokio::test]\nasync fn admission_strips_the_prefix_and_an_old_image_drops_it() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let label = suspend_label();\n    let b = bed(vec![], false).await;\n    let mut p = b.processor();\n    p.labels = HashSet::from([label.clone()]);\n    let prefixed = format!(\"dry_run__{label}\");\n    let msg = |labels: &[&str]| xai_kafka::KafkaMessage {\n        topic: p.topic.clone(),\n        payload: Some(bb1(labels, Account::Clean).encode_to_vec()),\n        ..Default::default()\n    };\n    p.process_batch(&[msg(&[&prefixed])]).await.unwrap();\n    let outcomes = std::mem::take(&mut *b.outcomes.lock().unwrap());\n    assert_eq!(outcomes.len(), 1, \"admitted\");\n    assert_eq!(outcomes[0].status, \"dry_run\");\n    assert_eq!(outcomes[0].info[\"dry_run_source\"], \"producer\");\n    assert!(b.ais.take().is_empty());\n    assert!(!p.labels.contains(&prefixed));\n    p.process_batch(&[msg(&[\"unsubscribed\"])]).await.unwrap();\n    assert!(\n        b.outcomes.lock().unwrap().is_empty(),\n",
+      "source_digest": "7b68a4b5ca194e723b950dcc9fae466a6a6b3f48dbd38740f1bf391eda0644bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 211,
+      "end_line": 235,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n\n        let response_bytes = match self.mux.call_raw(&payload).await {\n            Ok(b) => {\n                record_ais_metrics(&meta.thrift_method_name, \"ok\", labels, start.elapsed());\n",
+      "source_digest": "bff87e0d1d6e1696be289abac5ffd5d32cee7202f386f21ae83263428dd78151",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 219,
+      "end_line": 243,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n                seq,\n            )\n            .with_context(|| format!(\"AIS thrift encode failed ({})\", meta.thrift_method_name))?;\n\n        let response_bytes = match self.mux.call_raw(&payload).await {\n            Ok(b) => {\n                record_ais_metrics(&meta.thrift_method_name, \"ok\", labels, start.elapsed());\n                b\n            }\n            Err(e) => {\n                record_ais_metrics(&meta.thrift_method_name, \"error\", labels, start.elapsed());\n                return Err(anyhow::anyhow!(\n                    \"AIS thriftmux {} failed: {e}\",\n                    meta.thrift_method_name\n                ));\n",
+      "source_digest": "6d86d10690f5c343be8ea9178a0afda8b38397e052b359d7ccb61160c1b0c247",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 473,
+      "end_line": 497,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                || t.lookup_method(\"ActionIntakeService\", \"intakeAction\")\n                    .is_some()\n        );\n        assert!(\n            t.lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n                .is_some()\n                || t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\")\n                    .is_some()\n        );\n    }\n\n    #[test]\n    fn encode_suspend_user_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction\");\n        let body = json!({\n            \"actorHeader\": {\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}},\n            \"action\": {\n                \"suspendUser\": {\n                    \"userId\": 42,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n",
+      "source_digest": "ee5fafb59aa7f97a11920d5309db47c24438af10e17b591578be84e446cebb18",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 493,
+      "end_line": 517,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"action\": {\n                \"suspendUser\": {\n                    \"userId\": 42,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n                    \"additionalInfo\": [\"note\"]\n                }\n            },\n            \"tool\": \"RtpPlugin\",\n            \"auditHeader\": {\"note\": \"test\"}\n        });\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n",
+      "source_digest": "44f615c823c0d36051272c84123eba6b02c0f2a103886bcc4d2c48f9262c467f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 501,
+      "end_line": 525,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"tool\": \"RtpPlugin\",\n            \"auditHeader\": {\"note\": \"test\"}\n        });\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n",
+      "source_digest": "9cb5acee6bfd22cb719c97653d829b01e13bc09d914084b0b850eea0f365b926",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 504,
+      "end_line": 528,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n",
+      "source_digest": "0d4d485629fb7c94c96daf754b034e28e3fbd4ab968c7f1e982b1b15ee77e1a8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 510,
+      "end_line": 534,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                &body,\n                1,\n            )\n            .expect(\"encode\");\n        assert!(\n            bytes.len() > 16,\n            \"encoded payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn encode_multi_entity_smoke() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"multiEntityIntakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"multiEntityIntakeAction\"))\n            .expect(\"multiEntityIntakeAction\");\n        let body = build_multi_entity_request(\n            json!({\"plugin\": {\"pluginId\": \"xai-abuse-enforcement-service\"}}),\n            vec![\n                json!({\"suspendUser\": {\n                    \"userId\": 1,\n                    \"perm\": false,\n                    \"policy\": \"PlatformManipulation\",\n",
+      "source_digest": "c085b27fd8459b2bb09bbdffc361f9e4aef8105effcbe89275784f4e934e7b4f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 536,
+      "end_line": 560,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }}),\n                json!({\"bounceViaSelection\": {\n                    \"target\": {\"user\": {\"userId\": 1}},\n                    \"tags\": [],\n                    \"uncheckedTags\": [\"FAKE\"],\n                    \"bounceActor\": {\"simpleService\": {\"serviceName\": \"xai-abuse-enforcement-service\"}}\n                }}),\n            ],\n            \"RtpPlugin\",\n            Some(\"audit\"),\n        );\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode multiEntity\");\n        assert!(\n            bytes.len() > 32,\n            \"encoded multi payload too small: {}\",\n            bytes.len()\n",
+      "source_digest": "9fea4e1d7a56f7839fed0f17c312c48b6f1ec6910a48b5f08ab21ffe193e81d4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 544,
+      "end_line": 568,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"RtpPlugin\",\n            Some(\"audit\"),\n        );\n        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode multiEntity\");\n        assert!(\n            bytes.len() > 32,\n            \"encoded multi payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn thrift_ais_exception_validation_failed_is_permanent() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n",
+      "source_digest": "7c585807b19573159cf6947e88859bcc47e0ebfe954067089a669509570cb8d6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 547,
+      "end_line": 571,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let bytes = t\n            .encode_call(\n                method.thrift_method_name,\n                method.arg_field_name,\n                method.arg_field_id,\n                method.request_type,\n                &body,\n                1,\n            )\n            .expect(\"encode multiEntity\");\n        assert!(\n            bytes.len() > 32,\n            \"encoded multi payload too small: {}\",\n            bytes.len()\n        );\n    }\n\n    #[test]\n    fn thrift_ais_exception_validation_failed_is_permanent() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let method = t\n            .lookup_method(AIS_SERVICE, \"intakeAction\")\n            .or_else(|| t.lookup_method(\"ActionIntakeService\", \"intakeAction\"))\n            .expect(\"intakeAction in schema\");\n\n",
+      "source_digest": "fde362d5e039c599479b25eb9484e2d3293f7e967d810f53e855a43000597b22",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 586,
+      "end_line": 610,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let body = json!({\n            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n        let decoded = t\n            .decode_method_response(&bytes, &method)\n            .expect(\"declared aisException must decode, not hard-fail\");\n\n        assert!(\n            decoded.get(\"aisException\").is_some(),\n            \"expected {{aisException: …}}, got {decoded}\"\n        );\n        assert_eq!(\n            decoded\n",
+      "source_digest": "1366763137132d09ee2fe82922a892a75162e67c72ea2369d878f7067a3515c5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 587,
+      "end_line": 611,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"kind\": \"Internal\",\n            \"message\": \"Processor chain: 'add_labels_v2_processor_chain' threw an unhandled exception (Throwable) with message: 'User could not be successfully validated.'\",\n            \"underlyingDetails\": {\n                \"exceptionClass\": \"com.twitter.gizmoduck.thriftscala.ValidationFailed\",\n                \"message\": \"User could not be successfully validated.\",\n                \"stackTrace\": [\n                    \"com.twitter.gizmoduck.thriftscala.ValidationFailed$.decodeInternal(ValidationFailed.scala:195)\"\n                ]\n            }\n        });\n        let bytes = t\n            .encode_exception_reply(\"intakeAction\", 4, exception_type, &body, 1)\n            .expect(\"encode exception reply\");\n\n        let decoded = t\n            .decode_method_response(&bytes, &method)\n            .expect(\"declared aisException must decode, not hard-fail\");\n\n        assert!(\n            decoded.get(\"aisException\").is_some(),\n            \"expected {{aisException: …}}, got {decoded}\"\n        );\n        assert_eq!(\n            decoded\n                .pointer(\"/aisException/underlyingDetails/exceptionClass\")\n",
+      "source_digest": "15766c804df1e9dfee9477b85a8e99060b688791b8134bde72600478fd1d5290",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 111,
+      "end_line": 135,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_secs()\n}\n\nfn displaced_remaining_secs(displaced: &Option<(Vec<u8>, u64)>, now_secs: u64) -> Option<u64> {\n    match displaced {\n        Some((_, exp)) if *exp > now_secs => Some(exp - now_secs),\n        _ => None,\n    }\n}\n\nfn hex_encode(bytes: &[u8]) -> String {\n    use std::fmt::Write;\n    bytes\n        .iter()\n        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {\n            let _ = write!(out, \"{b:02x}\");\n            out\n        })\n}\n\nfn hex_decode(s: &str) -> Option<Vec<u8>> {\n    if !s.len().is_multiple_of(2) {\n        return None;\n",
+      "source_digest": "5278ad9b0a9c1dbe7069ae4f643348502a77d47f9818be14756d9499b590664c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 315,
+      "end_line": 339,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pkey: &str,\n        acted_class: u8,\n        displaced: Option<(&[u8], u64)>,\n    ) -> Option<u64> {\n        let ts = std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .unwrap_or_default()\n            .as_secs();\n        let nonce = claim_nonce();\n        let mut initial =\n            serde_json::json!({ \"ts\": ts, \"acted_class\": acted_class, \"nonce\": nonce });\n        if let Some((bytes, exp)) = displaced {\n            initial[\"displaced\"] = serde_json::Value::String(hex_encode(bytes));\n            initial[\"displaced_exp\"] = serde_json::Value::from(exp);\n        }\n        let deadline = crate::manhattan::ttl_nanos_from_secs(self.ttl_secs);\n        match self\n            .store\n            .put_with_ttl(pkey, initial.to_string().into_bytes(), deadline)\n            .await\n        {\n            Ok(()) => Some(nonce),\n            Err(e) => {\n                error!(\"Manhattan dedup put failed: {e}; allowing enforcement\");\n                crate::metrics::MANHATTAN_ERRORS_TOTAL.inc();\n",
+      "source_digest": "144b5eeb3a31c40840cb7c3eb650e04e0d33cb358222a8f61ca4a61e7092c064",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 790,
+      "end_line": 814,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n            drop(slots);\n            self.log(format!(\"invalidate(own_claim={})\", n.is_some()));\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn zstd_json(v: serde_json::Value) -> Vec<u8> {\n        zstd::encode_all(v.to_string().as_bytes(), 3).unwrap()\n    }\n\n            fn held_action_class(raw: &[u8]) -> u8 {\n        held_entry_meta(raw).class\n    }\n\n    #[test]\n    fn held_class_reads_acted_class_field() {\n        for class in [CLASS_NONE, CLASS_LABEL, CLASS_CHALLENGE, CLASS_SUSPEND] {\n            let entry = serde_json::json!({ \"status\": \"success\", \"acted_class\": class });\n            assert_eq!(held_action_class(&zstd_json(entry.clone())), class);\n            assert_eq!(held_action_class(entry.to_string().as_bytes()), class);\n",
+      "source_digest": "ffbc4dae9e4e9c0453b4cd92ce6690c5edddec677df062cb8293cddfed89a469",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 867,
+      "end_line": 891,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!((meta.class, meta.kind), (CLASS_SUSPEND, HeldKind::Outcome));\n    }\n\n    #[test]\n    fn bypass_claim_roundtrips_nonce_and_displaced_hold() {\n        let displaced_entry = zstd_json(serde_json::json!({\n            \"status\": \"success\", \"acted_class\": CLASS_LABEL, \"topic\": \"t\"\n        }));\n        let claim = serde_json::json!({\n            \"ts\": 1,\n            \"acted_class\": CLASS_SUSPEND,\n            \"nonce\": 42u64,\n            \"displaced\": hex_encode(&displaced_entry),\n            \"displaced_exp\": 2_000_000_000u64,\n        });\n        let meta = held_entry_meta(claim.to_string().as_bytes());\n        assert_eq!(\n            (meta.class, meta.kind),\n            (CLASS_SUSPEND, HeldKind::Placeholder)\n        );\n        assert_eq!(meta.nonce, Some(42));\n        let (bytes, exp) = meta.displaced.expect(\"displaced hold must roundtrip\");\n        assert_eq!(exp, 2_000_000_000);\n        let restored = held_entry_meta(&bytes);\n        assert_eq!(\n",
+      "source_digest": "2b2db516ac371ec7ba2c49b9f011fa354175179d62ce0dcb357fa97e60def9ac",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 890,
+      "end_line": 914,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let restored = held_entry_meta(&bytes);\n        assert_eq!(\n            (restored.class, restored.kind),\n            (CLASS_LABEL, HeldKind::Outcome)\n        );\n        let bad = serde_json::json!({ \"ts\": 1, \"displaced\": \"zz\", \"displaced_exp\": 5u64 });\n        assert_eq!(held_entry_meta(bad.to_string().as_bytes()).displaced, None);\n    }\n\n    #[test]\n    fn hex_roundtrip() {\n        let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();\n        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes));\n        assert_eq!(hex_decode(\"\"), Some(vec![]));\n        assert_eq!(hex_decode(\"abc\"), None, \"odd length\");\n        assert_eq!(hex_decode(\"zz\"), None, \"non-hex\");\n    }\n\n    #[test]\n    fn displaced_remaining_only_for_unexpired_holds() {\n        let displaced = Some((vec![1u8], 1_000u64));\n        assert_eq!(displaced_remaining_secs(&displaced, 400), Some(600));\n        assert_eq!(displaced_remaining_secs(&displaced, 1_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&displaced, 2_000), None, \"expired\");\n        assert_eq!(displaced_remaining_secs(&None, 0), None, \"absent\");\n",
+      "source_digest": "e24c000c2d5fd9cb38c21f6240e9be1c795575fe93ee0a3d67aaf60b52487e69",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/dedup_cache.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1171,
+      "end_line": 1195,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[tokio::test]\n    async fn an_expired_carry_is_not_restored() {\n        let _serial = crate::overturn_hold::tests::METRICS_LOCK.lock().await;\n        let store = Arc::new(MemStore::default());\n        let cache = ManhattanDedupCache::with_store(store.clone(), TTL, SKIP_TTL);\n        let carried =\n            zstd_json(serde_json::json!({ \"status\": \"success\", \"acted_class\": CLASS_LABEL }));\n        let now = now_secs();\n        let claim = serde_json::json!({\n            \"ts\": now,\n            \"acted_class\": CLASS_SUSPEND,\n            \"nonce\": 42u64,\n            \"displaced\": hex_encode(&carried),\n            \"displaced_exp\": now - 10,\n        });\n        store.set(\n            \"7\",\n            claim.to_string().into_bytes(),\n            (now + TTL) as i64 * NANOS,\n        );\n        cache\n            .update_skip(EntityType::User, USER, b\"skip\", CLASS_NONE, Some(42))\n            .await;\n        let puts = store.take_puts();\n        assert_eq!(puts.len(), 1);\n",
+      "source_digest": "d855ef0091233d761401ba7ef2e90e5d2bfd8a5b98f0ff71b6ed1eac5346a259",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 9,
+      "end_line": 33,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        other => format!(\"UnknownLabel({other})\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use xai_abuse_thrift_codec::{Transcoder, SCHEMA_AIS};\n\n    #[test]\n    fn names_match_the_ais_label_enum() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let encode = |label: serde_json::Value| {\n            t.encode_call(\n                \"intakeAction\",\n                \"\",\n                1,\n                \"com.twitter.agenttools.common.labels.thriftscala.LabelIdType\",\n                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n",
+      "source_digest": "75345b99f95451b854684b81e3dffc53ab0399bcdde11f51689f4e71dfdcd34f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/gizmoduck_labels.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 10,
+      "end_line": 34,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use xai_abuse_thrift_codec::{Transcoder, SCHEMA_AIS};\n\n    #[test]\n    fn names_match_the_ais_label_enum() {\n        let t = Transcoder::from_schema_bytes(SCHEMA_AIS).unwrap();\n        let encode = |label: serde_json::Value| {\n            t.encode_call(\n                \"intakeAction\",\n                \"\",\n                1,\n                \"com.twitter.agenttools.common.labels.thriftscala.LabelIdType\",\n                &serde_json::json!({ \"nativeUserLabels\": label }),\n                1,\n            )\n        };\n        for (ordinal, name) in [(23, SPAM_HIGH_RECALL), (118, CLIENT_EVENT_PHOENIX_SKIP)] {\n            assert_eq!(label_ordinal_to_name(ordinal), name);\n            assert_eq!(\n                encode(serde_json::json!(name)).unwrap(),\n",
+      "source_digest": "531e2d540ee5327fdf2bd3b5000097b6545422ec42ebfed64ccecc80e9423339",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2177cd054ca7e9b6f83b3bb4cfeec4b3114b29b7858f447f8886f25d56eab3a1",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "162fc8570e47c3e6263743ab160a83a46e0adfa5547ecd17039a3fb9b5e03afb",
+      "context_complete": true,
+      "task_id": "T-52478595abc212086648101d8e8c18f926ff07e01d1decc2d5ea85bf665e6fe8",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-20e440aa7b9b14a22ab6df4a0814aa05c024c530d5a964aaaae2514aa753e647",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-4159513a59ae509ec62f44a832f07d718fd3875e5d901ec71ab10d9e06c7f3d0",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d56e67ae0abf480bb8effda42787769516af8de72f8d2f4e52374960f4f78186",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-e31d6e842653cdd30c60409102dac6954a03da94146443f764eba141d4e5c428",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f76531c4a368d95aa9352594783378fc026408b73aecd82e1ce5029f164c3ca3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-ffe017c3578064e739b20337ee6e81c33ff7e3d1eeb1f72891ec1f2fb191f1b5",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5804a3a58b594ac89404d10b3eb46143a0e51ab173a47db7235b2975db9273bd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-50e4cb9321a3843f13960181793d899872bfc2542aa54cbc3cbc476e9738599b",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5ebd711d582b6709967c889a3f8d5d01a5c8655975da2777c049bbcbed89d443",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-6d9d9dee94aa959ca992ac3a3d66d48977d565a76a9702c1a0cc08063c1f312b",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6d3c52928946e5db2fd60f124756c17ff8cdc0e28efe6d540bc1ad812e6b40d2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-87c1e167af0c46d3b91866ccabfa5053a1744cb6647e254fb6a51e004ee48a28",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-44f7874424728091974b17c3a111d502a8d8d043b56edd55d66b86628fa5fce1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a50df41ed6a0bbc06acf1adbf31f68d544281ee584c8c1f36c70cf0d76d81288",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-43930a424decd1dd8a62e2959b1d65197ebe17d24539276ebc93bc2273c16ae7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-b0eee54010104c4e4456224895826a242131109d7210d3129af34c02d5f06296",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7fd70300ef833b72a1d13d84352d0e3c50ba662d7ead29d9a71e2552cd7c3633",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-b21b79d2c858ff414039fa841832c9bbf276a03951cbbdffc6590a53de39e929",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2586364c7c520e95616d424e17888f70368bcdcecb7370545fd3ae48119eed20",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-7290dc6aad8af20de5c20e72f34a53f57934453f7a1534d3bd1a382f09288ffe",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bb6436dd6c0a11de57944e06890bf1c2737b4a9e778efd199bb859479b5f3020",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-c57fc746b5ee1c8c9ed99ad9ca3c5b55f1f7fd58ad3ac09058f8f309df6d8a60",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-42c64ff6c46fcbb7d1429c6de2291543311f1ff482fc95cf3c28acfdefc4e86f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-e6e727e8e936cc2d7c755b444d5443affdd9e53035922be8b39b7e59329616e3",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-76d0dee3f319364feb0fc763cc65e9b59ab2450334d1efa395ae4260b510ddcd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-33253d8d5c50f16434535bd404d38a26f21cb5af9eca0d7ac5840be4fe5b71c4",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a09efa7467148d73825c7719de70700e14f765adf7266fd05a8256c0fa7b4dac",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-89285c97f9a9b6cadb0efd73f117c7c484bb9617d2ab39e50bff02483a8c70ad",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-608cd70f818ead1c3ea9d44655eba3de4f273ebdf91317544bbe97fb108b9c6e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-59e677d29e2949af9415e1ba29d463c27cb67077efd63454d9ebf52b4b427064",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-573a97da274e4aefb35adefad885b4e705fd2164e1f3ac330b09591e79dc1a10",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a8b6b19774df57ad985ff44780261aac1748ca5af0806408181330a83f540f38",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e508ff9de332c86334eb516c8cc99785e228bd52a7a12b3f3c9b085901bc7564",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-58416c6bffdd955e8baaefb2e7afbf575b8d5c286183c19ead8c996a9ef361b9",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f54ca2bbd4d4d5dd0d92d2a588d9e1a6282dd9df4f99638544e7c040393c1e84",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-d29ca05f1429d66b5e500b440ff015df48d9a44b9856dffa1d41e72e9b2f01df",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-58ec3dc74bf3c82cde49f11ff953f80e21ad339ae4137db468c851ffea68c426",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a218c28c256a5575ef51a6010858c16c2088cbba27f092be91f45803545c0cc3",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c9d661df278ebc8211abe3ff04cb5b2d1302eaa2c63254a0877c06d8f6752835",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-fde9ca49692a88409f643734fa08e96b66de3480a261f951d6cc9234ad6ecd9d",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e822a897d34a03121e34e41ec79326490e2ea9292fc786aad89e76316465f027",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-ba40a41d154d9eef1e5c76ecc04fd4c25935a42bc3a5d2383dae5b3b3a9b1635",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-799d07406d6c98aa2d085ef09eb3217396a547e3a78269db0c26a8dcb2a7c443",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-0d6afa8e505faec3c59bc5c0dd016b1c6acd046b14b7090f2349e095830f9b88",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-77e8ee582cbaa959237636b3f0f91ff12f84f488bab008a548bc130a1a01830d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-b0be9cbdd32fc64fc3bbd5a8616f3c2239438280d930ba9836792c7879d29eb1",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-405935b26d184a275b5bf2a030a18e4de5f3a48d802f911840889cc0f5e62534",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-1ccdb5f4a87fb675414853176bfa91996abbd24a08d9299cdd2c73077a93ff9e",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-78d8c30978eae996662910063b994ecf65db0df638814e6777e01ee60d6a9deb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a670aeabf573323aceeccb2a1fc9741af10151557a0f963da1cb4346451ece84",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f77f9ad609ca95a5c96b05a7841176a5847e7a146155ff7cccbb3318816b05e1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a3457e0e2af7e792bd2a7301d313e291838b2ada646a5f64390c02476c601ae0",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-dfd0b679ec5d439c68a11e563accfe427715ef54f6674bdf5312c708b8e437ab",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-2fc9990c7e8d945de94e128a69759b0a035a7940cf58066ae26cb4b0ddae516d",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5402d4cae5ea44fd9df9bab4a795badbd537e3f7f483cce587840b8ae6085b22",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-f30f2e649d0f6b4ac7c8756bac88a9561f0c5b392ff9cd190fe1a5ffbce83ff6",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c0524c7a4332d44008b2cc15fafc8e2b04aec2af6589b9ac9fd97644ab4fd754",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-4e930ece9c7f542557df6475500ac3e03b9638f0d5f9a63f0230ce4252e93027",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5ce8997529d5a1274941c77eb9b27c9fd42e7a1fb721b3ef4ace9b814bc057b9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-7b2aef26bb6dcd8465f18d9ea6daa1a644724a5226bda74dfaf4e2468dc5216e",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab236af49425e36e9390fb9505d400b866fc53c26f247ec31943da4abc8afa3c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-5d269494b8b22fe730063b7762589c4ed783966d934b3d4f7147971e2d3bad16",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-85a047917395492417051d401273e17d546ae20e3a639f91e22ee6f94d207971",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-3dfb103c7974ec7a472456591093132536570c5342ca618a437a01e0d62f0801",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a0d7d43db3b9d3c4a0d7088ccd8140e26ec91f50246850cb3f88b1cdb8177bd4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-019b7516758531b797f7b5330eac394aa044c1954e73b10384472de592ca502c",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2544115f8b1c3c9ead59508139e839e47f3c3ac0b5f5f4dcc2e54bd866c9db8d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-9c5b191c45abec7bfb702487056b586636e312cab9f0392063847b7ae7295de8",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c4013db240f1e832ae39bd9b1d32999d399c0fe452b5e1a59a7348ebcf61497f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-85d709a5be1244ae35e18adcf792d7158fa5fae8cb33db6e03c34c37fab3b4e8",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ccc6a31009d8e2bc56310246b21ecd57eb02340f73c96ab339f7376c23adaab8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-294b7408582d2437866483b3484db56b55204999d42119d6d1d018d702a3710a",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-145d6a61c6d284e191efe2a78cd02c28a7ec5ad137d8914636cd167e06740b83",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-f8f1e09c52c38667097755b5a712ccadf79132184bf7d05f3c946b0af09984a2",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8ada3a0bdcb13a548830fc22a56dc2ef4831496e5bcc8b79f498d4224636b9a7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-3f50e202e648924e62b29b42fef37712b90fa764355f1a5d31f632ac6b711149",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-35beb14ec8792b46a8fb66edf3975ce9af89897cbb99a6381f7c79ce6b0b087a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a6f10054f78936dafab40f7e0099253fceb5e0b0c0f94251db1739ba739df98d",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f415a24fee1f5dd1a93edfa55faf2d289ab4654df253b88a7800e069ee4d0de0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-48a4604f517d2b8c66d256e5b958f4006451709cbc86ac2d9783dbaf942d815d",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-430fb9dbf7ac0142937f456695c5f457197be4d7587b5ac4d7f0a6e9d4ddd819",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-d1d264db117edc515e57ade97595389845bcf5353951ff66df359556a3e4adb4",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-49f28d31dbb99d5d8d0642890302e35553cf7140e3b2fb3a15d457ff012b9bf1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-e830a9940032735d72a52c3d0658cf1d996b237aa236c4886d213a1294e9d05b",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f06831ec1a4231fe9f6651fd03ab7f0e4daa95b5408c21749c71b1f84f47bbbf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-a438bf88f61e55c6b2d2a9b151a6440c333fc7a0c4c88371722affe764f2a536",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-49fa2f65b9c80aa5f279e775fcf9745f8a632deb0389fa7604a870cef07ef2c3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-026971cf0e8e1f1554a340e571651f746158951640f14680bdd601b5fa971144",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/get_safety_labels.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9a0edfcf74041b10b7240b03b66226e14a8f4cebd1de0fd077ea90b3e2051780",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering",
+      "query_symbols": [
+        "CachedGetSafetyLabelsResponse",
+        "try_from_resolved",
+        "encode",
+        "GetSafetyLabelsOutcome",
+        "success_count",
+        "failure_count",
+        "accounted_count",
+        "try_from_resolved_reports_partial_failure"
+      ],
+      "context_complete": false,
+      "task_id": "T-e162a4417b0dba55726a404d84560ce65091e3e9fa275b29d7c7a78f4f6637fd",
+      "evidence_refs": [
+        "E47"
+      ]
+    }
+  ],
+  "task_id": "T-bb2c96fbe7d2039384f023453525a8d63d9ca16687cb07e27e7caf0d4c1c9cd6"
+}

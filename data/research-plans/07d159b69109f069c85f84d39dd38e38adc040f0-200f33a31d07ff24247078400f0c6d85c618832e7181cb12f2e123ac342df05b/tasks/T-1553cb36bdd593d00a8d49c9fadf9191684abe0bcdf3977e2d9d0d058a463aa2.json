@@ -1,0 +1,1834 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/mod.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-d70999cf6c836139662cd4f92f2a7ff33fa55b1c11843cd37575e6a68cc7be15",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/mod.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 353,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "pub mod batch;\npub(crate) mod community_source;\nmod decode;\nmod execute;\npub(crate) mod fallback_cache;\nmod fetcher;\nmod hydrator;\npub(crate) mod inventory;\npub mod metrics;\npub(crate) mod plan;\nmod relation;\npub(crate) mod sources;\nmod store;\npub mod tweet_source;\n\nuse crate::metrics::Rpc;\nuse crate::models::{\n    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetFeatures,\n    TweetId, UserEntity, ViewerFeatures, ViewerRelationship,\n};\npub(crate) use decode::author::AuthorNotFound;\npub(crate) use decode::author::fallback_cache as author_fallback_cache;\npub(crate) use decode::tweet::tweet_fallback_cache;\nuse decode::viewer::ViewerState;\nuse fallback_cache::FallbackCaches;\npub(crate) use hydrator::RequestRows;\npub use hydrator::{Hydrator, Hydrators};\npub(crate) use plan::HydrationPlan;\npub(crate) use relation::Relation;\nuse rustc_hash::FxHashMap;\nuse std::borrow::Cow;\nuse std::hash::Hash;\nuse std::sync::Arc;\nuse std::time::Duration;\nuse xai_visibility_filtering_proto as vf_pb;\n\npub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);\npub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(300);\npub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);\n\npub(crate) fn request_context(\n    entered: tokio::time::Instant,\n    grpc_timeout: Option<Duration>,\n) -> xai_x_rpc::CallContext {\n    xai_x_rpc::CallContext {\n        deadline: Some(\n            entered\n                + grpc_timeout\n                    .unwrap_or(HYDRATION_TIMEOUT)\n                    .saturating_sub(INBOUND_ALLOWANCE),\n        ),\n    }\n}\n\npub(crate) struct HydrationRequest<'a> {\n    viewer_id: Option<u64>,\n    country_code: Option<String>,\n    client_capability: ClientCapability,\n    raw_candidates: Vec<RawCandidate>,\n    users: Vec<AuthorId>,\n    quotes: Vec<QuoteEntry>,\n    posts_judged_for: Option<Rpc>,\n    fallback_caches: &'a FallbackCaches,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\npub(crate) struct QuoteEntry {\n    pub(crate) inner: TweetId,\n    pub(crate) outer: TweetId,\n}\n\nimpl<'a> HydrationRequest<'a> {\n    pub(crate) fn new(\n        viewer_id: Option<u64>,\n        country_code: Option<String>,\n        client_capability: ClientCapability,\n        raw_candidates: Vec<RawCandidate>,\n        posts_judged_for: Option<Rpc>,\n        fallback_caches: &'a FallbackCaches,\n    ) -> Self {\n        Self {\n            viewer_id,\n            country_code,\n            client_capability,\n            raw_candidates,\n            users: Vec::new(),\n            quotes: Vec::new(),\n            posts_judged_for,\n            fallback_caches,\n        }\n    }\n\n    #[cfg_attr(\n        not(test),\n        expect(dead_code, reason = \"remove once a served level takes user rows\")\n    )]\n    pub(crate) fn for_users(\n        viewer_id: u64,\n        users: Vec<AuthorId>,\n        fallback_caches: &'a FallbackCaches,\n    ) -> Self {\n        Self {\n            users,\n            ..Self::new(\n                Some(viewer_id),\n                None,\n                ClientCapability::default(),\n                Vec::new(),\n                None,\n                fallback_caches,\n            )\n        }\n    }\n\n    pub(crate) fn with_quotes(mut self, quotes: Vec<QuoteEntry>) -> Self {\n        self.quotes = quotes;\n        self\n    }\n}\n\nfn candidate_count_by_key<K: Eq + Hash>(keys: impl Iterator<Item = K>) -> FxHashMap<K, usize> {\n    let mut candidate_count_by_key =\n        FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());\n    for key in keys {\n        *candidate_count_by_key.entry(key).or_default() += 1;\n    }\n    candidate_count_by_key\n}\n\npub(crate) struct Hydration {\n    viewer: ViewerFeatures,\n    viewer_state: Option<ViewerState>,\n    planned: Hydrators,\n    incomplete: Hydrators,\n    tweets: FxHashMap<TweetId, HydratedTweet>,\n    users: FxHashMap<AuthorId, HydratedUser>,\n    quotes: FxHashMap<QuoteEntry, Quoted>,\n    has_fetched_retweet_sources: bool,\n    posts_judged_for: Option<Rpc>,\n}\n\n#[cfg_attr(\n    not(test),\n    expect(dead_code, reason = \"remove once a served level takes user rows\")\n)]\npub(crate) enum HydratedUser {\n    Resolved {\n        user: UserEntity,\n        viewer_relationship: ViewerRelationship,\n        failed: Hydrators,\n    },\n    Unresolved(Cause),\n}\n\n#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]\npub(crate) struct Quoted {\n    pub(crate) facts: QuoteFacts,\n    pub(crate) failed: Hydrators,\n}\n\nimpl Hydration {\n    pub(crate) fn viewer(&self) -> &ViewerFeatures {\n        &self.viewer\n    }\n\n            pub(crate) fn viewer_found(&self) -> bool {\n        self.viewer_state.is_some()\n    }\n\n    pub(crate) fn planned(&self) -> Hydrators {\n        self.planned\n    }\n\n        pub(crate) fn incomplete(&self) -> Hydrators {\n        self.incomplete\n    }\n\n    pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {\n        self.tweets.get(&id)\n    }\n\n    pub(crate) fn user(&self, id: AuthorId) -> Option<&HydratedUser> {\n        self.users.get(&id)\n    }\n\n    pub(crate) fn quoted(&self, id: TweetId, placement: Placement) -> Quoted {\n        match placement {\n            Placement::InnerQuoted { outer } => self\n                .quotes\n                .get(&QuoteEntry { inner: id, outer })\n                .copied()\n                .unwrap_or_default(),\n            Placement::Standalone | Placement::RetweetSource => Quoted::default(),\n        }\n    }\n\n    pub(crate) fn is_on(&self, relation: Relation) -> bool {\n        relation.is_on(self.posts_judged_for, self.planned)\n    }\n\n            pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {\n        let tweet = self.tweet(id)?;\n        let candidate = tweet.candidate()?;\n        let copy = copied\n            .then(|| self.tweet(tweet.source_tweet_id()?)?.candidate())\n            .flatten()\n            .map(|source| CopiedFromSource::of(&source.post.tweet_features))\n            .filter(|copy| !copy.is_on(&candidate.post.tweet_features));\n        Some(match copy {\n            None => Cow::Borrowed(candidate),\n            Some(copy) => {\n                let mut candidate = candidate.clone();\n                copy.copy_onto(&mut candidate.post.tweet_features);\n                Cow::Owned(candidate)\n            }\n        })\n    }\n\n    pub(crate) fn failed_nodes(&self, post: TweetId) -> Hydrators {\n        let Some(HydratedTweet::Resolved {\n            candidate,\n            source_tweet_id,\n            ..\n        }) = self.tweet(post)\n        else {\n            return Hydrators::empty();\n        };\n        let source = source_tweet_id\n            .and_then(|source| self.tweet(source)?.candidate())\n            .map_or(Hydrators::empty(), |source| source.failed);\n        candidate.failed.union(source)\n    }\n\n    pub(crate) fn has_fetched_retweet_sources(&self) -> bool {\n        self.has_fetched_retweet_sources\n    }\n}\n\n#[derive(Clone, Copy)]\nstruct CopiedFromSource {\n    has_media: bool,\n}\n\nimpl CopiedFromSource {\n    fn of(source: &TweetFeatures) -> Self {\n        Self {\n            has_media: source.media.has_uploaded_media,\n        }\n    }\n\n    fn is_on(self, retweet: &TweetFeatures) -> bool {\n        retweet.media.has_media == self.has_media\n    }\n\n    fn copy_onto(self, retweet: &mut TweetFeatures) {\n        retweet.media.has_media = self.has_media;\n    }\n}\n\n#[expect(\n    clippy::large_enum_variant,\n    reason = \"nearly every tweet resolves, so a box would cost an allocation per tweet\"\n)]\npub(crate) enum HydratedTweet {\n    Resolved {\n        candidate: PostCandidate,\n        source_tweet_id: Option<TweetId>,\n        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,\n    },\n    Unresolved {\n        reason: Unresolved,\n        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,\n    },\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\npub(crate) struct Unresolved {\n    pub(crate) lookup: Lookup,\n    pub(crate) cause: Cause,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub enum Lookup {\n    Tweet,\n    Author,\n    SharedTweet,\n    SharedAuthor,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum Cause {\n    NotFound,\n    Failed,\n}\n\nimpl HydratedTweet {\n    pub(crate) fn candidate(&self) -> Option<&PostCandidate> {\n        match self {\n            Self::Resolved { candidate, .. } => Some(candidate),\n            Self::Unresolved { .. } => None,\n        }\n    }\n\n    pub(crate) fn source_tweet_id(&self) -> Option<TweetId> {\n        match self {\n            Self::Resolved {\n                source_tweet_id, ..\n            } => *source_tweet_id,\n            Self::Unresolved { .. } => None,\n        }\n    }\n\n    pub(crate) fn source_to_merge(&self) -> Option<TweetId> {\n        match self {\n            Self::Resolved {\n                candidate,\n                source_tweet_id,\n                ..\n            } if !candidate.failed.has_must_have() => *source_tweet_id,\n            Self::Resolved { .. } | Self::Unresolved { .. } => None,\n        }\n    }\n\n    pub(crate) fn safety_labels(&self) -> Option<&Arc<vf_pb::SafetyLabelMap>> {\n        match self {\n            Self::Resolved { safety_labels, .. } | Self::Unresolved { safety_labels, .. } => {\n                safety_labels.as_ref()\n            }\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn request_context_budget_is_header_or_hang_guard_minus_allowance() {\n        let entered = tokio::time::Instant::now();\n\n        let header = Duration::from_millis(400);\n        assert_eq!(\n            request_context(entered, Some(header)).deadline,\n            Some(entered + header - INBOUND_ALLOWANCE)\n        );\n        assert_eq!(\n            request_context(entered, None).deadline,\n            Some(entered + HYDRATION_TIMEOUT - INBOUND_ALLOWANCE)\n        );\n    }\n}\n",
+      "source_digest": "da0303174cda9cf31f87859f645744b62734229068243421e50949352f5bcc95",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/mod.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 354,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "pub mod batch;\npub(crate) mod community_source;\nmod decode;\nmod execute;\npub(crate) mod fallback_cache;\nmod fetcher;\nmod hydrator;\npub(crate) mod inventory;\npub mod metrics;\npub(crate) mod plan;\nmod relation;\npub(crate) mod sources;\nmod store;\npub mod tweet_source;\n\nuse crate::metrics::Rpc;\nuse crate::models::{\n    AuthorId, ClientCapability, Placement, PostCandidate, QuoteFacts, RawCandidate, TweetId,\n    UserCandidate, UserEntity, ViewerFeatures, ViewerRelationship,\n};\npub(crate) use decode::author::AuthorNotFound;\npub(crate) use decode::author::fallback_cache as author_fallback_cache;\npub(crate) use decode::tweet::tweet_fallback_cache;\nuse decode::viewer::ViewerState;\nuse fallback_cache::FallbackCaches;\npub(crate) use fetcher::Owner;\npub(crate) use hydrator::RequestRows;\npub use hydrator::{Hydrator, Hydrators};\npub(crate) use plan::HydrationPlan;\npub(crate) use relation::Relation;\nuse rustc_hash::FxHashMap;\nuse std::borrow::Cow;\nuse std::hash::Hash;\nuse std::sync::Arc;\nuse std::time::Duration;\nuse xai_visibility_filtering_proto as vf_pb;\n\npub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);\npub(crate) const BEST_EFFORT_HYDRATION_TIMEOUT: Duration = Duration::from_millis(300);\npub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);\n\npub(crate) fn request_context(\n    entered: tokio::time::Instant,\n    grpc_timeout: Option<Duration>,\n) -> xai_x_rpc::CallContext {\n    xai_x_rpc::CallContext {\n        deadline: Some(\n            entered\n                + grpc_timeout\n                    .unwrap_or(HYDRATION_TIMEOUT)\n                    .saturating_sub(INBOUND_ALLOWANCE),\n        ),\n    }\n}\n\npub(crate) struct HydrationRequest<'a> {\n    viewer_id: Option<u64>,\n    country_code: Option<String>,\n    client_capability: ClientCapability,\n    raw_candidates: Vec<RawCandidate>,\n    users: Vec<AuthorId>,\n    quotes: Vec<QuoteEntry>,\n    posts_judged_for: Option<Rpc>,\n    fallback_caches: &'a FallbackCaches,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\npub(crate) struct QuoteEntry {\n    pub(crate) inner: TweetId,\n    pub(crate) outer: TweetId,\n}\n\nimpl<'a> HydrationRequest<'a> {\n    pub(crate) fn new(\n        viewer_id: Option<u64>,\n        country_code: Option<String>,\n        client_capability: ClientCapability,\n        raw_candidates: Vec<RawCandidate>,\n        posts_judged_for: Option<Rpc>,\n        fallback_caches: &'a FallbackCaches,\n    ) -> Self {\n        Self {\n            viewer_id,\n            country_code,\n            client_capability,\n            raw_candidates,\n            users: Vec::new(),\n            quotes: Vec::new(),\n            posts_judged_for,\n            fallback_caches,\n        }\n    }\n\n    pub(crate) fn for_users(\n        viewer_id: u64,\n        users: Vec<AuthorId>,\n        fallback_caches: &'a FallbackCaches,\n    ) -> Self {\n        Self {\n            users,\n            ..Self::new(\n                Some(viewer_id),\n                None,\n                ClientCapability::default(),\n                Vec::new(),\n                None,\n                fallback_caches,\n            )\n        }\n    }\n\n    pub(crate) fn with_quotes(mut self, quotes: Vec<QuoteEntry>) -> Self {\n        self.quotes = quotes;\n        self\n    }\n}\n\nfn candidate_count_by_key<K: Eq + Hash>(keys: impl Iterator<Item = K>) -> FxHashMap<K, usize> {\n    let mut candidate_count_by_key =\n        FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());\n    for key in keys {\n        *candidate_count_by_key.entry(key).or_default() += 1;\n    }\n    candidate_count_by_key\n}\n\npub(crate) struct Hydration {\n    viewer: ViewerFeatures,\n    viewer_state: Option<ViewerState>,\n    planned: Hydrators,\n    viewer_failed: Hydrators,\n    tweets: FxHashMap<TweetId, HydratedTweet>,\n    users: FxHashMap<AuthorId, HydratedUser>,\n    quotes: FxHashMap<QuoteEntry, Quoted>,\n    has_fetched_retweet_sources: bool,\n    posts_judged_for: Option<Rpc>,\n}\n\npub(crate) enum HydratedUser {\n    Resolved {\n        user: UserEntity,\n        viewer_relationship: ViewerRelationship,\n        failed: Hydrators,\n    },\n    Unresolved(Cause),\n}\n\n#[derive(Clone, Copy, Default)]\nstruct Quoted {\n    facts: QuoteFacts,\n    failed: Hydrators,\n}\n\nimpl Hydration {\n    pub(crate) fn viewer(&self) -> &ViewerFeatures {\n        &self.viewer\n    }\n\n            pub(crate) fn viewer_found(&self) -> bool {\n        self.viewer_state.is_some()\n    }\n\n    pub(crate) fn planned(&self) -> Hydrators {\n        self.planned\n    }\n\n    pub(crate) fn viewer_failed(&self) -> Hydrators {\n        self.viewer_failed\n    }\n\n    pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {\n        self.tweets.get(&id)\n    }\n\n    pub(crate) fn user(&self, id: AuthorId) -> Option<&HydratedUser> {\n        self.users.get(&id)\n    }\n\n    pub(crate) fn author(\n        &self,\n        id: TweetId,\n        placement: Placement,\n        reads: Hydrators,\n    ) -> Option<UserCandidate> {\n        let post = self.tweet(id)?.candidate()?;\n        let quoted = match placement {\n            Placement::InnerQuoted { outer } => self\n                .quotes\n                .get(&QuoteEntry { inner: id, outer })\n                .copied()\n                .unwrap_or_default(),\n            Placement::Standalone | Placement::RetweetSource => Quoted::default(),\n        };\n        Some(UserCandidate {\n            user: post.author.clone(),\n            viewer_relationship: post.viewer_relationship,\n            quote: quoted.facts,\n            failed: post.failed.intersection(reads).union(quoted.failed),\n        })\n    }\n\n    pub(crate) fn user_candidate(&self, id: AuthorId, reads: Hydrators) -> Option<UserCandidate> {\n        let HydratedUser::Resolved {\n            user,\n            viewer_relationship,\n            failed,\n        } = self.user(id)?\n        else {\n            return None;\n        };\n        Some(UserCandidate {\n            user: user.clone(),\n            viewer_relationship: *viewer_relationship,\n            quote: QuoteFacts::default(),\n            failed: failed.intersection(reads),\n        })\n    }\n\n    pub(crate) fn is_on(&self, relation: Relation) -> bool {\n        relation.is_on(self.posts_judged_for, self.planned)\n    }\n\n            pub(crate) fn candidate(&self, id: TweetId, copied: bool) -> Option<Cow<'_, PostCandidate>> {\n        let tweet = self.tweet(id)?;\n        let candidate = tweet.candidate()?;\n        let copy = copied\n            .then(|| self.tweet(tweet.source_tweet_id()?)?.candidate())\n            .flatten()\n            .map(|source| source.post.tweet_features.media.has_uploaded_media)\n            .filter(|&has_media| has_media != candidate.post.tweet_features.media.has_media);\n        Some(match copy {\n            None => Cow::Borrowed(candidate),\n            Some(has_media) => {\n                let mut candidate = candidate.clone();\n                candidate.post.tweet_features.media.has_media = has_media;\n                Cow::Owned(candidate)\n            }\n        })\n    }\n\n    pub(crate) fn failed_nodes(&self, post: TweetId) -> Hydrators {\n        let Some(HydratedTweet::Resolved {\n            candidate,\n            source_tweet_id,\n            ..\n        }) = self.tweet(post)\n        else {\n            return Hydrators::empty();\n        };\n        let source = source_tweet_id\n            .and_then(|source| self.tweet(source)?.candidate())\n            .map_or(Hydrators::empty(), |source| source.failed);\n        candidate.failed.union(source)\n    }\n\n    pub(crate) fn has_fetched_retweet_sources(&self) -> bool {\n        self.has_fetched_retweet_sources\n    }\n}\n\n#[expect(\n    clippy::large_enum_variant,\n    reason = \"nearly every tweet resolves, so a box would cost an allocation per tweet\"\n)]\npub(crate) enum HydratedTweet {\n    Resolved {\n        candidate: PostCandidate,\n        source_tweet_id: Option<TweetId>,\n        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,\n    },\n    Unresolved {\n        reason: Unresolved,\n        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,\n    },\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\npub(crate) struct Unresolved {\n    pub(crate) lookup: Lookup,\n    pub(crate) cause: Cause,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub enum Lookup {\n    Tweet,\n    Author,\n    SharedTweet,\n    SharedAuthor,\n}\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, strum::IntoStaticStr)]\n#[strum(serialize_all = \"snake_case\")]\npub(crate) enum Cause {\n    NotFound,\n    Failed,\n}\n\nimpl HydratedTweet {\n    pub(crate) fn candidate(&self) -> Option<&PostCandidate> {\n        match self {\n            Self::Resolved { candidate, .. } => Some(candidate),\n            Self::Unresolved { .. } => None,\n        }\n    }\n\n    pub(crate) fn source_tweet_id(&self) -> Option<TweetId> {\n        match self {\n            Self::Resolved {\n                source_tweet_id, ..\n            } => *source_tweet_id,\n            Self::Unresolved { .. } => None,\n        }\n    }\n\n    pub(crate) fn source_to_merge(&self) -> Option<TweetId> {\n        match self {\n            Self::Resolved {\n                candidate,\n                source_tweet_id,\n                ..\n            } if !candidate.failed.has_must_have() => *source_tweet_id,\n            Self::Resolved { .. } | Self::Unresolved { .. } => None,\n        }\n    }\n\n    pub(crate) fn safety_labels(&self) -> Option<&Arc<vf_pb::SafetyLabelMap>> {\n        match self {\n            Self::Resolved { safety_labels, .. } | Self::Unresolved { safety_labels, .. } => {\n                safety_labels.as_ref()\n            }\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn request_context_budget_is_header_or_hang_guard_minus_allowance() {\n        let entered = tokio::time::Instant::now();\n\n        let header = Duration::from_millis(400);\n        assert_eq!(\n            request_context(entered, Some(header)).deadline,\n            Some(entered + header - INBOUND_ALLOWANCE)\n        );\n        assert_eq!(\n            request_context(entered, None).deadline,\n            Some(entered + HYDRATION_TIMEOUT - INBOUND_ALLOWANCE)\n        );\n    }\n}\n",
+      "source_digest": "35a36b208d42113b9fc2123cf1f6245d9716960ee1c318bb9a35625506aecedd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1065,
+      "end_line": 1089,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n",
+      "source_digest": "b528cf008630eac82c0c146572828001afa18643d6a4a727942f5c00b71f3f03",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2684,
+      "end_line": 2708,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (ac, _) = loaded(&[live(head, None, None, vec![SUSPEND])]).await;\n        let user = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (user.mode, user.page_actions),\n            (ControlMode::Live, vec![SUSPEND])\n        );\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(\n            post,\n            Resolved::default(),\n            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n",
+      "source_digest": "9515fc71a74a5d807c45b796adffdd4ed6b9abe671a7d7d720266eb96e93799c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2687,
+      "end_line": 2711,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (user.mode, user.page_actions),\n            (ControlMode::Live, vec![SUSPEND])\n        );\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(\n            post,\n            Resolved::default(),\n            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n        let r = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (r.mode, r.forced),\n",
+      "source_digest": "4af107627ac385d887d7d55387b0e8f4c9f06be0b41f704d7667f3dd82cf2630",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2692,
+      "end_line": 2716,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            post,\n            Resolved::default(),\n            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n        let r = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (r.mode, r.forced),\n            (ControlMode::Recording, Some(\"wrong_entity\"))\n        );\n        assert!(r.page_actions.is_empty());\n    }\n\n",
+      "source_digest": "7b600a37e3faaa2f73da03af7cafe36db36f69678ecb76999ea067e6ef765cd4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2694,
+      "end_line": 2718,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n        let r = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (r.mode, r.forced),\n            (ControlMode::Recording, Some(\"wrong_entity\"))\n        );\n        assert!(r.page_actions.is_empty());\n    }\n\n    #[tokio::test]\n    async fn ignore_store_ignores_every_record() {\n",
+      "source_digest": "d21893a53e192753b5cead90688b6fa157feb04f70c89b2f8b1c9079dfed712b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 485,
+      "end_line": 509,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        before,\n        \"no seen row when the rules couldn't be evaluated\"\n    );\n    assert_eq!(t.status, \"success\");\n    assert!(!t.ais.is_empty());\n    let i = info(&t);\n    assert_eq!(i[\"matched_rule_id\"], \"page\");\n    assert!(!i.contains_key(\"rules_would_rule_id\"));\n    assert!(!i.contains_key(\"action_control_forced_recording\"), \"{i:?}\");\n}\n\n#[tokio::test]\nasync fn a_post_page_decision_skips_a_suspended_or_deactivated_author() {\n    let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;\n    let head = \"SpamEmbeddingPtosDistilled\";\n    let label = crate::replay_tests::rule_labels(BAKED_POST_RULES)\n        .into_iter()\n        .next()\n        .expect(\"a post routing label\");\n    let b = bed(\n        vec![live(\n            head,\n            None,\n            vec![\n                PageAction::PostSpamHighRecall {\n",
+      "source_digest": "9cd1c745b58ba641f9268d8a0324d316a7ce7c45b9c30c9bbddfbfc4bfe1ce49",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control_path_tests.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 850,
+      "end_line": 874,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let same_ais = ais_names(was) == ais_names(&moved);\n        let same_effect = was.status == moved.status && same_ais && was.tickets == moved.tickets;\n        let category = if same_effect && was.dedup_calls == moved.dedup_calls {\n            \"identical\".to_owned()\n        } else if same_effect {\n            \"same status, actions and tickets; only the dedup calls differ\".into()\n        } else if entity == \"post\"\n            && was.status == \"high_follower_count\"\n            && moved.status == \"very_high_follower_count\"\n            && moved.ais.is_empty()\n            && moved.tickets == 0\n        {\n            \"post author at the page's follower ceiling (the rules skip from a lower count)\".into()\n        } else if SAFETY_REASONS.contains(&was.status.as_str()) {\n            if moved.status != was.status || !moved.ais.is_empty() || moved.tickets != 0 {\n                unexplained.push(format!(\n                    \"{}: safety skip {} became {}\",\n                    sc.id, was.status, moved.status\n                ));\n                \"UNEXPLAINED\".into()\n            } else {\n                \"same safety skip; only the dedup class or claim differs\".into()\n            }\n        } else if (moved.status == ALREADY_SUSPENDED || moved.status == \"already_deactivated\")\n            && moved.ais.is_empty()\n",
+      "source_digest": "4abb6ae389b2b506f6a2b7205f505aabba6fddd18fb77515dde41c3263df670b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\npub async fn require_api_key(\n    State(keys): State<ApiKeys>,\n    mut req: Request,\n    next: Next,\n) -> Response {\n    let method = req.method().clone();\n    let uri = req.uri().clone();\n\n    if keys.is_empty() {\n        warn!(%method, %uri, \"rejecting request: no API keys configured (fail-closed)\");\n        return unauthorized();\n    }\n\n    let presented = match extract_bearer(req.headers()) {\n        Some(t) => t,\n        None => {\n            warn!(%method, %uri, \"rejecting request: missing or malformed Authorization header\");\n            return unauthorized();\n        }\n    };\n\n    let key_id = match keys.lookup(&presented) {\n        Some(id) => id,\n",
+      "source_digest": "817aaf238a40427c069e0dcedb36da40ccd7d39072c42246c1ae520109e93279",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 59,
+      "end_line": 83,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let method = req.method().clone();\n    let uri = req.uri().clone();\n\n    if keys.is_empty() {\n        warn!(%method, %uri, \"rejecting request: no API keys configured (fail-closed)\");\n        return unauthorized();\n    }\n\n    let presented = match extract_bearer(req.headers()) {\n        Some(t) => t,\n        None => {\n            warn!(%method, %uri, \"rejecting request: missing or malformed Authorization header\");\n            return unauthorized();\n        }\n    };\n\n    let key_id = match keys.lookup(&presented) {\n        Some(id) => id,\n        None => {\n            warn!(%method, %uri, \"rejecting request: token did not match any configured key\");\n            return unauthorized();\n        }\n    };\n\n    req.extensions_mut().insert(KeyId(key_id.clone()));\n",
+      "source_digest": "7744cbbdc28e36fa1fd824af5ecfd1ce5f5658f6be8286ddb0f6d121ecbf21b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let presented = match extract_bearer(req.headers()) {\n        Some(t) => t,\n        None => {\n            warn!(%method, %uri, \"rejecting request: missing or malformed Authorization header\");\n            return unauthorized();\n        }\n    };\n\n    let key_id = match keys.lookup(&presented) {\n        Some(id) => id,\n        None => {\n            warn!(%method, %uri, \"rejecting request: token did not match any configured key\");\n            return unauthorized();\n        }\n    };\n\n    req.extensions_mut().insert(KeyId(key_id.clone()));\n\n    let span = tracing::info_span!(\"authorized_request\", key_id = %key_id);\n    async move {\n        info!(%method, %uri, \"request authorized\");\n        next.run(req).await\n    }\n    .instrument(span)\n    .await\n",
+      "source_digest": "ce06ce15cd1f83caf4d012e7bdc9c2c02ceb707b14cb725af2fadba26ca85060",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 73,
+      "end_line": 97,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    };\n\n    let key_id = match keys.lookup(&presented) {\n        Some(id) => id,\n        None => {\n            warn!(%method, %uri, \"rejecting request: token did not match any configured key\");\n            return unauthorized();\n        }\n    };\n\n    req.extensions_mut().insert(KeyId(key_id.clone()));\n\n    let span = tracing::info_span!(\"authorized_request\", key_id = %key_id);\n    async move {\n        info!(%method, %uri, \"request authorized\");\n        next.run(req).await\n    }\n    .instrument(span)\n    .await\n}\n\nfn extract_bearer(headers: &HeaderMap) -> Option<String> {\n    let header_val = headers.get(header::AUTHORIZATION)?;\n    let header_str = header_val.to_str().ok()?;\n    let rest = header_str.strip_prefix(\"Bearer \")?;\n",
+      "source_digest": "a4c5baea09afdbc90201d3ad51f82ffeebc65f5d71c23c115a5b86e555d7a961",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let key_id = match keys.lookup(&presented) {\n        Some(id) => id,\n        None => {\n            warn!(%method, %uri, \"rejecting request: token did not match any configured key\");\n            return unauthorized();\n        }\n    };\n\n    req.extensions_mut().insert(KeyId(key_id.clone()));\n\n    let span = tracing::info_span!(\"authorized_request\", key_id = %key_id);\n    async move {\n        info!(%method, %uri, \"request authorized\");\n        next.run(req).await\n    }\n    .instrument(span)\n    .await\n}\n\nfn extract_bearer(headers: &HeaderMap) -> Option<String> {\n    let header_val = headers.get(header::AUTHORIZATION)?;\n    let header_str = header_val.to_str().ok()?;\n    let rest = header_str.strip_prefix(\"Bearer \")?;\n    let trimmed = rest.trim();\n    if trimmed.is_empty() {\n",
+      "source_digest": "7038e0f09102e8a14d8f6103c58b9a37516c1c830075e53628fa81826f728686",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 94,
+      "end_line": 118,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "fn extract_bearer(headers: &HeaderMap) -> Option<String> {\n    let header_val = headers.get(header::AUTHORIZATION)?;\n    let header_str = header_val.to_str().ok()?;\n    let rest = header_str.strip_prefix(\"Bearer \")?;\n    let trimmed = rest.trim();\n    if trimmed.is_empty() {\n        None\n    } else {\n        Some(trimmed.to_string())\n    }\n}\n\nfn unauthorized() -> Response {\n    (\n        StatusCode::UNAUTHORIZED,\n        [(\n            header::WWW_AUTHENTICATE,\n            r#\"Bearer realm=\"xai-abuse-enforcement\"\"#,\n        )],\n        \"unauthorized\\n\",\n    )\n        .into_response()\n}\n\nfn constant_time_eq(a: &[u8], b: &[u8]) -> bool {\n",
+      "source_digest": "8094c90898485c91ac8a50aef2326a15e2995419e77c16f2eb0b58889f320d16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/auth.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 101,
+      "end_line": 125,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    } else {\n        Some(trimmed.to_string())\n    }\n}\n\nfn unauthorized() -> Response {\n    (\n        StatusCode::UNAUTHORIZED,\n        [(\n            header::WWW_AUTHENTICATE,\n            r#\"Bearer realm=\"xai-abuse-enforcement\"\"#,\n        )],\n        \"unauthorized\\n\",\n    )\n        .into_response()\n}\n\nfn constant_time_eq(a: &[u8], b: &[u8]) -> bool {\n    if a.len() != b.len() {\n        return false;\n    }\n    let mut diff: u8 = 0;\n    for (x, y) in a.iter().zip(b.iter()) {\n        diff |= x ^ y;\n    }\n",
+      "source_digest": "6e4e17f1099e21fbeee68b81e070be93ba2dfb7ba27659a0e7de7f41d3e9c520",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 204,
+      "end_line": 228,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Ok(())\n        }\n        RunState::Done => Err(STATUS_RUN_DONE),\n    }\n}\n\npub fn check_message(\n    rec: &BackfillRunRecord,\n    score: &abuse_proto::ScoreResult,\n) -> Result<(), &'static str> {\n    let labels: &[String] = score.summary.as_ref().map_or(&[], |s| s.labels.as_slice());\n    if score.dry_run\n        || score.skip_author_credibility_prechecks\n        || !score.requested_actions.is_empty()\n        || !score.policy_version.is_empty()\n        || labels\n            .iter()\n            .any(|l| l.starts_with(DRY_RUN_LABEL_PREFIX) || l == FACTORY_LABEL)\n    {\n        return Err(STATUS_BAD_MESSAGE);\n    }\n    let (entity, entity_id) = Facts::resolve_target(score);\n    let (row, _) = crate::confidence::row_of(score.confidence);\n    let in_run = entity_of(entity) == rec.entity\n        && crate::facts::head_label(score) == rec.head\n",
+      "source_digest": "4325788c1dd60b52e78d98a73256119d262c8ad0e47c67bc4bcab1844e1b8961",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/backfill.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2965,
+      "end_line": 2989,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut other = s.clone();\n        other.model_version = \"clf2\".into();\n        assert_eq!(check_message(&rec, &other), Err(STATUS_NOT_IN_RUN));\n        let mut low = s.clone();\n        low.confidence = abuse_proto::Confidence::Low as i32;\n        assert_eq!(check_message(&rec, &low), Err(STATUS_NOT_IN_RUN));\n        let mut early = s.clone();\n        early.score_ts_ms = rec.window_start_ms - 1;\n        assert_eq!(check_message(&rec, &early), Err(STATUS_NOT_IN_RUN));\n        let mut left_out = s.clone();\n        left_out.user_id = 5;\n        assert_eq!(check_message(&rec, &left_out), Err(STATUS_NOT_IN_RUN));\n        s.skip_author_credibility_prechecks = true;\n        assert_eq!(check_message(&rec, &s), Err(STATUS_BAD_MESSAGE));\n    }\n\n    fn start_record() -> BackfillRunRecord {\n        let store = MemControlStore::default();\n        test_support::put_running(\n            &store,\n            \"run-00000001\",\n            \"H\",\n            vec![PageAction::Suspend {}],\n            vec![LevelRow::Mid],\n        )\n",
+      "source_digest": "a7b5a42ea9b3d10673614b9e93ce1fa166db015afa87f90610f2183c699146be",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 91,
+      "end_line": 115,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "pub struct UserFacts {\n    #[serde(default)]\n    pub allowlist: AllowlistFacts,\n    pub user: GizmoduckFacts,\n    pub cred: CredFacts,\n}\n\n#[derive(Debug, Clone, Default, Serialize, Deserialize)]\npub struct PostFacts {\n    #[serde(default)]\n    pub allowlist: AllowlistFacts,\n    pub present: bool,\n    pub author_id: i64,\n    #[serde(default)]\n    pub labels: Vec<String>,\n    #[serde(default)]\n    pub author: UserFacts,\n}\n\nimpl Facts {\n    pub fn user_allowlist(&self) -> &AllowlistFacts {\n        &self.user_signals().allowlist\n    }\n    pub fn user(&self) -> &GizmoduckFacts {\n        &self.user_signals().user\n",
+      "source_digest": "6f95f3bdf062076940a5e38bc16129607b4700fa21ea37f6a17589ee4ff66f6d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 95,
+      "end_line": 119,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    pub cred: CredFacts,\n}\n\n#[derive(Debug, Clone, Default, Serialize, Deserialize)]\npub struct PostFacts {\n    #[serde(default)]\n    pub allowlist: AllowlistFacts,\n    pub present: bool,\n    pub author_id: i64,\n    #[serde(default)]\n    pub labels: Vec<String>,\n    #[serde(default)]\n    pub author: UserFacts,\n}\n\nimpl Facts {\n    pub fn user_allowlist(&self) -> &AllowlistFacts {\n        &self.user_signals().allowlist\n    }\n    pub fn user(&self) -> &GizmoduckFacts {\n        &self.user_signals().user\n    }\n    pub fn cred(&self) -> &CredFacts {\n        &self.user_signals().cred\n    }\n",
+      "source_digest": "7bba0057142998793819031d0ae013be85572323149394d30ff1193d0e1120bc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 121,
+      "end_line": 145,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &mut self.user_signals_mut().allowlist\n    }\n    pub fn user_mut(&mut self) -> &mut GizmoduckFacts {\n        &mut self.user_signals_mut().user\n    }\n    pub fn cred_mut(&mut self) -> &mut CredFacts {\n        &mut self.user_signals_mut().cred\n    }\n\n    fn user_signals(&self) -> &UserFacts {\n        match &self.entity {\n            EntityFacts::User(s) => s,\n            EntityFacts::Post(p) => &p.author,\n        }\n    }\n    fn user_signals_mut(&mut self) -> &mut UserFacts {\n        match &mut self.entity {\n            EntityFacts::User(s) => s,\n            EntityFacts::Post(p) => &mut p.author,\n        }\n    }\n}\n\n#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]\npub struct RequestedActionFacts {\n",
+      "source_digest": "9202cce8d5d33ad75bdae6b0c3ee7e485bed55631c06fbda53efd843ea6e1174",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 127,
+      "end_line": 151,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &mut self.user_signals_mut().cred\n    }\n\n    fn user_signals(&self) -> &UserFacts {\n        match &self.entity {\n            EntityFacts::User(s) => s,\n            EntityFacts::Post(p) => &p.author,\n        }\n    }\n    fn user_signals_mut(&mut self) -> &mut UserFacts {\n        match &mut self.entity {\n            EntityFacts::User(s) => s,\n            EntityFacts::Post(p) => &mut p.author,\n        }\n    }\n}\n\n#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]\npub struct RequestedActionFacts {\n    pub kind: String,\n    pub perm: bool,\n    pub policy: String,\n    pub labels: Vec<String>,\n    pub ttl_msec: i64,\n    pub head: String,\n",
+      "source_digest": "35045df5995e1b35f7095c5ad7943f83e575ae9e5559d04837ff8f1a6f949f01",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 162,
+      "end_line": 186,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            head: a.head.clone(),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Default, Serialize, Deserialize)]\npub struct ScoreFacts {\n    pub model_version: String,\n    pub enforcement_note: String,\n    pub decoded_actions: String,\n    pub labels: Vec<String>,\n    #[serde(default)]\n    pub skip_author_credibility_prechecks: bool,\n    #[serde(default)]\n    pub requested_actions: Vec<RequestedActionFacts>,\n    #[serde(default)]\n    pub policy_version: String,\n}\n\nimpl ScoreFacts {\n    pub fn from_score(score: &ScoreResult) -> Self {\n        let v = serde_json::to_value(score).unwrap_or_default();\n        let take_string = |key: &str| -> String {\n            match v.get(key) {\n                Some(serde_json::Value::String(s)) => s.clone(),\n",
+      "source_digest": "0520961cac6b8c41085cfdfb4961eb341897023274da7966b4afd10ffa3e4d9f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 194,
+      "end_line": 218,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|s| {\n                s.labels\n                    .iter()\n                    .map(|l| crate::action_control::strip_dry_run_prefix(l).to_owned())\n                    .collect()\n            })\n            .unwrap_or_default();\n        Self {\n            model_version: take_string(\"model_version\"),\n            enforcement_note: take_string(\"enforcement_note\"),\n            decoded_actions: take_string(\"decoded_actions\"),\n            labels,\n            skip_author_credibility_prechecks: score.skip_author_credibility_prechecks,\n            requested_actions: score\n                .requested_actions\n                .iter()\n                .map(RequestedActionFacts::from_proto)\n                .collect(),\n            policy_version: score.policy_version.clone(),\n        }\n    }\n}\n\npub fn head_label(score: &ScoreResult) -> &str {\n    score\n",
+      "source_digest": "02e26c2fd0047542faa4493cdab5783f2e0927f9f4912e460f4facfd3a7bc3dc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 273,
+      "end_line": 297,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let mut m = BTreeMap::new();\n\n        m.insert(\"entity_type\".into(), self.entity_type.as_str().into());\n        m.insert(\"entity_id\".into(), self.entity_id.to_string());\n\n        m.insert(\"decoded_actions\".into(), self.score.decoded_actions.clone());\n        m.insert(\n            \"enforcement_note\".into(),\n            self.score.enforcement_note.clone(),\n        );\n        m.insert(\"model_version\".into(), self.score.model_version.clone());\n        m.insert(\n            \"skip_author_credibility_prechecks\".into(),\n            self.score.skip_author_credibility_prechecks.to_string(),\n        );\n        m.insert(\"source_topic\".into(), self.topic.clone());\n\n        match &self.entity {\n            EntityFacts::User(s) => emit_user_signals(&mut m, s),\n            EntityFacts::Post(p) => emit_post_facts(&mut m, p),\n        }\n\n        if let Some(resp) = &self.uas {\n            m.insert(\"uas_response\".into(), resp.clone());\n        }\n",
+      "source_digest": "fed4ef45b39ea65018bf0f89e8d38abf3e79d9788fd98ea5db182612e76b747d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/facts.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 274,
+      "end_line": 298,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        m.insert(\"entity_type\".into(), self.entity_type.as_str().into());\n        m.insert(\"entity_id\".into(), self.entity_id.to_string());\n\n        m.insert(\"decoded_actions\".into(), self.score.decoded_actions.clone());\n        m.insert(\n            \"enforcement_note\".into(),\n            self.score.enforcement_note.clone(),\n        );\n        m.insert(\"model_version\".into(), self.score.model_version.clone());\n        m.insert(\n            \"skip_author_credibility_prechecks\".into(),\n            self.score.skip_author_credibility_prechecks.to_string(),\n        );\n        m.insert(\"source_topic\".into(), self.topic.clone());\n\n        match &self.entity {\n            EntityFacts::User(s) => emit_user_signals(&mut m, s),\n            EntityFacts::Post(p) => emit_post_facts(&mut m, p),\n        }\n\n        if let Some(resp) = &self.uas {\n            m.insert(\"uas_response\".into(), resp.clone());\n        }\n\n",
+      "source_digest": "ffa0e6a4ba506a302998660fa3e58777acaf3e1170e5a45ae7c7c1ca2c563d10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 543,
+      "end_line": 567,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        keys\n    }\n}\n\npub struct ResolveInput<'a> {\n    pub head: &'a str,\n    pub classifier: &'a str,\n    pub labels: &'a [String],\n    pub entity: EntityType,\n    pub factory: bool,\n    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n        pub author_id: i64,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n        if let Some((k, r)) = self.records.get_key_value(lkey) {\n            return Some(Hit::Record(k, r));\n",
+      "source_digest": "55c2f5b4e6dc8a5a2125fe6db1a125de6e4c139ca94c3b0c84c2e094e2cf27e8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 993,
+      "end_line": 1017,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        bands.dedup();\n        let entity = entity_of(input.entity);\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let by_row = levels::resolve_rows(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim(),\n            cfg,\n            &mut safety,\n        );\n        let hit = match by_row {\n            Some(r) => {\n                out = Resolved {\n                    producer_dry: input.producer_dry,\n                    factory: input.factory,\n                    ..r\n                };\n",
+      "source_digest": "6bbcf52ffe530ecb818176edc8115071e91a6c8d57c9b3f0c97c94f3fa688e51",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1095,
+      "end_line": 1119,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            });\n        let mut safety_ok = Some(safety_ok);\n        let mut safety = |e: EntityType| safety_ok.take().is_none_or(|f| f(e));\n        levels::resolve_run(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim,\n            cfg,\n            &mut safety,\n            actions,\n        )\n    }\n\n            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {\n        Ok(self\n            .store\n            .get(MH_PKEY, lkey)\n",
+      "source_digest": "350d5f444d3e1b02c566f32c408000752e17e423c335793647508bcf4cf30f35",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1149,
+      "end_line": 1173,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            pub async fn refresh(&self) -> anyhow::Result<usize> {\n        let scanned = match tokio::time::timeout(self.scan_timeout, self.store.scan(MH_PKEY)).await\n        {\n            Ok(r) => r,\n            Err(_) => Err(anyhow::anyhow!(\n                \"action-control scan timed out after {} ms\",\n                self.scan_timeout.as_millis()\n            )),\n        };\n        let scanned = scanned.and_then(|rows| {\n            if rows.len() >= SCAN_LIMIT as usize {\n                Err(anyhow::anyhow!(\n                    \"action-control scan returned {} rows, its limit; the list may be incomplete\",\n                    rows.len()\n                ))\n            } else {\n                Ok(rows)\n            }\n        });\n        let rows = match scanned {\n            Ok(rows) => rows,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                metrics::ACTION_CONTROL_REFRESH_TOTAL\n                    .with_label_values(&[\"error\"])\n",
+      "source_digest": "b528cf008630eac82c0c146572828001afa18643d6a4a727942f5c00b71f3f03",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 2536,
+      "end_line": 2560,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n    }\n\n    fn input<'a>(head: &'a str, classifier: &'a str, labels: &'a [String]) -> ResolveInput<'a> {\n        ResolveInput {\n            head,\n            classifier,\n            labels,\n            entity: EntityType::User,\n            factory: false,\n            producer_dry: false,\n            confidence: None,\n            author_id: 1,\n        }\n    }\n\n    fn baked_safety() -> SafetyChecksByEntity {\n        let rules = crate::rules::RulesCache::new();\n        SafetyChecksByEntity {\n            user: crate::safety_checks::status(\n                EntityType::User,\n                &rules.resolve(EntityType::User, None),\n            ),\n            post: crate::safety_checks::status(\n                EntityType::Post,\n",
+      "source_digest": "4a84850c779f41cdf32f31e652c4baa78ac285901c44d4b8e3a4bbd0bf8620f7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3079,
+      "end_line": 3103,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let (ac, _) = loaded(&[live(head, None, None, vec![SUSPEND])]).await;\n        let user = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (user.mode, user.page_actions),\n            (ControlMode::Live, vec![SUSPEND])\n        );\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(\n            post,\n            Resolved::default(),\n            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n",
+      "source_digest": "9515fc71a74a5d807c45b796adffdd4ed6b9abe671a7d7d720266eb96e93799c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3082,
+      "end_line": 3106,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (user.mode, user.page_actions),\n            (ControlMode::Live, vec![SUSPEND])\n        );\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(\n            post,\n            Resolved::default(),\n            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n        let r = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (r.mode, r.forced),\n",
+      "source_digest": "4af107627ac385d887d7d55387b0e8f4c9f06be0b41f704d7667f3dd82cf2630",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3087,
+      "end_line": 3111,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            post,\n            Resolved::default(),\n            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n        let r = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (r.mode, r.forced),\n            (ControlMode::Recording, Some(\"wrong_entity\"))\n        );\n        assert!(r.page_actions.is_empty());\n    }\n\n",
+      "source_digest": "7b600a37e3faaa2f73da03af7cafe36db36f69678ecb76999ea067e6ef765cd4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3089,
+      "end_line": 3113,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"a user record never touches post decisions\"\n        );\n        let author = PageAction::SuspendAuthor {};\n        let (ac, _) = loaded(&[\n            live(head, None, None, vec![SUSPEND]),\n            live(head, None, None, vec![author]),\n        ])\n        .await;\n        assert_eq!(resolve(&ac, head, \"c\", &[]).page_actions, vec![SUSPEND]);\n        let post = ac.resolve(&post_input(&[]), &on(), |_| true);\n        assert_eq!(post.page_actions, vec![author]);\n        assert_eq!(post.matched.unwrap().lkey, \"post/h/SharedSpamBot\");\n        let mut odd = live(head, None, None, vec![author]);\n        odd.entity_type = ControlEntity::User;\n        let (ac, _) = loaded(&[odd]).await;\n        let r = resolve(&ac, head, \"c\", &[]);\n        assert_eq!(\n            (r.mode, r.forced),\n            (ControlMode::Recording, Some(\"wrong_entity\"))\n        );\n        assert!(r.page_actions.is_empty());\n    }\n\n    #[tokio::test]\n    async fn ignore_store_ignores_every_record() {\n",
+      "source_digest": "d21893a53e192753b5cead90688b6fa157feb04f70c89b2f8b1c9079dfed712b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5862,
+      "end_line": 5886,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n            async fn rollout_bed(rollout_bp: Option<u32>) -> (Arc<ActionControl>, Arc<MemControlStore>) {\n        loaded(&[\n            record(\"H\", None, None, ControlMode::Rows, vec![]),\n            ActionControlRecord {\n                rollout_bp,\n                ..row_rec(\"H\", LevelRow::Missing, ControlMode::Live, vec![SUSPEND])\n            },\n        ])\n        .await\n    }\n\n    fn by_author(ac: &ActionControl, author_id: i64) -> Resolved {\n        ac.resolve(\n            &ResolveInput {\n                author_id,\n                ..input(\"H\", \"c\", &[])\n            },\n            &on(),\n            |_| true,\n        )\n    }\n\n    #[tokio::test]\n    async fn a_row_rollout_acts_on_the_accounts_inside_it_and_records_the_rest() {\n",
+      "source_digest": "e7f0cae594eec0a5b1a8ed8d0fb62e7d88c3d9bb1740c364f98faedb3c442844",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5865,
+      "end_line": 5889,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            record(\"H\", None, None, ControlMode::Rows, vec![]),\n            ActionControlRecord {\n                rollout_bp,\n                ..row_rec(\"H\", LevelRow::Missing, ControlMode::Live, vec![SUSPEND])\n            },\n        ])\n        .await\n    }\n\n    fn by_author(ac: &ActionControl, author_id: i64) -> Resolved {\n        ac.resolve(\n            &ResolveInput {\n                author_id,\n                ..input(\"H\", \"c\", &[])\n            },\n            &on(),\n            |_| true,\n        )\n    }\n\n    #[tokio::test]\n    async fn a_row_rollout_acts_on_the_accounts_inside_it_and_records_the_rest() {\n        let (ac, _) = rollout_bed(Some(500)).await;\n        let mut inside = 0;\n        for id in 0..4_000i64 {\n",
+      "source_digest": "6f3eeff762d7ddf5d6071b4cc237c6e47e2421ab672a3e674de82c2d43b5770a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5878,
+      "end_line": 5902,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                ..input(\"H\", \"c\", &[])\n            },\n            &on(),\n            |_| true,\n        )\n    }\n\n    #[tokio::test]\n    async fn a_row_rollout_acts_on_the_accounts_inside_it_and_records_the_rest() {\n        let (ac, _) = rollout_bed(Some(500)).await;\n        let mut inside = 0;\n        for id in 0..4_000i64 {\n            let r = by_author(&ac, id);\n            if in_rollout(Some(500), \"H\", id) {\n                inside += 1;\n                assert_eq!((r.mode, r.forced), (ControlMode::Live, None), \"{id}\");\n            } else {\n                assert_eq!(\n                    (r.mode, r.forced),\n                    (ControlMode::Recording, Some(\"outside_rollout\")),\n                    \"{id}\"\n                );\n                assert_eq!(logged_because(&r).as_deref(), Some(\"outside_rollout\"));\n            }\n            assert_eq!(r.page_actions, vec![SUSPEND], \"{id}\");\n",
+      "source_digest": "ad1e94e93bf26d9d31b30df018b1b77854f8d2bd6891def5b80dcffde4e18402",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5903,
+      "end_line": 5927,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let keys = r.info_keys();\n            assert!(keys.contains(&(\"rollout_bp\".into(), \"500\".into())));\n            assert!(keys.contains(&(\"rollout_bucket\".into(), rollout_bucket(\"H\", id).to_string())));\n        }\n        assert!((120..280).contains(&inside), \"{inside} of 4,000 inside 5%\");\n    }\n\n    #[tokio::test]\n    async fn no_rollout_acts_on_every_account_and_zero_on_none() {\n        let (all, _) = rollout_bed(None).await;\n        let (none, _) = rollout_bed(Some(0)).await;\n        for id in 0..2_000i64 {\n            let r = by_author(&all, id);\n            assert_eq!((r.mode, r.forced), (ControlMode::Live, None), \"{id}\");\n            assert!(!r.info_keys().iter().any(|(k, _)| k.starts_with(\"rollout\")));\n            let r = by_author(&none, id);\n            assert_eq!(r.forced, Some(\"outside_rollout\"), \"{id}\");\n        }\n    }\n\n    #[tokio::test]\n    async fn a_rollout_never_makes_a_row_act_that_would_not() {\n        let (ac, _) = rollout_bed(Some(10_000)).await;\n        let off = ControlConfig {\n            enabled: false,\n",
+      "source_digest": "bf95989f2451e5e708f0f30e6535b2ddd1172627f9a03b27fa8c88424e644a73",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5906,
+      "end_line": 5930,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        assert!((120..280).contains(&inside), \"{inside} of 4,000 inside 5%\");\n    }\n\n    #[tokio::test]\n    async fn no_rollout_acts_on_every_account_and_zero_on_none() {\n        let (all, _) = rollout_bed(None).await;\n        let (none, _) = rollout_bed(Some(0)).await;\n        for id in 0..2_000i64 {\n            let r = by_author(&all, id);\n            assert_eq!((r.mode, r.forced), (ControlMode::Live, None), \"{id}\");\n            assert!(!r.info_keys().iter().any(|(k, _)| k.starts_with(\"rollout\")));\n            let r = by_author(&none, id);\n            assert_eq!(r.forced, Some(\"outside_rollout\"), \"{id}\");\n        }\n    }\n\n    #[tokio::test]\n    async fn a_rollout_never_makes_a_row_act_that_would_not() {\n        let (ac, _) = rollout_bed(Some(10_000)).await;\n        let off = ControlConfig {\n            enabled: false,\n            ..on()\n        };\n        let r = ac.resolve(&input(\"H\", \"c\", &[]), &off, |_| true);\n",
+      "source_digest": "3ed7b8fdd1b68ba979607f10d4e03fd52d83cb48ecb6063d7e5a1bd07f38eedb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 5960,
+      "end_line": 5984,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let bytes = store.rows.lock().unwrap()[&(\n                MH_PKEY.to_owned(),\n                level_lkey(ControlEntity::User, \"H\", None, row),\n            )]\n                .clone();\n            parse_record(&bytes).unwrap()\n        };\n        let missing = stored(LevelRow::Missing);\n        assert_eq!((missing.rollout_bp, missing.v), (Some(100), 4));\n        let low = stored(LevelRow::Low);\n        assert_eq!((low.rollout_bp, low.v), (None, ROWS_RECORD_VERSION));\n        assert_eq!(stored(LevelRow::High).rollout_bp, None);\n        let r = by_author(&ac, 7);\n        assert_eq!(r.forced.is_none(), in_rollout(Some(100), \"H\", 7));\n    }\n\n    #[tokio::test]\n    async fn raising_a_live_rows_rollout_needs_confirm_and_lowering_it_does_not() {\n        let (ac, _) = rollout_bed(Some(100)).await;\n        match set(&ac, missing_row_put(Some(500), None)).await {\n            Err(SetError::Invalid(\"confirm_required\", msg)) => {\n                assert!(msg.contains(\"rollout 1% to 5%\"), \"{msg}\")\n            }\n            other => panic!(\"{other:?}\"),\n        }\n",
+      "source_digest": "37131d36464c0fdb482698641797a7044ca1fec5d021bba4871eeef2352be57b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 6029,
+      "end_line": 6053,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[test]\n    fn rollout_percentages_read_plainly() {\n        assert_eq!(rollout_percent(100), \"1%\");\n        assert_eq!(rollout_percent(50), \"0.5%\");\n        assert_eq!(rollout_percent(1_225), \"12.25%\");\n        assert_eq!(rollout_percent(0), \"0%\");\n        assert_eq!(rollout_percent(ROLLOUT_ALL_BP), \"100%\");\n    }\n\n                            #[tokio::test]\n    async fn a_pod_that_cannot_read_a_newer_row_keeps_its_last_copy() {\n        let (ac, store) = rollout_bed(None).await;\n        assert_eq!(by_author(&ac, 7).mode, ControlMode::Live);\n        let lkey = level_lkey(ControlEntity::User, \"H\", None, LevelRow::Missing);\n        let mut newer = serde_json::to_value(ActionControlRecord {\n            rollout_bp: Some(100),\n            version: 2,\n            ..row_rec(\"H\", LevelRow::Missing, ControlMode::Live, vec![SUSPEND])\n        })\n        .unwrap();\n        newer[\"v\"] = (ACTION_CONTROL_RECORD_VERSION + 1).into();\n        newer[\"field_this_image_lacks\"] = true.into();\n        store.put_raw(&lkey, &serde_json::to_vec(&newer).unwrap());\n        ac.refresh().await.unwrap();\n        let held = by_author(&ac, 7);\n",
+      "source_digest": "d9882b146bc2abc92b5b38f547f8935a061344eda7b441152310d8d6b5e358db",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 6041,
+      "end_line": 6065,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(by_author(&ac, 7).mode, ControlMode::Live);\n        let lkey = level_lkey(ControlEntity::User, \"H\", None, LevelRow::Missing);\n        let mut newer = serde_json::to_value(ActionControlRecord {\n            rollout_bp: Some(100),\n            version: 2,\n            ..row_rec(\"H\", LevelRow::Missing, ControlMode::Live, vec![SUSPEND])\n        })\n        .unwrap();\n        newer[\"v\"] = (ACTION_CONTROL_RECORD_VERSION + 1).into();\n        newer[\"field_this_image_lacks\"] = true.into();\n        store.put_raw(&lkey, &serde_json::to_vec(&newer).unwrap());\n        ac.refresh().await.unwrap();\n        let held = by_author(&ac, 7);\n        assert_eq!(\n            (held.mode, held.forced),\n            (ControlMode::Live, None),\n            \"the copy it held still acts, on every account\"\n        );\n        let fresh = Arc::new(ActionControl::new(\n            store.clone(),\n            \"prod\".into(),\n            \"pod-1\".into(),\n        ));\n        fresh.refresh().await.unwrap();\n        let r = by_author(&fresh, 7);\n",
+      "source_digest": "e040fbb9c463a29a779a68763572a27d77e7094c614af34487bc17ef8796ed4b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 6053,
+      "end_line": 6077,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let held = by_author(&ac, 7);\n        assert_eq!(\n            (held.mode, held.forced),\n            (ControlMode::Live, None),\n            \"the copy it held still acts, on every account\"\n        );\n        let fresh = Arc::new(ActionControl::new(\n            store.clone(),\n            \"prod\".into(),\n            \"pod-1\".into(),\n        ));\n        fresh.refresh().await.unwrap();\n        let r = by_author(&fresh, 7);\n        assert_eq!(\n            (r.mode, r.forced),\n            (ControlMode::Recording, Some(\"unreadable\"))\n        );\n\n        let (ac, store) = rollout_bed(None).await;\n        store.put_record(&ActionControlRecord {\n            version: 2,\n            ..row_rec(\"H\", LevelRow::Missing, ControlMode::Recording, vec![])\n        });\n        ac.refresh().await.unwrap();\n        newer[\"version\"] = 3.into();\n",
+      "source_digest": "9429624bd183c248ae3c8b0bdbab3a7555d6ef1925d05436eac9d4e9e8a5658d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 6068,
+      "end_line": 6092,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (ControlMode::Recording, Some(\"unreadable\"))\n        );\n\n        let (ac, store) = rollout_bed(None).await;\n        store.put_record(&ActionControlRecord {\n            version: 2,\n            ..row_rec(\"H\", LevelRow::Missing, ControlMode::Recording, vec![])\n        });\n        ac.refresh().await.unwrap();\n        newer[\"version\"] = 3.into();\n        store.put_raw(&lkey, &serde_json::to_vec(&newer).unwrap());\n        ac.refresh().await.unwrap();\n        assert_eq!(by_author(&ac, 7).mode, ControlMode::Recording);\n    }\n\n    #[tokio::test]\n    async fn a_row_live_for_every_account_takes_a_rollout_only_after_a_log_only_save() {\n        let (ac, _) = rollout_bed(None).await;\n        match set(&ac, missing_row_put(Some(500), Some(CONFIRM_WORD))).await {\n            Err(SetError::Invalid(\"rollout_from_every_account\", msg)) => {\n                assert!(msg.contains(\"set it to log only and save\"), \"{msg}\")\n            }\n            other => panic!(\"{other:?}\"),\n        }\n        let paused_with_rollout = ActionControlPutRequest {\n",
+      "source_digest": "d3ae471e73beec20cd5ea1450b93da770ccd397a76d8897e434ba8100f2e80fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 6121,
+      "end_line": 6145,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            expected_version: Some(2),\n            mode: ControlMode::Recording,\n            actions: vec![],\n            ..missing_row_put(None, None)\n        };\n        assert!(set(&ac, off).await.is_ok());\n        let on = ActionControlPutRequest {\n            expected_version: Some(3),\n            ..missing_row_put(Some(500), Some(CONFIRM_WORD))\n        };\n        let on = set_at(&ac, on, NOW_MS + ROLLOUT_WAIT_MS).await;\n        assert!(on.is_ok(), \"{on:?}\");\n        assert!(in_rollout(Some(500), \"H\", 7) == by_author(&ac, 7).forced.is_none());\n    }\n\n            async fn log_only_at_now() -> (Arc<ActionControl>, Arc<MemControlStore>) {\n        let (ac, store) = rollout_bed(None).await;\n        let off = ActionControlPutRequest {\n            mode: ControlMode::Recording,\n            actions: vec![],\n            ..missing_row_put(None, None)\n        };\n        let off = set(&ac, off).await;\n        assert!(off.is_ok(), \"{off:?}\");\n        (ac, store)\n",
+      "source_digest": "a223d9b351c13e855d5dd63ba92c48e0586244001495cb07a673ebd603b1b125",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 6200,
+      "end_line": 6224,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let old = Arc::new(ActionControl::new(\n            store.clone(),\n            \"prod\".into(),\n            \"pod-old\".into(),\n        ));\n        let missed = Arc::new(ActionControl::new(\n            store.clone(),\n            \"prod\".into(),\n            \"pod-missed\".into(),\n        ));\n        for pod in [&old, &missed] {\n            pod.refresh().await.unwrap();\n            assert_eq!(by_author(pod, 7).mode, ControlMode::Live);\n        }\n        let off = ActionControlPutRequest {\n            mode: ControlMode::Recording,\n            actions: vec![],\n            ..missing_row_put(None, None)\n        };\n        assert!(set(&saver, off).await.is_ok());\n        let (c, _) = refusal(set_at(&saver, rollout_after_log_only(2), NOW_MS + 5_000).await);\n        assert_eq!(c, \"rollout_wait\");\n        let lkey = level_lkey(ControlEntity::User, \"H\", None, LevelRow::Missing);\n        let raw = store\n            .pkey_rows(MH_PKEY)\n",
+      "source_digest": "23667be1d19a436f3832cb7e1677a5c79398e8d4309843d66ee907d8fa09fd2c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d70999cf6c836139662cd4f92f2a7ff33fa55b1c11843cd37575e6a68cc7be15",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "9d4fdd99cf613ca34a9814e51ce4ddbfef548ffd9728a49dd1e68b46b07ee024",
+      "context_complete": true,
+      "task_id": "T-bfcd82cc7a054f2e2fb3005197a1a9ad622d397d84bbe402d7d0a6904b7952d8",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cecb3c171e36cd256fea4b80e6763197e61bff17f1455accb5fea96d48dd9295",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-0cb7e6f71aac6c02f3c8c8b56cb39601bc33f65cbf8c44b6cbaf74cec0876455",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5babd56a719898e931bf8bf909d19e88ae2c1c25f6f96dc52fb5087838282d75",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-7497be522b07966b4ed674ef61769571b4d99f2dcc1f137d83f72b5d56d8160c",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-34ba1d8f26e11e93ab11e9d83631a6a2044c5c8e51c42074154ef8a3b7afde7e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-f4db509919283ecf153ea1f59de641862e7d398ee180293e2215f22d79b62a34",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b5a929a15984597bf239d7f59505fe1028541724804f72115d1d204e2971a92c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-b5394090536715737ee33e00dd3193ab3186ff0ba1b5247602f2f0da1e6fcbb8",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0d02ab4992c7c4d9ae4a9f39727d2c43fc27f75d6662bc30748396641220146c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-dc13827c4aa2b5a77ecbaa4b010ca25bb68482427cfe773cf9eb91b1df5bb06b",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d72645071da722c337f2ba7e4af61ccda372fa32eb41fda20616a5753dd0cb16",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-7a1a17dd81693750903d2e6a3f46444653bee9ae6dd9a6ea051eaa7520c70d7b",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-78e5a7f406a9cc7cf057ac6ea0f753461fc6a64ff3e52370b5764be8c948b579",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-11162e6d4e33d2efeb52639385c8acfa793ae185006254996d00d9037bafb493",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a2d617bc8c0b3a4378209db43a80dc4f4c09b4c39fb63a65b4bb30a89c2a7127",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-0d9c6c94f6b45d354ef7dd0013d6a22a20b47868aac5398e357cc46893e9362a",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3d17bffe09b2302ce48f91ef51168ca941129e9e0c608ff3d6642e6da1b59738",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-a5370564480d556d6a1b051ba8dad5f2aa554296daab41fe2b4478db52de135a",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-34a1d75b4ff4807cd5e9e4871e85ee147b87b154ed82486bea8e108391872a7b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-0d285d5f427faefc139947a16b63f044cff3eab7e0ce99122e90df7dbff389c4",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2c4435058f2874f7e5d8b321a2a34587fa9505fa9c96e7493a089c538136b858",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-348fb68eaa105640eba1bd5d6087d2ce4cab9f5071dae33e0e6e6bc99a5b98ba",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0b3af8d30ed3f71b4f6300d5fae75a741e1d01bd8b7bb90a2ddfb749ac1243f7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-dbd4d7ec7795dff2dbca6f20ac7633bcbb94eeacda497531f8c1fe8a2870b55c",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-85629826fe1c4d5ea7229d391323f0bd206a3c7152dfa69d37e7663fb99de208",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-357e7d8a3739c5943b88a72d683d5b2b72a3745bf2eb6b7d045d6ff0b29a1984",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e0fabf0ece3122057d6ba367724720b86eaeec26101cf65db45ba635fe342838",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-8e20a5e3a3af48e52af7ed4e491ec65da3ec9ff4c4d01398a32ec2085a87b924",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-afc69e63b6e55726e64faea58bf9303c3cb46a8d4362ecd723a0fb65325d3962",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-1701780cd25ee4d154b9b325b4f469a167c3b70e6b8e64dda5d5efef220ce923",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a4e9e47c65db4daacd4c82a3a9892d4a1f467dd8d24ea5bb1df5825a7c62e2f4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-37fe91cdb502e5c8bb17d46b6240b11c6249df655ed35096ee7bc3cb2b85455d",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1dc147d254201020c786d63482c8b099b715a6733e9b08bc345e1d62bc4fabd6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-1f690e7c39e5dbc13a6395112d50d0f10183abdcfb410c2981adbf749d4fc264",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-49594aa4ea572d45d087c07433bee53ab22d7a0f510a9ad0627243d32e7a9f08",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-f32e2167eaf9887c85e0f82a6214acb1098ddc43fcf1830c7ca1c95e832e6890",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0f65a37c379de5c0df38b425e817f7317d86475633057a5dcb15aff5f749ed8a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-be1eadb8cb3a93c115191fa8265cc9d8c252061a02249dcf9ed72c22e391c4d2",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1941bb9a512441b4d9b1556d691ad45519dfbe40e9a7fd33bac85d096c81dcf0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-b30cad4288097d5df6f8a17b385ace23b911fdafd0652485768d96222b3c0598",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8fd60dc3dc89790bdbe0fbab09600f92e31069e7d4285537f5020e9c716e48f9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-0404bafffb03598b1a4fe01076b30f405e718f3666eec74d777d4f3ca41f575c",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6820eabac7eff6a63ccadc3044cfc25f154d3f45e4d0fa7c195c488df08be78d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-4f47f99ed60f1313f7fc8012ffa4c7b13fe33daf3d6db75e23234670ff6e59b4",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3eebaf2e6753d63cd960124669577a203ab53435959fe0a4408d91319adf40fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-d94ee6365f2bd9ed17b7ef588f3992ab48ae5a4e3103323c4b49e781fc68d14a",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-45aef8ef92adbd86183a3bda01935cc0add489192b3401283a1b77065687d40f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-89c1e44fc8bfd782b449145c7c63447b2f4e55e2a33024d9c54591ddf8d899f7",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab62a044e3ec6cb6c08b89a44bb50cd6dee7bba05e750c37905f7daa027529c7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-1edb3b9bbf6c23264da3dbfd80437f0e91e943ef2f6d719fc9ba7e480207d1af",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b855e9049cbc32bcc9d29cd000ee75a90fe768cb61c57f11973ad2200077a155",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-a5c0165c52c5b7b7990b1b501816d8480d1e31ea16c261de34ee7fc6f2fd7532",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1d95d06de294e3acb735f67d1d865d0be64ef09c58e4cb85208baf2f172a7718",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-5f9f9142a7ba3041062af2dd53270650281ac7688225edfecb7c6fe9ae01e83b",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-474b63a819064597d51632fa4ba07c43633d31104dc532c14a299dba9fcc9db0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-ae8cdeeee8c3aa5c49665767aaf427be106cab3e66c995f80ade4b4bbe5261a3",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e0596ea6445138ee222132614757f4664a2bd3c03c1e2bc4aeca788450006ce9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-d250ad2f685d35ad21d039638d75bee70a3028cb77f6199557d493806cecbc62",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0a33a3d6ee7d1bb4d4ab9bc6fe723df5a9a621460b7e09ae4f46378f0f991c6a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-76499be88b40d614c155ba128d19dfde113e7cbb655fed402131b0f2d59972ae",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d2acdc3ce7a52480fddd6b520327e2cbd9c052282535a09b7282e73995ec6dfc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-f30345b1e9864654cc41a7655b72c28e127e505b583690dcbbf136375bcbffdd",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c75e97ddc55eef0ff3deb92b550b359bd739e8a3316641d76b058f07a88dab9d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-2ca85b7be8b932603f0e26cd69e7494c2075061d6e2f7462c033c3880389cf1c",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e38cc795af8c83caa88a7e1818395546b010f4df6c14c4014b169b7313ab0215",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-0fe8e1fba5ef532012d990cee6f9a17dac0475fde39f02a6ad928d5563ae23c2",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b01a6bce097b4929cd14342f727257ad4de357d33cbe133ed51277e43a47eeee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-a9fda13932ae8aba90eaf1ac3939c501d4cb865d38ccb1129ab782e6fd568e7b",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-af57303386f50ecf60ebd43f1c457bad000791ccbbcead846c499f36105ce1ed",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-fb3217a0d637cb5390fafe90521ffb131f14ffb879140c383b15a000f8756de9",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-179171de8c6fbc7add33667d67a7726cc6e8667c7e14589a53c787910065faee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-30751e2254a778ca8cb98ddfc62fead02d82e91c2f117597687cbb53c3279a62",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fe7c5224d609a4edfa209ca89d52c9d259bccab3e998f2119781431ea3bc08bf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-cc3e5b13a21f5049235fee3bfb17ccffd7b0d8a9e2b1bd4253f13352afbe68de",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e87b98bec891ff5df6b97545b1dc8b1653d173fa4e76f785053b45f00738b35",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-8685bd3bbc6bd454b50581b8da164183398532bf2c3dd73e009936b5214ead72",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-96f66b94c9407408f8e970b7c1e1f90afdd1129fb9f438e323e7c7b9d34633f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-3e5df11c7dcbdc70d9518b70da3ede119288e0a4f513760cdae2a1bcdcdccb6e",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c215e84c5ffcc0c4bca63a04794d1edca2d13d819200435b9b0726150ee9d57f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-c2c49e2ad637c9d1d415c037323066e81a667acb0ff4a2555dc755b38e7a286c",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6e31e9fe6d65255c4e11e1e2ad4e4baaedbe0dcc1cc2400e0163c15568d23afa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-50735f917f7b1e91df8f4bd0a047fb5a6f13ae6b9bcbf5c3a04e47d1e5f663e6",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9b630807a877cd7e86ce983dfaa81eac075b968264a79c3563f5c12834059dcd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-d9d67ae94ad893503c235e4fdf3b0d821b79c799a347f21d86c4242e1d743100",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7f89f9c970ad35ede225118fee41780b890fe04c4f30b9bc74de3280ad3d2a59",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-6dd036610ab2235e9543fe004efb9cb378b1c85887d285692d93c846afb34f1d",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-55e1fcd8b1ca4adf036e1fcedc69bb205207f10e75e53f7ed830614bbe796b57",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-44027ae35352ac0c975904981ce7e332447fc73e2d52e64be6eea95c305df23a",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/mod.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c0c58ed2d37875093610ee82c9e2cb45f859262fae2fe7e957d9f567824890a3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "for_users",
+        "Hydration",
+        "Quoted",
+        "incomplete",
+        "viewer_failed",
+        "tweet",
+        "quoted",
+        "author"
+      ],
+      "context_complete": false,
+      "task_id": "T-d674191e4d7a74fc0d426dd8f60b4c6ec266c10639bba3d20fc1e2d476359e53",
+      "evidence_refs": [
+        "E47"
+      ]
+    }
+  ],
+  "task_id": "T-1553cb36bdd593d00a8d49c9fadf9191684abe0bcdf3977e2d9d0d058a463aa2"
+}

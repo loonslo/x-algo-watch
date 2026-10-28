@@ -1,0 +1,1711 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/store/quotes.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-231a8b0d2c62a9183c973b80f3e18353a6e5e8ede71e77fbe346888681e9c9e1",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 313,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use super::RequestRow;\nuse crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery};\nuse crate::hydration::batch::{HydrationBatch, RawHydrationBatch};\nuse crate::hydration::decode::author::DecodedAuthor;\nuse crate::hydration::fetcher::{AnyFetcher, Fetcher};\nuse crate::hydration::hydrator::{PairEdge, UserPair};\nuse crate::hydration::{candidate_count_by_key, Hydrator, Hydrators, QuoteEntry, Quoted};\nuse crate::models::{AuthorId, PairEdges, PureCore, QuoteFacts, QuoteLink, TweetId};\nuse rustc_hash::FxHashMap;\nuse std::cell::OnceCell;\nuse strum::VariantArray;\nuse xai_core_entities::entities::QuotedTweet;\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum PairKey {\n    Asked(UserPair),\n    Unasked,\n    InputFailed,\n}\n\n#[derive(Default)]\npub(super) struct Quotes {\n    entries: Vec<QuoteEntry>,\n    outers_to_fetch: Vec<TweetId>,\n    pub(super) quoted_tweets: Fetcher<QuotedTweet>,\n    pair_edges: [Fetcher<bool, UserPair>; PairEdge::VARIANTS.len()],\n}\n\npub(super) struct Pairing<'s> {\n    rows: &'s [RequestRow],\n    pure_cores: &'s Fetcher<PureCore>,\n    authors: &'s Fetcher<DecodedAuthor>,\n    author_by_tweet: OnceCell<FxHashMap<TweetId, Option<AuthorId>>>,\n}\n\nimpl<'s> Pairing<'s> {\n    pub(super) fn new(\n        rows: &'s [RequestRow],\n        pure_cores: &'s Fetcher<PureCore>,\n        authors: &'s Fetcher<DecodedAuthor>,\n    ) -> Self {\n        Self {\n            rows,\n            pure_cores,\n            authors,\n            author_by_tweet: OnceCell::new(),\n        }\n    }\n\n    fn quoted_author(&self, inner: TweetId) -> Option<AuthorId> {\n        let author_by_tweet = self.author_by_tweet.get_or_init(|| {\n            let mut author_by_tweet = FxHashMap::default();\n            for row in self.rows {\n                if let Some(tweet_id) = row.tweet_id() {\n                    author_by_tweet.entry(tweet_id).or_insert(row.author);\n                }\n            }\n            author_by_tweet\n        });\n        author_by_tweet.get(&inner).copied().flatten()\n    }\n\n    fn link(&self, quote: QuoteEntry) -> Option<QuoteLink> {\n        let core = self.pure_cores.get(quote.outer.0)?;\n        Some(QuoteLink {\n            outer: quote.outer,\n            quoting_author: core.source_author_id.unwrap_or(core.author_id).get(),\n        })\n    }\n\n    fn key(&self, edge: PairEdge, quote: QuoteEntry) -> PairKey {\n        let (Some(quoted), Some(link)) = (self.quoted_author(quote.inner), self.link(quote)) else {\n            return PairKey::InputFailed;\n        };\n        let (quoted, quoting) = (quoted.get(), link.quoting_author);\n        if quoted == quoting {\n            return PairKey::Unasked;\n        }\n        match edge {\n            PairEdge::AuthorBlocksOuterAuthor => PairKey::Asked(UserPair {\n                source: quoted,\n                destination: quoting,\n            }),\n            PairEdge::OuterAuthorFollowsAuthor => match self\n                .authors\n                .get(quoted)\n                .filter(|_| !self.authors.is_incomplete(quoted))\n            {\n                None => PairKey::InputFailed,\n                Some((author, _)) if author.is_protected => PairKey::Asked(UserPair {\n                    source: quoting,\n                    destination: quoted,\n                }),\n                Some(_) => PairKey::Unasked,\n            },\n        }\n    }\n}\n\nimpl Quotes {\n    pub(super) fn new(entries: &[QuoteEntry]) -> Self {\n        let mut entries = entries.to_vec();\n        entries.sort_unstable();\n        entries.dedup();\n        Self {\n            entries,\n            ..Self::default()\n        }\n    }\n\n    pub(super) fn outer_of(&self, inner: TweetId) -> Option<TweetId> {\n        self.entries\n            .iter()\n            .find(|quote| quote.inner == inner)\n            .map(|quote| quote.outer)\n    }\n\n    pub(super) fn outers_to_fetch(&self) -> &[TweetId] {\n        &self.outers_to_fetch\n    }\n\n    pub(super) fn join_outers(&mut self, rows: &[RequestRow]) {\n        let mut outers: Vec<TweetId> = self\n            .entries\n            .iter()\n            .map(|quote| quote.outer)\n            .filter(|&outer| !rows.iter().any(|row| row.tweet_id() == Some(outer)))\n            .collect();\n        outers.sort_unstable();\n        outers.dedup();\n        self.outers_to_fetch = outers;\n    }\n\n    pub(super) fn quoted_author(&self, inner: TweetId) -> Option<AuthorId> {\n        self.entries\n            .iter()\n            .filter(|quote| quote.inner == inner)\n            .find_map(|quote| {\n                self.quoted_tweets\n                    .get(quote.outer.0)\n                    .filter(|quoted| quoted.tweet_id == inner.0 && quoted.user_id != 0)\n            })\n            .map(|quoted| AuthorId(quoted.user_id))\n    }\n\n    pub(super) fn is_quoted_author_failed(&self, inner: TweetId) -> bool {\n        self.entries\n            .iter()\n            .filter(|quote| quote.inner == inner)\n            .any(|quote| self.quoted_tweets.is_incomplete(quote.outer.0))\n    }\n\n    fn asked_pairs(&self, edge: PairEdge, pairing: &Pairing<'_>) -> Vec<UserPair> {\n        let mut pairs: Vec<UserPair> = self\n            .entries\n            .iter()\n            .filter_map(|&quote| match pairing.key(edge, quote) {\n                PairKey::Asked(pair) => Some(pair),\n                PairKey::Unasked | PairKey::InputFailed => None,\n            })\n            .collect();\n        pairs.sort_unstable_by_key(|pair| (pair.source, pair.destination));\n        pairs.dedup();\n        pairs\n    }\n\n    pub(super) fn claim_pairs(\n        &mut self,\n        nodes: Hydrators,\n        pairing: &Pairing<'_>,\n    ) -> Vec<EdgeQuery> {\n        let mut queries: Vec<EdgeQuery> = Vec::new();\n        for edge in nodes.iter().filter_map(Hydrator::pair_edge) {\n            let pairs = self.asked_pairs(edge, pairing);\n            let Some(fetcher) = self.pair_edges.get_mut(usize::from(edge as u8)) else {\n                continue;\n            };\n            for pair in fetcher.claim(pairs) {\n                let from = EdgeFrom::User(pair.source);\n                match queries.last_mut() {\n                    Some(query) if query.graph == edge.graph() && query.from == from => {\n                        query.destination_ids.push(pair.destination);\n                    }\n                    _ => queries.push(EdgeQuery {\n                        graph: edge.graph(),\n                        direction: EdgeDirection::Forward,\n                        from,\n                        destination_ids: vec![pair.destination],\n                    }),\n                }\n            }\n        }\n        queries\n    }\n\n    pub(super) fn land_pairs(\n        &mut self,\n        queries: &[EdgeQuery],\n        answers: Vec<RawHydrationBatch<bool>>,\n    ) {\n        for (query, answer) in queries.iter().zip(answers) {\n            let (Some(edge), EdgeFrom::User(source)) =\n                (PairEdge::of_graph(query.graph), query.from)\n            else {\n                continue;\n            };\n            let pair = |destination| UserPair {\n                source,\n                destination,\n            };\n            let claimed: Vec<UserPair> = query.destination_ids.iter().copied().map(pair).collect();\n            let answers = answer\n                .into_hydrated()\n                .into_iter()\n                .map(|(destination, holds)| (pair(destination), holds))\n                .collect();\n            if let Some(fetcher) = self.pair_edges.get_mut(usize::from(edge as u8)) {\n                fetcher.land(&claimed, HydrationBatch::from_hydrated(answers));\n            }\n        }\n    }\n\n    pub(super) fn candidate_count_by_quoted_author(\n        &self,\n        nodes: Hydrators,\n        pairing: &Pairing<'_>,\n    ) -> FxHashMap<u64, usize> {\n        let quoted = |edge| {\n            self.entries\n                .iter()\n                .filter_map(move |&quote| match pairing.key(edge, quote) {\n                    PairKey::Asked(pair) => Some(pair.destination),\n                    PairKey::Unasked | PairKey::InputFailed => None,\n                })\n        };\n        candidate_count_by_key(\n            nodes\n                .iter()\n                .filter_map(Hydrator::pair_edge)\n                .flat_map(quoted),\n        )\n    }\n\n    fn pair_fetcher(&self, edge: PairEdge) -> Option<&Fetcher<bool, UserPair>> {\n        self.pair_edges.get(usize::from(edge as u8))\n    }\n\n    pub(super) fn incomplete(&self, callable: Hydrators) -> Hydrators {\n        callable\n            .iter()\n            .filter(|node| {\n                node.pair_edge()\n                    .and_then(|edge| self.pair_fetcher(edge))\n                    .is_some_and(|fetcher| fetcher.has_incomplete())\n            })\n            .fold(Hydrators::empty(), Hydrators::with)\n    }\n\n    pub(super) fn quoted(\n        &self,\n        callable: Hydrators,\n        pairing: &Pairing<'_>,\n    ) -> FxHashMap<QuoteEntry, Quoted> {\n        self.entries\n            .iter()\n            .map(|&quote| (quote, self.quoted_entry(quote, callable, pairing)))\n            .collect()\n    }\n\n    fn quoted_entry(\n        &self,\n        quote: QuoteEntry,\n        callable: Hydrators,\n        pairing: &Pairing<'_>,\n    ) -> Quoted {\n        let mut pair_edges = PairEdges::default();\n        let mut failed = Hydrators::empty();\n        for node in callable.iter() {\n            let Some((edge, fetcher)) = node\n                .pair_edge()\n                .and_then(|edge| Some((edge, self.pair_fetcher(edge)?)))\n            else {\n                continue;\n            };\n            let holds = match pairing.key(edge, quote) {\n                PairKey::Asked(pair) => {\n                    if !fetcher.is_claimed(pair) || fetcher.is_incomplete(pair) {\n                        failed = failed.with(node);\n                    }\n                    fetcher.get(pair).copied().unwrap_or_default()\n                }\n                PairKey::Unasked => false,\n                PairKey::InputFailed => {\n                    failed = failed.with(node);\n                    false\n                }\n            };\n            match edge {\n                PairEdge::AuthorBlocksOuterAuthor => pair_edges.author_blocks_outer_author = holds,\n                PairEdge::OuterAuthorFollowsAuthor => {\n                    pair_edges.outer_author_follows_author = holds\n                }\n            }\n        }\n        Quoted {\n            facts: QuoteFacts {\n                link: pairing.link(quote),\n                pair_edges,\n            },\n            failed,\n        }\n    }\n}\n",
+      "source_digest": "03c12d5b529378170c4e38c55a4db0c3843f06642ebd2dc91e7a1e9626ab2a46",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 273,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use super::{RequestRow, Store};\nuse crate::clients::socialgraph_client::{EdgeDirection, EdgeFrom, EdgeQuery};\nuse crate::hydration::batch::{HydrationBatch, RawHydrationBatch};\nuse crate::hydration::fetcher::{AnyFetcher, Fetcher};\nuse crate::hydration::hydrator::{PairEdge, UserPair};\nuse crate::hydration::inventory::classify;\nuse crate::hydration::relation::{quoting_author, Related};\nuse crate::hydration::{candidate_count_by_key, Cause, Hydrator, Hydrators, QuoteEntry, Quoted};\nuse crate::models::{AuthorId, PairEdges, QuoteFacts, QuoteLink, TweetId};\nuse rustc_hash::FxHashMap;\nuse strum::VariantArray;\nuse xai_core_entities::entities::QuotedTweet;\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum PairKey {\n    Asked(UserPair),\n    Unasked,\n    InputFailed,\n}\n\n#[derive(Default)]\npub(super) struct Quotes {\n    entries: Vec<QuoteEntry>,\n    pub(super) quoted_tweets: Fetcher<QuotedTweet>,\n    pair_edges: [Fetcher<bool, UserPair>; PairEdge::VARIANTS.len()],\n}\n\nimpl Quotes {\n    pub(super) fn new(entries: &[QuoteEntry]) -> Self {\n        let mut entries = entries.to_vec();\n        entries.sort_unstable();\n        entries.dedup();\n        Self {\n            entries,\n            ..Self::default()\n        }\n    }\n\n    pub(super) fn outer_of(&self, inner: TweetId) -> Option<TweetId> {\n        self.entries\n            .iter()\n            .find(|quote| quote.inner == inner)\n            .map(|quote| quote.outer)\n    }\n\n    pub(super) fn quoted_author(&self, inner: TweetId) -> Result<AuthorId, Cause> {\n        let quotes = || {\n            self.entries\n                .iter()\n                .filter(move |quote| quote.inner == inner)\n        };\n        let named = quotes().find_map(|quote| {\n            self.quoted_tweets\n                .get(quote.outer.0)\n                .filter(|quoted| quoted.tweet_id == inner.0 && quoted.user_id != 0)\n        });\n        match named {\n            Some(quoted) => Ok(AuthorId(quoted.user_id)),\n            None if quotes().any(|quote| self.quoted_tweets.is_incomplete(quote.outer.0)) => {\n                Err(Cause::Failed)\n            }\n            None => Err(Cause::NotFound),\n        }\n    }\n\n    fn pair_fetcher(&self, edge: PairEdge) -> Option<&Fetcher<bool, UserPair>> {\n        self.pair_edges.get(usize::from(edge as u8))\n    }\n\n    fn pair_fetcher_mut(&mut self, edge: PairEdge) -> Option<&mut Fetcher<bool, UserPair>> {\n        self.pair_edges.get_mut(usize::from(edge as u8))\n    }\n\n    pub(super) fn land_pairs<'q>(\n        &mut self,\n        queries: impl Iterator<Item = (PairEdge, &'q EdgeQuery)>,\n        answers: Vec<RawHydrationBatch<bool>>,\n    ) {\n        for ((edge, query), answer) in queries.zip(answers) {\n            let EdgeFrom::User(source) = query.from else {\n                continue;\n            };\n            let pair = |destination| UserPair {\n                source,\n                destination,\n            };\n            let claimed: Vec<UserPair> = query.destination_ids.iter().copied().map(pair).collect();\n            let answers = answer\n                .into_hydrated()\n                .into_iter()\n                .map(|(destination, holds)| (pair(destination), holds))\n                .collect();\n            if let Some(fetcher) = self.pair_fetcher_mut(edge) {\n                fetcher.land(&claimed, HydrationBatch::from_hydrated(answers));\n            }\n        }\n    }\n}\n\nimpl Store {\n    pub(super) fn quote_outers(&self) -> Vec<(usize, Related)> {\n        self.quotes\n            .entries\n            .iter()\n            .filter_map(|quote| {\n                let parent = self\n                    .rows\n                    .iter()\n                    .position(|row| row.tweet_id() == Some(quote.inner))?;\n                let related = Related {\n                    tweet_id: quote.outer,\n                    author: None,\n                };\n                Some((parent, related))\n            })\n            .collect()\n    }\n\n    fn paired_rows(&self) -> impl Iterator<Item = (&RequestRow, TweetId)> {\n        self.paired\n            .iter()\n            .filter_map(|&(parent, outer)| Some((self.rows.get(parent)?, outer)))\n    }\n\n    fn quoting_author(&self, outer: TweetId) -> Option<AuthorId> {\n        self.pure_cores.request().get(outer.0).map(quoting_author)\n    }\n\n    fn pair_key(&self, edge: PairEdge, parent: &RequestRow, outer: TweetId) -> PairKey {\n        let (Some(quoted), Some(quoting)) = (parent.author, self.quoting_author(outer)) else {\n            return PairKey::InputFailed;\n        };\n        let (quoted, quoting) = (quoted.get(), quoting.get());\n        if quoted == quoting {\n            return PairKey::Unasked;\n        }\n        match edge {\n            PairEdge::AuthorBlocksOuterAuthor => PairKey::Asked(UserPair {\n                source: quoted,\n                destination: quoting,\n            }),\n            PairEdge::OuterAuthorFollowsAuthor => match self\n                .authors\n                .request()\n                .get(quoted)\n                .filter(|_| !self.authors.request().is_incomplete(quoted))\n            {\n                None => PairKey::InputFailed,\n                Some((author, _)) if author.is_protected => PairKey::Asked(UserPair {\n                    source: quoting,\n                    destination: quoted,\n                }),\n                Some(_) => PairKey::Unasked,\n            },\n        }\n    }\n\n    fn asked_pairs(&self, edge: PairEdge) -> Vec<UserPair> {\n        let mut pairs: Vec<UserPair> = self\n            .paired_rows()\n            .filter_map(|(parent, outer)| match self.pair_key(edge, parent, outer) {\n                PairKey::Asked(asked) => Some(asked),\n                PairKey::Unasked | PairKey::InputFailed => None,\n            })\n            .collect();\n        pairs.sort_unstable_by_key(|pair| (pair.source, pair.destination));\n        pairs.dedup();\n        pairs\n    }\n\n    pub(super) fn claim_pairs(&mut self, nodes: Hydrators) -> Vec<(PairEdge, EdgeQuery)> {\n        let asked: Vec<(PairEdge, Vec<UserPair>)> = nodes\n            .iter()\n            .filter_map(Hydrator::pair_edge)\n            .map(|edge| (edge, self.asked_pairs(edge)))\n            .collect();\n        let mut queries: Vec<(PairEdge, EdgeQuery)> = Vec::new();\n        for (edge, pairs) in asked {\n            let Some(fetcher) = self.quotes.pair_fetcher_mut(edge) else {\n                continue;\n            };\n            for pair in fetcher.claim(pairs) {\n                let from = EdgeFrom::User(pair.source);\n                match queries.last_mut() {\n                    Some((queried, query)) if *queried == edge && query.from == from => {\n                        query.destination_ids.push(pair.destination);\n                    }\n                    _ => queries.push((\n                        edge,\n                        EdgeQuery {\n                            graph: edge.graph(),\n                            direction: EdgeDirection::Forward,\n                            from,\n                            destination_ids: vec![pair.destination],\n                        },\n                    )),\n                }\n            }\n        }\n        queries\n    }\n\n    pub(super) fn candidate_count_by_pair(&self, nodes: Hydrators) -> FxHashMap<u64, usize> {\n        let destinations = |edge| {\n            self.paired_rows().filter_map(move |(parent, outer)| {\n                match self.pair_key(edge, parent, outer) {\n                    PairKey::Asked(asked) => Some(asked.destination),\n                    PairKey::Unasked | PairKey::InputFailed => None,\n                }\n            })\n        };\n        candidate_count_by_key(\n            nodes\n                .iter()\n                .filter_map(Hydrator::pair_edge)\n                .flat_map(destinations),\n        )\n    }\n\n    pub(super) fn quoted(&self) -> FxHashMap<QuoteEntry, Quoted> {\n        self.paired_rows()\n            .filter_map(|(parent, outer)| {\n                let quote = QuoteEntry {\n                    inner: parent.tweet_id()?,\n                    outer,\n                };\n                Some((quote, self.quoted_entry(parent, outer)))\n            })\n            .collect()\n    }\n\n    fn quoted_entry(&self, parent: &RequestRow, outer: TweetId) -> Quoted {\n        let mut pair_edges = PairEdges::default();\n        let mut failed = Hydrators::empty();\n        for node in self.callable.iter() {\n            let Some((edge, fetcher)) = node\n                .pair_edge()\n                .and_then(|edge| Some((edge, self.quotes.pair_fetcher(edge)?)))\n            else {\n                continue;\n            };\n            let holds = match self.pair_key(edge, parent, outer) {\n                PairKey::Asked(asked) => {\n                    if classify(self.stake(node), fetcher.answer(asked)).fails_node() {\n                        failed = failed.with(node);\n                    }\n                    fetcher.get(asked).copied().unwrap_or_default()\n                }\n                PairKey::Unasked => false,\n                PairKey::InputFailed => {\n                    failed = failed.with(node);\n                    false\n                }\n            };\n            match edge {\n                PairEdge::AuthorBlocksOuterAuthor => pair_edges.author_blocks_outer_author = holds,\n                PairEdge::OuterAuthorFollowsAuthor => {\n                    pair_edges.outer_author_follows_author = holds\n                }\n            }\n        }\n        Quoted {\n            facts: QuoteFacts {\n                link: self.quoting_author(outer).map(|quoting| QuoteLink {\n                    outer,\n                    quoting_author: quoting.get(),\n                }),\n                pair_edges,\n            },\n            failed,\n        }\n    }\n}\n",
+      "source_digest": "3e1aef4095ef53a11a5596798afcda67e8174156e989dc200c6f7d78aa9d93b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 231,
+      "end_line": 255,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 255,
+      "end_line": 279,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 257,
+      "end_line": 281,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 325,
+      "end_line": 349,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 430,
+      "end_line": 454,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n",
+      "source_digest": "c7c734b954066febeddb84c77d5a8584db6cb3657e4778f388a6bb24d30ecc10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 610,
+      "end_line": 634,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    entity: EntityType,\n    factory: bool,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n",
+      "source_digest": "00f2b1bd8014f68d98f3f186ff7acfad81b0909cd4ec308a8fd9bc9d002dabf2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 611,
+      "end_line": 635,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    factory: bool,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n",
+      "source_digest": "e0bef38852ec6fb8879b46e8782b5b841a65e5e334c4f6fc6e2390bb79b141b2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 613,
+      "end_line": 637,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n",
+      "source_digest": "9bce26244ea648814061c78826542c2b9b0119f452db7cd24a465f50424ea0ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 616,
+      "end_line": 640,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n",
+      "source_digest": "c99c45777580071bfa5d0f258a7c88bed27e71e5d7a1c6bfb50323d4f3915e4e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 619,
+      "end_line": 643,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n",
+      "source_digest": "1b7af6c62e21d501ba3694ed8d72fb78a2642f3c013fc1a85488212d36cd9f1f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 623,
+      "end_line": 647,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n",
+      "source_digest": "d36d292644f3809c7f225932bffa98822f082b5700111a3fec53f9730df91747",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 626,
+      "end_line": 650,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n                None\n            };\n            let mode = if forced.is_some() {\n",
+      "source_digest": "a93659313ffd7bde11a3d32461cb5f281ac6a3d3f9d1c40ee40d1299664b947a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 700,
+      "end_line": 724,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\ntype SeenWrite = (&'static str, String, Vec<u8>);\n\nfn seen_guard_key(pkey: &str, lkey: &str) -> String {\n    if pkey == SEEN_PKEY {\n        lkey.to_owned()\n    } else {\n        format!(\"{pkey}:{lkey}\")\n    }\n}\n\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n",
+      "source_digest": "a439c6af21729cbf87f96a1947a1daca60a62afa614fa1bc01372dfedf008526",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 701,
+      "end_line": 725,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\ntype SeenWrite = (&'static str, String, Vec<u8>);\n\nfn seen_guard_key(pkey: &str, lkey: &str) -> String {\n    if pkey == SEEN_PKEY {\n        lkey.to_owned()\n    } else {\n        format!(\"{pkey}:{lkey}\")\n    }\n}\n\npub(crate) fn new_nonce() -> u64 {\n    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);\n    let nanos = std::time::SystemTime::now()\n        .duration_since(std::time::UNIX_EPOCH)\n        .unwrap_or_default()\n        .as_nanos() as u64;\n    nanos\n        ^ ((std::process::id() as u64) << 32)\n        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)\n}\n\nfn label_days(a: &PageAction) -> Option<i64> {\n    match a {\n        PageAction::SpamHighRecall { lifetime }\n",
+      "source_digest": "335983b74693f856fe80ebccab10ac4ed8ff6a73414ff9b6845783b438a3e8f4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 729,
+      "end_line": 753,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        _ => None,\n    }\n}\n\npub fn harsher_because(\n    before: Option<&ActionControlRecord>,\n    after: &ActionControlRecord,\n    rules_specs: Option<&[Value]>,\n) -> Vec<String> {\n    let before_mode = before.map_or(ControlMode::Rules, |b| b.mode);\n    let before_actions: &[PageAction] = before.map_or(&[], |b| &b.actions);\n    let mut why = Vec::new();\n    match (before_mode, after.mode) {\n        (ControlMode::Live, ControlMode::Live) => {}\n        (_, ControlMode::Live) => why.push(\"turns the scope live\".to_owned()),\n        (ControlMode::Recording, ControlMode::Rules) => {\n            why.push(\"hands the scope back to the GrowthBook rules, which act\".to_owned())\n        }\n        (ControlMode::Live, ControlMode::Rules) => {\n            let page = action_specs_value(&page_specs(before_actions));\n            let page = page.as_array().map(Vec::as_slice).unwrap_or_default();\n            match rules_specs {\n                Some(rules) if !rules.is_empty() && rules.iter().all(|r| covered_by(r, page)) => {}\n                _ => why.push(\n",
+      "source_digest": "c8963163cdefe732a410b222259ce23ce1e7fc4ca8e0725bde1844545c7f840e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 759,
+      "end_line": 783,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        _ => {}\n    }\n    if after.mode == ControlMode::Live && before_mode == ControlMode::Live {\n        for a in &after.actions {\n            let same_kind = before_actions.iter().find(|b| b.kind() == a.kind());\n            match (a, same_kind) {\n                (PageAction::Suspend {} | PageAction::SuspendAuthor {}, None) => {\n                    why.push(\"adds suspend\".into())\n                }\n                (PageAction::LivenessCheck {}, None) => why.push(\"adds liveness check\".into()),\n                (_, None) => why.push(\"adds a label\".into()),\n                (_, Some(b)) => {\n                    if let (Some(new), Some(old)) = (label_days(a), label_days(b))\n                        && new > old\n                    {\n                        why.push(\"makes the label last longer\".into());\n                    }\n                }\n            }\n        }\n    }\n    why\n}\n\nfn covered_by(rule: &Value, page: &[Value]) -> bool {\n",
+      "source_digest": "1d0e31535b9f27deb3b853ba55702298ee9ca8c2c8bf37dcfb23b40149c3d9a4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 183,
+      "end_line": 207,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 242,
+      "end_line": 266,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 251,
+      "end_line": 275,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 266,
+      "end_line": 290,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 268,
+      "end_line": 292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 336,
+      "end_line": 360,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 443,
+      "end_line": 467,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n",
+      "source_digest": "ed961668fa44b8e389692947127305fcd53b11f77ddffc393147cba89ef24dbd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 641,
+      "end_line": 665,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    record: &ActionControlRecord,\n    entity: EntityType,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n",
+      "source_digest": "d22c1e71331bad3076cc8c2acbd9e2f5f2c422c38b5f3b36e81811b3f9e09dac",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 642,
+      "end_line": 666,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    entity: EntityType,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n",
+      "source_digest": "103d3ef994d79356017acaa9ef163ace656fe9b265827cdd36e935d13b9efe0e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 644,
+      "end_line": 668,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n",
+      "source_digest": "db739ad00963da2108d720d7e479bdeb7f7c67113a7fe45a51521f7bcb8d7677",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 647,
+      "end_line": 671,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n",
+      "source_digest": "b9d8a1ef0e39cf143df43fed2b90161356b493f9d4fa0f6ebc6d8f8688954dfa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 651,
+      "end_line": 675,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n                None\n            };\n            let mode = if forced.is_some() {\n",
+      "source_digest": "70d4b1b1da6c34d6db3c26d6ee95c7785b8cf32b733b2fcf8e2a09c6ec59b498",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-231a8b0d2c62a9183c973b80f3e18353a6e5e8ede71e77fbe346888681e9c9e1",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "e753b95bbf01d9ea84c83f7b9ba9b694f2230f2c12932e7d6ed11ba8364c7a54",
+      "context_complete": true,
+      "task_id": "T-7aebdc8f8570604c740fe39965861deb216ae93683ad615c0198c42dfd4c2438",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9ebebf102ea39bda764c634fdf0e6e3d9ae7beef6f9ee0de245c4e9cd70d9d0b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-f8088ad8922a895ebd009fcbe2310e4ed0e2b29c626b1d12ea028abcae7dd68a",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9475339fc4afe231fba618a142b5d94b86fb608f161a1f6795fe11008eba4de6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-97ab4019ebbea5ea53f8555d26ab52a3b1058aac3516c9a3507568f2f1206297",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-859e4adeed30bf0746aa2e82c2accca544683de7b0fe63087a89d4be196d0078",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-425c77300c41c6ac9970f2e51accbae3cff862942086933a6a4306816e643492",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f2432f03a3c15cb720f64a0b6fc53fe69c30de86d9ad30e6242a19b1cb5b69d0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-8201857c6c5f86e5999247f26e60b385ae7f1fd2481bb7cb319e94aa2caaf430",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-210901c2db05fc0df3b32cd2aed946a2c80326a0e2d74e7392071168f5d72669",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-04ddd255d47d4a6fb502edd788a59c306a10a0b566f8f6b111d5485afe1da99c",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6af601206d879076557f7e492bc93c8ad38cd1cea3d4967a802048243bef1add",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-e1a0f45815f2e8a1d5e1c20a564183715130e53627ea68231b4529619fa6a9c4",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1c5387ab41abf8cbd8fdf1347a460dd8368a95e91722e11f2fe39ddacce109fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-3e88b83d93a64f8555084d36f576b44111835b61f16db8c0c179a69b45fc9138",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-65a5018a4c09d28e05329610080ff8e07f6d61d4d6acfe06303fe1da680e5a6f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-644cad544142c65baf21160dfe18bba292f2ea37d0b284a61029201cd2083e5d",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e98dc32da5b6f1978564b399fe4347bdc870b9b241d52ebc297234cb49efacb3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-52ddc057dccc014881aca90ab87f2ff14232c45d65ac4a193ba5efdf911ac522",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-58953aaf770622a381d57a5939e4d5065b5d1dda4147a2504f79bcc168d861ac",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ad06a21dff0c459eaa9fc53dc6ba9b7f80216ef22a19404063d2dfe7cd96c05",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-390510329860f6909b013718303c20e92243f4fa7960f422617ec12bba8d139c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-892ff69f4ab30e56bf89ab316272bde3cea73f0b31da7fb4b0bacc5cc673bb5a",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-79f548076bb3ce843423a862f8ae62cd07db8a1db1798753419ad3c7dde733e6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-a11586502a1e9e58e7fb204b0a4c0b19e2d788a0dc2b9b036849fa4c2e0d36dd",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6dcadee446d00fa86165f699e85e3b319f8b4d430d78ae67e07517f151230b5f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-d603e0a02c11c6c79fc113f0db04ae3a3a1c99cfe376c69445d6cef0572f0878",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3de567c246349f5f334afdf5b155c9112ae34554131395db2e45cda739d54f4c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-b6abb75c8ea8681090f107c114cf7dae3f61da4dd89b828f3aa9f7b5099c7fa5",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b009c6f05e95a604c2e7051b9779357785d9b861b8eee0f221daa0d161eb8f6b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-00f9116f1fd808452308ddea13741cef4b48b6d5613de21cbf6ee6dcec887def",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-32858c2700bc6aafe8ac7df6c4623a85ce0396a251e1b318a0798d01c18df25e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-aeec6f04e56b598a2916c16d5cfad2722e83f508a839aeb87913156dae8aaca9",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ac6a5f324427ca2c86fa226690f0456e9d63cd011e46096bdeb6e7e1525a5d62",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-3fdba3afe644957816c072860f656dde64db32741096d61b1f87d040b8a1d042",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8dc89fb2bfc45ce5d78f8b502e28239d99d197db4a49d47c4154d814e9595bdc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-817fba8aa42fc4140eb821111338c59b69e73818b1e9929984e12d3296dd4ab6",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9d503432fa10eb6a623e0d0d1484ddf3558c8526320146a48d16f54db3996d12",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-08f043cdc0bb7e87c39973409e0975992ccd235407a432f2fac85b5356d5a424",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8fcc23182d05651560a6cb9751d1ffdceb36d332c5c4fa8a29090521a375ef44",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-955520f02b8996bd6d7ccb9485995f1171a323467192419f1a32de09d86ba1a3",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e487f994b0c6c42217de32768cad3f4262bdbd63fb0fa9ef13b06c87ef084356",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-3fd20a7674dce1f9bd3b316efd244268caffe3577b74d4d0f64e89ef7d9da157",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fdd48793d5db5ef913e20454b4b89bcebead6cdfa1b637bffa6212350fd2c0ee",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-88632df7029904bb5d313e29128f1ee58ebc737b6c90a072fac8555fcacf9e75",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-10024367fc8c1402016ae4315fb37063faead6163eb0e4b124c41c5c18168fcb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-c8f6a9a01565f8cf58d5eecab5b939540f96177f10b025f86e50b58f389aa5fc",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ec5d53b25bf0e0f1c3d099ccf4e112ca277ed4adc39a22a330a112b657b6cc52",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-64559c9af440087867ed6f022c4722062be849cf9607d4c539e20b63a09437f7",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-26bc985d9c40b7818ca983eb4b0a7789cdd286d472aa4e354c3247cdd67df8a0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-fc4cd18ff63000a7716f1a4de88ae5dae592761abb569afeddee41346cfd9339",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6864b328f24edcdad7184eae8a2ac8e394ed8d065ef21b4e1c0b8816e4bc52bb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-bd7e2e2ff653f2d94ec80ecd43dd534858cb8cf95886a39241d2b33c87d04136",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4b0300a2caf5f3c542e2e2676ff273a0731d781ccdac1a16180ad1ad71285616",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-d14a3bcfd5e1bd886b849193487f13382511eb5d124f7cf13aac4f0f612746e5",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3eb22aada3d63b8bf0982a04a89547e416864457aa7cdd2da8f186bc11614768",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-a90157ec51fc3b85eb2291c6c3d031ed6de73c57372e2b4c639ec005d94e2618",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0b668d378e6174d6704b9d890b86a465b44aa5a811d67200f2bde919498447e7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-937a24bf153ae61d47830e0808371cb1e0bafa7064d7a450c3e57b2bdf64d205",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b56107f6873768e8c37f94925b19a29189b0435ae4afde9f6fa8fe1a0248a153",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-188885c6f3fec780e479abe0a8cdf675389a6cbc5ba2eb80eda0f0dbcd85e9b2",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c3e72f4f958d1be570a72281deded4ed79275ed8fdcc01f521b7dea94fa3ff0e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-0c1bc70990ed2abb85234ce423eaddbdc350c3e5faafb5a7496e194419a6b32f",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-839479bc4310519658bfeefd51a53a5f721d2c8d3794f09abb9f214c8d644051",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-f7c87886203d0b45c79c43fe132cd4ec9f96ff045b0518c94133a50496744a85",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2ff77e9635b58bdbb172af9a5f2360ab5dc824a6e721d4e1db5da0737e90011f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-82194e8c85bb5134c96dd874b525694048e494c68653474dd7e5684866abfaae",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ea0c7700d736cdcebe875ba36902352f138054e5eedfc123a75aff112097fee0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-b1f06125269afb6fd73aa7806d29c23c7da25c934f5c50ffcedf632d0dc6c977",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-352349e805995f20cbca5944fa4887217060265b7d10ea14defd505adf85c5f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-8501f89d12bf805d8c86feb136cef516567868a3821373c88d46e6aeff9feb56",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e81676a5fbc1a105473b6a62e807050a09579d5959761fa9481378e283024971",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-5674b404a175bde997fa9d2fb71c3f1ed507c9162e05bedcc1de83ea645c25ef",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d9afba29fdb2db8813456c377d3eb62ee5605a82c32648a76c8d7262f6cb3fd8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ba6f5299970798c2ca761869200c0495dfa842e53af8f139675de848ab82cfe",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6fdc99858eaf011ec04b82162e90e09f1195bde23b7efd244e5267b48257a20d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-d7126e66ee2ba2a98246abb16061f7762382dc4326450782088699e97f5946e8",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-986ed6cf8cda7803dd3d29d8a08ca3d0e57b718d7c7ccd2e497390e0fd723419",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-094a3666fa1b5d30f1edb3c5b9c7cbae535b5aefa85c88bac34de1b1ef787b5c",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-78fdf02a42ad4f41e4947d2349592f4975a6a39dfe97eecf36f1b9de4f8bb9c8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-fc5362bbb7039468792c69492590b0924730b914f6387babb5ac4a0be6bdbd00",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bc42d731d1f61bddda090ece4656c91e512f5720def19caa87e447cfe69121fc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-f83334c691c7cfb535bcf816cc8510eab314c3727dc2d6254ecca4e499b08e0c",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3f4b245d3408d9ac2e443eb213f6f64f5710908e3eaed4321f20fd72bbcc81df",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "Quotes",
+        "Pairing",
+        "new",
+        "quoted_author",
+        "outer_of",
+        "pair_fetcher",
+        "pair_fetcher_mut",
+        "land_pairs"
+      ],
+      "context_complete": false,
+      "task_id": "T-09dbf3ebebbd2b463114434a671fffda83113f6004870b093a6cd7fea5057ef5",
+      "evidence_refs": [
+        "E44"
+      ]
+    }
+  ],
+  "task_id": "T-0f47fa962c6b4278cd54366053df24625c4646982276b8cacdedaa082ebef017"
+}

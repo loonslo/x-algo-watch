@@ -1,0 +1,757 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/models/loss_recsys.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-b3ceb65067f9765eb34696c2c2765825938d24baba5ab823453db3230ced16e7",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 391,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport logging\n\nimport jax\nimport jax.numpy as jnp\nimport optax\nfrom jax.sharding import PartitionSpec as P\n\nfrom xrex.data.recsys.ads_head_masking import EARLY_RELABEL_STREAM_ID\nfrom xrex.utils.sharding import with_sharding_constraint_unless_manual\n\nlogger = logging.getLogger(__name__)\nrank_logger = logging.getLogger(\"rank\")\n\n\ndef multihot_loss_weights(padding_mask: jax.Array, raw_weights: jax.Array | None) -> jax.Array:\n    mask = padding_mask.astype(jnp.int32)\n    return mask if raw_weights is None else mask * raw_weights\n\n\ndef multihot_loss_compute(\n    logits: jax.Array,\n    raw_targets: jax.Array,\n    padding_mask: jax.Array,\n    loss_mask: jax.Array,\n    raw_weights: jax.Array | None = None,\n    one_hot_targets_sharding=P(None),\n    normalizer: jax.Array | None = None,\n):\n    logits = logits.astype(jnp.float32)\n\n    one_hot_targets = with_sharding_constraint_unless_manual(raw_targets, one_hot_targets_sharding)\n\n    assert logits.shape == one_hot_targets.shape\n\n    mask_3d = jnp.expand_dims(padding_mask, axis=-1) * loss_mask\n    mask = padding_mask.astype(jnp.int32)\n\n    bce_per_element = optax.sigmoid_binary_cross_entropy(\n        logits, one_hot_targets.astype(logits.dtype)\n    )\n\n    masked_bce = bce_per_element * mask_3d\n\n    if raw_weights is not None:\n        masked_bce = masked_bce * jnp.expand_dims(raw_weights, axis=-1)\n    if normalizer is None:\n        normalizer = jnp.sum(multihot_loss_weights(padding_mask, raw_weights))\n\n    cross_entropy_loss = jnp.sum(masked_bce) / (normalizer + 1e-10)\n\n    return (\n        cross_entropy_loss,\n        mask,\n    )\n\n\ndef continuous_loss_weights(\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    mask_negatives: bool,\n    raw_weights: jax.Array | None,\n) -> tuple[jax.Array, jax.Array]:\n    loss_mask = valid_mask & (~negative_sample_mask) if mask_negatives else valid_mask\n    return loss_mask, (loss_mask if raw_weights is None else loss_mask * raw_weights)\n\n\ndef continuous_loss_compute(\n    gt_raw: jax.Array,\n    pred_raw: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    norm_scale: float,\n    loss_type: str = \"mse\",\n    mask_negatives: bool = True,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    gt_raw = gt_raw.astype(jnp.float32)\n    pred_raw = pred_raw.astype(jnp.float32)\n\n    gt_clamped = jnp.clip(gt_raw, 0.0, norm_scale)\n    gt_norm = gt_clamped / norm_scale\n    pred_norm = pred_raw\n\n    pred_in_original_units = pred_raw * norm_scale\n\n    loss_mask, weights = continuous_loss_weights(\n        valid_mask, negative_sample_mask, mask_negatives, raw_weights\n    )\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n\n    if loss_type == \"mse\":\n        errors = (pred_norm - gt_norm) ** 2\n    elif loss_type == \"mae\":\n        errors = jnp.abs(pred_norm - gt_norm)\n    elif loss_type == \"huber\":\n        delta = 1.0\n        abs_diff = jnp.abs(pred_norm - gt_norm)\n        errors = jnp.where(abs_diff <= delta, 0.5 * abs_diff**2, delta * (abs_diff - 0.5 * delta))\n    else:\n        raise ValueError(f\"Unknown loss_type: {loss_type}\")\n\n    loss = jnp.sum(errors * weights) / jnp.maximum(normalizer, 1.0)\n\n    return loss, gt_clamped, pred_in_original_units, loss_mask, errors\n\n\ndef cread_log_thresholds(\n    norm_scale: float,\n    log_min_threshold: float,\n    num_thresholds: int,\n) -> tuple[float, ...]:\n    if num_thresholds < 2:\n        raise ValueError(f\"num_thresholds must be at least 2, got {num_thresholds}\")\n    if not 0.0 < log_min_threshold < norm_scale:\n        raise ValueError(\n            f\"log_min_threshold ({log_min_threshold}) must be in (0, norm_scale={norm_scale})\"\n        )\n    ratio = norm_scale / log_min_threshold\n    thresholds = [\n        log_min_threshold * ratio ** (k / (num_thresholds - 1)) for k in range(num_thresholds - 1)\n    ]\n    return tuple(thresholds) + (norm_scale,)\n\n\ndef cread_loss_compute(\n    gt_raw: jax.Array,\n    cread_logits: jax.Array,\n    restored_pred: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    thresholds: tuple[float, ...],\n    norm_scale: float,\n    restoration_weight: float,\n    mask_negatives: bool = True,\n    sentinel_values: tuple[float, ...] = (),\n    raw_weights: jax.Array | None = None,\n    restoration_loss_type: str = \"mae\",\n    huber_delta: float = 0.1,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    gt_raw = gt_raw.astype(jnp.float32)\n    logits = cread_logits.astype(jnp.float32)\n    restored = restored_pred.astype(jnp.float32)\n\n    num_thresholds = logits.shape[-1]\n    assert num_thresholds == len(thresholds), (\n        f\"cread_logits has {num_thresholds} thresholds, expected {len(thresholds)}: {thresholds}\"\n    )\n\n    gt_clamped = jnp.clip(gt_raw, 0.0, norm_scale)\n\n    threshold_arr = jnp.asarray(thresholds, dtype=jnp.float32)\n    targets = (gt_raw[..., None] > threshold_arr).astype(jnp.float32)\n\n    per_element_cls = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets), axis=-1)\n    restore_residual = jnp.abs(restored - gt_clamped) / norm_scale\n    if restoration_loss_type == \"mae\":\n        per_element_restore = restore_residual\n    elif restoration_loss_type == \"huber\":\n        per_element_restore = jnp.where(\n            restore_residual <= huber_delta,\n            0.5 * restore_residual**2 / huber_delta,\n            restore_residual - 0.5 * huber_delta,\n        )\n    else:\n        raise ValueError(f\"Unknown restoration_loss_type: {restoration_loss_type}\")\n    per_element_loss = per_element_cls + restoration_weight * per_element_restore\n\n    if mask_negatives:\n        loss_mask = valid_mask.astype(jnp.bool_) & (~negative_sample_mask)\n    else:\n        loss_mask = valid_mask.astype(jnp.bool_)\n    for sentinel in sentinel_values:\n        loss_mask = loss_mask & (gt_raw != sentinel)\n\n    weights = loss_mask if raw_weights is None else loss_mask * raw_weights\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n    num_loss_samples = jnp.maximum(normalizer, 1.0)\n    cls_loss = jnp.sum(per_element_cls * weights) / num_loss_samples\n    restoration_loss = jnp.sum(per_element_restore * weights) / num_loss_samples\n    loss = cls_loss + restoration_weight * restoration_loss\n\n    return loss, gt_clamped, restored, loss_mask, per_element_loss, cls_loss, restoration_loss\n\n\ndef purchase_value_valid_mask(\n    label_valid: jax.Array,\n    padding_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    sample_source: jax.Array,\n    has_click: jax.Array,\n    has_purchase: jax.Array,\n    keeper_mask: jax.Array,\n) -> jax.Array:\n    return (\n        label_valid.astype(jnp.bool_)\n        & padding_mask.astype(jnp.bool_)\n        & ~negative_sample_mask.astype(jnp.bool_)\n        & (sample_source == EARLY_RELABEL_STREAM_ID)\n        & has_click.astype(jnp.bool_)\n        & has_purchase.astype(jnp.bool_)\n        & keeper_mask.astype(jnp.bool_)\n    )\n\n\ndef purchase_value_weights(\n    raw_ratio: jax.Array,\n    baseline_mean_usd: jax.Array,\n    valid_mask: jax.Array,\n    raw_weights: jax.Array | None,\n) -> tuple[jax.Array, jax.Array]:\n    ratio = raw_ratio.astype(jnp.float32)\n    baseline = baseline_mean_usd.astype(jnp.float32)\n    valid = (\n        valid_mask.astype(jnp.bool_)\n        & jnp.isfinite(ratio)\n        & (ratio > 0)\n        & jnp.isfinite(baseline)\n        & (baseline > 0)\n    )\n    weights = jnp.ones_like(ratio) if raw_weights is None else raw_weights.astype(jnp.float32)\n    valid = valid & jnp.isfinite(weights) & (weights > 0)\n    return valid, jnp.where(valid, weights, 0.0)\n\n\ndef purchase_value_loss_compute(\n    raw_ratio: jax.Array,\n    pred_ratio: jax.Array,\n    baseline_mean_usd: jax.Array,\n    valid_mask: jax.Array,\n    delta: float = 1.0,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array]:\n    if not 0 < delta < float(\"inf\"):\n        raise ValueError(\"purchase value Huber delta must be finite and positive\")\n    ratio = raw_ratio.astype(jnp.float32)\n    baseline = baseline_mean_usd.astype(jnp.float32)\n    pred = pred_ratio.astype(jnp.float32)\n    valid, weights = purchase_value_weights(raw_ratio, baseline_mean_usd, valid_mask, raw_weights)\n    target = jnp.where(valid, ratio, 0.0)\n    error = jnp.where(valid, jnp.where(valid, pred, 0.0) - target, 0.0)\n    abs_error = jnp.abs(error)\n    quadratic = jnp.minimum(abs_error, delta)\n    errors = 0.5 * quadratic**2 + delta * (abs_error - quadratic)\n    weight_sum = jnp.sum(weights)\n    if normalizer is None:\n        normalizer = weight_sum\n    loss = jnp.sum(errors * weights) / jnp.where(normalizer > 0, normalizer, 1.0)\n    usd_abs_error = abs_error * jnp.where(valid, baseline, 0.0)\n    sums = jnp.stack(\n        [\n            jnp.sum(errors * weights),\n            jnp.sum(abs_error * weights),\n            jnp.sum(target * weights),\n            jnp.sum(jnp.where(valid, baseline, 0.0) * weights),\n            weight_sum,\n            jnp.sum(valid).astype(jnp.float32),\n            jnp.sum(jnp.abs(1.0 - target) * weights),\n            jnp.sum(usd_abs_error * weights),\n            jnp.sum(jnp.where(valid, pred, 0.0) * weights),\n        ]\n    )\n    return loss, sums\n\n\ndef purchase_value_stats(sums: jax.Array) -> dict[str, jax.Array]:\n    denominator = jnp.where(sums[4] > 0, sums[4], 1.0)\n    return {\n        \"purchase-value_delayed_website_clicked-loss\": sums[0] / denominator,\n        \"purchase-value_delayed_website_clicked-valid-count\": sums[5],\n        \"purchase-value_delayed_website_clicked-weight-sum\": sums[4],\n        \"purchase-value_delayed_website_clicked-ratio-mae\": sums[1] / denominator,\n        \"purchase-value_delayed_website_clicked-target-ratio\": sums[2] / denominator,\n        \"purchase-value_delayed_website_clicked-baseline-mean-usd\": sums[3] / denominator,\n        \"purchase-value_delayed_website_clicked-usd-mae\": sums[7] / denominator,\n        \"purchase-value_delayed_website_clicked-calib\": sums[8] / (sums[2] + 1e-12),\n    }\n\n\ndef purchase_value_smoothed_stats(\n    sums: jax.Array,\n    slice_count: jax.Array,\n    rce_ema: dict[str, jax.Array],\n    batch_size: jax.Array,\n    smoothing_windows: tuple[int, ...],\n) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:\n    batch_stat = jnp.concatenate([sums, slice_count.astype(jnp.float32)[None]])\n    a = jnp.minimum(1.0, batch_size / jnp.array(smoothing_windows, dtype=jnp.float32))[:, None]\n    old = jnp.stack(\n        [\n            rce_ema.get(f\"purchase_value/{ws}\", jnp.zeros((10,), dtype=jnp.float32))\n            for ws in smoothing_windows\n        ]\n    )\n    raw_updated = (1.0 - a) * old + a * batch_stat[None, :]\n    updated = jnp.where(\n        jnp.isnan(raw_updated),\n        jnp.where(jnp.isnan(old), batch_stat[None, :], old),\n        raw_updated,\n    )\n    weight = jnp.maximum(updated[:, 4], 1e-12)\n    has_labels = updated[:, 5] > 0\n    stats: dict[str, jax.Array] = {}\n    new_ema: dict[str, jax.Array] = {}\n    for i, ws in enumerate(smoothing_windows):\n        new_ema[f\"purchase_value/{ws}\"] = updated[i]\n        prefix = \"purchase-value_delayed_website_clicked-smoothed\"\n        for name, col in (\n            (\"loss\", 0),\n            (\"ratio-mae\", 1),\n            (\"target-ratio\", 2),\n            (\"baseline-mean-usd\", 3),\n            (\"usd-mae\", 7),\n        ):\n            stats[f\"{prefix}-{name}-{ws}\"] = jnp.where(\n                has_labels[i], updated[i, col] / weight[i], 0.0\n            )\n        stats[f\"{prefix}-mae-vs-prior-{ws}\"] = jnp.where(\n            updated[i, 6] > 0, updated[i, 1] / jnp.maximum(updated[i, 6], 1e-12), 0.0\n        )\n        stats[f\"{prefix}-calib-{ws}\"] = jnp.where(\n            updated[i, 2] > 0, updated[i, 8] / jnp.maximum(updated[i, 2], 1e-12), 0.0\n        )\n        stats[f\"{prefix}-ratio-valid-{ws}\"] = updated[i, 5] / jnp.maximum(updated[i, 9], 1.0)\n        stats[f\"{prefix}-valid-count-{ws}\"] = updated[i, 5]\n    return stats, new_ema\n\n\ndef binary_threshold_loss_compute(\n    gt_raw: jax.Array,\n    logit: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    threshold: float,\n    mask_negatives: bool = True,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    logit = logit.astype(jnp.float32)\n    gt_binary = (gt_raw.astype(jnp.float32) > threshold).astype(jnp.float32)\n    per_element_loss = optax.sigmoid_binary_cross_entropy(logit, gt_binary)\n\n    loss_mask, weights = continuous_loss_weights(\n        valid_mask, negative_sample_mask, mask_negatives, raw_weights\n    )\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n    loss = jnp.sum(per_element_loss * weights) / jnp.maximum(normalizer, 1.0)\n\n    pred_prob = jax.nn.sigmoid(logit)\n    return loss, gt_binary, pred_prob, loss_mask, per_element_loss\n\n\ndef tweedie_loss_compute(\n    gt_raw: jax.Array,\n    pred_raw: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    p: float = 1.5,\n    norm_scale: float = 300.0,\n    mask_negatives: bool = True,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    gt = jnp.clip(gt_raw.astype(jnp.float32), 0.0, norm_scale)\n    pred = jnp.maximum(pred_raw.astype(jnp.float32), 1e-6)\n\n    if abs(p - 1.0) < 1e-8:\n        deviance = -gt * jnp.log(pred) + pred\n    elif abs(p - 2.0) < 1e-8:\n        deviance = gt / pred + jnp.log(pred)\n    else:\n        log_pred = jnp.log(pred)\n        deviance = -gt * jnp.exp((1.0 - p) * log_pred) / (1.0 - p) + jnp.exp(\n            (2.0 - p) * log_pred\n        ) / (2.0 - p)\n\n    loss_mask, weights = continuous_loss_weights(\n        valid_mask, negative_sample_mask, mask_negatives, raw_weights\n    )\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n    loss = jnp.sum(deviance * weights) / jnp.maximum(normalizer, 1.0)\n\n    return loss, gt, pred, loss_mask, deviance\n",
+      "source_digest": "78a86f92b34486cd4207adf7ab0d6f1314e31f90005028634f9666b14635b65f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 246,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport logging\n\nimport jax\nimport jax.numpy as jnp\nimport optax\nfrom jax.sharding import PartitionSpec as P\n\nfrom xrex.utils.sharding import with_sharding_constraint_unless_manual\n\nlogger = logging.getLogger(__name__)\nrank_logger = logging.getLogger(\"rank\")\n\n\ndef multihot_loss_weights(padding_mask: jax.Array, raw_weights: jax.Array | None) -> jax.Array:\n    mask = padding_mask.astype(jnp.int32)\n    return mask if raw_weights is None else mask * raw_weights\n\n\ndef multihot_loss_compute(\n    logits: jax.Array,\n    raw_targets: jax.Array,\n    padding_mask: jax.Array,\n    loss_mask: jax.Array,\n    raw_weights: jax.Array | None = None,\n    one_hot_targets_sharding=P(None),\n    normalizer: jax.Array | None = None,\n):\n    logits = logits.astype(jnp.float32)\n\n    one_hot_targets = with_sharding_constraint_unless_manual(raw_targets, one_hot_targets_sharding)\n\n    assert logits.shape == one_hot_targets.shape\n\n    mask_3d = jnp.expand_dims(padding_mask, axis=-1) * loss_mask\n    mask = padding_mask.astype(jnp.int32)\n\n    bce_per_element = optax.sigmoid_binary_cross_entropy(\n        logits, one_hot_targets.astype(logits.dtype)\n    )\n\n    masked_bce = bce_per_element * mask_3d\n\n    if raw_weights is not None:\n        masked_bce = masked_bce * jnp.expand_dims(raw_weights, axis=-1)\n    if normalizer is None:\n        normalizer = jnp.sum(multihot_loss_weights(padding_mask, raw_weights))\n\n    cross_entropy_loss = jnp.sum(masked_bce) / (normalizer + 1e-10)\n\n    return (\n        cross_entropy_loss,\n        mask,\n    )\n\n\ndef continuous_loss_weights(\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    mask_negatives: bool,\n    raw_weights: jax.Array | None,\n) -> tuple[jax.Array, jax.Array]:\n    loss_mask = valid_mask & (~negative_sample_mask) if mask_negatives else valid_mask\n    return loss_mask, (loss_mask if raw_weights is None else loss_mask * raw_weights)\n\n\ndef continuous_loss_compute(\n    gt_raw: jax.Array,\n    pred_raw: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    norm_scale: float,\n    loss_type: str = \"mse\",\n    mask_negatives: bool = True,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    gt_raw = gt_raw.astype(jnp.float32)\n    pred_raw = pred_raw.astype(jnp.float32)\n\n    gt_clamped = jnp.clip(gt_raw, 0.0, norm_scale)\n    gt_norm = gt_clamped / norm_scale\n    pred_norm = pred_raw\n\n    pred_in_original_units = pred_raw * norm_scale\n\n    loss_mask, weights = continuous_loss_weights(\n        valid_mask, negative_sample_mask, mask_negatives, raw_weights\n    )\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n\n    if loss_type == \"mse\":\n        errors = (pred_norm - gt_norm) ** 2\n    elif loss_type == \"mae\":\n        errors = jnp.abs(pred_norm - gt_norm)\n    elif loss_type == \"huber\":\n        delta = 1.0\n        abs_diff = jnp.abs(pred_norm - gt_norm)\n        errors = jnp.where(abs_diff <= delta, 0.5 * abs_diff**2, delta * (abs_diff - 0.5 * delta))\n    else:\n        raise ValueError(f\"Unknown loss_type: {loss_type}\")\n\n    loss = jnp.sum(errors * weights) / jnp.maximum(normalizer, 1.0)\n\n    return loss, gt_clamped, pred_in_original_units, loss_mask, errors\n\n\ndef cread_log_thresholds(\n    norm_scale: float,\n    log_min_threshold: float,\n    num_thresholds: int,\n) -> tuple[float, ...]:\n    if num_thresholds < 2:\n        raise ValueError(f\"num_thresholds must be at least 2, got {num_thresholds}\")\n    if not 0.0 < log_min_threshold < norm_scale:\n        raise ValueError(\n            f\"log_min_threshold ({log_min_threshold}) must be in (0, norm_scale={norm_scale})\"\n        )\n    ratio = norm_scale / log_min_threshold\n    thresholds = [\n        log_min_threshold * ratio ** (k / (num_thresholds - 1)) for k in range(num_thresholds - 1)\n    ]\n    return tuple(thresholds) + (norm_scale,)\n\n\ndef cread_loss_compute(\n    gt_raw: jax.Array,\n    cread_logits: jax.Array,\n    restored_pred: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    thresholds: tuple[float, ...],\n    norm_scale: float,\n    restoration_weight: float,\n    mask_negatives: bool = True,\n    sentinel_values: tuple[float, ...] = (),\n    raw_weights: jax.Array | None = None,\n    restoration_loss_type: str = \"mae\",\n    huber_delta: float = 0.1,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    gt_raw = gt_raw.astype(jnp.float32)\n    logits = cread_logits.astype(jnp.float32)\n    restored = restored_pred.astype(jnp.float32)\n\n    num_thresholds = logits.shape[-1]\n    assert num_thresholds == len(thresholds), (\n        f\"cread_logits has {num_thresholds} thresholds, expected {len(thresholds)}: {thresholds}\"\n    )\n\n    gt_clamped = jnp.clip(gt_raw, 0.0, norm_scale)\n\n    threshold_arr = jnp.asarray(thresholds, dtype=jnp.float32)\n    targets = (gt_raw[..., None] > threshold_arr).astype(jnp.float32)\n\n    per_element_cls = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets), axis=-1)\n    restore_residual = jnp.abs(restored - gt_clamped) / norm_scale\n    if restoration_loss_type == \"mae\":\n        per_element_restore = restore_residual\n    elif restoration_loss_type == \"huber\":\n        per_element_restore = jnp.where(\n            restore_residual <= huber_delta,\n            0.5 * restore_residual**2 / huber_delta,\n            restore_residual - 0.5 * huber_delta,\n        )\n    else:\n        raise ValueError(f\"Unknown restoration_loss_type: {restoration_loss_type}\")\n    per_element_loss = per_element_cls + restoration_weight * per_element_restore\n\n    if mask_negatives:\n        loss_mask = valid_mask.astype(jnp.bool_) & (~negative_sample_mask)\n    else:\n        loss_mask = valid_mask.astype(jnp.bool_)\n    for sentinel in sentinel_values:\n        loss_mask = loss_mask & (gt_raw != sentinel)\n\n    weights = loss_mask if raw_weights is None else loss_mask * raw_weights\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n    num_loss_samples = jnp.maximum(normalizer, 1.0)\n    cls_loss = jnp.sum(per_element_cls * weights) / num_loss_samples\n    restoration_loss = jnp.sum(per_element_restore * weights) / num_loss_samples\n    loss = cls_loss + restoration_weight * restoration_loss\n\n    return loss, gt_clamped, restored, loss_mask, per_element_loss, cls_loss, restoration_loss\n\n\ndef binary_threshold_loss_compute(\n    gt_raw: jax.Array,\n    logit: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    threshold: float,\n    mask_negatives: bool = True,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    logit = logit.astype(jnp.float32)\n    gt_binary = (gt_raw.astype(jnp.float32) > threshold).astype(jnp.float32)\n    per_element_loss = optax.sigmoid_binary_cross_entropy(logit, gt_binary)\n\n    loss_mask, weights = continuous_loss_weights(\n        valid_mask, negative_sample_mask, mask_negatives, raw_weights\n    )\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n    loss = jnp.sum(per_element_loss * weights) / jnp.maximum(normalizer, 1.0)\n\n    pred_prob = jax.nn.sigmoid(logit)\n    return loss, gt_binary, pred_prob, loss_mask, per_element_loss\n\n\ndef tweedie_loss_compute(\n    gt_raw: jax.Array,\n    pred_raw: jax.Array,\n    valid_mask: jax.Array,\n    negative_sample_mask: jax.Array,\n    p: float = 1.5,\n    norm_scale: float = 300.0,\n    mask_negatives: bool = True,\n    raw_weights: jax.Array | None = None,\n    normalizer: jax.Array | None = None,\n) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:\n    gt = jnp.clip(gt_raw.astype(jnp.float32), 0.0, norm_scale)\n    pred = jnp.maximum(pred_raw.astype(jnp.float32), 1e-6)\n\n    if abs(p - 1.0) < 1e-8:\n        deviance = -gt * jnp.log(pred) + pred\n    elif abs(p - 2.0) < 1e-8:\n        deviance = gt / pred + jnp.log(pred)\n    else:\n        log_pred = jnp.log(pred)\n        deviance = -gt * jnp.exp((1.0 - p) * log_pred) / (1.0 - p) + jnp.exp(\n            (2.0 - p) * log_pred\n        ) / (2.0 - p)\n\n    loss_mask, weights = continuous_loss_weights(\n        valid_mask, negative_sample_mask, mask_negatives, raw_weights\n    )\n    if normalizer is None:\n        normalizer = jnp.sum(weights)\n    loss = jnp.sum(deviance * weights) / jnp.maximum(normalizer, 1.0)\n\n    return loss, gt, pred, loss_mask, deviance\n",
+      "source_digest": "3fb4d93d1c31f624c68f1b4e6ef0a90cd05625cc900b12435d3d9e1555a87ed6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 41,
+      "end_line": 65,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ADS_PRODUCT_KEY_TABLE_SIZE,\n    ENGAGEMENT_COUNT_BUCKET_MAP,\n    BoolFeature,\n    CategoricalFeature,\n    FloatFeature,\n    Int64Feature,\n)\nfrom xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch\nfrom xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats\nfrom xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n",
+      "source_digest": "e8e1155332c89ed99ec13054b8f33b7d91894a046470c46eb9d6b14564848796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 45,
+      "end_line": 69,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    FloatFeature,\n    Int64Feature,\n)\nfrom xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch\nfrom xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats\nfrom xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n",
+      "source_digest": "6bad5aa266f18a285a4bf48e9bcc840d04db20a827ebee2f6921948abc84da08",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch\nfrom xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats\nfrom xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n    REALIZED_POSITIVE_ACTIONS,\n    PageDecodeInputs,\n",
+      "source_digest": "59625fc007afccce4c8bcb94c194695fb9cdeb2360a3b1ed0a63810983e406e4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 49,
+      "end_line": 73,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats\nfrom xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n    REALIZED_POSITIVE_ACTIONS,\n    PageDecodeInputs,\n    PageRlConfig,\n",
+      "source_digest": "0c1d572a0d740e9a15e3a472066ce0bbf36732881418cc814f4bdd67525af9ab",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n    REALIZED_POSITIVE_ACTIONS,\n    PageDecodeInputs,\n    PageRlConfig,\n    page_decode_noop_outputs,\n",
+      "source_digest": "4ee5c30fccedc56da7a85dbe8d4790f9226ed73d7020a09c55c350f69feb6bfb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n    REALIZED_POSITIVE_ACTIONS,\n    PageDecodeInputs,\n    PageRlConfig,\n    page_decode_noop_outputs,\n    page_rl_head_features,\n",
+      "source_digest": "ba41e44a75bcf38be98f70c224253d3ff2f76ec02c6121dfb3ebd5a5dc098b9f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    purchase_value_loss_compute,\n    purchase_value_smoothed_stats,\n    purchase_value_stats,\n    purchase_value_valid_mask,\n    purchase_value_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n    REALIZED_POSITIVE_ACTIONS,\n    PageDecodeInputs,\n    PageRlConfig,\n    page_decode_noop_outputs,\n    page_rl_head_features,\n    page_rl_loss_and_stats,\n",
+      "source_digest": "b49e06e7f0e3c5521168fffb100976dbbc838ef5f38b59ef10a1ecc819a7fc0d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3783,
+      "end_line": 3807,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    value = batch[\"candidate_seq\"].get(name)\n                    if value is None:\n                        return jnp.zeros(mask.shape, dtype=dtype)\n                    value = cast_jax(value).astype(dtype)\n                    pad_len = mask.shape[1] - value.shape[1]\n                    return jnp.pad(value, ((0, 0), (0, pad_len)))\n\n                keeper_mask = (\n                    trained_heads.any(-1)\n                    if trained_heads is not None\n                    else jnp.ones_like(loss_padding_mask, dtype=jnp.bool_)\n                )\n                value_mask = purchase_value_valid_mask(\n                    label_valid=value_operand(\"value_label_valid\", jnp.bool_),\n                    padding_mask=loss_padding_mask,\n                    negative_sample_mask=negative_sample_mask,\n                    sample_source=source_id\n                    if source_id is not None\n                    else jnp.zeros_like(loss_padding_mask),\n                    has_click=targets[:, :, CLICK_ACTION_INDEX],\n                    has_purchase=targets[:, :, recsys_pb2.ActionName.ADS_PURCHASE_CONVERSION],\n                    keeper_mask=keeper_mask,\n                )\n                value_ratio = (\n                    candidate_continuous_actions[:, :, PURCHASE_VALUE_ACTION_INDEX]\n",
+      "source_digest": "69ce9c7ef7fc880913e2197f59be6f500cc92d8bfce57d1f0ec2de85a6a39eee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3802,
+      "end_line": 3826,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    has_click=targets[:, :, CLICK_ACTION_INDEX],\n                    has_purchase=targets[:, :, recsys_pb2.ActionName.ADS_PURCHASE_CONVERSION],\n                    keeper_mask=keeper_mask,\n                )\n                value_ratio = (\n                    candidate_continuous_actions[:, :, PURCHASE_VALUE_ACTION_INDEX]\n                    if candidate_continuous_actions is not None\n                    and candidate_continuous_actions.shape[-1] > PURCHASE_VALUE_ACTION_INDEX\n                    else jnp.zeros_like(loss_padding_mask, dtype=jnp.float32)\n                )\n                baseline = value_operand(\"value_baseline_mean_usd\", jnp.float32)\n                purchase_value = (value_ratio, baseline, value_mask)\n                _, weights = purchase_value_weights(value_ratio, baseline, value_mask, loss_weights)\n                total[\"purchase_value\"] = jnp.sum(weights)\n\n            candidate_inputs.append(\n                CandidateInputs(\n                    targets=targets,\n                    target_padding_mask=target_padding_mask,\n                    negative_sample_mask=negative_sample_mask,\n                    product_surface=product_surface,\n                    promoted_ids=promoted_ids,\n                    continuous_actions=candidate_continuous_actions,\n                    client_app_id=client_app_id,\n                    line_item_objective=line_item_objective,\n",
+      "source_digest": "91a886df84e6f52a5089787301ff4c16283ed6d22ac42719afc622ce20d74859",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4156,
+      "end_line": 4180,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    (0.0, DWELL_TIME_DEFAULT_SENTINEL_SEC)\n                    if loss_config.cread_mask_sentinel_labels\n                    else ()\n                )\n                (\n                    action_loss,\n                    gt_clamped,\n                    pred_in_original_units,\n                    cont_loss_mask,\n                    per_element_loss,\n                    cread_cls_loss,\n                    cread_restoration_loss,\n                ) = cread_loss_compute(\n                    gt_raw=gt_raw,\n                    cread_logits=self.cread_logits[loss_config.metric_name],\n                    restored_pred=pred_raw,\n                    valid_mask=head_valid_mask,\n                    negative_sample_mask=c.negative_sample_mask,\n                    thresholds=loss_config.cread_threshold_values,\n                    norm_scale=loss_config.norm_config.norm_scale,\n                    restoration_weight=loss_config.cread_restoration_weight,\n                    mask_negatives=loss_config.mask_negatives,\n                    sentinel_values=sentinel_values,\n                    raw_weights=loss_weights,\n                    restoration_loss_type=loss_config.cread_restoration_loss,\n",
+      "source_digest": "fee324206ca6e6ac2e96d75e19e1e45410760b64ca1e4f5ac3080c1b77eabe56",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4201,
+      "end_line": 4225,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    norm_scale=loss_config.norm_config.norm_scale,\n                    mask_negatives=loss_config.mask_negatives,\n                    raw_weights=loss_weights,\n                    normalizer=head_normalizer,\n                )\n            elif loss_config.loss_type == \"binary\":\n                (\n                    action_loss,\n                    gt_clamped,\n                    pred_in_original_units,\n                    cont_loss_mask,\n                    per_element_loss,\n                ) = binary_threshold_loss_compute(\n                    gt_raw=gt_raw,\n                    logit=head_logits_by_index[loss_config.action_index][..., 0],\n                    valid_mask=head_valid_mask,\n                    negative_sample_mask=c.negative_sample_mask,\n                    threshold=loss_config.binary_threshold,\n                    mask_negatives=loss_config.mask_negatives,\n                    raw_weights=loss_weights,\n                    normalizer=head_normalizer,\n                )\n            else:\n                (\n                    action_loss,\n",
+      "source_digest": "3b9d241db4bec48f1baae2eed3e22e2ddcce1f11b1e201dadf9b7764a096862a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4246,
+      "end_line": 4270,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"per_element_loss\": per_element_loss,\n                \"loss_mask\": cont_loss_mask,\n            }\n\n        stats = summarizer.get()\n        if loss_normalizers is not None:\n            assert stats.keys() <= {\"act-l2-loss\", \"attn-loss\", \"ffn-loss\"}, stats.keys()\n            stats = {key: value / loss_normalizers[\"num_partials\"] for key, value in stats.items()}\n        stats[\"origin-loss\"] = loss\n        stats.update(cread_stats)\n        if c.purchase_value is not None:\n            value_ratio, baseline, value_mask = c.purchase_value\n            value_loss, value_sums = purchase_value_loss_compute(\n                raw_ratio=value_ratio,\n                pred_ratio=candidate_continuous_preds[:, :, PURCHASE_VALUE_ACTION_INDEX],\n                baseline_mean_usd=baseline,\n                valid_mask=value_mask,\n                delta=self.config.purchase_value_huber_delta,\n                raw_weights=loss_weights,\n                normalizer=normalizer(\"purchase_value\"),\n            )\n            continuous_action_loss_total += self.config.purchase_value_loss_weight * value_loss\n            stats[\"_purchase-value-sums\"] = value_sums\n\n        regularization_loss = loss + self.config.act_l2_weight * stats[\"act-l2-loss\"]\n",
+      "source_digest": "867dc89bcedcd95c30b9f2f6e144be6ccbb904778b4f3c1cf2bfb40b01de2eb3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4557,
+      "end_line": 4581,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    loss_config.norm_config.norm_scale,\n                )\n            else:\n                xauc_gt = head[\"gt_clamped\"]\n            xauc_mask = head[\"loss_mask\"] & (xauc_gt > 0)\n            stats[f\"{loss_config.metric_name}-xauc-clicked\"] = metric_xauc(\n                pred=head[\"pred\"],\n                gt=xauc_gt,\n                valid_mask=xauc_mask,\n            )\n\n        if value_sums is not None:\n            value_stats = purchase_value_stats(value_sums)\n            stats.update(value_stats)\n            slice_count = stats.get(\n                \"delayed_website_clicked_num_tokens\", jnp.zeros((), jnp.float32)\n            )\n            stats[\"purchase-value_delayed_website_clicked-ratio-valid\"] = value_stats[\n                \"purchase-value_delayed_website_clicked-valid-count\"\n            ] / jnp.maximum(slice_count, 1)\n            if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None:\n                smoothed_stats, value_ema = purchase_value_smoothed_stats(\n                    sums=value_sums,\n                    slice_count=slice_count,\n                    rce_ema=rce_ema,\n",
+      "source_digest": "7911b4d96a912ff18ac921a5225bd2c521409c216f9be977011284a570d0fd65",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 4566,
+      "end_line": 4590,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            )\n\n        if value_sums is not None:\n            value_stats = purchase_value_stats(value_sums)\n            stats.update(value_stats)\n            slice_count = stats.get(\n                \"delayed_website_clicked_num_tokens\", jnp.zeros((), jnp.float32)\n            )\n            stats[\"purchase-value_delayed_website_clicked-ratio-valid\"] = value_stats[\n                \"purchase-value_delayed_website_clicked-valid-count\"\n            ] / jnp.maximum(slice_count, 1)\n            if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None:\n                smoothed_stats, value_ema = purchase_value_smoothed_stats(\n                    sums=value_sums,\n                    slice_count=slice_count,\n                    rce_ema=rce_ema,\n                    batch_size=rce_alpha[0] * smoothing_windows[0],\n                    smoothing_windows=self.config.purchase_value_smoothing_windows,\n                )\n                stats.update(smoothed_stats)\n                stats[\"_rce_ema\"] = {**stats.get(\"_rce_ema\", {}), **value_ema}\n\n        embedding_norms: dict[str, tuple[jax.Array, jax.Array]] = metric_inputs[\"embedding_norms\"]\n        for name, (l2_norms, padding) in embedding_norms.items():\n            num_valid = jnp.maximum(padding.sum(), 1.0)\n",
+      "source_digest": "c1777e202dfe1eeb0d4f4dd58aac49e64890cb8d3e81542939f62a81a6bf63cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 49,
+      "end_line": 73,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": ")\nfrom xrex.data.recsys.recsys_batch import (\n    AUX_VALUE_EVENTS,\n    EMBEDDING_CONFIG,\n    EmbeddingType,\n    RecsysFeaturesBatch,\n    aux_value_label_keys,\n)\nfrom xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats\nfrom xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n",
+      "source_digest": "38a0dc4f3b3b37206547835321c45731e0dd1ac8f938e59cc43d91c86ac23987",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 53,
+      "end_line": 77,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    EmbeddingType,\n    RecsysFeaturesBatch,\n    aux_value_label_keys,\n)\nfrom xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats\nfrom xrex.data.recsys.sequence_packing import SequencePackedLayout, packed_prefix_positions\nfrom xrex.models.layers import Linear, get_parameter\nfrom xrex.models.loss_recsys import (\n    binary_threshold_loss_compute,\n    continuous_loss_compute,\n    continuous_loss_weights,\n    cread_log_thresholds,\n    cread_loss_compute,\n    multihot_loss_compute,\n    multihot_loss_weights,\n    tweedie_loss_compute,\n)\nfrom xrex.models.model_utils import Parameter\nfrom xrex.models.normalization import rms_norm_fn\nfrom xrex.models.page_rl import (\n    REALIZED_NEGATIVE_ACTIONS,\n    REALIZED_POSITIVE_ACTIONS,\n    PageDecodeInputs,\n    PageRlConfig,\n    page_decode_noop_outputs,\n",
+      "source_digest": "f81a3c94935a6ca4dc0518f7bb2dc329aec824d9009b999f0bed91638988dd64",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4658,
+      "end_line": 4682,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    (0.0, DWELL_TIME_DEFAULT_SENTINEL_SEC)\n                    if loss_config.cread_mask_sentinel_labels\n                    else ()\n                )\n                (\n                    action_loss,\n                    gt_clamped,\n                    pred_in_original_units,\n                    cont_loss_mask,\n                    per_element_loss,\n                    cread_cls_loss,\n                    cread_restoration_loss,\n                ) = cread_loss_compute(\n                    gt_raw=gt_raw,\n                    cread_logits=self.cread_logits[loss_config.metric_name],\n                    restored_pred=pred_raw,\n                    valid_mask=head_valid_mask,\n                    negative_sample_mask=c.negative_sample_mask,\n                    thresholds=loss_config.cread_threshold_values,\n                    norm_scale=loss_config.norm_config.norm_scale,\n                    restoration_weight=loss_config.cread_restoration_weight,\n                    mask_negatives=loss_config.mask_negatives,\n                    sentinel_values=sentinel_values,\n                    raw_weights=loss_weights,\n                    restoration_loss_type=loss_config.cread_restoration_loss,\n",
+      "source_digest": "fee324206ca6e6ac2e96d75e19e1e45410760b64ca1e4f5ac3080c1b77eabe56",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "phoenix/xrex/models/recsys_model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4703,
+      "end_line": 4727,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    norm_scale=loss_config.norm_config.norm_scale,\n                    mask_negatives=loss_config.mask_negatives,\n                    raw_weights=loss_weights,\n                    normalizer=head_normalizer,\n                )\n            elif loss_config.loss_type == \"binary\":\n                (\n                    action_loss,\n                    gt_clamped,\n                    pred_in_original_units,\n                    cont_loss_mask,\n                    per_element_loss,\n                ) = binary_threshold_loss_compute(\n                    gt_raw=gt_raw,\n                    logit=head_logits_by_index[loss_config.action_index][..., 0],\n                    valid_mask=head_valid_mask,\n                    negative_sample_mask=c.negative_sample_mask,\n                    threshold=loss_config.binary_threshold,\n                    mask_negatives=loss_config.mask_negatives,\n                    raw_weights=loss_weights,\n                    normalizer=head_normalizer,\n                )\n            else:\n                (\n                    action_loss,\n",
+      "source_digest": "3b9d241db4bec48f1baae2eed3e22e2ddcce1f11b1e201dadf9b7764a096862a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b3ceb65067f9765eb34696c2c2765825938d24baba5ab823453db3230ced16e7",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "afa130102a9cf1f2ec59255a0235bf6455db8b653df36c8e83f6fd9b11c4c137",
+      "context_complete": true,
+      "task_id": "T-371923d9cbd0d35b78606d2479ac2edf7c92d044c1142ac30e5274c2b808ba52",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-df035d12c597414bceeb11384c32125f102feefd0a6036fc6e9c2c99bc57e81e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-79dcc624494eb0b4bece1bca14322070a8449f75119b715ef07a86bcf619b821",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1ac1be1be800ac3459f6d1a17a196a71800a74a60a244e3d245985434e4fa78a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-806ca524cce1640506935970366aa7df2d1c814845454741579b83ffbb2c3fb2",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6403e7fd8355985bb46a4b2b8af91994555846dde8bb2cf9d11681f52f0baeb6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-2ae33101bfd6d2774a7d4551ce07f30ba8093318a1499d588657fe99dff46564",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a02db101573519d4afb581f02a50d648b16f4796f761525bafffd74295736778",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-faa8796e19be60475374de2c447c69fe7b922571eb73c24a0156c6ccf5a8d157",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-53b6f482574bda0ee1a484592117a70a8dfa34cec79b20344a76e538401556f3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-8e06c80b09f09e03463e8b0b010aacad2f3948a7d1243a28da27ec6ce06b3d66",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4bea5e1acce498f71afcf40cbd074473af2f23838fa830f230337a52792c3224",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-8925a65c3922b63f5ddafb5fce0f5936da77ef2cb460cf7a22d1b8f95985cf62",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-68c2a6c993511900953bce1a8361e276a564fd38a03acbcf6f6e7c345f23d427",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-042415c2c6cd236c38f07259cf900b713aff5a4a43f388b734c173bd762e70df",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-38b2171c0354efd04ccc1b27b77b36e7accd9bba901fe47bd4f66c557b9c2dc4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-45ce3b7160a50747c065e6b019402a606989f8d8718f3a8d17a5f77ad4e117f4",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-867a86309aabc63e0bea832592d020e8dbc129a4098eb34b5e78368ddb3281fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-79d413b5b1df7bc627d44bd41612bb44b2301d8c83e7d9d5f38426ece280abf8",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6a7f405e02c11e2468e1738fce9ea5854d2796041eeb33039a93617da5fc54b2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-382087ca3620326eca243762a0ed42dba8acc60ed78caab7431c331f73b7bfc4",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4ceb8f812bb310601d61aefa55ec7727f59c7837c3d289c5c1fcb3671d363ae0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-e3a44b440218aed884c1257026cda8ef3780c9212689748058c518a5f12de5a7",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8ab36f8dd3e145d993ab59eb056686bad2d8a56afae0ef0479fbe3eee0ab2c30",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-cba20fab33b6556dac2b0494299ad6003ac229e0fe874315335d4b5b94766d35",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bce72dba11d42c025989ff0ee430456a9bc29c3d700d8e0eee0640a1f012f931",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-eab12c1e79dff0f45ab12a544fea9944a8df824168a64dad227ab2d96a085e8a",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-837f70876c0e5dc67abca2b43747d2731a197ca2e8fc38050e3e91297b6ec120",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-72a8df57d069e4bb17436ca3de5c6b43a4adf00c2e572d071c38b2657cc92402",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-82af88598f661503eba23bc1a6ab1783aded2e357a51f24b1017c9c8168c4d96",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-8f8cf3778a0c8bbf04666e72c200420fc55beb86c4f2a6f3cf943b078700e7eb",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-76e3a452943be33b4017e5e20bb6fd6e62b9b2f2e8a7da0869ee094653229f67",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-fcf6367ba614f6ee6013e48fe9a97b83278e34e57790fbca5308f21aed7ff48e",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-08dea5902cf4e28b5dcf7a2dbb5ac42dc13bc70583bebffb360dc8e45af6ddc7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-99cc45ad7e76c7106726f1b836a1126cd3611af2455fcb7ce70f63078472e591",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/loss_recsys.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3a8ba03a1f281d2711513a62fa211314198dac4daea32d655e5955dc5a11582d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "cread_loss_compute",
+        "purchase_value_valid_mask",
+        "purchase_value_weights",
+        "purchase_value_loss_compute",
+        "purchase_value_stats",
+        "purchase_value_smoothed_stats",
+        "binary_threshold_loss_compute"
+      ],
+      "context_complete": false,
+      "task_id": "T-28adeab2c90debc636ce5b686d7683310c976b372c0ba6067e0f196c3290cca5",
+      "evidence_refs": [
+        "E20"
+      ]
+    }
+  ],
+  "task_id": "T-346c8c021a70f1381d90d4512afe539b0273bff116fdaafb25e1ee53a719e767"
+}

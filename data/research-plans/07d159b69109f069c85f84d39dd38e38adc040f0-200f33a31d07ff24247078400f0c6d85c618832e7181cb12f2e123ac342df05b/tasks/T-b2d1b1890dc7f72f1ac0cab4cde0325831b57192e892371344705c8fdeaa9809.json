@@ -1,0 +1,1705 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/models/attention.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-f44ba0fb589bcc59246d0873fbadd5fd053e410fdccd46a68bc907a3f71be154",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/models/attention.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 328,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport functools\nfrom typing import Any, Callable, Optional\n\nimport haiku as hk\nimport jax\nimport jax.numpy as jnp\n\nfrom xai_configlib import Config, configclass\nfrom xrex.models.scaling import ScaleConfig\nfrom xrex.models.sharding_context import NamedShape, ShardingContext\nfrom xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual\n\n\n\u0040configclass\nclass AttentionConfig(Config):\n    key_size: int\n    num_q_heads: int\n    num_kv_heads: int\n    causal: bool = True\n    with_bias: bool = False\n    attn_logit_cap: float = -1.0\n    attn_logit_cap_method: str = \"tanh\"\n    attn_impl: str = \"pallas_attn\"\n    attn_sharding_namespace: str = \"attention\"\n    fa_version: str = \"3\"\n    qk_norm: bool = False\n    rotary: bool = False\n    rope_type: Optional[str] = \"1d\"\n    rope_base_exponent: int = 10000\n    temperature_scaling_const: int = -1\n    qkv_merge: bool = False\n    max_num_segments_per_batch: int = 128\n    enable_determinism: bool = False\n    attn_output_gate: bool = False\n    attn_output_gate_activation: str = \"silu\"\n\n\nclass Attention(hk.Module):\n    window_size: int = -1\n    supports_candidate_only: bool = False\n\n    def __init__(\n        self,\n        config: AttentionConfig,\n        scale_config: ScaleConfig,\n        name: Optional[str] = None,\n        sharding_context: ShardingContext = None,\n    ):\n        super().__init__(name=name)\n        self.config = config\n        self.scale_config = scale_config\n        self.sharding_context = sharding_context\n\n    def __call__(\n        self,\n        query: jax.Array,\n        key: Optional[jax.Array],\n        value: Optional[jax.Array],\n        segment_ids: Optional[jax.Array],\n        segment_ids_k: Optional[jax.Array],\n        temp: Optional[jax.Array],\n        **kwargs,\n    ):\n        return self.call_attn(query, key, value, segment_ids, segment_ids_k, temp, **kwargs)\n\n    def call_attn(\n        self,\n        query: jax.Array,\n        key: Optional[jax.Array],\n        value: Optional[jax.Array],\n        segment_ids: Optional[jax.Array],\n        segment_ids_k: Optional[jax.Array],\n        temp: Optional[jax.Array],\n        **kwargs,\n    ):\n        raise NotImplementedError(\"Please override this method for specific attention impl.\")\n\n\nclass CustomAttention(Attention):\n    def sharded_custom_op_with_extra_args(\n        self, **kwargs\n    ) -> tuple[Callable, dict[str, Callable[[str], NamedShape]]]:\n        raise NotImplementedError\n\n    def call_attn(self, query, key, value, segment_ids, segment_ids_k, temp, **kwargs):\n        assert self.sharding_context is not None\n\n        body_fn, extra_arg_shape_fns = self.sharded_custom_op_with_extra_args(**kwargs)\n        sharding_rule = functools.partial(\n            self.sharding_context.sharding_specs, namespace=self.config.attn_sharding_namespace\n        )\n\n        extra_args = []\n        extra_arg_shapes = []\n        for n, shape_fn in extra_arg_shape_fns:\n            arg = kwargs.get(n, None)\n            assert arg is not None, \"Attempted getting arg with name {n} but got None.\"\n            extra_args.append(arg)\n            extra_arg_shapes.append(shape_fn(arg.shape))\n\n        in_specs = tuple(\n            map(\n                sharding_rule,\n                [\n                    NamedShape(key.shape, (\"batch_attn\", \"replicated\", \"q_head\", \"hidden\")),\n                    NamedShape(key.shape, (\"batch_attn\", \"replicated\", \"kv_head\", \"hidden\")),\n                    NamedShape(key.shape, (\"batch_attn\", \"replicated\", \"kv_head\", \"hidden\")),\n                    NamedShape(segment_ids.shape, (\"batch_attn\", \"replicated\")),\n                    NamedShape(\n                        segment_ids_k.shape if segment_ids_k is not None else segment_ids.shape,\n                        (\"batch_attn\", \"replicated\"),\n                    ),\n                    NamedShape(temp.shape, (\"batch_attn\", \"replicated\")),\n                    *extra_arg_shapes,\n                ],\n            )\n        )\n\n        out_shape = query.shape\n        out_spec = tuple(\n            map(\n                sharding_rule,\n                [\n                    NamedShape(out_shape, (\"batch_attn\", \"replicated\", \"q_head\", \"hidden\")),\n                    NamedShape((1, 1), (\"batch_attn\", \"q_head\")),\n                ],\n            )\n        )\n\n        return shard_map_unless_manual(\n            body_fn,\n            mesh=self.sharding_context.mesh,\n            in_specs=in_specs,\n            out_specs=out_spec,\n            check_vma=False,\n        )(\n            query,\n            key,\n            value,\n            segment_ids,\n            segment_ids_k if segment_ids_k is not None else segment_ids,\n            temp,\n            *extra_args,\n        )\n\n\nclass PallasAttention(CustomAttention):\n    def sharded_custom_op_with_extra_args(self):\n        def sharded_mha(q, k, v, segment_ids, segment_ids_k, temp):\n            from xrex.pallas import attention as tt_attention\n\n            num_repeat = self.config.num_q_heads // self.config.num_kv_heads\n            k = jnp.repeat(k, num_repeat, axis=2)\n            v = jnp.repeat(v, num_repeat, axis=2)\n            return tt_attention.mha(\n                q,\n                k,\n                v,\n                temp,\n                segment_ids,\n                causal=self.config.causal,\n                sm_scale=self.scale_config.attn_output_scale(self.config.key_size),\n                cap=self.config.attn_logit_cap,\n                backward_pass_impl=\"triton_split\",\n                interpret=False,\n            ), None\n\n        return sharded_mha, ()\n\n\ndef import_attention_fa3():\n    import importlib.util\n\n    if importlib.util.find_spec(\"xrex.models.attention_fa3\") is not None:\n        from xrex.models import attention_fa3\n\n        return attention_fa3.FLASH_ATTN_IMPL\n    raise NotImplementedError(\n        \"attn_impl='flash_attn' selects the fa3 training-kernel arm \"\n        \"(xrex.models.attention_fa3, backed by the compiled xrex/cuda/fa3 \"\n        \"kernels), which is not available in this tree. Choose another \"\n        \"attn_impl (e.g. 'jax_attn' or 'pallas_ranker_attn').\"\n    )\n\n\ndef make_segment_ids_monotonic(segment_ids):\n    segment_ids -= jnp.expand_dims(segment_ids[:, 0], axis=-1)\n    segment_ids += jnp.expand_dims(jnp.pad(jnp.cumsum(segment_ids[:-1, -1] + 1), (1, 0)), axis=-1)\n    return segment_ids\n\n\ndef identity_segment_ids(segment_ids):\n    return segment_ids\n\n\ndef qk_tie_segment_ids(segment_ids, segment_ids_k):\n    q_row_min = jnp.expand_dims(segment_ids[:, 0], axis=-1)\n    k_row_min = jnp.expand_dims(segment_ids_k[:, 0], axis=-1)\n    row_min = jnp.minimum(q_row_min, k_row_min)\n    segment_ids -= row_min\n    segment_ids_k -= row_min\n    q_row_max = jnp.expand_dims(jnp.pad(jnp.cumsum(segment_ids[:-1, -1] + 1), (1, 0)), axis=-1)\n    k_row_max = jnp.expand_dims(jnp.pad(jnp.cumsum(segment_ids_k[:-1, -1] + 1), (1, 0)), axis=-1)\n    row_max = jnp.maximum(q_row_max, k_row_max)\n    segment_ids += row_max\n    segment_ids_k += row_max\n    return segment_ids, segment_ids_k\n\n\nSEG_IDS_FNS_REGISTRY = {\n    \"default\": make_segment_ids_monotonic,\n    \"identity\": identity_segment_ids,\n}\n\n\ndef make_attention_mask(\n    query_input: jax.Array,\n    key_input: jax.Array,\n    pairwise_fn: Callable[..., Any] = jnp.multiply,\n    dtype: Any = jnp.bfloat16,\n):\n    mask = pairwise_fn(jnp.expand_dims(query_input, axis=-1), jnp.expand_dims(key_input, axis=-2))\n    mask = jnp.expand_dims(mask, axis=-3)\n    return mask.astype(dtype)\n\n\ndef _cap_attention_logits(logits: jax.Array, cap: float, method: str) -> jax.Array:\n    if not cap or cap <= 0.0 or method == \"none\":\n        return logits\n    if method == \"tanh\":\n        cap_arr = jnp.array(cap, dtype=logits.dtype)\n        return cap_arr * jnp.tanh(logits / cap_arr)\n    if method == \"soft_sign\":\n        return logits / (1.0 + jnp.abs(logits) / cap)\n    raise ValueError(f\"attn_logit_cap_method {method!r} is not supported by JaxAttention.\")\n\n\nclass JaxAttention(Attention):\n    def call_attn(\n        self,\n        query: jax.Array,\n        key: Optional[jax.Array],\n        value: Optional[jax.Array],\n        segment_ids: Optional[jax.Array],\n        segment_ids_k: Optional[jax.Array],\n        temp: Optional[jax.Array],\n        **kwargs,\n    ):\n        mask = kwargs.get(\"masks\", None)\n        b, t, h, d = query.shape\n        _, _, kv_h, _ = key.shape\n        assert h % kv_h == 0, f\"query_heads {h} must be a multiple of kv_heads {kv_h}\"\n        assert self.sharding_context is not None\n\n        def sharding_rule(named_shape: NamedShape) -> jax.sharding.NamedSharding:\n            return jax.sharding.NamedSharding(\n                self.sharding_context.mesh,\n                self.sharding_context.sharding_specs(\n                    named_shape, namespace=self.config.attn_sharding_namespace\n                ),\n            )\n\n        query = jnp.reshape(query, (b, t, kv_h, h // kv_h, d))\n        query = with_sharding_constraint_unless_manual(\n            query,\n            sharding_rule(\n                NamedShape(\n                    query.shape, (\"batch_attn\", \"replicated\", \"head\", \"replicated\", \"hidden\")\n                ),\n            ),\n        )\n\n        attn_logits = jnp.einsum(\"...thHd,...Thd->...hHtT\", query, key).astype(jnp.float32)\n        attn_logits *= self.scale_config.attn_output_scale(self.config.key_size)\n        attn_logits = _cap_attention_logits(\n            attn_logits, self.config.attn_logit_cap, self.config.attn_logit_cap_method\n        )\n        if temp is not None:\n            attn_logits *= temp[:, None, None, :, None]\n\n        if self.config.causal:\n            causal_mask = jnp.tril(jnp.ones((1, 1, t, t))).astype(query.dtype)\n            mask = mask * causal_mask\n        if segment_ids is not None:\n            segment_ids = with_sharding_constraint_unless_manual(\n                segment_ids,\n                sharding_rule(\n                    NamedShape(segment_ids.shape, (\"batch_attn\", \"replicated\")),\n                ),\n            )\n            segment_ids_for_keys = segment_ids_k if segment_ids_k is not None else segment_ids\n            if segment_ids_k is not None:\n                segment_ids_for_keys = with_sharding_constraint_unless_manual(\n                    segment_ids_for_keys,\n                    sharding_rule(\n                        NamedShape(segment_ids_for_keys.shape, (\"batch_attn\", \"replicated\")),\n                    ),\n                )\n            segment_mask = make_attention_mask(\n                segment_ids, segment_ids_for_keys, jnp.equal, dtype=query.dtype\n            )\n            mask *= segment_mask\n\n        mask = mask[:, :, None, :, :]\n\n        if mask is not None:\n            if mask.ndim != attn_logits.ndim:\n                raise ValueError(\n                    f\"Mask dimensionality {mask.ndim} must match logits dimensionality \"\n                    f\"{attn_logits.ndim} for {mask.shape}/{attn_logits.shape}.\"\n                )\n            attn_logits = jnp.where(mask, attn_logits, -1e30)\n\n        attn_weights = jax.nn.softmax(attn_logits).astype(query.dtype)\n\n        attn = jnp.einsum(\"...hHtT,...Thd->...thHd\", attn_weights, value)\n        attn = with_sharding_constraint_unless_manual(\n            attn,\n            sharding_rule(\n                NamedShape(\n                    attn.shape, (\"batch_attn\", \"replicated\", \"head\", \"replicated\", \"hidden\")\n                ),\n            ),\n        )\n\n        return attn\n",
+      "source_digest": "ceab669469952913dbff4b569bb6cdf7ba921a6f163ef1f5c5a03be0e2517c19",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/models/attention.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 328,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport functools\nfrom typing import Any, Callable, Optional\n\nimport haiku as hk\nimport jax\nimport jax.numpy as jnp\n\nfrom xai_configlib import Config, configclass\nfrom xrex.models.scaling import ScaleConfig\nfrom xrex.models.sharding_context import NamedShape, ShardingContext\nfrom xrex.utils.sharding import shard_map_unless_manual, with_sharding_constraint_unless_manual\n\n\n\u0040configclass\nclass AttentionConfig(Config):\n    key_size: int\n    num_q_heads: int\n    num_kv_heads: int\n    causal: bool = True\n    with_bias: bool = False\n    attn_logit_cap: float = -1.0\n    attn_logit_cap_method: str = \"tanh\"\n    attn_impl: str = \"pallas_attn\"\n    candidate_only_attn_impl: Optional[str] = None\n    attn_sharding_namespace: str = \"attention\"\n    fa_version: str = \"3\"\n    qk_norm: bool = False\n    rotary: bool = False\n    rope_type: Optional[str] = \"1d\"\n    rope_base_exponent: int = 10000\n    temperature_scaling_const: int = -1\n    qkv_merge: bool = False\n    max_num_segments_per_batch: int = 128\n    enable_determinism: bool = False\n    attn_output_gate: bool = False\n    attn_output_gate_activation: str = \"silu\"\n\n\nclass Attention(hk.Module):\n    window_size: int = -1\n\n    def __init__(\n        self,\n        config: AttentionConfig,\n        scale_config: ScaleConfig,\n        name: Optional[str] = None,\n        sharding_context: ShardingContext = None,\n    ):\n        super().__init__(name=name)\n        self.config = config\n        self.scale_config = scale_config\n        self.sharding_context = sharding_context\n\n    def __call__(\n        self,\n        query: jax.Array,\n        key: Optional[jax.Array],\n        value: Optional[jax.Array],\n        segment_ids: Optional[jax.Array],\n        segment_ids_k: Optional[jax.Array],\n        temp: Optional[jax.Array],\n        **kwargs,\n    ):\n        return self.call_attn(query, key, value, segment_ids, segment_ids_k, temp, **kwargs)\n\n    def call_attn(\n        self,\n        query: jax.Array,\n        key: Optional[jax.Array],\n        value: Optional[jax.Array],\n        segment_ids: Optional[jax.Array],\n        segment_ids_k: Optional[jax.Array],\n        temp: Optional[jax.Array],\n        **kwargs,\n    ):\n        raise NotImplementedError(\"Please override this method for specific attention impl.\")\n\n\nclass CustomAttention(Attention):\n    def sharded_custom_op_with_extra_args(\n        self, **kwargs\n    ) -> tuple[Callable, dict[str, Callable[[str], NamedShape]]]:\n        raise NotImplementedError\n\n    def call_attn(self, query, key, value, segment_ids, segment_ids_k, temp, **kwargs):\n        assert self.sharding_context is not None\n\n        body_fn, extra_arg_shape_fns = self.sharded_custom_op_with_extra_args(**kwargs)\n        sharding_rule = functools.partial(\n            self.sharding_context.sharding_specs, namespace=self.config.attn_sharding_namespace\n        )\n\n        extra_args = []\n        extra_arg_shapes = []\n        for n, shape_fn in extra_arg_shape_fns:\n            arg = kwargs.get(n, None)\n            assert arg is not None, \"Attempted getting arg with name {n} but got None.\"\n            extra_args.append(arg)\n            extra_arg_shapes.append(shape_fn(arg.shape))\n\n        in_specs = tuple(\n            map(\n                sharding_rule,\n                [\n                    NamedShape(key.shape, (\"batch_attn\", \"replicated\", \"q_head\", \"hidden\")),\n                    NamedShape(key.shape, (\"batch_attn\", \"replicated\", \"kv_head\", \"hidden\")),\n                    NamedShape(key.shape, (\"batch_attn\", \"replicated\", \"kv_head\", \"hidden\")),\n                    NamedShape(segment_ids.shape, (\"batch_attn\", \"replicated\")),\n                    NamedShape(\n                        segment_ids_k.shape if segment_ids_k is not None else segment_ids.shape,\n                        (\"batch_attn\", \"replicated\"),\n                    ),\n                    NamedShape(temp.shape, (\"batch_attn\", \"replicated\")),\n                    *extra_arg_shapes,\n                ],\n            )\n        )\n\n        out_shape = query.shape\n        out_spec = tuple(\n            map(\n                sharding_rule,\n                [\n                    NamedShape(out_shape, (\"batch_attn\", \"replicated\", \"q_head\", \"hidden\")),\n                    NamedShape((1, 1), (\"batch_attn\", \"q_head\")),\n                ],\n            )\n        )\n\n        return shard_map_unless_manual(\n            body_fn,\n            mesh=self.sharding_context.mesh,\n            in_specs=in_specs,\n            out_specs=out_spec,\n            check_vma=False,\n        )(\n            query,\n            key,\n            value,\n            segment_ids,\n            segment_ids_k if segment_ids_k is not None else segment_ids,\n            temp,\n            *extra_args,\n        )\n\n\nclass PallasAttention(CustomAttention):\n    def sharded_custom_op_with_extra_args(self):\n        def sharded_mha(q, k, v, segment_ids, segment_ids_k, temp):\n            from xrex.pallas import attention as tt_attention\n\n            num_repeat = self.config.num_q_heads // self.config.num_kv_heads\n            k = jnp.repeat(k, num_repeat, axis=2)\n            v = jnp.repeat(v, num_repeat, axis=2)\n            return tt_attention.mha(\n                q,\n                k,\n                v,\n                temp,\n                segment_ids,\n                causal=self.config.causal,\n                sm_scale=self.scale_config.attn_output_scale(self.config.key_size),\n                cap=self.config.attn_logit_cap,\n                backward_pass_impl=\"triton_split\",\n                interpret=False,\n            ), None\n\n        return sharded_mha, ()\n\n\ndef import_attention_fa3():\n    import importlib.util\n\n    if importlib.util.find_spec(\"xrex.models.attention_fa3\") is not None:\n        from xrex.models import attention_fa3\n\n        return attention_fa3.FLASH_ATTN_IMPL\n    raise NotImplementedError(\n        \"attn_impl='flash_attn' selects the fa3 training-kernel arm \"\n        \"(xrex.models.attention_fa3, backed by the compiled xrex/cuda/fa3 \"\n        \"kernels), which is not available in this tree. Choose another \"\n        \"attn_impl (e.g. 'jax_attn' or 'pallas_ranker_attn').\"\n    )\n\n\ndef make_segment_ids_monotonic(segment_ids):\n    segment_ids -= jnp.expand_dims(segment_ids[:, 0], axis=-1)\n    segment_ids += jnp.expand_dims(jnp.pad(jnp.cumsum(segment_ids[:-1, -1] + 1), (1, 0)), axis=-1)\n    return segment_ids\n\n\ndef identity_segment_ids(segment_ids):\n    return segment_ids\n\n\ndef qk_tie_segment_ids(segment_ids, segment_ids_k):\n    q_row_min = jnp.expand_dims(segment_ids[:, 0], axis=-1)\n    k_row_min = jnp.expand_dims(segment_ids_k[:, 0], axis=-1)\n    row_min = jnp.minimum(q_row_min, k_row_min)\n    segment_ids -= row_min\n    segment_ids_k -= row_min\n    q_row_max = jnp.expand_dims(jnp.pad(jnp.cumsum(segment_ids[:-1, -1] + 1), (1, 0)), axis=-1)\n    k_row_max = jnp.expand_dims(jnp.pad(jnp.cumsum(segment_ids_k[:-1, -1] + 1), (1, 0)), axis=-1)\n    row_max = jnp.maximum(q_row_max, k_row_max)\n    segment_ids += row_max\n    segment_ids_k += row_max\n    return segment_ids, segment_ids_k\n\n\nSEG_IDS_FNS_REGISTRY = {\n    \"default\": make_segment_ids_monotonic,\n    \"identity\": identity_segment_ids,\n}\n\n\ndef make_attention_mask(\n    query_input: jax.Array,\n    key_input: jax.Array,\n    pairwise_fn: Callable[..., Any] = jnp.multiply,\n    dtype: Any = jnp.bfloat16,\n):\n    mask = pairwise_fn(jnp.expand_dims(query_input, axis=-1), jnp.expand_dims(key_input, axis=-2))\n    mask = jnp.expand_dims(mask, axis=-3)\n    return mask.astype(dtype)\n\n\ndef _cap_attention_logits(logits: jax.Array, cap: float, method: str) -> jax.Array:\n    if not cap or cap <= 0.0 or method == \"none\":\n        return logits\n    if method == \"tanh\":\n        cap_arr = jnp.array(cap, dtype=logits.dtype)\n        return cap_arr * jnp.tanh(logits / cap_arr)\n    if method == \"soft_sign\":\n        return logits / (1.0 + jnp.abs(logits) / cap)\n    raise ValueError(f\"attn_logit_cap_method {method!r} is not supported by JaxAttention.\")\n\n\nclass JaxAttention(Attention):\n    def call_attn(\n        self,\n        query: jax.Array,\n        key: Optional[jax.Array],\n        value: Optional[jax.Array],\n        segment_ids: Optional[jax.Array],\n        segment_ids_k: Optional[jax.Array],\n        temp: Optional[jax.Array],\n        **kwargs,\n    ):\n        mask = kwargs.get(\"masks\", None)\n        b, t, h, d = query.shape\n        _, _, kv_h, _ = key.shape\n        assert h % kv_h == 0, f\"query_heads {h} must be a multiple of kv_heads {kv_h}\"\n        assert self.sharding_context is not None\n\n        def sharding_rule(named_shape: NamedShape) -> jax.sharding.NamedSharding:\n            return jax.sharding.NamedSharding(\n                self.sharding_context.mesh,\n                self.sharding_context.sharding_specs(\n                    named_shape, namespace=self.config.attn_sharding_namespace\n                ),\n            )\n\n        query = jnp.reshape(query, (b, t, kv_h, h // kv_h, d))\n        query = with_sharding_constraint_unless_manual(\n            query,\n            sharding_rule(\n                NamedShape(\n                    query.shape, (\"batch_attn\", \"replicated\", \"head\", \"replicated\", \"hidden\")\n                ),\n            ),\n        )\n\n        attn_logits = jnp.einsum(\"...thHd,...Thd->...hHtT\", query, key).astype(jnp.float32)\n        attn_logits *= self.scale_config.attn_output_scale(self.config.key_size)\n        attn_logits = _cap_attention_logits(\n            attn_logits, self.config.attn_logit_cap, self.config.attn_logit_cap_method\n        )\n        if temp is not None:\n            attn_logits *= temp[:, None, None, :, None]\n\n        if self.config.causal:\n            causal_mask = jnp.tril(jnp.ones((1, 1, t, t))).astype(query.dtype)\n            mask = mask * causal_mask\n        if segment_ids is not None:\n            segment_ids = with_sharding_constraint_unless_manual(\n                segment_ids,\n                sharding_rule(\n                    NamedShape(segment_ids.shape, (\"batch_attn\", \"replicated\")),\n                ),\n            )\n            segment_ids_for_keys = segment_ids_k if segment_ids_k is not None else segment_ids\n            if segment_ids_k is not None:\n                segment_ids_for_keys = with_sharding_constraint_unless_manual(\n                    segment_ids_for_keys,\n                    sharding_rule(\n                        NamedShape(segment_ids_for_keys.shape, (\"batch_attn\", \"replicated\")),\n                    ),\n                )\n            segment_mask = make_attention_mask(\n                segment_ids, segment_ids_for_keys, jnp.equal, dtype=query.dtype\n            )\n            mask *= segment_mask\n\n        mask = mask[:, :, None, :, :]\n\n        if mask is not None:\n            if mask.ndim != attn_logits.ndim:\n                raise ValueError(\n                    f\"Mask dimensionality {mask.ndim} must match logits dimensionality \"\n                    f\"{attn_logits.ndim} for {mask.shape}/{attn_logits.shape}.\"\n                )\n            attn_logits = jnp.where(mask, attn_logits, -1e30)\n\n        attn_weights = jax.nn.softmax(attn_logits).astype(query.dtype)\n\n        attn = jnp.einsum(\"...hHtT,...Thd->...thHd\", attn_weights, value)\n        attn = with_sharding_constraint_unless_manual(\n            attn,\n            sharding_rule(\n                NamedShape(\n                    attn.shape, (\"batch_attn\", \"replicated\", \"head\", \"replicated\", \"hidden\")\n                ),\n            ),\n        )\n\n        return attn\n",
+      "source_digest": "7c0e2dc7399f6777bed09e4a25b6a4178f9d04f617c808d9f7ceb89d242aeb59",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "adult-content/calibration.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 25,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import logging\n\nimport numpy as np\nimport pandas as pd\nfrom sklearn.isotonic import IsotonicRegression\nfrom sklearn.metrics import confusion_matrix\n\n\nlogger = logging.getLogger(__name__)\n\n\nclass Metrics(object):\n    def __init__(self, df, thresholds=None):\n        self.df = df\n        self.y_true = df[\"label\"] == 1\n        self.thresholds = (\n            thresholds\n            if thresholds is not None\n            else np.linspace(0.0, 1.0, 200, dtype=np.float32)\n        )\n\n    def at_threshold(self, threshold):\n        self.y_pred = self.df[\"pred\"] >= threshold\n        cm = confusion_matrix(self.y_true, self.y_pred)\n        tn = cm[0][0]\n",
+      "source_digest": "219bd3061018ad9d25194385f4a435158c09c114e7f39329d65532631e8a305b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "adult-content/config.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from datetime import datetime\nimport os\n\n\nclass TrainingConfig:\n    INPUT_EMBEDDING_DIM = 256\n\n    def __init__(\n        self,\n        train_dataset_path,\n        eval_dataset_path,\n        resample=False,\n        repeat=True,\n        input_embedding_dim=None,\n        model_dir=None,\n        dense_layer_units=128,\n        batch_size=256,\n        learning_rate=0.001,\n        num_epochs=100,\n        num_steps_per_epoch=400,\n",
+      "source_digest": "69e90c77083b383e9883edc349790bffed899a2f37c71520bb3786ddf9f3de06",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "adult-content/config.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        num_steps_per_epoch=400,\n    ):\n        if model_dir is None:\n            model_dir = os.path.join(\"runs\", datetime.now().strftime(\"%Y%m%d_%H%M%S\"))\n        if input_embedding_dim is None:\n            input_embedding_dim = self.INPUT_EMBEDDING_DIM\n        for argname, value in locals().items():\n            if argname != \"self\":\n                setattr(self, argname, value)\n\n\nclass CalibrationConfig:\n    def __init__(\n        self,\n        dataset_path,\n        output_dir=None,\n        num_thresholds=200,\n    ):\n        if output_dir is None:\n            output_dir = os.path.join(\n                \"calibration\", datetime.now().strftime(\"%Y%m%d_%H%M%S\")\n            )\n        for argname, value in locals().items():\n            if argname != \"self\":\n                setattr(self, argname, value)\n",
+      "source_digest": "c08e54aeb17b3401bdd13163e64c0a821bc1d4c80104c8ef0ef1bd246042e568",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "bdsm/runtime/manhattan_scorer.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 22,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import logging\nimport os\n\nimport numpy as np\n\nlog = logging.getLogger(\"manhattan_scorer\")\n\n\nclass ManhattanArrowReader:\n    def __init__(self, endpoint: str = \"localhost:8080\"):\n        from manhattan_cli.mh_client import ManhattanClient, ManhattanClientConfig, Tenant\n\n        self.client = ManhattanClient(ManhattanClientConfig(endpoint=endpoint), secure=False)\n        self.tenant = Tenant(\n            cluster=os.environ.get(\"MH_CLUSTER\", \"your-cluster\"),\n            app_id=os.environ.get(\"MH_APP_ID\", \"your-app\"),\n            dataset=os.environ.get(\"MH_DATASET\", \"your-dataset\"),\n        )\n        self._long_to_bytes = ManhattanClient.long_to_bytes\n\n    def get_raw_bytes(self, user_id: int) -> bytes | None:\n        try:\n",
+      "source_digest": "eb8de785c7ef8a385e661936c5a1b17552e4bd10ee42ff878fc3d60e0c64b53c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "bdsm/runtime/model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 80,
+      "end_line": 104,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    return cos, sin\n\n\ndef _repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:\n    if n_rep == 1:\n        return x\n    B, T, kv_heads, Dh = x.shape\n    x = jnp.broadcast_to(x[:, :, :, None, :], (B, T, kv_heads, n_rep, Dh))\n    return x.reshape(B, T, kv_heads * n_rep, Dh)\n\n\nclass Backbone(hk.Module):\n    def __init__(self, config: BackboneConfig, name: str = \"abuse_v3\"):\n        super().__init__(name=name)\n        self.c = config\n        self.D = config.emb_size\n\n    def _build_input_embeddings(self, batch: dict) -> tuple[jax.Array, jax.Array]:\n        D = self.D\n        aseq = batch[\"action_seq\"]\n        B = aseq[\"padding_mask\"].shape[0]\n        init = hk.initializers.TruncatedNormal(stddev=0.02)\n        vinit = hk.initializers.VarianceScaling(1.0, \"fan_out\", \"truncated_normal\")\n\n        action_table = hk.get_parameter(\n",
+      "source_digest": "3b07ecf7c03a56953fe6a7953cfefd3eb484eff47d039c7bc8e373315c524a0f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "bdsm/runtime/model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 81,
+      "end_line": 105,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n\ndef _repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:\n    if n_rep == 1:\n        return x\n    B, T, kv_heads, Dh = x.shape\n    x = jnp.broadcast_to(x[:, :, :, None, :], (B, T, kv_heads, n_rep, Dh))\n    return x.reshape(B, T, kv_heads * n_rep, Dh)\n\n\nclass Backbone(hk.Module):\n    def __init__(self, config: BackboneConfig, name: str = \"abuse_v3\"):\n        super().__init__(name=name)\n        self.c = config\n        self.D = config.emb_size\n\n    def _build_input_embeddings(self, batch: dict) -> tuple[jax.Array, jax.Array]:\n        D = self.D\n        aseq = batch[\"action_seq\"]\n        B = aseq[\"padding_mask\"].shape[0]\n        init = hk.initializers.TruncatedNormal(stddev=0.02)\n        vinit = hk.initializers.VarianceScaling(1.0, \"fan_out\", \"truncated_normal\")\n\n        action_table = hk.get_parameter(\n            \"action_emb\",\n",
+      "source_digest": "1ec97c8589d01792c383d9a71c9053485604d5e33971d0f20ac81b3f72c6b1a1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "bdsm/runtime/sequence_cache.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 36,
+      "end_line": 60,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    \"post_language_code\": lambda ua: int(ua.tweetInfo.languageCode),\n    \"quoting_author_id\": lambda ua: int(ua.tweetInfo.quotingAuthorId),\n    \"quoted_author_id\": lambda ua: int(ua.tweetInfo.quotedAuthorId),\n    \"in_reply_to_author_id\": lambda ua: int(ua.tweetInfo.inReplyToAuthorId),\n    \"retweeting_author_id\": lambda ua: int(ua.tweetInfo.retweetingAuthorId),\n    \"engaging_ip_country_code\": lambda ua: int(ua.actionInfo.userActionMeta.engagingIpCountryCode),\n    \"served_time_ms\": lambda ua: int(ua.actionInfo.userActionMeta.servedTimeMs),\n    \"search_query\": lambda ua: str(ua.actionInfo.userActionMeta.searchQuery),\n}\n\n\nclass SequenceCacheClient:\n    def __init__(\n        self,\n        host: str = \"localhost\",\n        port: int = 6379,\n        timeout_ms: int = 150,\n    ):\n        import redis as redis_lib\n\n        self._r = redis_lib.Redis(\n            host=host,\n            port=port,\n            socket_timeout=timeout_ms / 1000.0,\n            socket_connect_timeout=timeout_ms / 1000.0,\n",
+      "source_digest": "f561754a83d2520ae789949f152b016650b07af811765ec74fcb4fe08b04da2e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "bdsm/runtime/sequence_cache.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 65,
+      "end_line": 89,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    def get(self, user_id: int) -> bytes | None:\n        return self._r.get(str(user_id))\n\n    def set(self, user_id: int, value: bytes, ttl_secs: int) -> None:\n        try:\n            self._r.setex(str(user_id), ttl_secs, value)\n        except Exception:\n            pass\n\n\nclass RealtimeCacheClient:\n    def __init__(\n        self,\n        host: str = \"localhost\",\n        port: int = 6382,\n        timeout_ms: int = 100,\n    ):\n        import redis as redis_lib\n\n        self._r = redis_lib.Redis(\n            host=host,\n            port=port,\n            socket_timeout=timeout_ms / 1000.0,\n            socket_connect_timeout=timeout_ms / 1000.0,\n",
+      "source_digest": "5e81423c0feeed9b167a959e874dfbc4552dd5c7e058f105452d9fa28fc31202",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "clip/config.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from datetime import datetime\nimport os\n\n\nclass ClipConfig:\n    DEFAULT_FINAL_EMBEDDING_DIM = 256\n\n    def __init__(\n        self,\n        dataset_path,\n        input_resolution=224,\n        use_data_augmentation=False,\n        clip_model_type=\"ViT-B/32\",\n        top_feedforward=True,\n        final_embedding_dim=None,\n        logit_scale=4.5065,\n        model_dir=None,\n        save_interval=5000,\n        save_last_ckpt_only=True,\n        batch_size=128,\n",
+      "source_digest": "c8d4be656e48cb16c1e757db980451fab4e8672abdd9311efc9331417516cbbb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "clip/datasets/language_image_dataset.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 25,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from functools import partial\n\nfrom twitter.clip.utils.data_utils import (\n    clean_text as clean_text_fn,\n    get_clip_decode_and_proc_fn,\n    read_tfrecords_from_gcs,\n)\n\nimport tensorflow as tf\n\n\nclass LanguageImageGcsDataset:\n    def __init__(\n        self,\n        features=None,\n        text_field=\"tweet_text\",\n        encoded_image_field=\"image_byte_string\",\n        image_field=\"image\",\n        input_resolution=224,\n        channels=3,\n        resize_side_buffer=32,\n        use_data_augmentation=False,\n        clean_text=True,\n        batch_size=128,\n        eval_batch_size=None,\n",
+      "source_digest": "de14b30c42a14374abc53b65f2567c977b954d58f59ed8dec997181aa2a6f000",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "clip/datasets/media_cache_dataset.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3,
+      "end_line": 27,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import importlib\nimport os\n\nfrom twitter.clip.utils.data_utils import blobstore_fetch\nfrom twitter.magicpony.common import file_access\n\nfrom google.cloud import bigquery\nimport pkg_resources\nimport tensorflow as tf\n\n\nclass MediaCacheBqDataset:\n    def __init__(\n        self,\n        project_id,\n        dataset_id,\n        table_id,\n        element_spec,\n        media_field,\n        download_image_size=\"small\",\n        http_urls=False,\n        bq_compute_project=\"example-media-project\",\n    ):\n        self.project_id = project_id\n        self.dataset_id = dataset_id\n",
+      "source_digest": "a71237ed2fd9ae749ecebf0d518508100c0c5a73a57980746e2922481292ac11",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "clip/keras_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n            print(f\"Extracting model to: {local_path}\")\n            with zipfile.ZipFile(zip_file_path, \"r\") as zip_ref:\n                zip_ref.extractall(local_path)\n\n    return local_path\n\n\nclass TwitterCLIPKeras(tf.keras.Model):\n    IMAGE_EMBEDDINGS_OUTPUT_KEY = \"image_embeddings\"\n    TEXT_EMBEDDINGS_OUTPUT_KEY = \"text_embeddings\"\n\n    def __init__(self, image_module, text_module, image_size, embedding_dim):\n        super().__init__()\n        self.image_module = image_module\n        self.text_module = text_module\n        self.image_size = image_size\n        self.embedding_dim = embedding_dim\n\n    \u0040tf.function(\n        input_signature=[\n            {\n                \"images\": tf.TensorSpec([None, 3, None, None], tf.float32),\n                \"texts\": tf.TensorSpec([None, None], tf.int64),\n            }\n",
+      "source_digest": "bcfab917ced27592ee638feead99d206f40dcafadcfba6a0daa7d4deffebd029",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "clip/keras_model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 68,
+      "end_line": 92,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            print(f\"Extracting model to: {local_path}\")\n            with zipfile.ZipFile(zip_file_path, \"r\") as zip_ref:\n                zip_ref.extractall(local_path)\n\n    return local_path\n\n\nclass TwitterCLIPKeras(tf.keras.Model):\n    IMAGE_EMBEDDINGS_OUTPUT_KEY = \"image_embeddings\"\n    TEXT_EMBEDDINGS_OUTPUT_KEY = \"text_embeddings\"\n\n    def __init__(self, image_module, text_module, image_size, embedding_dim):\n        super().__init__()\n        self.image_module = image_module\n        self.text_module = text_module\n        self.image_size = image_size\n        self.embedding_dim = embedding_dim\n\n    \u0040tf.function(\n        input_signature=[\n            {\n                \"images\": tf.TensorSpec([None, 3, None, None], tf.float32),\n                \"texts\": tf.TensorSpec([None, None], tf.int64),\n            }\n        ]\n",
+      "source_digest": "9e8c7f331a2d29863a48f61c9b196d80750b4cf256c8117c7491587e7599f719",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "clip/model.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 46,
+      "end_line": 70,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"Twitter-ViT-B/32-128\": \"https://example.invalid/models/twitter/clip_source_d128_bs2784/clip_source_d128_bs2784_twitter-clip-d128.pt\",\n    }\n\n    TWITTER_MODELS_PRETRAINED_BASE = {\n        \"Twitter-ViT-B/32-256\": \"ViT-B/32\",\n        \"Twitter-ViT-B/32-128\": \"ViT-B/32\",\n    }\n\n    MODELS = {**PRETRAINED_MODELS, **TWITTER_MODELS}\n\n    MODEL_NAMES = tuple(MODELS.keys())\n\n    def __init__(\n        self,\n        clip_model_type=DEFAULT_CLIP_MODEL_TYPE,\n        top_feedforward=True,\n        final_embedding_dim=DEFAULT_FINAL_EMBEDDING_DIM,\n        truncate_text=True,\n        logit_scale=None,\n        use_gpu=None,\n    ):\n        self.clip_model_type = clip_model_type\n\n        if clip_model_type not in self.MODELS:\n            raise ValueError(\n",
+      "source_digest": "413b1bc43f36beba10946fa9290077ec20d31c266dff9c85f537d3357ea9345f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 7,
+      "end_line": 31,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    def forward(self, x):\n        return (\n            0.5\n            * x\n            * (\n                1\n                + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))\n            )\n        )\n\n\nclass LayerNorm(torch.nn.Module):\n    def __init__(self, features, eps=1e-6):\n        super(LayerNorm, self).__init__()\n        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n",
+      "source_digest": "32ef4e41b41fec0f0681091a9c28e457869fc097a9f8975795846b0e500b4e90",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 8,
+      "end_line": 32,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        return (\n            0.5\n            * x\n            * (\n                1\n                + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))\n            )\n        )\n\n\nclass LayerNorm(torch.nn.Module):\n    def __init__(self, features, eps=1e-6):\n        super(LayerNorm, self).__init__()\n        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n    def __init__(self, d_in, d_h, d_out, dropout=0.1):\n",
+      "source_digest": "ffe2b06edf1aa7885035ef9c2e3dbe8448dc10b7f7fc9c553dc56015b45862a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        super(LayerNorm, self).__init__()\n        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n    def __init__(self, d_in, d_h, d_out, dropout=0.1):\n        super(PositionwiseFeedForward, self).__init__()\n        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n",
+      "source_digest": "23d0a1fc908afa839ebeeeef557b1c24df5f2067ea487ecf3f2cd3b56c979e85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 21,
+      "end_line": 45,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n    def __init__(self, d_in, d_h, d_out, dropout=0.1):\n        super(PositionwiseFeedForward, self).__init__()\n        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n",
+      "source_digest": "7259efe03473c1be90a6beff190a544ec3d621be0c7ab5e7f0cd72aa9f4ea308",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 33,
+      "end_line": 57,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        super(PositionwiseFeedForward, self).__init__()\n        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(ImageCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.visual.output_dim\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n",
+      "source_digest": "763c996aaf2d668b2646d4c197bc87cf7269c0d0f47953160d55ee44afcd45a4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 34,
+      "end_line": 58,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(ImageCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.visual.output_dim\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n",
+      "source_digest": "df2430842f993899c5c10de3abf5aef18df860a22eeacdeda10ed423ae8f9b0b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 53,
+      "end_line": 77,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n    def forward(self, image):\n        out = self.model.encode_image(image)\n        return self.ff(out) if self.top_feedforward else out\n\n\nclass TextCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(TextCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.transformer.width\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n",
+      "source_digest": "369db794531dc0382d329df821a1e24edc89f5ce39422c1c24c9182dd7f247a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "clip/modules.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 54,
+      "end_line": 78,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n    def forward(self, image):\n        out = self.model.encode_image(image)\n        return self.ff(out) if self.top_feedforward else out\n\n\nclass TextCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(TextCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.transformer.width\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n",
+      "source_digest": "f4431041d78e82de5b7f4b81caa54a338d58c8c87af8c633068ddd019ffcc9bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "grox/core/clients/nightowl_client.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 16,
+      "end_line": 40,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    0.05,\n    0.1,\n    0.25,\n    0.5,\n    1.0,\n    1.5,\n    2.0,\n    5.0,\n)\n\n\nclass NightOwlClient:\n    def __init__(self, endpoint: str, timeout: float = 2.0):\n        self._endpoint = endpoint\n        self._timeout = timeout\n        self._channel: grpc.aio.Channel | None = None\n        self._stub: NightOwlSearchServiceStub | None = None\n\n    async def _ensure_stub(self) -> NightOwlSearchServiceStub:\n        if self._channel is None:\n            self._channel = grpc.aio.insecure_channel(\n                self._endpoint,\n                options=[\n                    (\"grpc.max_receive_message_length\", 128 * 1024 * 1024),\n                    (\"grpc.max_send_message_length\", 128 * 1024 * 1024),\n",
+      "source_digest": "899a994739d70655d941f4465f13315b0271c24f9a5d7457fa1aa5c39bd6ded0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "grox/core/data_loaders/asr_processor.py",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 78,
+      "end_line": 102,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return f.read()\n\n\ndef _clean_asr(raw: str) -> str:\n    if \"<asr_text>\" in raw:\n        raw = raw.split(\"<asr_text>\", 1)[1]\n    if \"</asr_text>\" in raw:\n        raw = raw.split(\"</asr_text>\", 1)[0]\n    return raw.strip()\n\n\nclass _ASRWorker:\n    def __init__(\n        self, task_queue: Queue, resp_queue: Queue, shutdown_event: MultiprocessingEvent\n    ):\n        self._task_queue: Queue[tuple[_ASRRequest, dict[str, str]]] = task_queue\n        self._resp_queue: Queue[_ASRResult] = resp_queue\n        self._shutdown_event: MultiprocessingEvent = shutdown_event\n\n    \u0040staticmethod\n    def _metrics_attributes() -> dict[str, str]:\n        return {\"pid\": str(os.getpid())}\n\n    async def _transcribe(self, request: _ASRRequest) -> str | None:\n        asr_config = grox_config.asr\n",
+      "source_digest": "fac03f99d2500bf965661eb87b9d2dece47be4afe20f05d6cdd76a1c4b82f6f3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "adult-content/calibration.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 25,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import logging\n\nimport numpy as np\nimport pandas as pd\nfrom sklearn.isotonic import IsotonicRegression\nfrom sklearn.metrics import confusion_matrix\n\n\nlogger = logging.getLogger(__name__)\n\n\nclass Metrics(object):\n    def __init__(self, df, thresholds=None):\n        self.df = df\n        self.y_true = df[\"label\"] == 1\n        self.thresholds = (\n            thresholds\n            if thresholds is not None\n            else np.linspace(0.0, 1.0, 200, dtype=np.float32)\n        )\n\n    def at_threshold(self, threshold):\n        self.y_pred = self.df[\"pred\"] >= threshold\n        cm = confusion_matrix(self.y_true, self.y_pred)\n        tn = cm[0][0]\n",
+      "source_digest": "219bd3061018ad9d25194385f4a435158c09c114e7f39329d65532631e8a305b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "adult-content/config.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from datetime import datetime\nimport os\n\n\nclass TrainingConfig:\n    INPUT_EMBEDDING_DIM = 256\n\n    def __init__(\n        self,\n        train_dataset_path,\n        eval_dataset_path,\n        resample=False,\n        repeat=True,\n        input_embedding_dim=None,\n        model_dir=None,\n        dense_layer_units=128,\n        batch_size=256,\n        learning_rate=0.001,\n        num_epochs=100,\n        num_steps_per_epoch=400,\n",
+      "source_digest": "69e90c77083b383e9883edc349790bffed899a2f37c71520bb3786ddf9f3de06",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "adult-content/config.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        num_steps_per_epoch=400,\n    ):\n        if model_dir is None:\n            model_dir = os.path.join(\"runs\", datetime.now().strftime(\"%Y%m%d_%H%M%S\"))\n        if input_embedding_dim is None:\n            input_embedding_dim = self.INPUT_EMBEDDING_DIM\n        for argname, value in locals().items():\n            if argname != \"self\":\n                setattr(self, argname, value)\n\n\nclass CalibrationConfig:\n    def __init__(\n        self,\n        dataset_path,\n        output_dir=None,\n        num_thresholds=200,\n    ):\n        if output_dir is None:\n            output_dir = os.path.join(\n                \"calibration\", datetime.now().strftime(\"%Y%m%d_%H%M%S\")\n            )\n        for argname, value in locals().items():\n            if argname != \"self\":\n                setattr(self, argname, value)\n",
+      "source_digest": "c08e54aeb17b3401bdd13163e64c0a821bc1d4c80104c8ef0ef1bd246042e568",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "bdsm/runtime/manhattan_scorer.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 22,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import logging\nimport os\n\nimport numpy as np\n\nlog = logging.getLogger(\"manhattan_scorer\")\n\n\nclass ManhattanArrowReader:\n    def __init__(self, endpoint: str = \"localhost:8080\"):\n        from manhattan_cli.mh_client import ManhattanClient, ManhattanClientConfig, Tenant\n\n        self.client = ManhattanClient(ManhattanClientConfig(endpoint=endpoint), secure=False)\n        self.tenant = Tenant(\n            cluster=os.environ.get(\"MH_CLUSTER\", \"your-cluster\"),\n            app_id=os.environ.get(\"MH_APP_ID\", \"your-app\"),\n            dataset=os.environ.get(\"MH_DATASET\", \"your-dataset\"),\n        )\n        self._long_to_bytes = ManhattanClient.long_to_bytes\n\n    def get_raw_bytes(self, user_id: int) -> bytes | None:\n        try:\n",
+      "source_digest": "eb8de785c7ef8a385e661936c5a1b17552e4bd10ee42ff878fc3d60e0c64b53c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "bdsm/runtime/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 80,
+      "end_line": 104,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    return cos, sin\n\n\ndef _repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:\n    if n_rep == 1:\n        return x\n    B, T, kv_heads, Dh = x.shape\n    x = jnp.broadcast_to(x[:, :, :, None, :], (B, T, kv_heads, n_rep, Dh))\n    return x.reshape(B, T, kv_heads * n_rep, Dh)\n\n\nclass Backbone(hk.Module):\n    def __init__(self, config: BackboneConfig, name: str = \"abuse_v3\"):\n        super().__init__(name=name)\n        self.c = config\n        self.D = config.emb_size\n\n    def _build_input_embeddings(self, batch: dict) -> tuple[jax.Array, jax.Array]:\n        D = self.D\n        aseq = batch[\"action_seq\"]\n        B = aseq[\"padding_mask\"].shape[0]\n        init = hk.initializers.TruncatedNormal(stddev=0.02)\n        vinit = hk.initializers.VarianceScaling(1.0, \"fan_out\", \"truncated_normal\")\n\n        action_table = hk.get_parameter(\n",
+      "source_digest": "3b07ecf7c03a56953fe6a7953cfefd3eb484eff47d039c7bc8e373315c524a0f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "bdsm/runtime/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 81,
+      "end_line": 105,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n\ndef _repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:\n    if n_rep == 1:\n        return x\n    B, T, kv_heads, Dh = x.shape\n    x = jnp.broadcast_to(x[:, :, :, None, :], (B, T, kv_heads, n_rep, Dh))\n    return x.reshape(B, T, kv_heads * n_rep, Dh)\n\n\nclass Backbone(hk.Module):\n    def __init__(self, config: BackboneConfig, name: str = \"abuse_v3\"):\n        super().__init__(name=name)\n        self.c = config\n        self.D = config.emb_size\n\n    def _build_input_embeddings(self, batch: dict) -> tuple[jax.Array, jax.Array]:\n        D = self.D\n        aseq = batch[\"action_seq\"]\n        B = aseq[\"padding_mask\"].shape[0]\n        init = hk.initializers.TruncatedNormal(stddev=0.02)\n        vinit = hk.initializers.VarianceScaling(1.0, \"fan_out\", \"truncated_normal\")\n\n        action_table = hk.get_parameter(\n            \"action_emb\",\n",
+      "source_digest": "1ec97c8589d01792c383d9a71c9053485604d5e33971d0f20ac81b3f72c6b1a1",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "bdsm/runtime/sequence_cache.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 36,
+      "end_line": 60,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    \"post_language_code\": lambda ua: int(ua.tweetInfo.languageCode),\n    \"quoting_author_id\": lambda ua: int(ua.tweetInfo.quotingAuthorId),\n    \"quoted_author_id\": lambda ua: int(ua.tweetInfo.quotedAuthorId),\n    \"in_reply_to_author_id\": lambda ua: int(ua.tweetInfo.inReplyToAuthorId),\n    \"retweeting_author_id\": lambda ua: int(ua.tweetInfo.retweetingAuthorId),\n    \"engaging_ip_country_code\": lambda ua: int(ua.actionInfo.userActionMeta.engagingIpCountryCode),\n    \"served_time_ms\": lambda ua: int(ua.actionInfo.userActionMeta.servedTimeMs),\n    \"search_query\": lambda ua: str(ua.actionInfo.userActionMeta.searchQuery),\n}\n\n\nclass SequenceCacheClient:\n    def __init__(\n        self,\n        host: str = \"localhost\",\n        port: int = 6379,\n        timeout_ms: int = 150,\n    ):\n        import redis as redis_lib\n\n        self._r = redis_lib.Redis(\n            host=host,\n            port=port,\n            socket_timeout=timeout_ms / 1000.0,\n            socket_connect_timeout=timeout_ms / 1000.0,\n",
+      "source_digest": "f561754a83d2520ae789949f152b016650b07af811765ec74fcb4fe08b04da2e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "bdsm/runtime/sequence_cache.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 65,
+      "end_line": 89,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    def get(self, user_id: int) -> bytes | None:\n        return self._r.get(str(user_id))\n\n    def set(self, user_id: int, value: bytes, ttl_secs: int) -> None:\n        try:\n            self._r.setex(str(user_id), ttl_secs, value)\n        except Exception:\n            pass\n\n\nclass RealtimeCacheClient:\n    def __init__(\n        self,\n        host: str = \"localhost\",\n        port: int = 6382,\n        timeout_ms: int = 100,\n    ):\n        import redis as redis_lib\n\n        self._r = redis_lib.Redis(\n            host=host,\n            port=port,\n            socket_timeout=timeout_ms / 1000.0,\n            socket_connect_timeout=timeout_ms / 1000.0,\n",
+      "source_digest": "5e81423c0feeed9b167a959e874dfbc4552dd5c7e058f105452d9fa28fc31202",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "clip/config.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 20,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from datetime import datetime\nimport os\n\n\nclass ClipConfig:\n    DEFAULT_FINAL_EMBEDDING_DIM = 256\n\n    def __init__(\n        self,\n        dataset_path,\n        input_resolution=224,\n        use_data_augmentation=False,\n        clip_model_type=\"ViT-B/32\",\n        top_feedforward=True,\n        final_embedding_dim=None,\n        logit_scale=4.5065,\n        model_dir=None,\n        save_interval=5000,\n        save_last_ckpt_only=True,\n        batch_size=128,\n",
+      "source_digest": "c8d4be656e48cb16c1e757db980451fab4e8672abdd9311efc9331417516cbbb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "clip/datasets/language_image_dataset.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 25,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "from functools import partial\n\nfrom twitter.clip.utils.data_utils import (\n    clean_text as clean_text_fn,\n    get_clip_decode_and_proc_fn,\n    read_tfrecords_from_gcs,\n)\n\nimport tensorflow as tf\n\n\nclass LanguageImageGcsDataset:\n    def __init__(\n        self,\n        features=None,\n        text_field=\"tweet_text\",\n        encoded_image_field=\"image_byte_string\",\n        image_field=\"image\",\n        input_resolution=224,\n        channels=3,\n        resize_side_buffer=32,\n        use_data_augmentation=False,\n        clean_text=True,\n        batch_size=128,\n        eval_batch_size=None,\n",
+      "source_digest": "de14b30c42a14374abc53b65f2567c977b954d58f59ed8dec997181aa2a6f000",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "clip/datasets/media_cache_dataset.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 3,
+      "end_line": 27,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "import importlib\nimport os\n\nfrom twitter.clip.utils.data_utils import blobstore_fetch\nfrom twitter.magicpony.common import file_access\n\nfrom google.cloud import bigquery\nimport pkg_resources\nimport tensorflow as tf\n\n\nclass MediaCacheBqDataset:\n    def __init__(\n        self,\n        project_id,\n        dataset_id,\n        table_id,\n        element_spec,\n        media_field,\n        download_image_size=\"small\",\n        http_urls=False,\n        bq_compute_project=\"example-media-project\",\n    ):\n        self.project_id = project_id\n        self.dataset_id = dataset_id\n",
+      "source_digest": "a71237ed2fd9ae749ecebf0d518508100c0c5a73a57980746e2922481292ac11",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "clip/keras_model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 67,
+      "end_line": 91,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n            print(f\"Extracting model to: {local_path}\")\n            with zipfile.ZipFile(zip_file_path, \"r\") as zip_ref:\n                zip_ref.extractall(local_path)\n\n    return local_path\n\n\nclass TwitterCLIPKeras(tf.keras.Model):\n    IMAGE_EMBEDDINGS_OUTPUT_KEY = \"image_embeddings\"\n    TEXT_EMBEDDINGS_OUTPUT_KEY = \"text_embeddings\"\n\n    def __init__(self, image_module, text_module, image_size, embedding_dim):\n        super().__init__()\n        self.image_module = image_module\n        self.text_module = text_module\n        self.image_size = image_size\n        self.embedding_dim = embedding_dim\n\n    \u0040tf.function(\n        input_signature=[\n            {\n                \"images\": tf.TensorSpec([None, 3, None, None], tf.float32),\n                \"texts\": tf.TensorSpec([None, None], tf.int64),\n            }\n",
+      "source_digest": "bcfab917ced27592ee638feead99d206f40dcafadcfba6a0daa7d4deffebd029",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "clip/keras_model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 68,
+      "end_line": 92,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            print(f\"Extracting model to: {local_path}\")\n            with zipfile.ZipFile(zip_file_path, \"r\") as zip_ref:\n                zip_ref.extractall(local_path)\n\n    return local_path\n\n\nclass TwitterCLIPKeras(tf.keras.Model):\n    IMAGE_EMBEDDINGS_OUTPUT_KEY = \"image_embeddings\"\n    TEXT_EMBEDDINGS_OUTPUT_KEY = \"text_embeddings\"\n\n    def __init__(self, image_module, text_module, image_size, embedding_dim):\n        super().__init__()\n        self.image_module = image_module\n        self.text_module = text_module\n        self.image_size = image_size\n        self.embedding_dim = embedding_dim\n\n    \u0040tf.function(\n        input_signature=[\n            {\n                \"images\": tf.TensorSpec([None, 3, None, None], tf.float32),\n                \"texts\": tf.TensorSpec([None, None], tf.int64),\n            }\n        ]\n",
+      "source_digest": "9e8c7f331a2d29863a48f61c9b196d80750b4cf256c8117c7491587e7599f719",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "clip/model.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 46,
+      "end_line": 70,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        \"Twitter-ViT-B/32-128\": \"https://example.invalid/models/twitter/clip_source_d128_bs2784/clip_source_d128_bs2784_twitter-clip-d128.pt\",\n    }\n\n    TWITTER_MODELS_PRETRAINED_BASE = {\n        \"Twitter-ViT-B/32-256\": \"ViT-B/32\",\n        \"Twitter-ViT-B/32-128\": \"ViT-B/32\",\n    }\n\n    MODELS = {**PRETRAINED_MODELS, **TWITTER_MODELS}\n\n    MODEL_NAMES = tuple(MODELS.keys())\n\n    def __init__(\n        self,\n        clip_model_type=DEFAULT_CLIP_MODEL_TYPE,\n        top_feedforward=True,\n        final_embedding_dim=DEFAULT_FINAL_EMBEDDING_DIM,\n        truncate_text=True,\n        logit_scale=None,\n        use_gpu=None,\n    ):\n        self.clip_model_type = clip_model_type\n\n        if clip_model_type not in self.MODELS:\n            raise ValueError(\n",
+      "source_digest": "413b1bc43f36beba10946fa9290077ec20d31c266dff9c85f537d3357ea9345f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 7,
+      "end_line": 31,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    def forward(self, x):\n        return (\n            0.5\n            * x\n            * (\n                1\n                + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))\n            )\n        )\n\n\nclass LayerNorm(torch.nn.Module):\n    def __init__(self, features, eps=1e-6):\n        super(LayerNorm, self).__init__()\n        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n",
+      "source_digest": "32ef4e41b41fec0f0681091a9c28e457869fc097a9f8975795846b0e500b4e90",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 8,
+      "end_line": 32,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        return (\n            0.5\n            * x\n            * (\n                1\n                + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))\n            )\n        )\n\n\nclass LayerNorm(torch.nn.Module):\n    def __init__(self, features, eps=1e-6):\n        super(LayerNorm, self).__init__()\n        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n    def __init__(self, d_in, d_h, d_out, dropout=0.1):\n",
+      "source_digest": "ffe2b06edf1aa7885035ef9c2e3dbe8448dc10b7f7fc9c553dc56015b45862a6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 20,
+      "end_line": 44,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        super(LayerNorm, self).__init__()\n        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n    def __init__(self, d_in, d_h, d_out, dropout=0.1):\n        super(PositionwiseFeedForward, self).__init__()\n        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n",
+      "source_digest": "23d0a1fc908afa839ebeeeef557b1c24df5f2067ea487ecf3f2cd3b56c979e85",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 21,
+      "end_line": 45,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.a_2 = torch.nn.Parameter(torch.ones(features))\n        self.b_2 = torch.nn.Parameter(torch.zeros(features))\n        self.eps = eps\n\n    def forward(self, x):\n        mean = x.mean(x.dim() - 1, keepdim=True)\n        std = x.std(x.dim() - 1, keepdim=True)\n        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2\n\n\nclass PositionwiseFeedForward(torch.nn.Module):\n    def __init__(self, d_in, d_h, d_out, dropout=0.1):\n        super(PositionwiseFeedForward, self).__init__()\n        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n",
+      "source_digest": "7259efe03473c1be90a6beff190a544ec3d621be0c7ab5e7f0cd72aa9f4ea308",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 33,
+      "end_line": 57,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        super(PositionwiseFeedForward, self).__init__()\n        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(ImageCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.visual.output_dim\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n",
+      "source_digest": "763c996aaf2d668b2646d4c197bc87cf7269c0d0f47953160d55ee44afcd45a4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 34,
+      "end_line": 58,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.w_1 = torch.nn.Linear(d_in, d_h)\n        self.w_2 = torch.nn.Linear(d_h, d_out)\n        self.dropout = torch.nn.Dropout(dropout)\n        self.activation = GeLU()\n        self.ln = LayerNorm(d_out)\n\n    def forward(self, x):\n        return self.ln(self.w_2(self.dropout(self.activation(self.w_1(x)))))\n\n\nclass ImageCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(ImageCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.visual.output_dim\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n",
+      "source_digest": "df2430842f993899c5c10de3abf5aef18df860a22eeacdeda10ed423ae8f9b0b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 53,
+      "end_line": 77,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n    def forward(self, image):\n        out = self.model.encode_image(image)\n        return self.ff(out) if self.top_feedforward else out\n\n\nclass TextCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(TextCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.transformer.width\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n",
+      "source_digest": "369db794531dc0382d329df821a1e24edc89f5ce39422c1c24c9182dd7f247a7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "clip/modules.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 54,
+      "end_line": 78,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n    def forward(self, image):\n        out = self.model.encode_image(image)\n        return self.ff(out) if self.top_feedforward else out\n\n\nclass TextCLIP(torch.nn.Module):\n    def __init__(self, model, top_feedforward=False, d_h=None, d_out=None):\n        super(TextCLIP, self).__init__()\n        self.model = model\n        self.embedding_dim = model.transformer.width\n        self.top_feedforward = top_feedforward\n        if self.top_feedforward:\n            d_h = self.embedding_dim // 2 * 3 if d_h is None else d_h\n            d_out = self.embedding_dim // 2 if d_out is None else d_out\n            self.ff = PositionwiseFeedForward(\n                d_in=self.embedding_dim,\n                d_h=d_h,\n                d_out=d_out,\n            )\n\n",
+      "source_digest": "f4431041d78e82de5b7f4b81caa54a338d58c8c87af8c633068ddd019ffcc9bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E49": {
+      "path": "grox/core/clients/nightowl_client.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 16,
+      "end_line": 40,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    0.05,\n    0.1,\n    0.25,\n    0.5,\n    1.0,\n    1.5,\n    2.0,\n    5.0,\n)\n\n\nclass NightOwlClient:\n    def __init__(self, endpoint: str, timeout: float = 2.0):\n        self._endpoint = endpoint\n        self._timeout = timeout\n        self._channel: grpc.aio.Channel | None = None\n        self._stub: NightOwlSearchServiceStub | None = None\n\n    async def _ensure_stub(self) -> NightOwlSearchServiceStub:\n        if self._channel is None:\n            self._channel = grpc.aio.insecure_channel(\n                self._endpoint,\n                options=[\n                    (\"grpc.max_receive_message_length\", 128 * 1024 * 1024),\n                    (\"grpc.max_send_message_length\", 128 * 1024 * 1024),\n",
+      "source_digest": "899a994739d70655d941f4465f13315b0271c24f9a5d7457fa1aa5c39bd6ded0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E50": {
+      "path": "grox/core/data_loaders/asr_processor.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 78,
+      "end_line": 102,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return f.read()\n\n\ndef _clean_asr(raw: str) -> str:\n    if \"<asr_text>\" in raw:\n        raw = raw.split(\"<asr_text>\", 1)[1]\n    if \"</asr_text>\" in raw:\n        raw = raw.split(\"</asr_text>\", 1)[0]\n    return raw.strip()\n\n\nclass _ASRWorker:\n    def __init__(\n        self, task_queue: Queue, resp_queue: Queue, shutdown_event: MultiprocessingEvent\n    ):\n        self._task_queue: Queue[tuple[_ASRRequest, dict[str, str]]] = task_queue\n        self._resp_queue: Queue[_ASRResult] = resp_queue\n        self._shutdown_event: MultiprocessingEvent = shutdown_event\n\n    \u0040staticmethod\n    def _metrics_attributes() -> dict[str, str]:\n        return {\"pid\": str(os.getpid())}\n\n    async def _transcribe(self, request: _ASRRequest) -> str | None:\n        asr_config = grox_config.asr\n",
+      "source_digest": "fac03f99d2500bf965661eb87b9d2dece47be4afe20f05d6cdd76a1c4b82f6f3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f44ba0fb589bcc59246d0873fbadd5fd053e410fdccd46a68bc907a3f71be154",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "1a41c5f2b3557e8abc335d703cbdc79b1db72ab1e6ffa7929766f0f856c80dac",
+      "context_complete": true,
+      "task_id": "T-9ebe5f2e27dc5bcfe184b7e14d075052839f31b9b98d61e13184d082b782daf8",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a952e61901e3b02e5cabaee1d56926b3f808394cec02753338f65f2100a628d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-475981ad54e11af09e71902ee34d54115380ae34ff65afb04b6c83d75e2f2d05",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4164365faab3cb154a60a756d20278c29426ab82d1110ed03c1eade0a06cc3a6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-8c4d5c67f05e810130711fbc4fbd7d829dfb1093ee14e396c1760f11b59c56b6",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d387b80ded9a813b2746799b3d92fdecb29aaf34127faa443c5f1b9af5ac666c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-61bba7d6d7bc5f509954717946ec97358ccab918fe7b760b1ca583eadb56a8c7",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9c33eacbde0fd058a20ca60f0a08ee666647b177df252726722ab550c71a16d3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ff178528abdbf019403fc3d970af7905b17bbfd0614cf83558665378a8ea4b19",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ea6eee273bcc69a17dad52216115889b86d4a432eb05730f83c5fe05a6d7076e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-34e03bb14cc4d98a664fbe08c6b96f70ed6e249de49d67edca7d8f157eb78b08",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d156a4f9826c70d1a9b6c251e3193231ad804a238cc9616ffff7b2d0b498efc9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-4c22355f6919494938b86c265aa4bfa8ffbf3051bc1a82b413867e1572576658",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-55adabbb968bc70b10d19d00b93f374a1fd7ca90f9aa1e359b83631f41c5b092",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-4eb72d9d27ca2874f154c09763c662d4a9e5b4122dd51f819f1fd593f78c0417",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6fd2ce774a5e59d41742c9597f0ef1e3e897e8e8ce9d0fc38723a2e1dbf72ea1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-bfaf161e84dadcf4b1c8ba8722872db68c77be36899583251b4e3628db96f999",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-64ea748fb3d9e9b1a4e9baf2887bc0a48d1480dbfc36e8cc3539234ac3b70581",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-fae32210f0325c3e9644b66fcc5911b68173e0cf3d85d474b376e3915d4a0dbe",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1cf9429c2e9acc3f1a69401d6c62377f5f75d056d55f5af5b34f73563d7d65d5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-e88fb801a5c34275b697e0b8108cd8836418433cf90d6b039ec640ac3ef73b6d",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-37e1fcea28d78548ea77ce91c8c26ac7b58d74de3e6427dc9f4e4a2f1f879eeb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ba24118131ae5dac5ea3b0d39af5aae65a9a443d7b8cebaa098fa068a8df7dfa",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d468f4c8825ed3de9a14785c0410af670a370c6260a188d2ef0d210b52dee1fa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-497407fc93ac3bf990bf7bccd78defa5b85acb68c5cd778c9d6438a245f560c6",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-63675b678a291294ec3b3615cdb8ee3467edd8e5101d98889a08053cb42bcd1f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-3db06fbcb5ee4e438b374c0b4364cba4844b71c3d8ae7b002a019b34990c1249",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7244bd636c3c768b13f454cc9f917c18ab073d5dfbf30f8091c61b6af6bd7292",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-a9d25ecbfbdb69a6cbcda9ce526520d8c17db705f1e9c610174fcddbb8dda1d1",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b973f8cd6ed0c3c5977b10a8282dfc337d64a1eb324456846bb26941dd1c8fa9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-11c3e7244b96aa1531e7adf695cd9bf45468201466f9a69b367f20d843945f38",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-948e291fbbb937e04f8f6eb2071f25225693f86f0799a8a7c71701a479a2dfb8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-88669e94d43f0e56798eae4bb51ac833e61f73cb49d84d62084f2bde2b72829c",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-acc2fabfad94cc3723a3a0c9205d86911caed16d08133868c8466efb8732fe78",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-758f564c941861477a03e332d73f387d23b4a7d1c8999a32f194977f5900b453",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0da370a9f3e22892726b57b91cdd3175a7e51c18145aa94f8d3757de01073634",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-6052c0045b8c634b85b6588ab47569720433c39a47fcc5602fb2b2743408247b",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a23947e697b3b239ffc7b13d14a5a90c3bab00bb4e076768bc7863d64545a7e9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-dc253709784dc0387e9e3e62c52290fb6927b46a7566951f672d87a4e5ee7d9b",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fdb742e89e0137f2b49712d4066bbffbe0df5ef4e7a6e4ecfd7f2486c586244c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-25ae2039b7f918125e1a3fb464d60083b9d4a2813fd76df01178a151eb5afbf8",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-026f4606f0856e2e1b14cb66d6d71ffb89dcfd5caf755641a40d88ca158a0415",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-78513296d13c755f83cca028d68d5830beb37aa247e1b85f2d0ec11618013b3f",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca6f6fcb39e3677841fefc6daaa1bab73aed857ca71cc8ca7d04acf91e5ae3e9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-7ce6fb881c8b1d406103acf0a688b4534e3579142ed00df7c69bf1ddfcb1e967",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8b11776a2eb61b106cd544589fdebd5a17260fe6b6896822699d541ba8a87d46",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-17527259c2c94f77c35b7119d7a6a14d13c7639caa1f369e1dd501dace6e9462",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ab60188d4775afcba0e7d85571051afb9acd258c01b4ad8beec7be5885e6cdbd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-4700008d54a4e29f342606aaf5229fbbac10b1ef40a5e76a96a4a7145297aa48",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a3c0ff448993f73693d2d3be297b0c50f28d37c73383d6535ccf7f79056e234b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-8ca064db0a3fccb611764a71d5086a9c735c959c7b34229fc122b4e2be2d65ca",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3f473c9e17ca9b84ad75640eba3dd1d032cfaa49d39a493e2d601ead9492f663",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-cc267fd3d222d02fea79203947c4a8ad680605b41bf73a745f79b026c540b621",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-832e35cb4dc5ecdaf9cdd00ba55c189d158a94b0b69c2340417b2b3671e6d2fb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-e40825180715eb054f92d30fef35dfe35c68a4a9a98703cf7bdc46ba95f8443c",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b23a41a7c9e01b92b561c6d072d63ef7548f3be0013a99d20a748bd71d433ef4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-60c253127c91a16b15174e4f348f0593779f55727440efd78bb7d0a140d84a4f",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c478d8b882cfec3eceb3f445cff81200d0c698953d728672bae628b34a546e2f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-33e5eabc3edced0967a98b488d43fae9927ae3494b134d32c1f90633afef4ddd",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-972870e11909392425f6b8556a5af440889c108bc63e626dad7271e13b37e229",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d51b738a8cb1180d6ff941b6e8cdc116a73a8f941b807786d1a23b378077bd42",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fa648dd5ec608d04f3f765627ffb47a21cf8e6872a0f156e70ff9b19117433ec",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-da0ed5cede2cc9facefa6ff3aa80e51c40c39b2e710215e09884a668d6e67785",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d9cb8f096f6ccbedceea046f6c1e51751b8012d431021e133be5580b1a5d1c54",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-dd7c4fd4f0a6a0b06cd04be9c7b590dd63521077658ff86e45f89b190df6d5a9",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d7c0b71c7e7e9fecd5eeef5097e1698d83325767cb6cc728c0d116f37f1350f4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-310f3b87bd3c63e6c592aeb54b063a99bd86efb68e3848448c5e3f027e7764fd",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-29ed22139415a284fa7ca9f58af8f40d3bde812103c73d89aca7a68b660d9f8d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-f0df98d7256ce32c721fd9b1b9b6b95ff6b1023744fbd8bbdbd3c0b3f040b362",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5801d3063d4ba38a94d621f35c80a8d97b8829c3ecfd8cab7152eb15f5de5106",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-4c058dc1cbcafddffac80689c1c7e50c508e8c7ec3a3670b149926419877feb0",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a92743d755c18371a83d0b7e1734be39d9d6dc6b5eb27bdfd2d384453269d90d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d1be4298a7a49d39bc97c06e4368f24d1a150819108e349d3892e312dfd00a68",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bdd757bf75fc9bdcc387050a4651c35de77307b709f6df0a1c153e7a9eb667f3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-cb94ca5aa98c58606d6bcea5671071cc0796c3755bdec3c468fbd03da8921c2a",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-33a2d3aedda2136031c9ead031ae48b7d9ad4431e698f3f76bb8398f17bd4b8c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-234a50693b4e3172d198aaa96886aa906a0109419f8938f93bd006f83e44c9f1",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-235f9451cf3848ffa75638de571a0b51555af2847f3d1828a19c498bf67e919a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-8544a65f74c21304b329af60b8f2fb5d9df155a545d39b89b40dde69e398a42c",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8261b8be86a8859810ae35b04e9d259b9747ad9cfcb9423e1389ab3dd854f56a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-bc84791712c67cb6cd80fb4122fcf6acd65076d68dabef6404a9c266f7253f0e",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-11a1c88f241f91b7d1bd3639a31c1a4c0945e9272e6151d919c6e5bbdfcaa508",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d00d43ede1e8d8f5356cbb0c53c34e22598cf2693e00ddebdd3dd5b3b7f5da7a",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-be74c9184346d17caf4dc1f9dde6e94b5bdbda3aae71875bbe95ee6bf4750846",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-dcd952721e29953fccd51468c2d1f5ae1670d925c928e5716259dfea56bdacc7",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-53a98d955141e3dca44c2583a6e0d84ec3c2124e830097697e88e6114380d3d7",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-342aa0ba30b5f9fdd48ebd7051df125ab472faa019428cbf28e845c2b4a7a1f8",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f9eb9cc81a91c8fc7cdd766e5b30375f3b2cd92c2dab8ff02df6e1226e10e1d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-499928fd714c6f0aa529069ec6ed7aad70fadafd90c16980a957bc3acf29f572",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a1120dcb326fd19d799871d69da8a5207bf82b2874e095001340316b43f3baae",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-ab59583e44865f15dc4deda6d6a97358ba5475c0987ea7acdc46a3f5e6c290c1",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-20c671025f92563b1d83d054c3950f88006926dbff9776fcaf05c6edc7c23097",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-8dea79ba1e086adca9cf73dcfdb6969610892deb21ce8a393d7537da48f6df1c",
+      "evidence_refs": [
+        "E48"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4f9a5c4d33deea34a024d7ee597b474a68ea245a40a998344796a79d87df3850",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-f67fe918d88efd70dcd54d9a8d7034d8dd8a196124ac5e189582019e17a2a622",
+      "evidence_refs": [
+        "E49"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/attention.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-52b98793a58414587fa0297fd43b48fb7f588adb3ef08ef821d899a75fa57d58",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "AttentionConfig",
+        "Attention",
+        "__init__"
+      ],
+      "context_complete": false,
+      "task_id": "T-d24ee1dbbb64d85129f6444d2f99101b3762dbe01367631073291a493d176854",
+      "evidence_refs": [
+        "E50"
+      ]
+    }
+  ],
+  "task_id": "T-b2d1b1890dc7f72f1ac0cab4cde0325831b57192e892371344705c8fdeaa9809"
+}

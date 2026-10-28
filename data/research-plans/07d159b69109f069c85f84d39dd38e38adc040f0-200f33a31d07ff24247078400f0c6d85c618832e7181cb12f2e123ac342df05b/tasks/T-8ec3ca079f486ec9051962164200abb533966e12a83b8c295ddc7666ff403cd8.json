@@ -1,0 +1,1664 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/store/resolve.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-b3cbaa51905ca88890903ddf4df77defeda459386652b94346d54c17cf407fe9",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 272,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use super::key_origin::{KeyOrigin, Names};\nuse super::{RequestRow, Store};\nuse crate::hydration::fetcher::AnyFetcher;\nuse crate::hydration::inventory::MissPolicy;\nuse crate::hydration::relation::Relation;\nuse crate::hydration::{\n    Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, Unresolved,\n};\nuse crate::models::{\n    AuthorId, ConversationControlFeatures, PostCandidate, PostEntity, SafetyLabelMap,\n    TweetFeatures, TweetId, UserEntity, ViewerRelationship,\n};\nuse rustc_hash::FxHashMap;\nuse xai_core_entities::entities::ConversationControlArm;\n\nimpl Store {\n    pub(super) fn hydrated_tweet(\n        &self,\n        row: &RequestRow,\n        position: usize,\n        id: TweetId,\n        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,\n        incomplete: Hydrators,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> HydratedTweet {\n        let safety_labels = self.labels.get(id.0).cloned();\n        match self.resolve(row, id, tweet_misses) {\n            Ok(author_id) => {\n                let candidate = self.candidate(row, position, id, author_id, incomplete, unclaimed);\n                HydratedTweet::Resolved {\n                    candidate,\n                    source_tweet_id: self.source_tweet_id(id),\n                    safety_labels,\n                }\n            }\n            Err(reason) => HydratedTweet::Unresolved {\n                reason,\n                safety_labels,\n            },\n        }\n    }\n\n    pub(super) fn hydrated_user(\n        &self,\n        row: &RequestRow,\n        position: usize,\n        user: AuthorId,\n        incomplete: Hydrators,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> HydratedUser {\n        match self.author_miss(user) {\n            Some(cause) => HydratedUser::Unresolved(cause),\n            None => HydratedUser::Resolved {\n                user: self.author(user),\n                viewer_relationship: self.edges(row, position).0,\n                failed: self.failed(row, position, incomplete, unclaimed),\n            },\n        }\n    }\n\n    fn resolve(\n        &self,\n        row: &RequestRow,\n        id: TweetId,\n        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,\n    ) -> Result<AuthorId, Unresolved> {\n        let tweet = |cause| Unresolved {\n            lookup: Lookup::Tweet,\n            cause,\n        };\n        if let Some(&Some(cause)) = tweet_misses.get(&id) {\n            match cause {\n                Cause::NotFound if self.quotes.quoted_author(id).is_some() => {}\n                Cause::NotFound if self.quotes.is_quoted_author_failed(id) => {\n                    return Err(tweet(Cause::Failed));\n                }\n                Cause::NotFound | Cause::Failed => return Err(tweet(cause)),\n            }\n        }\n        let author_id = row.author.ok_or_else(|| tweet(Cause::Failed))?;\n        let (shared_tweet, shared_author) =\n            self.shared_misses(id, tweet_misses).unwrap_or_default();\n        [\n            (Lookup::SharedTweet, shared_tweet),\n            (Lookup::Author, self.author_miss(author_id)),\n            (Lookup::SharedAuthor, shared_author),\n        ]\n        .into_iter()\n        .filter_map(|(lookup, miss)| {\n            Some(Unresolved {\n                lookup,\n                cause: miss?,\n            })\n        })\n        .min_by_key(|unresolved| unresolved.cause)\n        .map_or(Ok(author_id), Err)\n    }\n\n    fn shared_misses(\n        &self,\n        tweet_id: TweetId,\n        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,\n    ) -> Option<(Option<Cause>, Option<Cause>)> {\n        let core = self\n            .pure_cores\n            .get(tweet_id.0)\n            .filter(|_| self.is_on(Relation::RetweetSource))?;\n        let source_id = core.source_tweet_id?;\n        let shared_tweet = *tweet_misses.get(&source_id)?;\n        let shared_author = core.source_author_id.or_else(|| {\n            self.rows\n                .iter()\n                .find(|row| row.tweet_id() == Some(source_id))?\n                .author\n        });\n        Some((\n            shared_tweet,\n            shared_author.and_then(|author_id| self.author_miss(author_id)),\n        ))\n    }\n\n    fn unresolving(&self, names: Names) -> impl Iterator<Item = (Hydrator, &dyn AnyFetcher)> + '_ {\n        self.callable\n            .iter()\n            .filter(move |&node| {\n                node.spec().source.miss_policy() == MissPolicy::Unresolves\n                    && self.origin(node).names() == names\n            })\n            .filter_map(|node| Some((node, self.fetcher(node)?)))\n    }\n\n    pub(super) fn tweet_miss(\n        &self,\n        tweet_id: TweetId,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> Option<Cause> {\n        let key = tweet_id.0;\n        let has_joined_retweet_sources = self.has_joined_retweet_sources;\n        self.unresolving(Names::Post)\n            .filter_map(|(node, fetcher)| {\n                if has_joined_retweet_sources && !fetcher.is_claimed(key) {\n                    unclaimed.push((node, key));\n                }\n                fetcher.miss(key)\n            })\n            .min()\n    }\n\n    fn author_miss(&self, author_id: AuthorId) -> Option<Cause> {\n        self.unresolving(Names::Author)\n            .filter_map(|(_, fetcher)| fetcher.miss(author_id.get()))\n            .min()\n    }\n\n    fn author(&self, author_id: AuthorId) -> UserEntity {\n        let (author_features, author_labels) = self\n            .authors\n            .get(author_id.get())\n            .copied()\n            .unwrap_or_default();\n        UserEntity::new(author_id.get(), author_features, author_labels)\n    }\n\n    fn edges(&self, row: &RequestRow, position: usize) -> (ViewerRelationship, Hydrators) {\n        let (viewer_relationship, post_edges) = self\n            .callable\n            .iter()\n            .filter(|&node| {\n                node.edge()\n                    .and_then(|edge| {\n                        let key = self.parent_key(node, row, position)?;\n                        self.edge_fetcher(edge)?.get(key).copied()\n                    })\n                    .unwrap_or(false)\n            })\n            .fold(\n                (ViewerRelationship::default(), Hydrators::empty()),\n                |(mut relationship, mut post), node| {\n                    if let Some(slot) = relationship.slot(node) {\n                        *slot = true;\n                    } else {\n                        post = post.with(node);\n                    }\n                    (relationship, post)\n                },\n            );\n        debug_assert!(post_edges\n            .iter()\n            .all(|node| viewer_relationship.get(node).is_none()));\n        (viewer_relationship, post_edges)\n    }\n\n    pub(super) fn candidate(\n        &self,\n        row: &RequestRow,\n        position: usize,\n        tweet_id: TweetId,\n        author_id: AuthorId,\n        incomplete: Hydrators,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> PostCandidate {\n        let id = tweet_id.0;\n        let (viewer_relationship, post_edges) = self.edges(row, position);\n        PostCandidate {\n            author: self.author(author_id),\n            viewer_relationship,\n            post: PostEntity {\n                tweet_id: id,\n                source_tweet_id: self.source_tweet_id(tweet_id).map(|source| source.0),\n                is_reply: self\n                    .pure_cores\n                    .get(id)\n                    .is_some_and(|core| core.reply_to.is_some()),\n                tweet_features: TweetFeatures::default(),\n                safety_labels: self\n                    .labels\n                    .get(id)\n                    .map(|labels| SafetyLabelMap::from_proto_label_types(labels))\n                    .unwrap_or_default(),\n                edges: post_edges,\n                conversation_control: self.control(row).cloned().map(|control| {\n                    ConversationControlFeatures {\n                        viewer_country: self\n                            .viewer_id\n                            .filter(|_| control.arm == ConversationControlArm::Co)\n                            .and_then(|viewer_id| self.viewer_country.get(viewer_id))\n                            .cloned(),\n                        control,\n                    }\n                }),\n                community_moderation: self\n                    .community_moderations\n                    .get(id)\n                    .copied()\n                    .unwrap_or_default(),\n                viewer_is_community_moderator: self\n                    .key(KeyOrigin::ModeratedCommunity, row)\n                    .and_then(|community_id| self.community_moderators.get(community_id))\n                    .copied(),\n                viewer_is_removed_from_community: self\n                    .key(KeyOrigin::TweetCommunity, row)\n                    .and_then(|community_id| self.community_viewer_removals.get(community_id))\n                    .copied()\n                    .unwrap_or_default(),\n                article_has_media_entities: self\n                    .key(KeyOrigin::TweetArticle, row)\n                    .and_then(|article_id| self.article_media_entities.get(article_id))\n                    .copied()\n                    .unwrap_or_default(),\n                article_has_cover_media: self\n                    .key(KeyOrigin::TweetArticle, row)\n                    .and_then(|article_id| self.article_cover_media.get(article_id))\n                    .copied()\n                    .unwrap_or_default(),\n                article_lifecycle: self\n                    .key(KeyOrigin::TweetArticle, row)\n                    .and_then(|article_id| self.article_lifecycles.get(article_id))\n                    .copied(),\n                reacted_to_post_safety_labels: self\n                    .read_key(Hydrator::ReactedToPostSafetyLabels, position)\n                    .and_then(|post_id| self.labels.get(post_id))\n                    .map(|labels| SafetyLabelMap::from_proto_label_types(labels))\n                    .unwrap_or_default(),\n                reacted_to_author_is_protected: self\n                    .read_key(Hydrator::ReactedToAuthorSafety, position)\n                    .and_then(|user_id| self.authors.get(user_id))\n                    .is_some_and(|(author, _)| author.is_protected),\n            },\n            failed: self.failed(row, position, incomplete, unclaimed),\n        }\n    }\n}\n",
+      "source_digest": "eba90274f8bcf0220d44b9b9656963cbaab7fce56e0e1f8577e4480d62e93996",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 304,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use super::key_origin::{KeyOrigin, Names};\nuse super::{RequestRow, Store};\nuse crate::hydration::fetcher::Fetcher;\nuse crate::hydration::inventory::Stake;\nuse crate::hydration::relation::Relation;\nuse crate::hydration::{\n    Cause, HydratedTweet, HydratedUser, Hydrator, Hydrators, Lookup, Unresolved,\n};\nuse crate::models::{\n    AuthorId, ConversationControlFeatures, PostCandidate, PostEntity, SafetyLabelMap,\n    TweetFeatures, TweetId, UserEntity, ViewerRelationship,\n};\nuse rustc_hash::FxHashMap;\nuse xai_core_entities::entities::ConversationControlArm;\n\nimpl Store {\n    pub(super) fn hydrated_tweet(\n        &self,\n        row: &RequestRow,\n        position: usize,\n        id: TweetId,\n        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> HydratedTweet {\n        let safety_labels = self.labels.request().get(id.0).cloned();\n        match self.resolve(row, id, tweet_misses) {\n            Ok(author_id) => {\n                let candidate = self.candidate(row, position, id, author_id, unclaimed);\n                HydratedTweet::Resolved {\n                    candidate,\n                    source_tweet_id: self.source_tweet_id(id),\n                    safety_labels,\n                }\n            }\n            Err(reason) => HydratedTweet::Unresolved {\n                reason,\n                safety_labels,\n            },\n        }\n    }\n\n    pub(super) fn hydrated_user(\n        &self,\n        row: &RequestRow,\n        position: usize,\n        user: AuthorId,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> HydratedUser {\n        match self.author_miss(user) {\n            Some(cause) => HydratedUser::Unresolved(cause),\n            None => HydratedUser::Resolved {\n                user: self.actor(row, user),\n                viewer_relationship: self.edges(row, position).0,\n                failed: self.failed(row, position, unclaimed),\n            },\n        }\n    }\n\n    fn resolve(\n        &self,\n        row: &RequestRow,\n        id: TweetId,\n        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,\n    ) -> Result<AuthorId, Unresolved> {\n        let tweet = |cause| Unresolved {\n            lookup: Lookup::Tweet,\n            cause,\n        };\n        match tweet_misses.get(&id) {\n            Some(&Some(Cause::NotFound)) => {\n                self.quotes.quoted_author(id).map_err(tweet)?;\n            }\n            Some(&Some(Cause::Failed)) => return Err(tweet(Cause::Failed)),\n            Some(None) | None => {}\n        }\n        let author_id = row.author.ok_or_else(|| tweet(Cause::Failed))?;\n        let (shared_tweet, shared_author) =\n            self.shared_misses(id, tweet_misses).unwrap_or_default();\n        [\n            (Lookup::SharedTweet, shared_tweet),\n            (Lookup::Author, self.author_miss(author_id)),\n            (Lookup::SharedAuthor, shared_author),\n        ]\n        .into_iter()\n        .filter_map(|(lookup, miss)| {\n            Some(Unresolved {\n                lookup,\n                cause: miss?,\n            })\n        })\n        .min_by_key(|unresolved| unresolved.cause)\n        .map_or(Ok(author_id), Err)\n    }\n\n    fn shared_misses(\n        &self,\n        tweet_id: TweetId,\n        tweet_misses: &FxHashMap<TweetId, Option<Cause>>,\n    ) -> Option<(Option<Cause>, Option<Cause>)> {\n        let core = self\n            .pure_cores\n            .request()\n            .get(tweet_id.0)\n            .filter(|_| self.is_on(Relation::RetweetSource))?;\n        let source_id = core.source_tweet_id?;\n        let shared_tweet = *tweet_misses.get(&source_id)?;\n        let shared_author = core.source_author_id.or_else(|| {\n            self.rows\n                .iter()\n                .find(|row| row.tweet_id() == Some(source_id))?\n                .author\n        });\n        Some((\n            shared_tweet,\n            shared_author.and_then(|author_id| self.author_miss(author_id)),\n        ))\n    }\n\n    fn unresolving(&self, names: Names) -> impl Iterator<Item = Hydrator> + '_ {\n        self.callable.iter().filter(move |&node| {\n            self.stake(node) == Stake::Exists && self.origin(node).names() == names\n        })\n    }\n\n    pub(super) fn tweet_miss(\n        &self,\n        tweet_id: TweetId,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> Option<Cause> {\n        let key = tweet_id.0;\n        let has_joined_retweet_sources = self.has_joined_retweet_sources();\n        self.unresolving(Names::Post)\n            .filter_map(|node| {\n                if has_joined_retweet_sources && !self.fetcher(node)?.is_claimed(key) {\n                    unclaimed.push((node, key));\n                }\n                self.existence_miss(node, key)\n            })\n            .min()\n    }\n\n    fn author_miss(&self, author_id: AuthorId) -> Option<Cause> {\n        self.unresolving(Names::Author)\n            .filter_map(|node| self.existence_miss(node, author_id.get()))\n            .min()\n    }\n\n    fn author(&self, author_id: AuthorId) -> UserEntity {\n        let (author_features, author_labels) = self\n            .authors\n            .request()\n            .get(author_id.get())\n            .copied()\n            .unwrap_or_default();\n        UserEntity {\n            id: author_id.get(),\n            features: author_features,\n            labels: author_labels,\n            ..UserEntity::default()\n        }\n    }\n\n    fn actor(&self, row: &RequestRow, user: AuthorId) -> UserEntity {\n        let ((features, labels), profile) =\n            self.actors.get(user.get()).copied().unwrap_or_default();\n        let lacks = |fetcher: &Fetcher<bool>, origin| {\n            self.key(origin, row)\n                .and_then(|key| fetcher.get(key))\n                .is_some_and(|held| !held)\n        };\n        UserEntity {\n            id: user.get(),\n            features,\n            labels,\n            profile,\n            lacks_confirmed_email: lacks(\n                &self.actor_emails,\n                KeyOrigin::UserIfViewerFiltersNoConfirmedEmail,\n            ),\n            lacks_verified_phone: lacks(\n                &self.actor_phones,\n                KeyOrigin::UserIfViewerFiltersNoConfirmedPhone,\n            ),\n        }\n    }\n\n    fn edges(&self, row: &RequestRow, position: usize) -> (ViewerRelationship, Hydrators) {\n        let (viewer_relationship, post_edges) = self\n            .callable\n            .iter()\n            .filter(|&node| {\n                node.edge()\n                    .and_then(|edge| {\n                        let key = self.parent_key(node, row, position)?;\n                        self.edge_fetcher(edge)?.get(key).copied()\n                    })\n                    .unwrap_or(false)\n            })\n            .fold(\n                (ViewerRelationship::default(), Hydrators::empty()),\n                |(mut relationship, mut post), node| {\n                    if let Some(slot) = relationship.slot(node) {\n                        *slot = true;\n                    } else {\n                        post = post.with(node);\n                    }\n                    (relationship, post)\n                },\n            );\n        debug_assert!(post_edges\n            .iter()\n            .all(|node| viewer_relationship.get(node).is_none()));\n        (viewer_relationship, post_edges)\n    }\n\n    pub(super) fn candidate(\n        &self,\n        row: &RequestRow,\n        position: usize,\n        tweet_id: TweetId,\n        author_id: AuthorId,\n        unclaimed: &mut Vec<(Hydrator, u64)>,\n    ) -> PostCandidate {\n        let id = tweet_id.0;\n        let (viewer_relationship, post_edges) = self.edges(row, position);\n        PostCandidate {\n            author: self.author(author_id),\n            viewer_relationship,\n            post: PostEntity {\n                tweet_id: id,\n                source_tweet_id: self.source_tweet_id(tweet_id).map(|source| source.0),\n                is_reply: self\n                    .pure_cores\n                    .request()\n                    .get(id)\n                    .is_some_and(|core| core.reply_to.is_some()),\n                tweet_features: TweetFeatures::default(),\n                safety_labels: self\n                    .labels\n                    .request()\n                    .get(id)\n                    .map(|labels| SafetyLabelMap::from_proto_label_types(labels))\n                    .unwrap_or_default(),\n                edges: post_edges,\n                conversation_control: self.control(row).cloned().map(|control| {\n                    ConversationControlFeatures {\n                        viewer_country: self\n                            .viewer_id\n                            .filter(|_| control.arm == ConversationControlArm::Co)\n                            .and_then(|viewer_id| self.viewer_country.get(viewer_id))\n                            .cloned(),\n                        control,\n                    }\n                }),\n                community_moderation: self\n                    .community_moderations\n                    .get(id)\n                    .copied()\n                    .unwrap_or_default(),\n                viewer_is_community_moderator: self\n                    .key(KeyOrigin::ModeratedCommunity, row)\n                    .and_then(|community_id| self.community_moderators.get(community_id))\n                    .copied(),\n                viewer_is_removed_from_community: self\n                    .key(KeyOrigin::TweetCommunity, row)\n                    .and_then(|community_id| self.community_viewer_removals.get(community_id))\n                    .copied()\n                    .unwrap_or_default(),\n                article_has_media_entities: self\n                    .key(KeyOrigin::TweetArticle, row)\n                    .and_then(|article_id| self.article_media_entities.get(article_id))\n                    .copied()\n                    .unwrap_or_default(),\n                article_has_cover_media: self\n                    .key(KeyOrigin::TweetArticle, row)\n                    .and_then(|article_id| self.article_cover_media.get(article_id))\n                    .copied()\n                    .unwrap_or_default(),\n                article_lifecycle: self\n                    .key(KeyOrigin::TweetArticle, row)\n                    .and_then(|article_id| self.article_lifecycles.get(article_id))\n                    .copied(),\n                reacted_to_post_safety_labels: self\n                    .read_key(Hydrator::ReactedToPostSafetyLabels, position)\n                    .and_then(|post_id| {\n                        self.labels\n                            .of(self.owner(Hydrator::ReactedToPostSafetyLabels))\n                            .get(post_id)\n                    })\n                    .map(|labels| SafetyLabelMap::from_proto_label_types(labels))\n                    .unwrap_or_default(),\n                reacted_to_author_is_protected: self\n                    .read_key(Hydrator::ReactedToAuthorSafety, position)\n                    .and_then(|user_id| {\n                        self.authors\n                            .of(self.owner(Hydrator::ReactedToAuthorSafety))\n                            .get(user_id)\n                    })\n                    .is_some_and(|(author, _)| author.is_protected),\n            },\n            failed: self.failed(row, position, unclaimed),\n        }\n    }\n}\n",
+      "source_digest": "2cbe9d374a3d80d74e0684a06c3e8c1887daf687414026f88875beeb2b3a372b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 510,
+      "end_line": 534,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if let Some(r) = &self.row {\n            keys.extend(r.info_keys(self.mode == ControlMode::Recording, self.forced));\n        }\n        keys\n    }\n}\n\npub struct ResolveInput<'a> {\n    pub head: &'a str,\n    pub classifier: &'a str,\n    pub labels: &'a [String],\n    pub entity: EntityType,\n    pub factory: bool,\n    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n",
+      "source_digest": "ced5b137b607046d8343503dfe0839c748b9504770e3487bf50eeb6ebfe1c090",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 599,
+      "end_line": 623,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                }\n            }\n        }\n        snap.records.remove(except);\n        snap\n    }\n}\n\n#[allow(clippy::too_many_arguments)]\nfn effective(\n    record: &ActionControlRecord,\n    entity: EntityType,\n    factory: bool,\n    cfg: &ControlConfig,\n    stale: bool,\n    safety_ok: bool,\n) -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n",
+      "source_digest": "36f6114b724fa415381918d5a87d0d4958fd85d930d2c171746f9926e61a48f7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 615,
+      "end_line": 639,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": ") -> (ControlMode, Vec<PageAction>, Option<&'static str>) {\n    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n",
+      "source_digest": "b6588d85ed43c686a4645bd5416ccc91d60a47efefba5381aecd84e91a0502b0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 616,
+      "end_line": 640,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    let entity_ok = record.entity_type == entity_of(entity)\n        && record\n            .actions\n            .iter()\n            .all(|a| a.entity() == record.entity_type);\n    match record.mode {\n        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n",
+      "source_digest": "c99c45777580071bfa5d0f258a7c88bed27e71e5d7a1c6bfb50323d4f3915e4e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 622,
+      "end_line": 646,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ControlMode::Rules => (ControlMode::Rules, Vec::new(), None),\n        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n",
+      "source_digest": "b49ce13d79149a96e1f5bcb988a1b27317b156f69b22243ca738e0cffa1aa818",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 623,
+      "end_line": 647,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        ControlMode::Rows => (ControlMode::Recording, Vec::new(), Some(\"unreadable\")),\n        ControlMode::Recording if record.actions.is_empty() => {\n            (ControlMode::Recording, Vec::new(), None)\n        }\n        ControlMode::Recording if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Recording if !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Recording => (ControlMode::Recording, record.actions.clone(), None),\n        ControlMode::Live if factory => {\n            (ControlMode::Recording, Vec::new(), Some(\"factory_managed\"))\n        }\n        ControlMode::Live if record.actions.is_empty() || !entity_ok => {\n            (ControlMode::Recording, Vec::new(), Some(\"wrong_entity\"))\n        }\n        ControlMode::Live => {\n            let forced = if !cfg.enabled {\n                Some(\"kill_switch\")\n            } else if stale {\n                Some(\"stale_snapshot\")\n            } else if !safety_ok {\n                Some(\"safety_checks_changed\")\n            } else {\n",
+      "source_digest": "d36d292644f3809c7f225932bffa98822f082b5700111a3fec53f9730df91747",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 910,
+      "end_line": 934,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                row: LevelRow::Missing,\n                unknown: false,\n                evidence: None,\n                now_ms: crate::now_millis(),\n            });\n        let by_row = levels::resolve_rows(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n            },\n            &claim,\n            cfg,\n            &mut safety,\n        );\n        let hit = match by_row {\n            Some(r) => {\n                out = Resolved {\n                    producer_dry: input.producer_dry,\n                    ..r\n                };\n",
+      "source_digest": "ac917d5540b25cfff492e55b3931df1e552ea2c2f67122924e92ce8f04675f0c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 947,
+      "end_line": 971,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Hit::Ambiguous) => {\n                out.mode = ControlMode::Recording;\n                out.forced = Some(\"band_ambiguous\");\n            }\n            Some(Hit::Unreadable) => {\n                out.mode = ControlMode::Recording;\n                out.forced = Some(\"unreadable\");\n            }\n            Some(Hit::Record(lkey, record)) => {\n                let (mode, actions, forced) = effective(\n                    record,\n                    input.entity,\n                    input.factory,\n                    cfg,\n                    stale,\n                    record.mode != ControlMode::Live || safety(input.entity),\n                );\n                out.mode = mode;\n                out.page_actions = actions;\n                out.forced = forced;\n                out.matched = Some(Matched {\n                    lkey: lkey.to_owned(),\n                    record: record.clone(),\n                });\n            }\n",
+      "source_digest": "c823f4aaf8c84c376d2452aa3c7e2a9b323d50761753d79d293925b4a2100135",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1010,
+      "end_line": 1034,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                evidence: None,\n                now_ms: crate::now_millis(),\n            });\n        let mut safety_ok = Some(safety_ok);\n        let mut safety = |e: EntityType| safety_ok.take().is_none_or(|f| f(e));\n        levels::resolve_run(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n            },\n            &claim,\n            cfg,\n            &mut safety,\n            actions,\n        )\n    }\n\n            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {\n        Ok(self\n            .store\n",
+      "source_digest": "1eca4b59e9b72c8c14d0ad9552cb71b4bf785b14d88ca803ac09b15c2a44adde",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1450,
+      "end_line": 1474,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        });\n        Ok(seen)\n    }\n\n\n    fn view(\n        &self,\n        lkey: &str,\n        rec: &ActionControlRecord,\n        cfg: &ControlConfig,\n        stale: bool,\n        safety: &SafetyChecksByEntity,\n        factory_heads: &HashSet<(ControlEntity, String)>,\n    ) -> ActionControlView {\n        let entity = rec.entity_type;\n        let safety_ok = match entity {\n            ControlEntity::User => safety.user.ok,\n            ControlEntity::Post => safety.post.ok,\n        };\n        let (mode, _, forced) = if rec.mode == ControlMode::Rows {\n            (ControlMode::Rows, Vec::new(), None)\n        } else {\n            effective(\n                rec,\n                match entity {\n",
+      "source_digest": "fb08c2a9bac00672b8036d9fb844ec40f274e7b235d10cbf5f02404a3e1dd894",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1466,
+      "end_line": 1490,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            ControlEntity::User => safety.user.ok,\n            ControlEntity::Post => safety.post.ok,\n        };\n        let (mode, _, forced) = if rec.mode == ControlMode::Rows {\n            (ControlMode::Rows, Vec::new(), None)\n        } else {\n            effective(\n                rec,\n                match entity {\n                    ControlEntity::User => EntityType::User,\n                    ControlEntity::Post => EntityType::Post,\n                },\n                factory_heads.contains(&(entity, rec.head.clone())),\n                cfg,\n                stale,\n                safety_ok,\n            )\n        };\n        ActionControlView {\n            record: rec.clone(),\n            scope: rec.scope().to_owned(),\n            lkey: lkey.to_owned(),\n            effective_mode: mode,\n            forced_recording_reason: forced.map(str::to_owned),\n        }\n",
+      "source_digest": "2b609784e048ef7fdd24c8fbcc42b2da4771cfd3ec31f9753c33283574a2c2dd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1507,
+      "end_line": 1531,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                (Vec::new(), Some(e.to_string()))\n            }\n        };\n        let seen_rows = match seen_rows {\n            Ok(s) => s,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                seen_error.get_or_insert_with(|| e.to_string());\n                Vec::new()\n            }\n        };\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let snap = self.snapshot();\n        let stale = self.is_stale();\n        let mut records: Vec<ActionControlView> = snap\n            .records\n            .iter()\n            .map(|(k, r)| self.view(k, r, cfg, stale, &safety, &factory_heads))\n            .collect();\n        records.sort_by(|a, b| a.lkey.cmp(&b.lkey));\n",
+      "source_digest": "42d3e4269f1610ad3179336a6dbeb70fec7b13ea6a62d908cd0c97d24169bb0d",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1509,
+      "end_line": 1533,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        };\n        let seen_rows = match seen_rows {\n            Ok(s) => s,\n            Err(e) => {\n                metrics::MANHATTAN_ERRORS_TOTAL.inc();\n                seen_error.get_or_insert_with(|| e.to_string());\n                Vec::new()\n            }\n        };\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let snap = self.snapshot();\n        let stale = self.is_stale();\n        let mut records: Vec<ActionControlView> = snap\n            .records\n            .iter()\n            .map(|(k, r)| self.view(k, r, cfg, stale, &safety, &factory_heads))\n            .collect();\n        records.sort_by(|a, b| a.lkey.cmp(&b.lkey));\n        let mut unreadable: Vec<UnreadableRecord> = snap\n            .unreadable\n",
+      "source_digest": "77e45aa3993dd4a1e77588bdd9b5ca97025eb13dddeaed5340ee5e411695def5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1517,
+      "end_line": 1541,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            }\n        };\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let snap = self.snapshot();\n        let stale = self.is_stale();\n        let mut records: Vec<ActionControlView> = snap\n            .records\n            .iter()\n            .map(|(k, r)| self.view(k, r, cfg, stale, &safety, &factory_heads))\n            .collect();\n        records.sort_by(|a, b| a.lkey.cmp(&b.lkey));\n        let mut unreadable: Vec<UnreadableRecord> = snap\n            .unreadable\n            .iter()\n            .map(|(k, (e, v))| UnreadableRecord {\n                lkey: k.clone(),\n                error: e.clone(),\n                version: *v,\n            })\n            .collect();\n        unreadable.sort_by(|a, b| a.lkey.cmp(&b.lkey));\n",
+      "source_digest": "e73172f8f74ee4fea2693ea27ebb8c3f14f383cd94472a178bd25f2e6ba78fd6",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1693,
+      "end_line": 1717,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    head_rows[0].entity_type.as_str(),\n                    entity.as_str()\n                ),\n            );\n        }\n        let scope_rows: Vec<&ActionControlSeen> = head_rows\n            .into_iter()\n            .filter(|s| s.entity_type == entity)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let acts = matches!(req.mode, ControlMode::Live | ControlMode::Rows);\n        let factory = scope_rows.iter().any(|s| s.factory);\n        if factory && (acts || (req.mode == ControlMode::Recording && !req.actions.is_empty())) {\n            return bad(\n                \"factory_managed\",\n                \"this head's actions come from its Model Factory policy; change them there (the off switch and recording without actions are allowed here)\"\n                    .into(),\n            );\n        }\n        Ok(())\n    }\n\n    async fn get_record(\n        &self,\n",
+      "source_digest": "c986c899cc91b0b1c10a0686522e34196543e5e3e557e616c2f073725d61cf23",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1694,
+      "end_line": 1718,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    entity.as_str()\n                ),\n            );\n        }\n        let scope_rows: Vec<&ActionControlSeen> = head_rows\n            .into_iter()\n            .filter(|s| s.entity_type == entity)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let acts = matches!(req.mode, ControlMode::Live | ControlMode::Rows);\n        let factory = scope_rows.iter().any(|s| s.factory);\n        if factory && (acts || (req.mode == ControlMode::Recording && !req.actions.is_empty())) {\n            return bad(\n                \"factory_managed\",\n                \"this head's actions come from its Model Factory policy; change them there (the off switch and recording without actions are allowed here)\"\n                    .into(),\n            );\n        }\n        Ok(())\n    }\n\n    async fn get_record(\n        &self,\n        lkey: &str,\n",
+      "source_digest": "06b06d22b24668a8602408315eda7972d7096a7107066474e6e93db731787b68",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1696,
+      "end_line": 1720,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n        }\n        let scope_rows: Vec<&ActionControlSeen> = head_rows\n            .into_iter()\n            .filter(|s| s.entity_type == entity)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let acts = matches!(req.mode, ControlMode::Live | ControlMode::Rows);\n        let factory = scope_rows.iter().any(|s| s.factory);\n        if factory && (acts || (req.mode == ControlMode::Recording && !req.actions.is_empty())) {\n            return bad(\n                \"factory_managed\",\n                \"this head's actions come from its Model Factory policy; change them there (the off switch and recording without actions are allowed here)\"\n                    .into(),\n            );\n        }\n        Ok(())\n    }\n\n    async fn get_record(\n        &self,\n        lkey: &str,\n    ) -> Result<Option<(Option<ActionControlRecord>, u64)>, SetError> {\n        Ok(self\n",
+      "source_digest": "4f71ae88820f00c5da2c8046e1742d086823776e4748c30b0dde3835af76fdb9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1697,
+      "end_line": 1721,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        let scope_rows: Vec<&ActionControlSeen> = head_rows\n            .into_iter()\n            .filter(|s| s.entity_type == entity)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let acts = matches!(req.mode, ControlMode::Live | ControlMode::Rows);\n        let factory = scope_rows.iter().any(|s| s.factory);\n        if factory && (acts || (req.mode == ControlMode::Recording && !req.actions.is_empty())) {\n            return bad(\n                \"factory_managed\",\n                \"this head's actions come from its Model Factory policy; change them there (the off switch and recording without actions are allowed here)\"\n                    .into(),\n            );\n        }\n        Ok(())\n    }\n\n    async fn get_record(\n        &self,\n        lkey: &str,\n    ) -> Result<Option<(Option<ActionControlRecord>, u64)>, SetError> {\n        Ok(self\n            .get_raw(lkey)\n",
+      "source_digest": "1e11727d2f274b3e68515e921cc1e8010442ad7ed6698b9f428ff97c82cf9724",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1991,
+      "end_line": 2015,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let scope_rows: Vec<&ActionControlSeen> = seen\n            .iter()\n            .filter(|s| s.head == req.head && s.entity_type == req.entity_type)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let rules_specs: Option<Vec<Value>> = (!scope_rows.is_empty()).then(|| {\n            scope_rows\n                .iter()\n                .flat_map(|s| s.action_specs.as_array().cloned().unwrap_or_default())\n                .collect()\n        });\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n            }\n            let (entity, safety_ok) = match p.entity_type {\n                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n",
+      "source_digest": "0c6396ab9da241e19f217dbc4d240b645d1241f0cc7ae61ec147c928d357d825",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1993,
+      "end_line": 2017,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .filter(|s| s.head == req.head && s.entity_type == req.entity_type)\n            .filter(|s| req.classifier.as_ref().is_none_or(|c| &s.classifier == c))\n            .filter(|s| req.band.as_ref().is_none_or(|b| &s.band == b))\n            .collect();\n        let rules_specs: Option<Vec<Value>> = (!scope_rows.is_empty()).then(|| {\n            scope_rows\n                .iter()\n                .flat_map(|s| s.action_specs.as_array().cloned().unwrap_or_default())\n                .collect()\n        });\n        let factory_heads: HashSet<(ControlEntity, String)> = seen\n            .iter()\n            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n            }\n            let (entity, safety_ok) = match p.entity_type {\n                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let factory = factory_heads.contains(&(p.entity_type, p.head.clone()))\n",
+      "source_digest": "11536827f4b248f19ee0b18d889cba980f1e3093d44744146d5d5965d63f3bce",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2005,
+      "end_line": 2029,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .filter(|s| s.factory)\n            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n            }\n            let (entity, safety_ok) = match p.entity_type {\n                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let factory = factory_heads.contains(&(p.entity_type, p.head.clone()))\n                || factory_heads.contains(&(req.entity_type, req.head.clone()));\n            let (mode, _, _) = effective(&p, entity, factory, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n",
+      "source_digest": "cb1504a6b338043a3d2ed76a8617c4086fa0994053dc2d8f4e439a9a215536a9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2006,
+      "end_line": 2030,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .map(|s| (s.entity_type, s.head.clone()))\n            .collect();\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n            }\n            let (entity, safety_ok) = match p.entity_type {\n                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let factory = factory_heads.contains(&(p.entity_type, p.head.clone()))\n                || factory_heads.contains(&(req.entity_type, req.head.clone()));\n            let (mode, _, _) = effective(&p, entity, factory, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n",
+      "source_digest": "22a61f5696fc779c66fcb1df71fa76d8ec5ac63ff307e7cb67c6c7a85a87126a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2007,
+      "end_line": 2031,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .collect();\n        let stale = self.is_stale();\n        let as_running = |p: ActionControlRecord| {\n            if req.mode != ControlMode::Rules || p.mode != ControlMode::Live {\n                return p;\n            }\n            let (entity, safety_ok) = match p.entity_type {\n                ControlEntity::User => (EntityType::User, safety.user.ok),\n                ControlEntity::Post => (EntityType::Post, safety.post.ok),\n            };\n            let factory = factory_heads.contains(&(p.entity_type, p.head.clone()))\n                || factory_heads.contains(&(req.entity_type, req.head.clone()));\n            let (mode, _, _) = effective(&p, entity, factory, cfg, stale, safety_ok);\n            ActionControlRecord { mode, ..p }\n        };\n        let mut harsher: Vec<String> = Vec::new();\n        for prior in &priors {\n            let why = harsher_because(\n                prior\n                    .as_ref()\n                    .map(levels::for_compare)\n                    .map(&as_running)\n                    .as_ref(),\n                &levels::for_compare(&rec),\n                rules_specs.as_deref(),\n",
+      "source_digest": "baa6909b8668cb15e6fbffcfd1b5d58dffcfb1b04f39f48b4efd34e0c5f54e8c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2092,
+      "end_line": 2116,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if readback.write_nonce != rec.write_nonce {\n            return Err(SetError::LostRace(Some(readback)));\n        }\n        self.apply_local(lkey.clone(), rec.clone());\n        info!(\n            lkey,\n            mode = rec.mode.as_str(),\n            version = rec.version,\n            updated_by = %rec.updated_by,\n            key_id,\n            \"action control written\"\n        );\n        let view = self.view(&lkey, &rec, cfg, self.is_stale(), safety, &factory_heads);\n        Ok(SetOutcome {\n            view,\n            before,\n            harsher_because: harsher,\n            history_written,\n        })\n    }\n\n                        fn shadowed(\n        own_lkey: &str,\n        req: &ActionControlPutRequest,\n        cfg: &ControlConfig,\n",
+      "source_digest": "d2fa75887ce541d7d1ce67cc1a58dd024b92df7f945ab4d208ec3cafa741b8b5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 434,
+      "end_line": 458,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct Resolved {\n    pub matched: Option<Matched>,\n        pub mode: ControlMode,\n        pub page_actions: Vec<PageAction>,\n        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n            pub factory: bool,\n                pub unlisted: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n",
+      "source_digest": "f0b0dc3aaa27e7a1f95d9ad4598dc49e7a237bf3ec60057d3f99c1ab41b3ebcb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 449,
+      "end_line": 473,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n",
+      "source_digest": "f33983c5b37be54f310893a989845d53190185dbb5c2621f4a68357dd2935b15",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 457,
+      "end_line": 481,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n            factory: false,\n            unlisted: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n            pub fn rules_unread(&self) -> bool {\n        self.factory || self.unlisted\n    }\n\n                        pub fn admit_unlisted(mut self) -> Option<Self> {\n        if self.factory || self.mode == ControlMode::Rules {\n            return None;\n        }\n",
+      "source_digest": "65c32af5a781c1a21449999cb961fc7979aba86ded24d6641d588c4eedbcdcf3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 463,
+      "end_line": 487,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n            pub fn rules_unread(&self) -> bool {\n        self.factory || self.unlisted\n    }\n\n                        pub fn admit_unlisted(mut self) -> Option<Self> {\n        if self.factory || self.mode == ControlMode::Rules {\n            return None;\n        }\n        self.unlisted = true;\n        self.dedup_class = Some(page_class(&self.page_actions));\n        Some(self)\n    }\n\n    pub fn recording(&self) -> bool {\n",
+      "source_digest": "25dab4ea171da8012f7262b4f0f16e190eb0f87744fc2e2d94cd1e0d5098eeaf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 467,
+      "end_line": 491,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.factory\n            || self.unlisted\n            || (self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty()))\n    }\n\n            pub fn rules_unread(&self) -> bool {\n        self.factory || self.unlisted\n    }\n\n                        pub fn admit_unlisted(mut self) -> Option<Self> {\n        if self.factory || self.mode == ControlMode::Rules {\n            return None;\n        }\n        self.unlisted = true;\n        self.dedup_class = Some(page_class(&self.page_actions));\n        Some(self)\n    }\n\n    pub fn recording(&self) -> bool {\n        self.mode == ControlMode::Recording\n    }\n\n                pub fn record_only(&self) -> bool {\n",
+      "source_digest": "1879d5aa879daf5ce806910ac3fb23f0896b5c90fa77e1c39fddf8ec353b38a5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 540,
+      "end_line": 564,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        if let Some(r) = &self.row {\n            keys.extend(r.info_keys(self.mode == ControlMode::Recording, self.forced));\n        }\n        keys\n    }\n}\n\npub struct ResolveInput<'a> {\n    pub head: &'a str,\n    pub classifier: &'a str,\n    pub labels: &'a [String],\n    pub entity: EntityType,\n    pub factory: bool,\n    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n        pub author_id: i64,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n",
+      "source_digest": "268f7aba24bc4a9b069e2eb375d3df45a2cd2e75b9290250f6f2191052190b2b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 543,
+      "end_line": 567,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        keys\n    }\n}\n\npub struct ResolveInput<'a> {\n    pub head: &'a str,\n    pub classifier: &'a str,\n    pub labels: &'a [String],\n    pub entity: EntityType,\n    pub factory: bool,\n    pub producer_dry: bool,\n        pub confidence: Option<crate::confidence::Claim>,\n        pub author_id: i64,\n}\n\nenum Hit<'a> {\n    Record(&'a str, &'a ActionControlRecord),\n    Unreadable,\n    Ambiguous,\n}\n\nimpl Snapshot {\n    fn at<'a>(&'a self, lkey: &str) -> Option<Hit<'a>> {\n        if let Some((k, r)) = self.records.get_key_value(lkey) {\n            return Some(Hit::Record(k, r));\n",
+      "source_digest": "55c2f5b4e6dc8a5a2125fe6db1a125de6e4c139ca94c3b0c84c2e094e2cf27e8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 941,
+      "end_line": 965,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        self.snapshot_age(&self.snapshot())\n            .is_none_or(|a| a > STALE_AFTER)\n    }\n\n            pub fn resolve(\n        &self,\n        input: &ResolveInput<'_>,\n        cfg: &ControlConfig,\n        safety_ok: impl FnOnce(EntityType) -> bool,\n    ) -> Resolved {\n        let mut out = Resolved {\n            producer_dry: input.producer_dry,\n            factory: input.factory,\n            ..Default::default()\n        };\n        let claim = || {\n            input\n                .confidence\n                .clone()\n                .unwrap_or_else(|| crate::confidence::Claim {\n                    row: LevelRow::Missing,\n                    unknown: false,\n                    evidence: None,\n                    now_ms: crate::now_millis(),\n                })\n",
+      "source_digest": "a03ebe5d117d56d75434fe76a88aac019e42f5a1bd79bbc105195b8c7a9867aa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 956,
+      "end_line": 980,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let claim = || {\n            input\n                .confidence\n                .clone()\n                .unwrap_or_else(|| crate::confidence::Claim {\n                    row: LevelRow::Missing,\n                    unknown: false,\n                    evidence: None,\n                    now_ms: crate::now_millis(),\n                })\n        };\n        if cfg.ignore_store || input.head.is_empty() {\n            if input.factory {\n                out.mode = ControlMode::Recording;\n                out.forced = cfg.ignore_store.then_some(\"ignore_store\");\n                out.row = Some(RowOutcome::new(&claim()));\n                out.by_row = true;\n                out.dedup_class = Some(page_class(&[]));\n            }\n            return out;\n        }\n        let snap = self.snapshot();\n        if !input.factory && snap.records.is_empty() && snap.unreadable.is_empty() {\n            return out;\n        }\n",
+      "source_digest": "f46088741246fb216818029fbe925ee599af494887e811f181f194b0a3ec7bd3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 966,
+      "end_line": 990,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        };\n        if cfg.ignore_store || input.head.is_empty() {\n            if input.factory {\n                out.mode = ControlMode::Recording;\n                out.forced = cfg.ignore_store.then_some(\"ignore_store\");\n                out.row = Some(RowOutcome::new(&claim()));\n                out.by_row = true;\n                out.dedup_class = Some(page_class(&[]));\n            }\n            return out;\n        }\n        let snap = self.snapshot();\n        if !input.factory && snap.records.is_empty() && snap.unreadable.is_empty() {\n            return out;\n        }\n        let mut safety_ok = Some(safety_ok);\n        let mut safety_seen: Option<bool> = None;\n        let mut safety = |e: EntityType| {\n            *safety_seen.get_or_insert_with(|| safety_ok.take().is_none_or(|f| f(e)))\n        };\n        let mut bands: Vec<&str> = input\n            .labels\n            .iter()\n            .map(|l| strip_dry_run_prefix(l))\n            .filter(|l| valid_name(l))\n",
+      "source_digest": "1916f240336ea3649a3c990df78ed8aa470a4c7c762dbde1c228a553084817e9",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 991,
+      "end_line": 1015,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .collect();\n        bands.sort_unstable();\n        bands.dedup();\n        let entity = entity_of(input.entity);\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let by_row = levels::resolve_rows(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim(),\n            cfg,\n            &mut safety,\n        );\n        let hit = match by_row {\n            Some(r) => {\n                out = Resolved {\n                    producer_dry: input.producer_dry,\n                    factory: input.factory,\n",
+      "source_digest": "c7d214add308eb6b6161c11e5be3569993f4b0fe18ff5f99934d14effff16895",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 993,
+      "end_line": 1017,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        bands.dedup();\n        let entity = entity_of(input.entity);\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let by_row = levels::resolve_rows(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim(),\n            cfg,\n            &mut safety,\n        );\n        let hit = match by_row {\n            Some(r) => {\n                out = Resolved {\n                    producer_dry: input.producer_dry,\n                    factory: input.factory,\n                    ..r\n                };\n",
+      "source_digest": "6bbcf52ffe530ecb818176edc8115071e91a6c8d57c9b3f0c97c94f3fa688e51",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1003,
+      "end_line": 1027,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim(),\n            cfg,\n            &mut safety,\n        );\n        let hit = match by_row {\n            Some(r) => {\n                out = Resolved {\n                    producer_dry: input.producer_dry,\n                    factory: input.factory,\n                    ..r\n                };\n                None\n            }\n            None => snap.plain_decider(\n                entity,\n                input.head,\n                cfg.aliases.get(input.head).map(String::as_str),\n                input.classifier,\n                &bands,\n            ),\n        };\n",
+      "source_digest": "7a430177d3ae773ef7b09df5b40686c6d4286a268af7bf65e90238566950675c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1069,
+      "end_line": 1093,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        &self,\n        input: &ResolveInput<'_>,\n        cfg: &ControlConfig,\n        safety_ok: impl FnOnce(EntityType) -> bool,\n        actions: &[PageAction],\n    ) -> Resolved {\n        if cfg.ignore_store {\n            return Resolved {\n                mode: ControlMode::Recording,\n                page_actions: actions.to_vec(),\n                forced: Some(\"ignore_store\"),\n                dedup_class: Some(page_class(actions)),\n                factory: input.factory,\n                ..Default::default()\n            };\n        }\n        let snap = self.snapshot();\n        let stale = self.snapshot_age(&snap).is_none_or(|a| a > STALE_AFTER);\n        let claim = input\n            .confidence\n            .clone()\n            .unwrap_or_else(|| crate::confidence::Claim {\n                row: LevelRow::Missing,\n                unknown: false,\n                evidence: None,\n",
+      "source_digest": "a98b8eb467c07f572161496aa4d68fcc99d2a744f19942c51f17871f2ab53abe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1093,
+      "end_line": 1117,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                evidence: None,\n                now_ms: crate::now_millis(),\n            });\n        let mut safety_ok = Some(safety_ok);\n        let mut safety = |e: EntityType| safety_ok.take().is_none_or(|f| f(e));\n        levels::resolve_run(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim,\n            cfg,\n            &mut safety,\n            actions,\n        )\n    }\n\n            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {\n        Ok(self\n",
+      "source_digest": "f3823c86a1b24b28f46793b2ff86f00e8f1f05c8d7e7ed2fba9785a004484550",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1095,
+      "end_line": 1119,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            });\n        let mut safety_ok = Some(safety_ok);\n        let mut safety = |e: EntityType| safety_ok.take().is_none_or(|f| f(e));\n        levels::resolve_run(\n            &snap,\n            &levels::RowContext {\n                entity: input.entity,\n                head: input.head,\n                alias: cfg.aliases.get(input.head).map(String::as_str),\n                classifier: input.classifier,\n                factory: input.factory,\n                stale,\n                author_id: input.author_id,\n            },\n            &claim,\n            cfg,\n            &mut safety,\n            actions,\n        )\n    }\n\n            pub async fn stored_version(&self, lkey: &str) -> anyhow::Result<Option<u64>> {\n        Ok(self\n            .store\n            .get(MH_PKEY, lkey)\n",
+      "source_digest": "350d5f444d3e1b02c566f32c408000752e17e423c335793647508bcf4cf30f35",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1773,
+      "end_line": 1797,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n        }\n        let admits = req.admit_unlisted_labels == Some(true);\n        if admits && (req.classifier.is_some() || req.band.is_some() || req.confidence.is_some()) {\n            return bad(\n                \"admit_unlisted_labels_scope\",\n                \"only a head record (no classifier, band or row) can admit decisions whose labels the topic doesn't list\"\n                    .into(),\n            );\n        }\n        if !head_rows\n            .iter()\n            .any(|s| s.factory && s.entity_type == entity)\n        {\n            return Ok(());\n        }\n        if admits {\n            return bad(\n                \"factory_admit_unlisted_labels\",\n                \"a Model Factory head's decisions keep the topic's label list\".into(),\n            );\n        }\n        let settings = || {\n            req.rows\n                .iter()\n",
+      "source_digest": "d08eacef46154af26c2f5671222417466d72a0d228b333e3fd898ee8b2539afd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1779,
+      "end_line": 1803,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                \"only a head record (no classifier, band or row) can admit decisions whose labels the topic doesn't list\"\n                    .into(),\n            );\n        }\n        if !head_rows\n            .iter()\n            .any(|s| s.factory && s.entity_type == entity)\n        {\n            return Ok(());\n        }\n        if admits {\n            return bad(\n                \"factory_admit_unlisted_labels\",\n                \"a Model Factory head's decisions keep the topic's label list\".into(),\n            );\n        }\n        let settings = || {\n            req.rows\n                .iter()\n                .flat_map(|r| LevelRow::ALL.into_iter().filter_map(|row| r.get(row)))\n        };\n        if req.rollout_bp.is_some() || settings().any(|s| s.rollout_bp.is_some()) {\n            return bad(\n                \"factory_rollout\",\n                \"a Model Factory head's rows act on every account; they take no rollout\".into(),\n",
+      "source_digest": "25231153f1afc591809d139c4969664d10767612cd3483d048d1e8df71cf3bb5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1780,
+      "end_line": 1804,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                    .into(),\n            );\n        }\n        if !head_rows\n            .iter()\n            .any(|s| s.factory && s.entity_type == entity)\n        {\n            return Ok(());\n        }\n        if admits {\n            return bad(\n                \"factory_admit_unlisted_labels\",\n                \"a Model Factory head's decisions keep the topic's label list\".into(),\n            );\n        }\n        let settings = || {\n            req.rows\n                .iter()\n                .flat_map(|r| LevelRow::ALL.into_iter().filter_map(|row| r.get(row)))\n        };\n        if req.rollout_bp.is_some() || settings().any(|s| s.rollout_bp.is_some()) {\n            return bad(\n                \"factory_rollout\",\n                \"a Model Factory head's rows act on every account; they take no rollout\".into(),\n            );\n",
+      "source_digest": "81d5d6775f41b7ee67d5eac11cab08dc34820083529342582afca1365abfcac4",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b3cbaa51905ca88890903ddf4df77defeda459386652b94346d54c17cf407fe9",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "acbbf4a74febd7b7df9634e5b4753787a1fc060d3c93d75e26dba907ec8c2181",
+      "context_complete": true,
+      "task_id": "T-6ce54d228cc3bbf918d782f1c12c17ce193e571cf09ec941ce7d27f63b193d0f",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-38de4cc541968906730d6308b7d5dd42d94216cf5ddc8912ee7d6bff1bb70f15",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-982fd283e6316fc63aa729c5d58757005b439bee57cedb1957cf04a7418f3f5b",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3647230bb2c5df4b8d81d9757200281a39e82d9f79785d358098c2ddba5a9f59",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-9b4a13af700dc66e402149c514333547816df4f352e6a5e5385229c59a713989",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2edf9359aca78b47456e7543313b42148489e947ad03eccb23f67ad564af02ce",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-7d9cfaaacec4d53b3a5b9b051dd237504b4b7feee3ba57af8453014c18e9f50e",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6f6e8298c33722a68a9160ee1d624a738a6a6d3cc89acfc1a0066b90c01df74e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-e42cac3ce69aabc38bf6fbcd5e795ec94a2cd787eb16cdd49a666d6e4160dfb8",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-aee1732ba7f02eb853c9355a2839a0be2b30aeef1c559e6acc3cf6533d17357b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-c48a758fa8e1a691bba857d0d0f8c9c27a5db54b79a096cb70bddfc89cc640bb",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3722fd373792dcafb4d7e0cef261d689c46da432efc7218ebf51229d31557004",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-bef00827bfae62b3d5b1b5d19e117ac5e865a2dd00e7b3e6d18faee132291665",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7a3329edebccad785a6efb5e507f76b82a0c4dafc1a42245df482be895666e22",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-8a4959d1fd0bc54c002dce7cc09df6dd34165d22d6281ce2e76e8138706f3f8e",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-da0118fe71576e4b3316dbf71b62f01192ef3a0f4242f73502beb8779b023a70",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-e2820847799c09ac5f13d2551401997c052ad6038725f4052d6708a5169dd90f",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a19690327097a7f0d6870ef4a0066563fbd6ebf897a8b967a5fa7f42de287198",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-a4610fc4e12d8b7bb33ebea5e1c7d45f8947d5f92d3d817f30950826b5c331a4",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d92ff1c3069e5b1fa1385419e81a63a3b54c977bc728a41a32e75bd33be1d935",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-f1c029203a5b4903f045e906570cfde7aff9e24c52fe5bff6e8da0df868eca09",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7260ad792fd9be8e9007717555eb95ebae8af8bd71238a5af73cebd279f4748c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-033783b541240e3f05d60d4b72bd6567da8a26209d5d56aa51e8c4775b237d78",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-74e4e80fea969349131c5c802d307f67a7f9a886935237250111253cd2a7b144",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-b71975295627a54fc925184539963a3c687b7d66fe5befccc1e155a7b77e9721",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d290f131842210a3e3169dfafc98619e2845b5e06a8753b618f460bba4e33b95",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-214cf087ed490dc61c3b13195a3b5442a3080591a9805d5f9d0a86d6572f10f8",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-caa98c4254847925a0f6d9e5c78c1999d1ed2512834c3a1b0cd408bba114c5d0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-8afa901aa40ad0c467a1f06acec558d0be23432e0b12e01a27235b5fe9c1c0c2",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4e9205ec02b0f9337d1d26785330e77a3b2a28e5d4bf7526fcdbb8c59ba82bf0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ab9c70d0c198a292e7a740c011d5be9d5f089d4f1fec1f175ee36dd96bcb427",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-25192cd32d00f7bb80327680abec21882e64a81db6872fb9e33a2335db1d2595",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-c6451837f88770100236a3e34ebc861da4ca10d0696a64e244f1bcd0bbfec4f8",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-118eb0856d92ab03d851ef53cd94281c1d9e72f906028f181bcd3084e56de54c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-974c98d92382249fd4637654f479d912984eeed1b83e49b0b17fe883ec250a4b",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-90fcd3b2242862d13eb28287ccb7d383c051f243eb074ece32c43d23fdd49f3c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-b6cb999b1f4ae75b4cba10249ec1bed9b0ac0dfb119ec98b0e53e81f2acdbf79",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a548084849e2e7dd5c922cef26b48da5933220210b6ddb7a657164ce77472a9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-947c8b4abeaa17f12740bb8fd23ec0b120e7ed5dc3df1543a109128cc492d46c",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9f3b0598c23f9300311184eb7d35de1d138599cd9205656c24f4584c547ee803",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-74f38c571245da428c1a66a2190dfe2ea0500a593a6c353046644f46f3719715",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e3f22d159f802b246f3112b371c3be31727cef711586dfe09e920995cf778e28",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-51dce6805be4d934354c2491488e3957a5ff3e2459415d8428556776e85e5f77",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c60a4f369aad57ffced4d016e48dfcb7e54c94c464f3f68ba3d39aac49bcc761",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-2178a0909b87a371eec6d56b01296afe78b900a08771c6ca3c157d35c051b80c",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d5a9cc549646a986c0c6e4c019991c28087dbb3681694a3806e366f51fec890f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-6b778c27f86b0f6df1fe1444ee55df69fbeb50440eeb5439ff905893e4968105",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a71c586bb8203fb56f3d7e927aa2983022d31e5d32e64011a2d24c4a54b29cd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-8436d7ca917dbd0920539005932c3faa17d9fc144bdf59c691603f552e68f42d",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e44f0741586fe9d6d812d7362fe6ba27055512ba99568319f45af474183e2125",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-471314b800e600eaa4c30a54ec58870f8b531bec7710835fe703f204d7e8e472",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4592c6824fb1745d58717d23a576dea62464061b3b923ae667f44fa66bb06ffa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-eff00f58d264c62bff1dd2ad069d068cbe7e31514b2a61af0ea0bfbf56c55556",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2e3cbf519ed8df1faa2d817bd7249bd9c97aa027dcd3be3547c62e3404c38b60",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-517fd0e6050e96dbdf999f4ef189a5bf9d486266be495d85e993c5e24f540651",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8da90e4dd4a056f50de2c4e969499757dc8359eb51132e2e010cd671d5977770",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-6b8e8352ff16db646a31dcfebd555cd733a22ef7e43d75bd1a5d3ac0fd366d80",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9673811dc8669bf7affb6ae48968e8764f1d968c70731133202bc7f05012920f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-7682be7e4005fb7a28d3d692a7100a5b42243093e18b5d45d77d6035963f6731",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4550ac9190cc96ac93bbaeaefd4f2dddaf0a2e462730068569973ca7560d5014",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-b6ab5ce99888be451aba88a13d4e50f44f7a164c946cdad43cb5ce0c6a82d2f9",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6d8e1545ea393efbc1c17f8f5c6255f258d367fcf0028fc0a9c7e950014d2c4c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-ee4bbdbb8336e2478a0fabb1cd2c9d3ba950d61066366227c14d754ec52d7020",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6da77d85dbc2dc55d5b72efbdc971a97949f551a0c348a820b1242c722ca075f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-6ad959b0745852bee7fa1eadc3634e71b9e75db9fd2d4dd23faa5c1736c20e13",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-338add230874e11327598d63e3837ea4c58c5c8e7fcb8a4ec238279f1d2bcf9b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-d5238dc4eac12b2ffe5d3f322ba63179b80189d0dc04ceffed069eeae9662b22",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-01137f58b0bea65e14e86fbec4c98ef4464f8a8585b1b86c8498daf18686f935",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-039ba782f1b6c2002726b2b2fe5a17f155957e3e6f9293ef3e3339c376f24a5c",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3d1d42e7eb01b6d1b744893ea1782b48b149ab04fbc0344f5c5de80da98f6b75",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-616645747aa0cf6ec88066ed721ff693c5a3d6c3ceec9f770721c3857dc727c6",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b44da6ee23557f109b434e044dbd898dea692ea413f70038ee6be8d414b36230",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-111718602aea0a03ba24e9a7e21e90103457db215fbc21ae62b0bfd2c927888d",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-62c02553b0630956660bddc4527dd2cb6a34ea5fbcee042f6c7156371569865f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-17620ddc7517d8e887ce8fff05c6949e5e37ef8dfdb6334d1d94d2671ba1c08c",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f7fe808693641f89bf14667933f9c2ed1c3c2f927451d4ec8c6f35a46c0bd85b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-fde7c3ed0f50f2f4e6ab17b1d204387108297adb77f4f2cacbb323aa2ae2aeea",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f5b232efacf80882e91c047a3a2e8070dd0a17ef3481f45cc802017607bb1f82",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa9440d469a081b696c6066650a96b9c288cc84b982a5a807a5fbf8677ab3eea",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c6bdd137e691e0ad5cab7dac06db47d7246b44ee1394093f96969357d6bd114f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-dccfc4b9a680c8b8b7917b9df4deff113d05299591a88be3ff264a2014304589",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2867e1cb1c64e0a5ab125cbbca0d3c4d63cde5d887217885fb505a1c46fa014e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-6571fdd1613e6a0196e956b5c3881c4e15a2703919ed8a3ca4f1eb4af0090fcf",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-728b86a1443e61dd024d59059dbdf4b47d1a154aa0ea6ec17cfa83f7866b2c9b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-80cfcdd1e59190941171bbcb5d4a54b01806680fbf367164f55216cd8d31f7a1",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/store/resolve.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-114d2ca0143fc7d62a7a75f9a61c4f2ea52ba0dc781221f88003c5d1e44653f8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/hydration",
+      "query_symbols": [
+        "unresolving",
+        "tweet_miss",
+        "author_miss",
+        "author",
+        "actor",
+        "edges"
+      ],
+      "context_complete": false,
+      "task_id": "T-7b3b828959f6efd01b837944faa9edc71c1b9053281feaba51d999de7872d584",
+      "evidence_refs": [
+        "E45"
+      ]
+    }
+  ],
+  "task_id": "T-8ec3ca079f486ec9051962164200abb533966e12a83b8c295ddc7666ff403cd8"
+}

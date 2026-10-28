@@ -1,0 +1,1105 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-125f28a9288d852eabebc3ee6071f48ed384643c41b3432541ebca286b66c8e5",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/staging",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 436,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use super::{\n    BatchOutcome, Compared, Lens, TWEETYPIE_TIMEOUT, TpResult, TweetypieReference, get_tweet_fields,\n};\nuse crate::models::viewer::Client;\nuse crate::models::{EvaluationKey, Placement, TweetId};\nuse crate::post_evaluator::PostEvaluation;\nuse crate::quote::QuotePass;\nuse crate::result_label::{Class, NONE, label};\nuse crate::rules::SafetyLevel;\nuse std::collections::{HashMap, HashSet};\nuse std::sync::Arc;\nuse tokio::time::timeout;\nuse xai_twittercontext_proto::TwitterContextViewer;\n\nimpl TpResult {\n    pub(crate) fn inner_quoted(&self) -> TpResult {\n        Lens::InnerQuoted.answer(self)\n    }\n}\n\nimpl Lens {\n    fn answer(self, outer: &TpResult) -> TpResult {\n        let failed_class: &str = Class::Failed.into();\n        match (self, &outer.quoted) {\n            (Self::Standalone | Self::Outer, _) => outer.clone(),\n            (Self::InnerQuoted | Self::QuotePass, Some(quoted)) => (**quoted).clone(),\n            (Self::InnerQuoted | Self::QuotePass, None) => TpResult {\n                label: if outer.label.0 == failed_class {\n                    outer.label.clone()\n                } else {\n                    label(Class::Missing, NONE)\n                },\n                result: None,\n                strato_error: outer.strato_error.clone(),\n                quoted: None,\n            },\n        }\n    }\n}\n\nimpl TweetypieReference {\n    pub(in crate::staging::reference) fn spawn_quote_comparison(\n        self: &Arc<Self>,\n        viewer_id: Option<u64>,\n        context: Option<&TwitterContextViewer>,\n        country_code: Option<&str>,\n        safety_level: SafetyLevel,\n        outcomes: &[PostEvaluation],\n        quote_passes: &[QuotePass],\n    ) {\n        let Some(viewer_id) = viewer_id else {\n            return;\n        };\n        let Some(quotes) = quote_comparisons(safety_level, outcomes, quote_passes) else {\n            return;\n        };\n        let client = TwitterContextViewer {\n            user_id: viewer_id.cast_signed(),\n            ..context\n                .cloned()\n                .unwrap_or_else(|| Client::Web.context(None, country_code))\n        };\n        let country_code = country_code.map(str::to_owned);\n        self.detach(move |reference| async move {\n            reference\n                .compare_quotes(viewer_id, country_code, client, quotes)\n                .await\n        });\n    }\n\n    async fn compare_quotes(\n        &self,\n        viewer_id: u64,\n        country_code: Option<String>,\n        client: TwitterContextViewer,\n        quotes: QuoteComparisons,\n    ) -> BatchOutcome {\n        let Ok(tp) = timeout(\n            TWEETYPIE_TIMEOUT,\n            get_tweet_fields(&self.tweetypie, &client, &quotes.outers),\n        )\n        .await\n        else {\n            return BatchOutcome::TweetypieTimeout;\n        };\n        let by_outer: HashMap<TweetId, &TpResult> =\n            quotes.outers.iter().copied().zip(&tp).collect();\n        let answers: Vec<(&Served, TpResult)> = quotes\n            .served\n            .iter()\n            .filter_map(|served| Some((served, served.lens.answer(by_outer.get(&served.outer)?))))\n            .collect();\n        self.record(answers.iter().map(|(served, tp)| Compared {\n            lens: served.lens,\n            tweet_id: served.outcome.tweet_id,\n            viewer_id,\n            country_code: country_code.as_deref(),\n            tp,\n            vf: Some(&served.outcome),\n            pass: served.pass.as_ref(),\n        }));\n        BatchOutcome::Compared\n    }\n}\n\nstruct Served {\n    lens: Lens,\n    outer: TweetId,\n    outcome: PostEvaluation,\n    pass: Option<QuotePass>,\n}\n\nstruct QuoteComparisons {\n    outers: Vec<TweetId>,\n    served: Vec<Served>,\n}\n\nfn quote_comparisons(\n    safety_level: SafetyLevel,\n    outcomes: &[PostEvaluation],\n    quote_passes: &[QuotePass],\n) -> Option<QuoteComparisons> {\n    match safety_level {\n        SafetyLevel::TimelineHomeHydration => {}\n        SafetyLevel::FilterAll\n        | SafetyLevel::TimelineHome\n        | SafetyLevel::TimelineHomeRecommendations\n        | SafetyLevel::ImmersiveExpandedRecommendations\n        | SafetyLevel::QuotedTweetRules => return None,\n    }\n    let mut outers = Vec::new();\n    for outcome in outcomes {\n        if let Placement::InnerQuoted { outer } = outcome.placement\n            && !outers.contains(&outer)\n        {\n            outers.push(outer);\n        }\n    }\n    if outers.is_empty() {\n        return None;\n    }\n    let passes: HashMap<EvaluationKey, &QuotePass> =\n        quote_passes.iter().map(|pass| (pass.key, pass)).collect();\n    let mut seen = HashSet::new();\n    let mut served = Vec::new();\n    for outcome in outcomes {\n        let (lens, outer) = match outcome.placement {\n            Placement::InnerQuoted { outer } => (Lens::InnerQuoted, outer),\n            Placement::Standalone if outers.contains(&outcome.tweet_id) => {\n                (Lens::Outer, outcome.tweet_id)\n            }\n            Placement::Standalone | Placement::RetweetSource => continue,\n        };\n        if !seen.insert(outcome.key()) {\n            continue;\n        }\n        let pass = passes.get(&outcome.key()).map(|&pass| pass.clone());\n        if let Some(pass) = &pass {\n            served.push(Served {\n                lens: Lens::QuotePass,\n                outer,\n                outcome: outcome.clone(),\n                pass: Some(pass.clone()),\n            });\n        }\n        served.push(Served {\n            lens,\n            outer,\n            outcome: outcome.clone(),\n            pass,\n        });\n    }\n    Some(QuoteComparisons { outers, served })\n}\n\n#[cfg(test)]\nmod tests {\n    use super::super::tests::{compared, outcome, pair, shown};\n    use super::super::{tp_failed, tp_result};\n    use super::*;\n    use crate::models::{Decided, DropReason, Evaluation, Verdict, Withholding};\n    use crate::quote::{PassOutcome, Rerendered};\n    use crate::result_label::Failure;\n    use crate::rules::RuleId;\n    use xai_strato::strato_thrift::StratoResult;\n    use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;\n    use xai_x_thrift::get_tweet_fields::{\n        GetTweetFieldsResult, TweetFieldsResultFound, TweetFieldsResultState,\n    };\n    use xai_x_thrift::safety_result::FilteredReason;\n    use xai_x_thrift::tweet_service::TweetFieldsResultFiltered;\n\n    #[test]\n    fn a_quote_entry_reads_its_outers_quoted_tweet_result_else_missing_or_the_outers_failure() {\n        let found = TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));\n        let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(\n            FilteredReason::AuthorIsSuspended(true),\n        ));\n        let outer = |state: &TweetFieldsResultState, quoted| {\n            tp_result(StratoResult::Ok {\n                value: Some(GetTweetFieldsResult::new(5, state.clone(), quoted)),\n                ttl: -1,\n            })\n        };\n        let cases = [\n            (\n                outer(&found, Some(suspended.clone())),\n                Lens::InnerQuoted,\n                (\"drop\", \"author_is_suspended\"),\n            ),\n            (\n                outer(&found, Some(suspended.clone())),\n                Lens::Outer,\n                (\"allow\", \"none\"),\n            ),\n            (outer(&found, None), Lens::InnerQuoted, (\"missing\", \"none\")),\n            (\n                outer(&suspended, None),\n                Lens::InnerQuoted,\n                (\"missing\", \"none\"),\n            ),\n            (\n                tp_failed(Failure::RpcError),\n                Lens::InnerQuoted,\n                (\"failed\", \"rpc_error\"),\n            ),\n        ];\n        for (outer, lens, (class, reason)) in cases {\n            assert_eq!(\n                lens.answer(&outer).label,\n                pair(class, reason),\n                \"{lens:?} {:?}\",\n                outer.label\n            );\n        }\n    }\n\n    #[test]\n    fn a_quote_entry_is_labelled_with_the_quoted_tweet_rules_rule_that_drops_its_author() {\n        let tp = TpResult {\n            label: pair(\"allow\", NONE),\n            result: None,\n            strato_error: None,\n            quoted: None,\n        };\n        let vf = PostEvaluation {\n            placement: Placement::InnerQuoted { outer: TweetId(7) },\n            ..outcome(shown())\n        };\n        let muted = Evaluation::complete(Verdict::Withheld(Decided {\n            value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::ViewerMutesAuthor)),\n            id: RuleId::QuotedViewerMutesAuthorNotFollowing,\n            by: \"quoted_viewer_mutes_author_not_following/drop\",\n        }));\n        let allowed = Evaluation::complete(shown());\n        let pass = |author| QuotePass {\n            key: vf.key(),\n            outcome: PassOutcome::Passed,\n            author,\n        };\n        for (pass, rule) in [\n            (\n                Some(pass(Some(muted.clone()))),\n                \"quoted_viewer_mutes_author_not_following/drop\",\n            ),\n            (Some(pass(Some(allowed.clone()))), NONE),\n            (Some(pass(None)), NONE),\n            (None, NONE),\n        ] {\n            let compared = Compared {\n                lens: Lens::InnerQuoted,\n                pass: pass.as_ref(),\n                ..compared(&tp, Some(&vf))\n            };\n            let bucket = compared.bucket();\n            assert!(\n                bucket\n                    .counter_labels(\"sha\")\n                    .contains(&(\"quoted_tweet_rule\", rule))\n            );\n            assert_eq!(\n                compared.to_json(&bucket, \"sha\", None)[\"quoted_tweet_rule\"],\n                rule\n            );\n        }\n    }\n\n    #[test]\n    fn only_a_level_82_request_with_a_quote_entry_compares_each_entry_once_against_its_outer() {\n        let entry = |tweet_id, placement| PostEvaluation {\n            tweet_id: TweetId(tweet_id),\n            placement,\n            ..outcome(shown())\n        };\n        let quoting = |outer| Placement::InnerQuoted {\n            outer: TweetId(outer),\n        };\n        let request = [\n            entry(10, Placement::Standalone),\n            entry(1, quoting(10)),\n            entry(3, Placement::Standalone),\n            entry(1, quoting(10)),\n            entry(2, quoting(20)),\n        ];\n        let selected = |level, outcomes: &[PostEvaluation]| {\n            quote_comparisons(level, outcomes, &[]).map(|quotes| {\n                let served: Vec<_> = quotes\n                    .served\n                    .iter()\n                    .map(|served| (served.lens, served.outer.0, served.outcome.tweet_id.0))\n                    .collect();\n                (quotes.outers, served)\n            })\n        };\n        assert_eq!(\n            selected(SafetyLevel::TimelineHomeHydration, &request),\n            Some((\n                vec![TweetId(10), TweetId(20)],\n                vec![\n                    (Lens::Outer, 10, 10),\n                    (Lens::InnerQuoted, 10, 1),\n                    (Lens::InnerQuoted, 20, 2),\n                ]\n            ))\n        );\n        for level in [\n            SafetyLevel::FilterAll,\n            SafetyLevel::TimelineHome,\n            SafetyLevel::TimelineHomeRecommendations,\n            SafetyLevel::ImmersiveExpandedRecommendations,\n            SafetyLevel::QuotedTweetRules,\n        ] {\n            assert!(selected(level, &request).is_none(), \"{level:?}\");\n        }\n        assert!(selected(SafetyLevel::TimelineHomeHydration, &request[..1]).is_none());\n        let passes = [QuotePass {\n            key: request[1].key(),\n            outcome: PassOutcome::Passed,\n            author: None,\n        }];\n        let lenses: Vec<_> =\n            quote_comparisons(SafetyLevel::TimelineHomeHydration, &request, &passes)\n                .unwrap()\n                .served\n                .iter()\n                .map(|served| {\n                    (\n                        served.lens,\n                        served.outcome.tweet_id.0,\n                        served.pass.is_some(),\n                    )\n                })\n                .collect();\n        assert_eq!(\n            lenses,\n            [\n                (Lens::Outer, 10, false),\n                (Lens::QuotePass, 1, true),\n                (Lens::InnerQuoted, 1, true),\n                (Lens::InnerQuoted, 2, false),\n            ]\n        );\n    }\n\n    #[test]\n    fn the_quote_pass_lens_compares_the_pass_result_and_names_its_outcome() {\n        static AUTHOR_IS_SUSPENDED: FilteredReason = FilteredReason::AuthorIsSuspended(true);\n        let tp = TpResult {\n            label: pair(\"drop\", \"author_is_suspended\"),\n            result: None,\n            strato_error: None,\n            quoted: None,\n        };\n        let inner = PostEvaluation {\n            placement: Placement::InnerQuoted { outer: TweetId(7) },\n            ..outcome(shown())\n        };\n        let suspended = Evaluation::complete(Verdict::Withheld(Decided {\n            value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),\n            id: RuleId::SuspendedAuthor,\n            by: \"suspended_author/drop\",\n        }));\n        let dropped = PassOutcome::Dropped(Rerendered {\n            by: RuleId::SuspendedAuthor,\n            reason: &AUTHOR_IS_SUSPENDED,\n        });\n        for (outcome, lens, vf, quote_pass) in [\n            (\n                dropped.clone(),\n                Lens::QuotePass,\n                pair(\"drop\", \"author_is_suspended\"),\n                \"dropped\",\n            ),\n            (dropped, Lens::InnerQuoted, pair(\"allow\", NONE), NONE),\n            (\n                PassOutcome::OuterWithheld,\n                Lens::QuotePass,\n                pair(\"missing\", NONE),\n                \"outer_withheld\",\n            ),\n            (\n                PassOutcome::FailedOpen,\n                Lens::QuotePass,\n                pair(\"allow\", NONE),\n                \"failed_open\",\n            ),\n        ] {\n            let pass = QuotePass {\n                key: inner.key(),\n                outcome,\n                author: Some(suspended.clone()),\n            };\n            let compared = Compared {\n                lens,\n                pass: Some(&pass),\n                ..compared(&tp, Some(&inner))\n            };\n            let bucket = compared.bucket();\n            assert_eq!(\n                (&bucket.vf, bucket.quote_pass, bucket.quoted_tweet_rule),\n                (&vf, quote_pass, \"suspended_author/drop\"),\n                \"{lens:?} {:?}\",\n                pass.outcome\n            );\n            assert!(\n                bucket\n                    .counter_labels(\"sha\")\n                    .contains(&(\"quote_pass\", quote_pass))\n            );\n            assert_eq!(\n                compared.to_json(&bucket, \"sha\", None)[\"quote_pass\"],\n                quote_pass\n            );\n        }\n    }\n}\n",
+      "source_digest": "2150c5987e54bec1d453262d9bdbaff1f76429e59f0726ae595907887f2ca6a3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 432,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use super::{\n    BatchOutcome, Compared, Lens, TWEETYPIE_TIMEOUT, TpResult, TweetypieReference, get_tweet_fields,\n};\nuse crate::models::viewer::Client;\nuse crate::models::{EvaluationKey, Placement, TweetId};\nuse crate::post_evaluator::PostEvaluation;\nuse crate::quote::QuotePass;\nuse crate::result_label::{Class, NONE, label};\nuse crate::rules::SafetyLevel;\nuse std::collections::{HashMap, HashSet};\nuse std::sync::Arc;\nuse tokio::time::timeout;\nuse xai_twittercontext_proto::TwitterContextViewer;\n\nimpl Lens {\n    fn answer(self, outer: &TpResult) -> TpResult {\n        let failed_class: &str = Class::Failed.into();\n        match (self, &outer.quoted) {\n            (Self::Standalone | Self::Outer, _) => outer.clone(),\n            (Self::InnerQuoted | Self::QuotePass, Some(quoted)) => (**quoted).clone(),\n            (Self::InnerQuoted | Self::QuotePass, None) => TpResult {\n                label: if outer.label.0 == failed_class {\n                    outer.label.clone()\n                } else {\n                    label(Class::Missing, NONE)\n                },\n                result: None,\n                strato_error: outer.strato_error.clone(),\n                quoted: None,\n            },\n        }\n    }\n}\n\nimpl TweetypieReference {\n    pub(in crate::staging::reference) fn spawn_quote_comparison(\n        self: &Arc<Self>,\n        viewer_id: Option<u64>,\n        context: Option<&TwitterContextViewer>,\n        country_code: Option<&str>,\n        safety_level: SafetyLevel,\n        outcomes: &[PostEvaluation],\n        quote_passes: &[QuotePass],\n    ) {\n        let Some(viewer_id) = viewer_id else {\n            return;\n        };\n        let Some(quotes) = quote_comparisons(safety_level, outcomes, quote_passes) else {\n            return;\n        };\n        let client = TwitterContextViewer {\n            user_id: viewer_id.cast_signed(),\n            ..context\n                .cloned()\n                .unwrap_or_else(|| Client::Web.context(None, country_code))\n        };\n        let country_code = country_code.map(str::to_owned);\n        self.detach(move |reference| async move {\n            reference\n                .compare_quotes(viewer_id, country_code, client, quotes)\n                .await\n        });\n    }\n\n    async fn compare_quotes(\n        &self,\n        viewer_id: u64,\n        country_code: Option<String>,\n        client: TwitterContextViewer,\n        quotes: QuoteComparisons,\n    ) -> BatchOutcome {\n        let Ok(tp) = timeout(\n            TWEETYPIE_TIMEOUT,\n            get_tweet_fields(&self.tweetypie, &client, &quotes.outers),\n        )\n        .await\n        else {\n            return BatchOutcome::TweetypieTimeout;\n        };\n        let by_outer: HashMap<TweetId, &TpResult> =\n            quotes.outers.iter().copied().zip(&tp).collect();\n        let answers: Vec<(&Served, TpResult)> = quotes\n            .served\n            .iter()\n            .filter_map(|served| Some((served, served.lens.answer(by_outer.get(&served.outer)?))))\n            .collect();\n        self.record(answers.iter().map(|(served, tp)| Compared {\n            lens: served.lens,\n            tweet_id: served.outcome.tweet_id,\n            viewer_id,\n            country_code: country_code.as_deref(),\n            tp,\n            vf: Some(&served.outcome),\n            pass: served.pass.as_ref(),\n        }));\n        BatchOutcome::Compared\n    }\n}\n\nstruct Served {\n    lens: Lens,\n    outer: TweetId,\n    outcome: PostEvaluation,\n    pass: Option<QuotePass>,\n}\n\nstruct QuoteComparisons {\n    outers: Vec<TweetId>,\n    served: Vec<Served>,\n}\n\nfn quote_comparisons(\n    safety_level: SafetyLevel,\n    outcomes: &[PostEvaluation],\n    quote_passes: &[QuotePass],\n) -> Option<QuoteComparisons> {\n    match safety_level {\n        SafetyLevel::TimelineHomeHydration => {}\n        SafetyLevel::FilterAll\n        | SafetyLevel::TimelineHome\n        | SafetyLevel::TimelineHomeRecommendations\n        | SafetyLevel::ImmersiveExpandedRecommendations\n        | SafetyLevel::QuotedTweetRules\n        | SafetyLevel::NotificationsFollow\n        | SafetyLevel::NotificationsWriterV2 => return None,\n    }\n    let mut outers = Vec::new();\n    for outcome in outcomes {\n        if let Placement::InnerQuoted { outer } = outcome.placement\n            && !outers.contains(&outer)\n        {\n            outers.push(outer);\n        }\n    }\n    if outers.is_empty() {\n        return None;\n    }\n    let passes: HashMap<EvaluationKey, &QuotePass> =\n        quote_passes.iter().map(|pass| (pass.key, pass)).collect();\n    let mut seen = HashSet::new();\n    let mut served = Vec::new();\n    for outcome in outcomes {\n        let (lens, outer) = match outcome.placement {\n            Placement::InnerQuoted { outer } => (Lens::InnerQuoted, outer),\n            Placement::Standalone if outers.contains(&outcome.tweet_id) => {\n                (Lens::Outer, outcome.tweet_id)\n            }\n            Placement::Standalone | Placement::RetweetSource => continue,\n        };\n        if !seen.insert(outcome.key()) {\n            continue;\n        }\n        let pass = passes.get(&outcome.key()).map(|&pass| pass.clone());\n        if let Some(pass) = &pass {\n            served.push(Served {\n                lens: Lens::QuotePass,\n                outer,\n                outcome: outcome.clone(),\n                pass: Some(pass.clone()),\n            });\n        }\n        served.push(Served {\n            lens,\n            outer,\n            outcome: outcome.clone(),\n            pass,\n        });\n    }\n    Some(QuoteComparisons { outers, served })\n}\n\n#[cfg(test)]\nmod tests {\n    use super::super::tests::{compared, outcome, pair, shown};\n    use super::super::{tp_failed, tp_result};\n    use super::*;\n    use crate::models::{Decided, DropReason, Evaluation, Verdict, Withholding};\n    use crate::quote::{PassOutcome, Rerendered};\n    use crate::result_label::Failure;\n    use crate::rules::RuleId;\n    use xai_strato::strato_thrift::StratoResult;\n    use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;\n    use xai_x_thrift::get_tweet_fields::{\n        GetTweetFieldsResult, TweetFieldsResultFound, TweetFieldsResultState,\n    };\n    use xai_x_thrift::safety_result::FilteredReason;\n    use xai_x_thrift::tweet_service::TweetFieldsResultFiltered;\n\n    #[test]\n    fn a_quote_entry_reads_its_outers_quoted_tweet_result_else_missing_or_the_outers_failure() {\n        let found = TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));\n        let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(\n            FilteredReason::AuthorIsSuspended(true),\n        ));\n        let outer = |state: &TweetFieldsResultState, quoted| {\n            tp_result(StratoResult::Ok {\n                value: Some(GetTweetFieldsResult::new(5, state.clone(), quoted)),\n                ttl: -1,\n            })\n        };\n        let cases = [\n            (\n                outer(&found, Some(suspended.clone())),\n                Lens::InnerQuoted,\n                (\"drop\", \"author_is_suspended\"),\n            ),\n            (\n                outer(&found, Some(suspended.clone())),\n                Lens::Outer,\n                (\"allow\", \"none\"),\n            ),\n            (outer(&found, None), Lens::InnerQuoted, (\"missing\", \"none\")),\n            (\n                outer(&suspended, None),\n                Lens::InnerQuoted,\n                (\"missing\", \"none\"),\n            ),\n            (\n                tp_failed(Failure::RpcError),\n                Lens::InnerQuoted,\n                (\"failed\", \"rpc_error\"),\n            ),\n        ];\n        for (outer, lens, (class, reason)) in cases {\n            assert_eq!(\n                lens.answer(&outer).label,\n                pair(class, reason),\n                \"{lens:?} {:?}\",\n                outer.label\n            );\n        }\n    }\n\n    #[test]\n    fn a_quote_entry_is_labelled_with_the_quoted_tweet_rules_rule_that_drops_its_author() {\n        let tp = TpResult {\n            label: pair(\"allow\", NONE),\n            result: None,\n            strato_error: None,\n            quoted: None,\n        };\n        let vf = PostEvaluation {\n            placement: Placement::InnerQuoted { outer: TweetId(7) },\n            ..outcome(shown())\n        };\n        let muted = Evaluation::complete(Verdict::Withheld(Decided {\n            value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::ViewerMutesAuthor)),\n            id: RuleId::QuotedViewerMutesAuthorNotFollowing,\n            by: \"quoted_viewer_mutes_author_not_following/drop\",\n        }));\n        let allowed = Evaluation::complete(shown());\n        let pass = |author| QuotePass {\n            key: vf.key(),\n            outcome: PassOutcome::Passed,\n            author,\n        };\n        for (pass, rule) in [\n            (\n                Some(pass(Some(muted.clone()))),\n                \"quoted_viewer_mutes_author_not_following/drop\",\n            ),\n            (Some(pass(Some(allowed.clone()))), NONE),\n            (Some(pass(None)), NONE),\n            (None, NONE),\n        ] {\n            let compared = Compared {\n                lens: Lens::InnerQuoted,\n                pass: pass.as_ref(),\n                ..compared(&tp, Some(&vf))\n            };\n            let bucket = compared.bucket();\n            assert!(\n                bucket\n                    .counter_labels(\"sha\")\n                    .contains(&(\"quoted_tweet_rule\", rule))\n            );\n            assert_eq!(\n                compared.to_json(&bucket, \"sha\", None)[\"quoted_tweet_rule\"],\n                rule\n            );\n        }\n    }\n\n    #[test]\n    fn only_a_level_82_request_with_a_quote_entry_compares_each_entry_once_against_its_outer() {\n        let entry = |tweet_id, placement| PostEvaluation {\n            tweet_id: TweetId(tweet_id),\n            placement,\n            ..outcome(shown())\n        };\n        let quoting = |outer| Placement::InnerQuoted {\n            outer: TweetId(outer),\n        };\n        let request = [\n            entry(10, Placement::Standalone),\n            entry(1, quoting(10)),\n            entry(3, Placement::Standalone),\n            entry(1, quoting(10)),\n            entry(2, quoting(20)),\n        ];\n        let selected = |level, outcomes: &[PostEvaluation]| {\n            quote_comparisons(level, outcomes, &[]).map(|quotes| {\n                let served: Vec<_> = quotes\n                    .served\n                    .iter()\n                    .map(|served| (served.lens, served.outer.0, served.outcome.tweet_id.0))\n                    .collect();\n                (quotes.outers, served)\n            })\n        };\n        assert_eq!(\n            selected(SafetyLevel::TimelineHomeHydration, &request),\n            Some((\n                vec![TweetId(10), TweetId(20)],\n                vec![\n                    (Lens::Outer, 10, 10),\n                    (Lens::InnerQuoted, 10, 1),\n                    (Lens::InnerQuoted, 20, 2),\n                ]\n            ))\n        );\n        for level in [\n            SafetyLevel::FilterAll,\n            SafetyLevel::TimelineHome,\n            SafetyLevel::TimelineHomeRecommendations,\n            SafetyLevel::ImmersiveExpandedRecommendations,\n            SafetyLevel::QuotedTweetRules,\n        ] {\n            assert!(selected(level, &request).is_none(), \"{level:?}\");\n        }\n        assert!(selected(SafetyLevel::TimelineHomeHydration, &request[..1]).is_none());\n        let passes = [QuotePass {\n            key: request[1].key(),\n            outcome: PassOutcome::Passed,\n            author: None,\n        }];\n        let lenses: Vec<_> =\n            quote_comparisons(SafetyLevel::TimelineHomeHydration, &request, &passes)\n                .unwrap()\n                .served\n                .iter()\n                .map(|served| {\n                    (\n                        served.lens,\n                        served.outcome.tweet_id.0,\n                        served.pass.is_some(),\n                    )\n                })\n                .collect();\n        assert_eq!(\n            lenses,\n            [\n                (Lens::Outer, 10, false),\n                (Lens::QuotePass, 1, true),\n                (Lens::InnerQuoted, 1, true),\n                (Lens::InnerQuoted, 2, false),\n            ]\n        );\n    }\n\n    #[test]\n    fn the_quote_pass_lens_compares_the_pass_result_and_names_its_outcome() {\n        static AUTHOR_IS_SUSPENDED: FilteredReason = FilteredReason::AuthorIsSuspended(true);\n        let tp = TpResult {\n            label: pair(\"drop\", \"author_is_suspended\"),\n            result: None,\n            strato_error: None,\n            quoted: None,\n        };\n        let inner = PostEvaluation {\n            placement: Placement::InnerQuoted { outer: TweetId(7) },\n            ..outcome(shown())\n        };\n        let suspended = Evaluation::complete(Verdict::Withheld(Decided {\n            value: Withholding::Drop(DropReason::Legacy(VfFilteredReason::AuthorIsSuspended)),\n            id: RuleId::SuspendedAuthor,\n            by: \"suspended_author/drop\",\n        }));\n        let dropped = PassOutcome::Dropped(Rerendered {\n            by: RuleId::SuspendedAuthor,\n            reason: &AUTHOR_IS_SUSPENDED,\n        });\n        for (outcome, lens, vf, quote_pass) in [\n            (\n                dropped.clone(),\n                Lens::QuotePass,\n                pair(\"drop\", \"author_is_suspended\"),\n                \"dropped\",\n            ),\n            (dropped, Lens::InnerQuoted, pair(\"allow\", NONE), NONE),\n            (\n                PassOutcome::OuterWithheld,\n                Lens::QuotePass,\n                pair(\"missing\", NONE),\n                \"outer_withheld\",\n            ),\n            (\n                PassOutcome::FailedOpen,\n                Lens::QuotePass,\n                pair(\"allow\", NONE),\n                \"failed_open\",\n            ),\n        ] {\n            let pass = QuotePass {\n                key: inner.key(),\n                outcome,\n                author: Some(suspended.clone()),\n            };\n            let compared = Compared {\n                lens,\n                pass: Some(&pass),\n                ..compared(&tp, Some(&inner))\n            };\n            let bucket = compared.bucket();\n            assert_eq!(\n                (&bucket.vf, bucket.quote_pass, bucket.quoted_tweet_rule),\n                (&vf, quote_pass, \"suspended_author/drop\"),\n                \"{lens:?} {:?}\",\n                pass.outcome\n            );\n            assert!(\n                bucket\n                    .counter_labels(\"sha\")\n                    .contains(&(\"quote_pass\", quote_pass))\n            );\n            assert_eq!(\n                compared.to_json(&bucket, \"sha\", None)[\"quote_pass\"],\n                quote_pass\n            );\n        }\n    }\n}\n",
+      "source_digest": "44f64df835e3c67f59a46a370aa0a99012e15553621a17678f96d2074aa98271",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3434,
+      "end_line": 3458,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(\n            code(set_cfg(renamed(\"NewName\", None)).await),\n            \"confirm_required\"\n        );\n        assert!(\n            set_cfg(renamed(\"NewName\", Some(CONFIRM_WORD)))\n                .await\n                .is_ok()\n        );\n    }\n\n    #[tokio::test]\n    async fn put_answer_shows_this_pods_effective_mode() {\n        let (ac, _) = loaded(&[]).await;\n        let killed = ControlConfig {\n            enabled: false,\n            ..Default::default()\n        };\n        let out = ac\n            .set(\n                put(\"H\", ControlMode::Live, vec![SUSPEND]),\n                \"w\",\n                \"k\",\n                1,\n                &killed,\n",
+      "source_digest": "de8e939a7a18f9194ccd5c523d7ec71666ecd36db86ffaf2a1a7458d8a1a35ff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 89,
+      "end_line": 113,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[cfg(test)]\n#[derive(Default)]\npub(crate) struct AisRecorder {\n    pub calls: std::sync::Mutex<Vec<(String, Value)>>,\n}\n\n#[cfg(test)]\nimpl AisRecorder {\n    pub(crate) fn take(&self) -> Vec<(String, Value)> {\n        std::mem::take(&mut *self.calls.lock().unwrap())\n    }\n\n    fn answer(&self, method: &str, request: Value) -> Value {\n        let n = request\n            .get(\"actions\")\n            .and_then(Value::as_array)\n            .map_or(0, Vec::len);\n        self.calls\n            .lock()\n            .unwrap()\n            .push((method.to_owned(), request));\n        if n > 0 {\n            let ok: serde_json::Map<String, Value> =\n                (0..n).map(|i| (i.to_string(), json!({}))).collect();\n            json!({ \"successesfulActions\": ok, \"failedActions\": {} })\n",
+      "source_digest": "2490566b75349863c310f444897f0dc13fd99c7ff5897c109190203c024d8606",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 204,
+      "end_line": 228,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) -> Result<Value> {\n        self.call_method(&self.multi, request, labels).await\n    }\n\n    async fn call_method(\n        &self,\n        meta: &MethodMeta,\n        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n",
+      "source_digest": "1146994b9020b70e4b54beed05011d945aff105f9d9bf4e7f1424e94e6218d0e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n            \"the record list came from a pod's copy ({}), not the store; retry when the store answers\",\n            list.error.unwrap_or_default()\n        );\n    }\n    let planned = plan(&list, &args.updated_by);\n    println!(\"{} off switch(es) to turn on ({REASON}):\", planned.len());\n    for s in &planned {\n        println!(\"  {}\", switch_lkey(s));\n    }\n    if !args.apply {\n        println!(\"plan only; rerun with --apply to write the switches\");\n        return Ok(());\n    }\n",
+      "source_digest": "407192d801c89660bfbad0f68361221ee4217a7bef43d5f2f036335130854902",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/service-lib/src/metrics.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 229,
+      "end_line": 253,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &[\"mode\", \"outcome\", \"topic\"])\n            .unwrap();\n\n                pub static ref HOLD_GATE_BREAKER_SKIP_TOTAL: IntCounter =\n        register_int_counter!(\n            \"abuse_enforcement_hold_gate_breaker_skip_total\",\n            \"Overturn-hold gate probes skipped because the circuit breaker was open.\")\n            .unwrap();\n\n                                            pub static ref HOLD_GATE_BACKOFF_SKIP_TOTAL: IntCounter =\n        register_int_counter!(\n            \"abuse_enforcement_hold_gate_backoff_skip_total\",\n            \"Overturn-hold gate probes skipped because the reachable-error backoff was armed (ledger answers but cannot serve).\")\n            .unwrap();\n\n                                        pub static ref HOLD_GATE_PROBE_SECONDS: Histogram =\n        register_histogram!(\n            \"abuse_enforcement_hold_gate_probe_seconds\",\n            \"Overturn-hold gate ledger probe latency.\",\n            vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0])\n            .unwrap();\n\n                                            pub static ref HOLD_GATE_PROBE_SCHED_DELAY_SECONDS: Histogram =\n        register_histogram!(\n            \"abuse_enforcement_hold_gate_probe_sched_delay_seconds\",\n",
+      "source_digest": "0b3a96064a708d2787de187972e584de2b85672c32c2b262fee05a917e8d7dcf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/service-lib/src/off_switch.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1069,
+      "end_line": 1093,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let sw = Arc::new(\n            OffSwitch::new(store.clone(), Arc::new(MemStore::default()))\n                .with_scan_timeout(Duration::from_millis(20)),\n        );\n        let task =\n            sw.spawn_refresh_with(|| true, Duration::from_millis(40), Duration::from_millis(2));\n        wait_for_scans(&store, 3).await;\n        assert!(!sw.ready(true), \"each hung read times out and is retried\");\n\n        store.hang_scan.store(false, Ordering::Relaxed);\n        assert!(\n            until_ready(&sw, Duration::from_secs(5)).await,\n            \"ready once a read answers\"\n        );\n        assert!(sw.lookup(\"H\", \"c\", NOW).is_some());\n        task.abort();\n    }\n\n    #[tokio::test]\n    async fn disabled_feature_does_not_wait_or_read() {\n        let store = Arc::new(MemStore::default());\n        store.fail_scan.store(true, Ordering::Relaxed);\n        let sw = Arc::new(OffSwitch::new(store.clone(), Arc::new(MemStore::default())));\n        let task = sw.spawn_refresh_with(\n            || false,\n",
+      "source_digest": "2a81874e4a2a7b17095e48c982f28e508fcefcc1260f0539c298188949165e64",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 523,
+      "end_line": 547,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\n#[derive(Debug, thiserror::Error)]\npub(crate) enum HoldStoreError {\n        #[error(\"no hold store configured (OVERTURN_HOLD_LEDGER_URL unset)\")]\n    NotConfigured,\n                    #[error(\"bad URL: {0}\")]\n    BadUrl(String),\n                #[error(\"ledger service unreachable: {0}\")]\n    Unreachable(String),\n            #[error(\"timed out after {0:?}\")]\n    Timeout(Duration),\n                    #[error(\"ledger service answered {status}{}\", code.map_or_else(String::new, |c| format!(\" code={}\", c.probe_code().as_str())))]\n    Upstream {\n        status: u16,\n        code: Option<LedgerCode>,\n    },\n                    #[error(\"response decode: {0}\")]\n    Decode(String),\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) enum ProbeErrorCode {\n        ConnectRefused,\n        AuthFailed,\n",
+      "source_digest": "60b4129a83769b23a3b942b5d8548b7ade108eb39a973bbb4cfaeb8b25f9b1af",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 591,
+      "end_line": 615,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ProbeError {\n    fn breaker_open(retry_in_secs: u64) -> Self {\n        Self {\n            code: ProbeErrorCode::BreakerOpen,\n            detail: format!(\"breaker open: ledger probe skipped (next trial in {retry_in_secs}s)\"),\n        }\n    }\n\n    fn reachable_backoff(retry_in_secs: u64, streak: u32, last: Option<ProbeErrorCode>) -> Self {\n        Self {\n            code: ProbeErrorCode::ReachableBackoff,\n            detail: format!(\n                \"reachable-error backoff: the ledger service answered but could not serve \\\n                 {streak} consecutive probes (last: {}); probe skipped (next in {retry_in_secs}s)\",\n                last.map_or(\"?\", ProbeErrorCode::as_str)\n            ),\n        }\n    }\n}\n\nimpl From<&HoldStoreError> for ProbeError {\n    fn from(e: &HoldStoreError) -> Self {\n        Self {\n            code: e.code(),\n            detail: e.to_string(),\n",
+      "source_digest": "e2b5f941f1163fe80f7010c3a2a4af8fda642c88e69219613f180be76c94c7e0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 642,
+      "end_line": 666,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            HoldStoreError::Upstream {\n                code: Some(code), ..\n            } => code.probe_code(),\n            HoldStoreError::Upstream {\n                status: HTTP_GATEWAY_TIMEOUT,\n                code: None,\n            } => ProbeErrorCode::Timeout,\n            HoldStoreError::Upstream { code: None, .. } => ProbeErrorCode::LedgerStatus,\n            HoldStoreError::Decode(_) => ProbeErrorCode::Decode,\n        }\n    }\n\n                            pub(crate) fn ledger_answered(&self) -> Option<bool> {\n        match self {\n            HoldStoreError::Upstream { .. } | HoldStoreError::Decode(_) => Some(true),\n            HoldStoreError::Unreachable(_) | HoldStoreError::Timeout(_) => Some(false),\n            HoldStoreError::BadUrl(_) | HoldStoreError::NotConfigured => None,\n        }\n    }\n\n        pub(crate) fn breaker_signal(&self) -> BreakerSignal {\n        match self {\n            HoldStoreError::Unreachable(_) | HoldStoreError::Timeout(_) => BreakerSignal::Failure,\n            HoldStoreError::Upstream {\n                code: Some(code), ..\n",
+      "source_digest": "e584656575e1e764926f054f3bab795b7a437fd2fd6375bcadb1daee392038a5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1375,
+      "end_line": 1399,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                        b.last_reachable_error = None;\n                    }\n                    Some(code) => {\n                        b.reachable_errors = b.reachable_errors.saturating_add(1);\n                        b.last_reachable_error = Some(code);\n                        if b.reachable_errors >= REACHABLE_ERRORS_BEFORE_BACKOFF {\n                            b.backoff_until = Some(self.clock.now() + REACHABLE_ERROR_BACKOFF);\n                            if b.reachable_errors == REACHABLE_ERRORS_BEFORE_BACKOFF {\n                                warn!(\n                                    reachable_errors = b.reachable_errors,\n                                    code = code.as_str(),\n                                    backoff_secs = REACHABLE_ERROR_BACKOFF.as_secs(),\n                                    \"overturn-hold gate: the ledger service answers but cannot \\\n                                     serve (persistent reachable error, e.g. wrong path or \\\n                                     missing grant); probes skipped for {}s at a time and counted \\\n                                     as probe errors (code reachable_backoff) until a probe \\\n                                     succeeds — the breaker stays closed\",\n                                    REACHABLE_ERROR_BACKOFF.as_secs()\n                                );\n                            } else {\n                                debug!(\n                                    reachable_errors = b.reachable_errors,\n                                    code = code.as_str(),\n                                    \"overturn-hold gate: reachable-error backoff re-armed\"\n                                );\n",
+      "source_digest": "87c57a76e5bdc07c7e52d1e14fc291f40b138b30e2af8ab27435e752596f6b8f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1544,
+      "end_line": 1568,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n        let probe_started = self.clock.now();\n        let started = Instant::now();\n        let (res, elapsed) =\n            match spawn_probe(Arc::clone(store), user_id, labels.to_vec(), cfg.timeout_ms).await {\n                Ok((res, elapsed)) => (res, elapsed),\n                Err(e) => (Err(e), started.elapsed()),\n            };\n        metrics::HOLD_GATE_PROBE_SECONDS.observe(elapsed.as_secs_f64());\n        metrics::HOLD_GATE_PROBE_SCHED_DELAY_SECONDS\n            .observe(started.elapsed().saturating_sub(elapsed).as_secs_f64());\n        let probe_ms = elapsed.as_millis() as u64;\n        let answered = match &res {\n            Ok(_) => Some(true),\n            Err(e) => e.ledger_answered(),\n        };\n        if let Some(answered) = answered {\n            metrics::HOLD_GATE_DB_CONNECTED.set(i64::from(answered));\n        }\n        let (signal, error) = match &res {\n            Ok(_) => (BreakerSignal::Reachable, None),\n            Err(e) => (e.breaker_signal(), Some(e.code())),\n        };\n        if error.is_none() {\n            self.probe_failures.store(0, Ordering::Relaxed);\n",
+      "source_digest": "4f9e5a79bb68b3b7b9de0a4b2710f4a501147d570d3a9861d2a299f6fe49ae0b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1546,
+      "end_line": 1570,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let started = Instant::now();\n        let (res, elapsed) =\n            match spawn_probe(Arc::clone(store), user_id, labels.to_vec(), cfg.timeout_ms).await {\n                Ok((res, elapsed)) => (res, elapsed),\n                Err(e) => (Err(e), started.elapsed()),\n            };\n        metrics::HOLD_GATE_PROBE_SECONDS.observe(elapsed.as_secs_f64());\n        metrics::HOLD_GATE_PROBE_SCHED_DELAY_SECONDS\n            .observe(started.elapsed().saturating_sub(elapsed).as_secs_f64());\n        let probe_ms = elapsed.as_millis() as u64;\n        let answered = match &res {\n            Ok(_) => Some(true),\n            Err(e) => e.ledger_answered(),\n        };\n        if let Some(answered) = answered {\n            metrics::HOLD_GATE_DB_CONNECTED.set(i64::from(answered));\n        }\n        let (signal, error) = match &res {\n            Ok(_) => (BreakerSignal::Reachable, None),\n            Err(e) => (e.breaker_signal(), Some(e.code())),\n        };\n        if error.is_none() {\n            self.probe_failures.store(0, Ordering::Relaxed);\n        }\n        self.breaker_after_probe(trial, generation, signal, error);\n",
+      "source_digest": "2d6bef737e0c6cbdb94b65a49ed589cc402d0f1ebf5a928d301ea8525e30b5ad",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1548,
+      "end_line": 1572,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            match spawn_probe(Arc::clone(store), user_id, labels.to_vec(), cfg.timeout_ms).await {\n                Ok((res, elapsed)) => (res, elapsed),\n                Err(e) => (Err(e), started.elapsed()),\n            };\n        metrics::HOLD_GATE_PROBE_SECONDS.observe(elapsed.as_secs_f64());\n        metrics::HOLD_GATE_PROBE_SCHED_DELAY_SECONDS\n            .observe(started.elapsed().saturating_sub(elapsed).as_secs_f64());\n        let probe_ms = elapsed.as_millis() as u64;\n        let answered = match &res {\n            Ok(_) => Some(true),\n            Err(e) => e.ledger_answered(),\n        };\n        if let Some(answered) = answered {\n            metrics::HOLD_GATE_DB_CONNECTED.set(i64::from(answered));\n        }\n        let (signal, error) = match &res {\n            Ok(_) => (BreakerSignal::Reachable, None),\n            Err(e) => (e.breaker_signal(), Some(e.code())),\n        };\n        if error.is_none() {\n            self.probe_failures.store(0, Ordering::Relaxed);\n        }\n        self.breaker_after_probe(trial, generation, signal, error);\n\n        match res {\n",
+      "source_digest": "d3a9365b8cf8167607cde7e708abb87533ac89fc7da15be9c164a9ef48f8e6d5",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1549,
+      "end_line": 1573,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                Ok((res, elapsed)) => (res, elapsed),\n                Err(e) => (Err(e), started.elapsed()),\n            };\n        metrics::HOLD_GATE_PROBE_SECONDS.observe(elapsed.as_secs_f64());\n        metrics::HOLD_GATE_PROBE_SCHED_DELAY_SECONDS\n            .observe(started.elapsed().saturating_sub(elapsed).as_secs_f64());\n        let probe_ms = elapsed.as_millis() as u64;\n        let answered = match &res {\n            Ok(_) => Some(true),\n            Err(e) => e.ledger_answered(),\n        };\n        if let Some(answered) = answered {\n            metrics::HOLD_GATE_DB_CONNECTED.set(i64::from(answered));\n        }\n        let (signal, error) = match &res {\n            Ok(_) => (BreakerSignal::Reachable, None),\n            Err(e) => (e.breaker_signal(), Some(e.code())),\n        };\n        if error.is_none() {\n            self.probe_failures.store(0, Ordering::Relaxed);\n        }\n        self.breaker_after_probe(trial, generation, signal, error);\n\n        match res {\n            Ok(holds) => {\n",
+      "source_digest": "2e5fb0ca41ea1bb2ecf7d2564bde162ef146f316d457db09e0469d0bff4f04db",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2621,
+      "end_line": 2645,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    #[tokio::test]\n    async fn positive_cached_negative_not() {\n        let _serial = METRICS_LOCK.lock().await;\n        let store = FakeHoldStore::new(vec![hold(11, 110, 30)]);\n        let gate = HoldGate::new(Some(store.clone()));\n        let c = cfg(GateMode::Enforce);\n\n        let before_hit = counter(\"enforce\", \"cache_hit\");\n        let a = gate.evaluate(&c, 11, TOPIC, &[TEMP]).await;\n        let b = gate.evaluate(&c, 11, TOPIC, &[TEMP]).await;\n        assert_eq!(a.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(b.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(store.calls(), 1, \"positive answer must be cached\");\n        assert_eq!(counter(\"enforce\", \"cache_hit\"), before_hit + 1);\n        assert_eq!(b.info[\"overturn_hold_probe_ms\"], \"0\");\n        assert_eq!(gate.cached_len(), 1);\n\n        gate.evaluate(&c, 12, TOPIC, &[TEMP]).await;\n        gate.evaluate(&c, 12, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 3, \"negative answers are never cached\");\n        assert_eq!(gate.cached_len(), 1);\n    }\n\n    #[tokio::test]\n    async fn positive_cache_can_be_disabled() {\n",
+      "source_digest": "39dbbb91e5dbc94b3e6baac23b9cd60fd50425aa118f85b17ee4fe05a911f88e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2628,
+      "end_line": 2652,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let before_hit = counter(\"enforce\", \"cache_hit\");\n        let a = gate.evaluate(&c, 11, TOPIC, &[TEMP]).await;\n        let b = gate.evaluate(&c, 11, TOPIC, &[TEMP]).await;\n        assert_eq!(a.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(b.skip_status, Some(STATUS_HOLD_OVERTURNED));\n        assert_eq!(store.calls(), 1, \"positive answer must be cached\");\n        assert_eq!(counter(\"enforce\", \"cache_hit\"), before_hit + 1);\n        assert_eq!(b.info[\"overturn_hold_probe_ms\"], \"0\");\n        assert_eq!(gate.cached_len(), 1);\n\n        gate.evaluate(&c, 12, TOPIC, &[TEMP]).await;\n        gate.evaluate(&c, 12, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 3, \"negative answers are never cached\");\n        assert_eq!(gate.cached_len(), 1);\n    }\n\n    #[tokio::test]\n    async fn positive_cache_can_be_disabled() {\n        let _serial = METRICS_LOCK.lock().await;\n        let store = FakeHoldStore::new(vec![hold(11, 110, 30)]);\n        let gate = HoldGate::new(Some(store.clone()));\n        let c = HoldGateConfig {\n            mode: GateMode::Enforce,\n            positive_cache_secs: 0,\n            ..HoldGateConfig::default()\n",
+      "source_digest": "237424bface47d668db45877d96da06c798c77bd674f9106790ce463f4f8c1bf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 2998,
+      "end_line": 3022,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (bare(429), Reachable),\n            (HoldStoreError::Decode(\"missing field\".into()), Neutral),\n            (HoldStoreError::BadUrl(\"does not parse\".into()), Neutral),\n            (HoldStoreError::NotConfigured, Neutral),\n        ];\n        for (err, want) in cases {\n            assert_eq!(err.breaker_signal(), want, \"{err}\");\n        }\n        assert_eq!(fwd(200, LedgerCode::PoolWait).breaker_signal(), Neutral);\n        assert_eq!(fwd(418, LedgerCode::AuthFailed).breaker_signal(), Failure);\n        assert_eq!(\n            fwd(504, LedgerCode::StatementTimeout).to_string(),\n            \"ledger service answered 504 code=statement_timeout\"\n        );\n        assert_eq!(bare(502).to_string(), \"ledger service answered 502\");\n        assert!(\n            HoldStoreError::Unreachable(\"x\".into())\n                .to_string()\n                .starts_with(\"ledger service unreachable:\")\n        );\n        assert!(\n            HoldStoreError::Decode(\"x\".into())\n                .to_string()\n                .starts_with(\"response decode:\")\n        );\n",
+      "source_digest": "c724a2f0ecc277258c0bd9f0fbb0789b7ab9ec89a0568ff8738fabccc6af51e8",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3000,
+      "end_line": 3024,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (HoldStoreError::BadUrl(\"does not parse\".into()), Neutral),\n            (HoldStoreError::NotConfigured, Neutral),\n        ];\n        for (err, want) in cases {\n            assert_eq!(err.breaker_signal(), want, \"{err}\");\n        }\n        assert_eq!(fwd(200, LedgerCode::PoolWait).breaker_signal(), Neutral);\n        assert_eq!(fwd(418, LedgerCode::AuthFailed).breaker_signal(), Failure);\n        assert_eq!(\n            fwd(504, LedgerCode::StatementTimeout).to_string(),\n            \"ledger service answered 504 code=statement_timeout\"\n        );\n        assert_eq!(bare(502).to_string(), \"ledger service answered 502\");\n        assert!(\n            HoldStoreError::Unreachable(\"x\".into())\n                .to_string()\n                .starts_with(\"ledger service unreachable:\")\n        );\n        assert!(\n            HoldStoreError::Decode(\"x\".into())\n                .to_string()\n                .starts_with(\"response decode:\")\n        );\n    }\n\n",
+      "source_digest": "e4a3fccbe1713a258f2883c891cb52eaba73e0d33d2b523c16188ec9aca2d5ae",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3039,
+      "end_line": 3063,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            (fwd(500, LedgerCode::Other), Some(true)),\n            (\n                HoldStoreError::Upstream {\n                    status: 404,\n                    code: None,\n                },\n                Some(true),\n            ),\n            (HoldStoreError::Decode(\"x\".into()), Some(true)),\n            (HoldStoreError::BadUrl(\"x\".into()), None),\n            (HoldStoreError::NotConfigured, None),\n        ] {\n            assert_eq!(err.ledger_answered(), want, \"{err}\");\n        }\n\n        let store = FakeHoldStore::new(vec![hold(1, 10, 30)]);\n        let gate = HoldGate::with_breaker(Some(store.clone()), 100, Duration::from_secs(60));\n        let c = cfg(GateMode::Enforce);\n        metrics::HOLD_GATE_DB_CONNECTED.set(0);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 1);\n        store.set_failure(FakeFailure::Unreachable);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 0, \"hop failed\");\n        store.set_failure(FakeFailure::SqlPermission);\n",
+      "source_digest": "527562ae8c9d4cfe79e946f3b0da2c3e03be8f6e634829a9722a486b4f5decc0",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3056,
+      "end_line": 3080,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let c = cfg(GateMode::Enforce);\n        metrics::HOLD_GATE_DB_CONNECTED.set(0);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 1);\n        store.set_failure(FakeFailure::Unreachable);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 0, \"hop failed\");\n        store.set_failure(FakeFailure::SqlPermission);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(\n            metrics::HOLD_GATE_DB_CONNECTED.get(),\n            1,\n            \"a 500 with a code is an answer\"\n        );\n        store.set_failure(FakeFailure::Unreachable);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 0);\n        store.set_failure(FakeFailure::Decode);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(\n            metrics::HOLD_GATE_DB_CONNECTED.get(),\n            1,\n            \"an undecodable 200 is an answer\"\n        );\n        let no_store = HoldGate::new(None);\n",
+      "source_digest": "53dc530470d2b06e6c376693c0bc7bab731c2d8a837d68793a5b4fcef2dee64a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3066,
+      "end_line": 3090,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            metrics::HOLD_GATE_DB_CONNECTED.get(),\n            1,\n            \"a 500 with a code is an answer\"\n        );\n        store.set_failure(FakeFailure::Unreachable);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 0);\n        store.set_failure(FakeFailure::Decode);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(\n            metrics::HOLD_GATE_DB_CONNECTED.get(),\n            1,\n            \"an undecodable 200 is an answer\"\n        );\n        let no_store = HoldGate::new(None);\n        no_store.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(\n            metrics::HOLD_GATE_DB_CONNECTED.get(),\n            1,\n            \"not_configured leaves it\"\n        );\n        let bad = HoldGate::from_url(Some(\"not a url\"), false, None);\n        bad.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(\n            metrics::HOLD_GATE_DB_CONNECTED.get(),\n",
+      "source_digest": "5780148f6fa1546520432ee1d59268cd813258958c8263db4c4b784f0c9beb70",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3244,
+      "end_line": 3268,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n            assert_eq!(out.info[\"overturn_hold_probe_error\"], \"other\");\n        }\n        assert_eq!(store.calls(), N, \"every call was a real probe\");\n        assert_eq!(gate.probe_failures(), N as u64, \"counted, never reset\");\n        assert_eq!(\n            logs.lines_containing(\"probe failed\"),\n            1,\n            \"one sampled warn for {N} consecutive reachable errors:\\n{}\",\n            String::from_utf8_lossy(&logs.0.lock().unwrap())\n        );\n        assert_eq!(\n            logs.lines_containing(\"answers but cannot serve\"),\n            1,\n            \"the backoff arms (and logs) once per run\"\n        );\n        assert!(\n            !gate.breaker_open(),\n            \"reachable errors never open the breaker\"\n        );\n\n        store.set_failure(FakeFailure::None);\n        clock.advance(past_backoff);\n        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        assert_eq!(gate.probe_failures(), 0);\n",
+      "source_digest": "0d8dd61ac9a5f280b25724f63487c6ea45c3011338d63aebf5b47558d0d3dacf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3268,
+      "end_line": 3292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(gate.probe_failures(), 0);\n        store.set_failure(FakeFailure::NotFound);\n        for _ in 0..N {\n            clock.advance(past_backoff);\n            let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n            assert_eq!(out.info[\"overturn_hold_probe_error\"], \"ledger_status\");\n        }\n        assert_eq!(\n            logs.lines_containing(\"probe failed\"),\n            2,\n            \"one more for the new run\"\n        );\n        assert_eq!(logs.lines_containing(\"answers but cannot serve\"), 2);\n        let before = logs.lines_containing(\"probe failed\");\n        for _ in 0..20 {\n            let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n            assert_eq!(out.info[\"overturn_hold_probe_error\"], \"reachable_backoff\");\n        }\n        assert_eq!(logs.lines_containing(\"probe failed\"), before);\n        assert_eq!(logs.lines_containing(\"probe skipped\"), 0);\n    }\n\n                                            #[tokio::test]\n    async fn persistent_reachable_errors_back_off_without_opening_the_breaker() {\n        let _serial = METRICS_LOCK.lock().await;\n",
+      "source_digest": "d8b4cca87241ee445af76f0acdcba89cf4a16675476e777ec4b436addfb52b60",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/overturn_hold.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 3569,
+      "end_line": 3593,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        store.set_failure(FakeFailure::Unreachable);\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2, \"trial reached the store\");\n        assert!(gate.breaker_open(), \"unreachable on the trial re-opens\");\n        assert!(!gate.half_open_inflight(), \"slot released\");\n        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 2, \"re-opened: skipped for another window\");\n\n        clock.advance(PAST_OPEN);\n        store.set_failure(FakeFailure::SqlPermission);\n        gate.evaluate(&c, 3, TOPIC, &[TEMP]).await;\n        assert_eq!(store.calls(), 3);\n        assert!(!gate.breaker_open(), \"service answered: reachable, closed\");\n    }\n\n                #[tokio::test]\n    async fn decode_errors_are_neutral_for_the_breaker() {\n        let _serial = METRICS_LOCK.lock().await;\n        let store = FakeHoldStore::new(vec![]);\n        let (gate, clock) = breaker_gate(store.clone(), 2, DEFAULT_BREAKER_OPEN);\n        let c = cfg(GateMode::Enforce);\n        store.set_fail(true);\n        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;\n        store.set_failure(FakeFailure::Decode);\n        for _ in 0..5 {\n",
+      "source_digest": "5325813e61b31c9d3bcc560367b46fad12cfc3e650adc0af16d135f4f66c02ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 4032,
+      "end_line": 4056,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        assert_eq!(\n            code(set_cfg(renamed(\"NewName\", None)).await),\n            \"confirm_required\"\n        );\n        assert!(\n            set_cfg(renamed(\"NewName\", Some(CONFIRM_WORD)))\n                .await\n                .is_ok()\n        );\n    }\n\n    #[tokio::test]\n    async fn put_answer_shows_this_pods_effective_mode() {\n        let (ac, _) = loaded(&[]).await;\n        let killed = ControlConfig {\n            enabled: false,\n            ..Default::default()\n        };\n        let out = ac\n            .set(\n                put(\"H\", ControlMode::Live, vec![SUSPEND]),\n                \"w\",\n                \"k\",\n                1,\n                &killed,\n",
+      "source_digest": "de8e939a7a18f9194ccd5c523d7ec71666ecd36db86ffaf2a1a7458d8a1a35ff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 89,
+      "end_line": 113,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[cfg(test)]\n#[derive(Default)]\npub(crate) struct AisRecorder {\n    pub calls: std::sync::Mutex<Vec<(String, Value)>>,\n}\n\n#[cfg(test)]\nimpl AisRecorder {\n    pub(crate) fn take(&self) -> Vec<(String, Value)> {\n        std::mem::take(&mut *self.calls.lock().unwrap())\n    }\n\n    fn answer(&self, method: &str, request: Value) -> Value {\n        let n = request\n            .get(\"actions\")\n            .and_then(Value::as_array)\n            .map_or(0, Vec::len);\n        self.calls\n            .lock()\n            .unwrap()\n            .push((method.to_owned(), request));\n        if n > 0 {\n            let ok: serde_json::Map<String, Value> =\n                (0..n).map(|i| (i.to_string(), json!({}))).collect();\n            json!({ \"successesfulActions\": ok, \"failedActions\": {} })\n",
+      "source_digest": "2490566b75349863c310f444897f0dc13fd99c7ff5897c109190203c024d8606",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/service-lib/src/ais_client.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 204,
+      "end_line": 228,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    ) -> Result<Value> {\n        self.call_method(&self.multi, request, labels).await\n    }\n\n    async fn call_method(\n        &self,\n        meta: &MethodMeta,\n        request: Value,\n        labels: AisMetricLabels<'_>,\n    ) -> Result<Value> {\n        #[cfg(test)]\n        if let Some(recorder) = &self.recorder {\n            return Ok(recorder.answer(&meta.thrift_method_name, request));\n        }\n        let start = Instant::now();\n        let seq = self.seq.fetch_add(1, Ordering::Relaxed);\n\n        let payload = self\n            .transcoder\n            .encode_call(\n                &meta.thrift_method_name,\n                \"\",\n                meta.arg_field_id,\n                &meta.request_type,\n                &request,\n",
+      "source_digest": "1146994b9020b70e4b54beed05011d945aff105f9d9bf4e7f1424e94e6218d0e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/service-lib/src/bin/action_control_rollback.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 30,
+      "end_line": 54,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        .timeout(Duration::from_secs(10))\n        .build()?;\n    let list: ActionControlListResponse = http\n        .get(format!(\"{}/api/action_controls\", args.service_url))\n        .bearer_auth(&token)\n        .send()\n        .await?\n        .error_for_status()?\n        .json()\n        .await?;\n    if list.source != \"store\" {\n        bail!(\n            \"the record list came from a pod's copy ({}), not the store; retry when the store answers\",\n            list.error.unwrap_or_default()\n        );\n    }\n    let planned = plan(&list, &args.updated_by);\n    println!(\"{} off switch(es) to turn on ({REASON}):\", planned.len());\n    for s in &planned {\n        println!(\"  {}\", switch_lkey(s));\n    }\n    if !args.apply {\n        println!(\"plan only; rerun with --apply to write the switches\");\n        return Ok(());\n    }\n",
+      "source_digest": "407192d801c89660bfbad0f68361221ee4217a7bef43d5f2f036335130854902",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/service-lib/src/metrics.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 221,
+      "end_line": 245,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            &[\"mode\", \"outcome\", \"topic\"])\n            .unwrap();\n\n                pub static ref HOLD_GATE_BREAKER_SKIP_TOTAL: IntCounter =\n        register_int_counter!(\n            \"abuse_enforcement_hold_gate_breaker_skip_total\",\n            \"Overturn-hold gate probes skipped because the circuit breaker was open.\")\n            .unwrap();\n\n                                            pub static ref HOLD_GATE_BACKOFF_SKIP_TOTAL: IntCounter =\n        register_int_counter!(\n            \"abuse_enforcement_hold_gate_backoff_skip_total\",\n            \"Overturn-hold gate probes skipped because the reachable-error backoff was armed (ledger answers but cannot serve).\")\n            .unwrap();\n\n                                        pub static ref HOLD_GATE_PROBE_SECONDS: Histogram =\n        register_histogram!(\n            \"abuse_enforcement_hold_gate_probe_seconds\",\n            \"Overturn-hold gate ledger probe latency.\",\n            vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0])\n            .unwrap();\n\n                                            pub static ref HOLD_GATE_PROBE_SCHED_DELAY_SECONDS: Histogram =\n        register_histogram!(\n            \"abuse_enforcement_hold_gate_probe_sched_delay_seconds\",\n",
+      "source_digest": "0b3a96064a708d2787de187972e584de2b85672c32c2b262fee05a917e8d7dcf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/service-lib/src/off_switch.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1100,
+      "end_line": 1124,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        let sw = Arc::new(\n            OffSwitch::new(store.clone(), Arc::new(MemStore::default()))\n                .with_scan_timeout(Duration::from_millis(20)),\n        );\n        let task =\n            sw.spawn_refresh_with(|| true, Duration::from_millis(40), Duration::from_millis(2));\n        wait_for_scans(&store, 3).await;\n        assert!(!sw.ready(true), \"each hung read times out and is retried\");\n\n        store.hang_scan.store(false, Ordering::Relaxed);\n        assert!(\n            until_ready(&sw, Duration::from_secs(5)).await,\n            \"ready once a read answers\"\n        );\n        assert!(sw.lookup(\"H\", \"c\", NOW).is_some());\n        task.abort();\n    }\n\n    #[tokio::test]\n    async fn disabled_feature_does_not_wait_or_read() {\n        let store = Arc::new(MemStore::default());\n        store.fail_scan.store(true, Ordering::Relaxed);\n        let sw = Arc::new(OffSwitch::new(store.clone(), Arc::new(MemStore::default())));\n        let task = sw.spawn_refresh_with(\n            || false,\n",
+      "source_digest": "2a81874e4a2a7b17095e48c982f28e508fcefcc1260f0539c298188949165e64",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-125f28a9288d852eabebc3ee6071f48ed384643c41b3432541ebca286b66c8e5",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/staging",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "007c164ea60c1c65e5df92db4faf6da50af72fabd1696d397465b99103489af5",
+      "context_complete": true,
+      "task_id": "T-873d940f76c737e0813364ffb0eb5eb688f7e760ee20f992cd5fa2cd93091482",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c83a742ed593b20b70c0801b32386f6648e1fc46b3331ce68c27167be87799b4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-5ee7a39e5e9e922cdd55bf7daad02ee84cf264ca52ca3fe820f61dd3885e4ccc",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ff9d2b0603a6e8a2cb14160e4ec70e96327a8f97001263ab3c55ea0b00130c42",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-c38ab108add8b663ad02cbafa6901975f08dde5070593ef5094715c3cff1bbf5",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3e89bedba9421b71fedc4ba469ee385ab8ce7e3015acd3d6964a368b7c8aa10c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-c365b5c6b0463f09796e971b5725d6b952299dd8e579e9a7f41e5c538286ca66",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-58dc979d8ef932980c0f6091742fe0c8054afc423c7723a562d27fc6082c1455",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-e351a0c25d49a5b43d2e64d88c0ca08ca4c3dc3607ae4390b7a0e0274fe87fd1",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-88d777bb437af2c25ae73f93a3a3685702e92ca7e7e3ad7acb57e901ce542941",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-804d9eeb2a8d9488efcb254384f1c1c3258c6b4882f985c2fb7d77b50d76bac2",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-bc2598604af72486277212fcf9a9e043422eb47a2182a2a29477c5162a126dfa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-c0a5ea699e8d983f77e99bd3cd8cc4b0032cec8ab65cbcc425e6f76c0ecb50e7",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e690c4bcc1146b44a2f64916c01eb8986dfa4c0853ca9af82a1d537a0c001155",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-8b68a2e86fdd2022efc13426c372aa0719bdddd3361c6c1ea7fcd81e7de0ac96",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1d3c650bdf0f153b16a786d8f0fd1e1c0fa2fdca2055b6fca9bde4d71da69c13",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-817d0920834d611e4a1ad830b3d8344a9cc735f0522a9e5d559cabdb1699ec5b",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-29b47fb582b16c5ca13789ae649f39d30fbaef3220ae9a63c314aa7f573f9a81",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-f8d649ad5bb429f34165c2f443e309ca89382fc261e3dce291cbb59b8d473a26",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-162ce3c4256b37e05b196938acf4a4f954e14603814359a4f2a28c8adf487e77",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-24105eed6c56b447a64de6fbb6dcb9e807dfe1012a244e6586325b74ab54ac6b",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-554c8e7ca20d6b21d626cfb6994fa6202555eeceb27cfafcca8e46eaf5fb3caa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-0e9fc8ae6c591cb165e7616e767d43bdbac6bd7e046d6c9d500ccfb4fd13a601",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ffe67a93dd690a651873a83b6f92c1a465f495e04440fe9e16e4dc45662fe781",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-24cc24ceb15a517386d22e4f40c8df9c842e63f778d61d3f5564a2a317b41efe",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4f04169b80f68bcecaf08a2704e477e3581d613f2d09b019185ec80564aea194",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-f55be6848f31628f73f2d974aed2569e97cd0858692ca1c797247e9a255ecd98",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6e58df0d2d69ba9744fb16a01b3a0f999f405d3b1e4375f95c4f92125f2b6392",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-6c9cd6eda53feb502b5af0c4fefe89309daba5becfb168b53b48973aac8be310",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d6438bf75e9628f5294948d576dd2ad8ff286ceebb8696f36fc03923a56123f3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-0261ae1ed2969c550c78a9dc94fca8916b97111086210d534ed23e5698a88110",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b3e8b535600075a5a1781fb76e8a4a7d706a628cc44ea2c0eec56f8f6afe9d0c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-ccb220a291cfdf519cf21cac205b260b4667ba5d49f9efcee288d814f204bf24",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-3a8cc80b8ce7c731efd5d2bc15752f651e18c31cab950302148dbb14a88d29cc",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-a2316a8f204fc9135a47b1bdc01580d969573806e4f81de32fe5ce22e35b4a03",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5f3fc4c74937a4777a1181eec05d7550a52f5c97b3bc3157ec6c2286dd9eb7be",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-6bee75ae04cb3b9c371b72b4294277ec3fd500ef1fedac3c67eb466276a4c90c",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-60a70d5ec0e5e77595ece9b7b199dc0eedd219c3088ce8be0de5aede07408be0",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-790ce21c5f460383f8dbe7c45e2f722178531863d5bf108051b27fcd650c639f",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1d98ea8575b92d3023016c83c20d96ff2d46a4772bd0b31a98e95e144fb9cde1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-21cece59c889f2958e1e0d2b4fd9edbb23a04ce31a465329d88f5c447c920e93",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ebfc6ee0a6101cd0c88cc1a609c74452b021e5a817d8292cc3527ebfcce78215",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-06b38ee323c410541b002ffe4387934da50ed2c42bc1b5272419ae9e273e2119",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-86a5fff8f0f7af11ecd217c6553f59669949aefef71e8f8901b1a7b8d88f59f2",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-57ec9f7e8fd30fa3858dac66d5f92f0adb621fe976aee4eda48153ce90f47bec",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a41fa283af18ae7d91301272501e4b096dbb7d511a56229ef5981fd9a42a0b76",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-0086c3b02bf94c2cf49d635fcfc859029b5ef1df0e22be3a79489749980ac906",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca1cd05feb5a151b1b7c9c9d9a1e1fce35eb68c52d26f6c5fe163f01b1bc7ebb",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-fec528e6524720ad43da9591d1f936f01c7e5ed992f230859cc9c8b1fefcf76b",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-f550f57ca75f5aa65de69de68d8142097b1e39c65da247b2af9060c40ebeb2ac",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-404d3431c0f5eea45cd44904df518a9b4f9a81613928f081e138fa03d92762a7",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-268d237491575ae3f4260862b65ef21180fc4ea29672ea7c6b8e2c3b93f4d636",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-35a79c3a4d12c0935dfd466ec97c1329aa9c7bc23434c0aa78f616a875467244",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-44ada2b145f6b8b668d6d7653fbc72abde1cf670b5931eb40da2811516705dff",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-1a051883a2b2992e628c9287b8002f516766c0bfa7346b133c76a8bd5f995ae1",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-10808baa31acde8a6f20146c40aa9b8bd6b1a37efd6447bae97a0009449f3f17",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-c9092aeb27d4a26f42d2dca934b30811124036ef0e9771c583914c79839f2ad2",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4fb3e37e3018ddbc9c8e2ba6fa254a42c93e29a24dc317aa47517f0e76e30115",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-ebb256bab79064a1ede76e4da61cd94d4e7d692ed74d0c99c47cf8a8a4267f5d",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/staging/reference/tweetypie/quotes.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2c9933aba5c5404393546b9b49dc99d84ddff78822411c6585936762cad789e3",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/staging",
+      "query_symbols": [
+        "inner_quoted",
+        "answer",
+        "quote_comparisons"
+      ],
+      "context_complete": false,
+      "task_id": "T-f75e614305e2072a90ca637364e2a7664989c99150fec90f99b90249074b7102",
+      "evidence_refs": [
+        "E32"
+      ]
+    }
+  ],
+  "task_id": "T-57e558196b40b1bdb09ba0707c12a7a1f0160f4c24df28fce5c89a27fcff2879"
+}

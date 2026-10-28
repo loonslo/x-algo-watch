@@ -1,0 +1,1871 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/safety_label_source/lookup.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-790d75c6228ff62fda4f279fdb5b08297f3705f29186ad567114bcf65ca52e12",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/safety_label_source",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 304,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use rustc_hash::FxHashMap;\nuse std::collections::{BTreeMap, HashMap};\nuse std::sync::Arc;\n\nuse tonic::async_trait;\nuse xai_visibility_filtering_proto as vf_pb;\n\nuse super::metrics::{self, BatchStage};\nuse super::types::{FailureKind, FallbackReason, LabelSource, ManhattanOutcome, TwemcacheOutcome};\nuse super::warmer::Warmer;\n\n#[derive(Debug, Clone, thiserror::Error)]\n#[error(\"{kind:?}: {message}\")]\npub struct LookupError {\n    pub(crate) kind: FailureKind,\n    pub(crate) message: String,\n}\n\nimpl LookupError {\n    pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {\n        Self {\n            kind,\n            message: message.into(),\n        }\n    }\n}\n\npub(crate) type LookupResults = FxHashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>;\n\n#[async_trait]\npub(crate) trait TwemcacheLookup: Send + Sync {\n    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome>;\n}\n\n#[async_trait]\npub(crate) trait ManhattanLookup: Send + Sync {\n    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome>;\n}\n\npub(crate) struct RemoteSource {\n    twemcache: Arc<dyn TwemcacheLookup>,\n    manhattan: Arc<dyn ManhattanLookup>,\n    warmer: Option<Arc<dyn Warmer>>,\n}\n\nimpl RemoteSource {\n    pub(crate) fn new<T, M>(twemcache: Arc<T>, manhattan: Arc<M>) -> Self\n    where\n        T: TwemcacheLookup + 'static,\n        M: ManhattanLookup + 'static,\n    {\n        let twemcache: Arc<dyn TwemcacheLookup> = twemcache;\n        let manhattan: Arc<dyn ManhattanLookup> = manhattan;\n        Self {\n            twemcache,\n            manhattan,\n            warmer: None,\n        }\n    }\n\n    pub(crate) fn with_warmer(mut self, warmer: Arc<dyn Warmer>) -> Self {\n        self.warmer = Some(warmer);\n        self\n    }\n\n    pub(crate) async fn get(&self, ids: &[u64]) -> LookupResults {\n        let mut twemcache_results = self.twemcache.get(ids).await;\n        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());\n        let mut fallback_ids = Vec::new();\n        let mut fallback_counts: BTreeMap<FallbackReason, usize> = BTreeMap::new();\n        let mut warm_ids = Vec::new();\n\n        for &tweet_id in ids {\n            if results.contains_key(&tweet_id) || fallback_ids.contains(&tweet_id) {\n                continue;\n            }\n            match twemcache_results.remove(&tweet_id) {\n                Some(TwemcacheOutcome::Hit(label_map)) => {\n                    results.insert(tweet_id, Ok(label_map));\n                }\n                Some(TwemcacheOutcome::NotFound) => {\n                    results.insert(\n                        tweet_id,\n                        Ok(vf_pb::SafetyLabelMap {\n                            labels: HashMap::new(),\n                        }),\n                    );\n                }\n                Some(TwemcacheOutcome::Miss) => {\n                    fallback_ids.push(tweet_id);\n                    if self.warmer.is_some() {\n                        warm_ids.push(tweet_id);\n                    }\n                }\n                Some(TwemcacheOutcome::FallThrough(reason)) => {\n                    fallback_ids.push(tweet_id);\n                    *fallback_counts.entry(reason).or_insert(0) += 1;\n                }\n                None => {\n                    fallback_ids.push(tweet_id);\n                    *fallback_counts\n                        .entry(FallbackReason::MissingResponse)\n                        .or_insert(0) += 1;\n                }\n            }\n        }\n\n        for (reason, count) in fallback_counts {\n            metrics::record_cache_fallback_keys(LabelSource::Twemcache, reason, count);\n        }\n\n        if let Some(warmer) = &self.warmer\n            && !warm_ids.is_empty()\n        {\n            warmer.warm(warm_ids);\n        }\n\n        metrics::record_batch_size(BatchStage::ManhattanFallback, fallback_ids.len());\n        let mut manhattan_results = self.manhattan.get(&fallback_ids).await;\n        for tweet_id in fallback_ids {\n            match manhattan_results.remove(&tweet_id) {\n                Some(ManhattanOutcome::Resolved(label_map)) => {\n                    results.insert(tweet_id, Ok(label_map));\n                }\n                Some(ManhattanOutcome::Failure(failure)) => {\n                    results.insert(tweet_id, Err(failure));\n                }\n                None => {\n                    results.insert(\n                        tweet_id,\n                        Err(LookupError::new(\n                            FailureKind::ManhattanFetch,\n                            \"missing from MH response\",\n                        )),\n                    );\n                }\n            }\n        }\n\n        results\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeTwemcache {\n        results: Mutex<HashMap<u64, TwemcacheOutcome>>,\n    }\n\n    impl FakeTwemcache {\n        fn new(results: HashMap<u64, TwemcacheOutcome>) -> Arc<Self> {\n            Arc::new(Self {\n                results: Mutex::new(results),\n            })\n        }\n    }\n\n    #[async_trait]\n    impl TwemcacheLookup for FakeTwemcache {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {\n            let mut results = self.results.lock().unwrap();\n            ids.iter()\n                .filter_map(|id| results.remove(id).map(|result| (*id, result)))\n                .collect()\n        }\n    }\n\n    struct FakeManhattan {\n        results: Mutex<HashMap<u64, ManhattanOutcome>>,\n        calls: Mutex<Vec<Vec<u64>>>,\n    }\n\n    impl FakeManhattan {\n        fn new(results: HashMap<u64, ManhattanOutcome>) -> Arc<Self> {\n            Arc::new(Self {\n                results: Mutex::new(results),\n                calls: Mutex::new(Vec::new()),\n            })\n        }\n\n        fn calls(&self) -> Vec<Vec<u64>> {\n            self.calls.lock().unwrap().clone()\n        }\n    }\n\n    #[async_trait]\n    impl ManhattanLookup for FakeManhattan {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {\n            self.calls.lock().unwrap().push(ids.to_vec());\n            let mut results = self.results.lock().unwrap();\n            ids.iter()\n                .filter_map(|id| results.remove(id).map(|result| (*id, result)))\n                .collect()\n        }\n    }\n\n    struct FakeWarmer {\n        published: Mutex<Vec<Vec<u64>>>,\n    }\n\n    impl FakeWarmer {\n        fn new() -> Arc<Self> {\n            Arc::new(Self {\n                published: Mutex::new(Vec::new()),\n            })\n        }\n\n        fn published(&self) -> Vec<Vec<u64>> {\n            self.published.lock().unwrap().clone()\n        }\n    }\n\n    impl Warmer for FakeWarmer {\n        fn warm(&self, miss_ids: Vec<u64>) {\n            self.published.lock().unwrap().push(miss_ids);\n        }\n    }\n\n    fn empty_label_map() -> vf_pb::SafetyLabelMap {\n        vf_pb::SafetyLabelMap {\n            labels: HashMap::new(),\n        }\n    }\n\n    #[tokio::test]\n    async fn duplicate_ids_resolve_once_without_a_phantom_miss() {\n        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));\n        let manhattan = FakeManhattan::new(HashMap::from([(\n            42,\n            ManhattanOutcome::Resolved(empty_label_map()),\n        )]));\n        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));\n\n        let results = source.get(&[42, 42]).await;\n\n        assert!(results.get(&42).unwrap().is_ok());\n        assert_eq!(manhattan.calls(), vec![vec![42]]);\n    }\n\n    #[tokio::test]\n    async fn get_missing_from_manhattan_is_fetch_error() {\n        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));\n        let manhattan = FakeManhattan::new(HashMap::new());\n        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));\n\n        let results = source.get(&[42]).await;\n\n        assert!(matches!(\n            results.get(&42).unwrap(),\n            Err(failure) if failure.kind == FailureKind::ManhattanFetch\n        ));\n        assert_eq!(manhattan.calls(), vec![vec![42]]);\n    }\n\n    #[tokio::test]\n    async fn plain_miss_publishes_to_warmer() {\n        let twemcache = FakeTwemcache::new(HashMap::from([\n            (1, TwemcacheOutcome::Hit(empty_label_map())),\n            (2, TwemcacheOutcome::NotFound),\n            (3, TwemcacheOutcome::Miss),\n            (4, TwemcacheOutcome::FallThrough(FallbackReason::Timeout)),\n        ]));\n        let manhattan = FakeManhattan::new(HashMap::from([\n            (3, ManhattanOutcome::Resolved(empty_label_map())),\n            (4, ManhattanOutcome::Resolved(empty_label_map())),\n            (5, ManhattanOutcome::Resolved(empty_label_map())),\n        ]));\n        let warmer = FakeWarmer::new();\n        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan))\n            .with_warmer(Arc::<FakeWarmer>::clone(&warmer));\n\n        let results = source.get(&[1, 2, 3, 4, 5]).await;\n\n        assert_eq!(results.len(), 5);\n        assert!(results.values().all(Result::is_ok));\n        assert_eq!(manhattan.calls(), vec![vec![3, 4, 5]]);\n        assert_eq!(warmer.published(), vec![vec![3]]);\n    }\n\n    #[tokio::test]\n    async fn full_warm_channel_does_not_affect_fallback_result() {\n        use super::super::warmer::CacheWarmer;\n\n        let (warmer, _rx) = CacheWarmer::without_drain_task(1);\n        let warmer = Arc::new(warmer);\n        warmer.warm(vec![0]);\n\n        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));\n        let manhattan = FakeManhattan::new(HashMap::from([(\n            42,\n            ManhattanOutcome::Resolved(empty_label_map()),\n        )]));\n        let source =\n            RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan)).with_warmer(warmer);\n\n        let results = source.get(&[42]).await;\n\n        assert!(results.get(&42).unwrap().is_ok());\n        assert_eq!(manhattan.calls(), vec![vec![42]]);\n    }\n}\n",
+      "source_digest": "207ca1953315536040ef54eea3f025beab518c4e85b373a125717bd08048b25a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 265,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use rustc_hash::FxHashMap;\nuse std::collections::{BTreeMap, HashMap};\nuse std::sync::Arc;\n\nuse tonic::async_trait;\nuse xai_visibility_filtering_proto as vf_pb;\n\nuse super::metrics::{self, BatchStage};\nuse super::types::{FailureKind, FallbackReason, LabelSource, TwemcacheOutcome};\nuse super::warmer::CacheWarmer;\n\n#[derive(Debug, Clone, thiserror::Error)]\n#[error(\"{kind:?}: {message}\")]\npub struct LookupError {\n    pub(crate) kind: FailureKind,\n    pub(crate) message: String,\n}\n\nimpl LookupError {\n    pub(crate) fn new(kind: FailureKind, message: impl Into<String>) -> Self {\n        Self {\n            kind,\n            message: message.into(),\n        }\n    }\n}\n\npub(crate) type LookupResults = FxHashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>;\n\n#[async_trait]\npub(crate) trait TwemcacheLookup: Send + Sync {\n    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome>;\n}\n\n#[async_trait]\npub(crate) trait ManhattanLookup: Send + Sync {\n    async fn get(&self, ids: &[u64]) -> LookupResults;\n}\n\npub(crate) struct RemoteSource {\n    twemcache: Arc<dyn TwemcacheLookup>,\n    manhattan: Arc<dyn ManhattanLookup>,\n    warmer: Option<Arc<CacheWarmer>>,\n}\n\nimpl RemoteSource {\n    pub(crate) fn new<T, M>(twemcache: Arc<T>, manhattan: Arc<M>) -> Self\n    where\n        T: TwemcacheLookup + 'static,\n        M: ManhattanLookup + 'static,\n    {\n        let twemcache: Arc<dyn TwemcacheLookup> = twemcache;\n        let manhattan: Arc<dyn ManhattanLookup> = manhattan;\n        Self {\n            twemcache,\n            manhattan,\n            warmer: None,\n        }\n    }\n\n    pub(crate) fn with_warmer(mut self, warmer: Arc<CacheWarmer>) -> Self {\n        self.warmer = Some(warmer);\n        self\n    }\n\n    pub(crate) async fn get(&self, ids: &[u64]) -> LookupResults {\n        let mut twemcache_results = self.twemcache.get(ids).await;\n        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());\n        let mut fallback_ids = Vec::new();\n        let mut fallback_counts: BTreeMap<FallbackReason, usize> = BTreeMap::new();\n        let mut warm_ids = Vec::new();\n\n        for &tweet_id in ids {\n            if results.contains_key(&tweet_id) || fallback_ids.contains(&tweet_id) {\n                continue;\n            }\n            match twemcache_results.remove(&tweet_id) {\n                Some(TwemcacheOutcome::Hit(label_map)) => {\n                    results.insert(tweet_id, Ok(label_map));\n                }\n                Some(TwemcacheOutcome::NotFound) => {\n                    results.insert(\n                        tweet_id,\n                        Ok(vf_pb::SafetyLabelMap {\n                            labels: HashMap::new(),\n                        }),\n                    );\n                }\n                Some(TwemcacheOutcome::Miss) => {\n                    fallback_ids.push(tweet_id);\n                    if self.warmer.is_some() {\n                        warm_ids.push(tweet_id);\n                    }\n                }\n                Some(TwemcacheOutcome::FallThrough(reason)) => {\n                    fallback_ids.push(tweet_id);\n                    *fallback_counts.entry(reason).or_insert(0) += 1;\n                }\n                None => {\n                    fallback_ids.push(tweet_id);\n                    *fallback_counts\n                        .entry(FallbackReason::MissingResponse)\n                        .or_insert(0) += 1;\n                }\n            }\n        }\n\n        for (reason, count) in fallback_counts {\n            metrics::record_cache_fallback_keys(LabelSource::Twemcache, reason, count);\n        }\n\n        if let Some(warmer) = &self.warmer\n            && !warm_ids.is_empty()\n        {\n            warmer.warm(warm_ids);\n        }\n\n        metrics::record_batch_size(BatchStage::ManhattanFallback, fallback_ids.len());\n        let mut manhattan_results = self.manhattan.get(&fallback_ids).await;\n        for tweet_id in fallback_ids {\n            let result = manhattan_results.remove(&tweet_id).unwrap_or_else(|| {\n                Err(LookupError::new(\n                    FailureKind::ManhattanFetch,\n                    \"missing from MH response\",\n                ))\n            });\n            results.insert(tweet_id, result);\n        }\n\n        results\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeTwemcache {\n        results: Mutex<HashMap<u64, TwemcacheOutcome>>,\n    }\n\n    impl FakeTwemcache {\n        fn new(results: HashMap<u64, TwemcacheOutcome>) -> Arc<Self> {\n            Arc::new(Self {\n                results: Mutex::new(results),\n            })\n        }\n    }\n\n    #[async_trait]\n    impl TwemcacheLookup for FakeTwemcache {\n        async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {\n            let mut results = self.results.lock().unwrap();\n            ids.iter()\n                .filter_map(|id| results.remove(id).map(|result| (*id, result)))\n                .collect()\n        }\n    }\n\n    struct FakeManhattan {\n        results: Mutex<HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>>,\n        calls: Mutex<Vec<Vec<u64>>>,\n    }\n\n    impl FakeManhattan {\n        fn new(results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>) -> Arc<Self> {\n            Arc::new(Self {\n                results: Mutex::new(results),\n                calls: Mutex::new(Vec::new()),\n            })\n        }\n\n        fn calls(&self) -> Vec<Vec<u64>> {\n            self.calls.lock().unwrap().clone()\n        }\n    }\n\n    #[async_trait]\n    impl ManhattanLookup for FakeManhattan {\n        async fn get(&self, ids: &[u64]) -> LookupResults {\n            self.calls.lock().unwrap().push(ids.to_vec());\n            let mut results = self.results.lock().unwrap();\n            ids.iter()\n                .filter_map(|id| results.remove(id).map(|result| (*id, result)))\n                .collect()\n        }\n    }\n\n    fn empty_label_map() -> vf_pb::SafetyLabelMap {\n        vf_pb::SafetyLabelMap {\n            labels: HashMap::new(),\n        }\n    }\n\n    #[tokio::test]\n    async fn duplicate_ids_resolve_once_without_a_phantom_miss() {\n        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));\n        let manhattan = FakeManhattan::new(HashMap::from([(42, Ok(empty_label_map()))]));\n        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));\n\n        let results = source.get(&[42, 42]).await;\n\n        assert!(results.get(&42).unwrap().is_ok());\n        assert_eq!(manhattan.calls(), vec![vec![42]]);\n    }\n\n    #[tokio::test]\n    async fn get_missing_from_manhattan_is_fetch_error() {\n        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));\n        let manhattan = FakeManhattan::new(HashMap::new());\n        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));\n\n        let results = source.get(&[42]).await;\n\n        assert!(matches!(\n            results.get(&42).unwrap(),\n            Err(failure) if failure.kind == FailureKind::ManhattanFetch\n        ));\n        assert_eq!(manhattan.calls(), vec![vec![42]]);\n    }\n\n    #[tokio::test]\n    async fn plain_miss_publishes_to_warmer() {\n        let twemcache = FakeTwemcache::new(HashMap::from([\n            (1, TwemcacheOutcome::Hit(empty_label_map())),\n            (2, TwemcacheOutcome::NotFound),\n            (3, TwemcacheOutcome::Miss),\n            (4, TwemcacheOutcome::FallThrough(FallbackReason::Timeout)),\n        ]));\n        let manhattan = FakeManhattan::new(HashMap::from([\n            (3, Ok(empty_label_map())),\n            (4, Ok(empty_label_map())),\n            (5, Ok(empty_label_map())),\n        ]));\n        let (warmer, mut published) = CacheWarmer::without_drain_task(2);\n        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan))\n            .with_warmer(Arc::new(warmer));\n\n        let results = source.get(&[1, 2, 3, 4, 5]).await;\n\n        assert_eq!(results.len(), 5);\n        assert!(results.values().all(Result::is_ok));\n        assert_eq!(manhattan.calls(), vec![vec![3, 4, 5]]);\n        assert_eq!(published.try_recv().unwrap(), vec![3]);\n        assert!(published.try_recv().is_err());\n    }\n\n    #[tokio::test]\n    async fn full_warm_channel_does_not_affect_fallback_result() {\n        let (warmer, _rx) = CacheWarmer::without_drain_task(1);\n        let warmer = Arc::new(warmer);\n        warmer.warm(vec![0]);\n\n        let twemcache = FakeTwemcache::new(HashMap::from([(42, TwemcacheOutcome::Miss)]));\n        let manhattan = FakeManhattan::new(HashMap::from([(42, Ok(empty_label_map()))]));\n        let source =\n            RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan)).with_warmer(warmer);\n\n        let results = source.get(&[42]).await;\n\n        assert!(results.get(&42).unwrap().is_ok());\n        assert_eq!(manhattan.calls(), vec![vec![42]]);\n    }\n}\n",
+      "source_digest": "ed1c73bf4f3dec5d7cd560439c183b2948b48afaf1fc813a4ef8e60be608a4bc",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[global_allocator]\nstatic GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;\n\nuse std::{path::PathBuf, time::Duration};\n\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n",
+      "source_digest": "6ed1d822fc9a316683d817d362ebe05e1b3427ef2c4c83d87fb063ece2d6be18",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E9": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 61,
+      "end_line": 85,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n",
+      "source_digest": "acde26443fa3453ea8fda52d2defcf2aa4b350f988f5d32bd00a3deb37cef732",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E10": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E11": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 172,
+      "end_line": 196,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E12": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 231,
+      "end_line": 255,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E13": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 234,
+      "end_line": 258,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n",
+      "source_digest": "0c8b8e899736f78334eca4c1bbc2cefb83e8dba5560a6401e0b9174db9b2f9ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E14": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 239,
+      "end_line": 263,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n",
+      "source_digest": "3b66c2eb9d34025ee21d73c23734bfa58ae0c5351ce0724f7fded35be761ac2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E15": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 240,
+      "end_line": 264,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E16": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 241,
+      "end_line": 265,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n",
+      "source_digest": "3b459aead22e76de83f09adc1f40d8923c400fbb73e20f139c3ebaed896c7c74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E17": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 249,
+      "end_line": 273,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n",
+      "source_digest": "76e68c7dd92cb925c03bff5084565e8c3996c0632a0efefd992d15aca69ad512",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E18": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 254,
+      "end_line": 278,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n",
+      "source_digest": "2ef43c2b2422d591adc1a5a26208dd2c4fd94f64917dc5fc488c0784ead24cdb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E19": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 255,
+      "end_line": 279,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E20": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 257,
+      "end_line": 281,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E21": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 260,
+      "end_line": 284,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n",
+      "source_digest": "45fa552996f5fb3a28052b8383ec9d4651425ec81f83214072c321e5a06d8942",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E22": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 308,
+      "end_line": 332,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n",
+      "source_digest": "028df223a225c87816005e22b8068f867d315e188915e5b7e3455e92da278c16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E23": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 325,
+      "end_line": 349,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E24": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 363,
+      "end_line": 387,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n",
+      "source_digest": "da98d3da877c54d27d3233597981864602a1ab0f9a4a2c9d508c5583453b09ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E25": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 366,
+      "end_line": 390,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()> {\n",
+      "source_digest": "097d415899e9d2ab709782b1e8c6b09b4ec2264e0491bf31349b7b6685b0fdfe",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E26": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 430,
+      "end_line": 454,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        pub forced: Option<&'static str>,\n            pub dedup_class: Option<u8>,\n        pub producer_dry: bool,\n            pub row: Option<RowOutcome>,\n            pub by_row: bool,\n}\n\nimpl Default for Resolved {\n    fn default() -> Self {\n        Self {\n            matched: None,\n            mode: ControlMode::Rules,\n            page_actions: Vec::new(),\n            forced: None,\n            dedup_class: None,\n            producer_dry: false,\n            row: None,\n            by_row: false,\n        }\n    }\n}\n\nimpl Resolved {\n        pub fn page_driven(&self) -> bool {\n        self.mode != ControlMode::Rules && (self.by_row || !self.page_actions.is_empty())\n",
+      "source_digest": "c7c734b954066febeddb84c77d5a8584db6cb3657e4778f388a6bb24d30ecc10",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E27": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 18,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "#[global_allocator]\nstatic GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;\n\nuse std::{path::PathBuf, time::Duration};\n\nuse axum::{http::StatusCode, routing::get, Router};\nuse clap::Parser;\nuse tower_http::services::{ServeDir, ServeFile};\nuse tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};\nuse tracing::{info, Level};\nuse xai_service_runner::ServerBuilder;\n\nuse xai_abuse_enforcement_service::auth::ApiKeys;\nuse xai_abuse_enforcement_service::config::Config;\nuse xai_abuse_enforcement_service::{\n    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,\n    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,\n};\n",
+      "source_digest": "6ed1d822fc9a316683d817d362ebe05e1b3427ef2c4c83d87fb063ece2d6be18",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E28": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 48,
+      "end_line": 72,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        info!(\n            key_ids = ?api_keys.configured_key_ids(),\n            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n",
+      "source_digest": "af84285fa61d2905e936eb77a96b421b92d89c6441d38aab516aae00189fb44a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E29": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 50,
+      "end_line": 74,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            \"api-key auth configured for protected admin endpoints\"\n        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n",
+      "source_digest": "7e0c926253c3f95eac0a203437961f8a2b7e2014af4953503324ceaf54769c6f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E30": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 51,
+      "end_line": 75,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        );\n    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n",
+      "source_digest": "bda4b5a077c9d18afa49e8224d4df747e13e659a9751601777602e29bf372673",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E31": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 52,
+      "end_line": 76,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n\n    let api_router = build_api_router(state.clone(), api_keys);\n    let docs_router = build_docs_router();\n\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n",
+      "source_digest": "08ca7d16f797bc5ef09f76c2dcf0b28b530f3d5812eec33d616eec3878fda0cf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E32": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 56,
+      "end_line": 80,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let public_dir = admin_ui_public_dir();\n    info!(public_dir = %public_dir.display(), \"serving admin UI static bundle\");\n    let index_html = public_dir.join(\"index.html\");\n    let admin_ui = ServeDir::new(&public_dir).fallback(ServeFile::new(index_html));\n\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n",
+      "source_digest": "0badead82279115eb9f906f8b770a0399a92394848ef790384862b34e2d03a1b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E33": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 61,
+      "end_line": 85,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    let trace_layer = TraceLayer::new_for_http()\n        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))\n        .on_response(DefaultOnResponse::new().level(Level::INFO));\n\n    let ready_state = state.clone();\n\n    let app: Router = Router::new()\n        .nest(\"/api\", api_router)\n        .merge(docs_router)\n        .route(\n            \"/kafka_ready\",\n            get(move || {\n                let state = ready_state.clone();\n                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n",
+      "source_digest": "acde26443fa3453ea8fda52d2defcf2aa4b350f988f5d32bd00a3deb37cef732",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E34": {
+      "path": "abuse-enforcement-service/server/src/main.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 75,
+      "end_line": 99,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                async move {\n                    if service_ready(&state) {\n                        StatusCode::OK\n                    } else {\n                        StatusCode::SERVICE_UNAVAILABLE\n                    }\n                }\n            }),\n        )\n        .fallback_service(admin_ui)\n        .layer(trace_layer);\n\n    let server = ServerBuilder::new(cfg.port)\n        .merge(app)\n        .drain_period(Duration::from_secs(cfg.drain_period_secs))\n        .on_ready(|| async {\n            info!(\"Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)\");\n        });\n    spawn_config_refresh(&state, server.shutdown_signal());\n\n    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());\n    let served = server.run().await;\n\n    let kafka = shutdown_kafka_startup(&state, kafka).await;\n    served?;\n",
+      "source_digest": "5ec764cee77058fb4b7ea0aecc553e36351f820a480a1d066cbdd125964446eb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E35": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 183,
+      "end_line": 207,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "    }\n}\n\nfn ttl_days(ttl_msec: i64) -> Value {\n    if ttl_msec % 86_400_000 == 0 {\n        Value::from(ttl_msec / 86_400_000)\n    } else {\n        Value::from(ttl_msec as f64 / 86_400_000.0)\n    }\n}\n\npub fn action_specs_value(specs: &[ActionSpec]) -> Value {\n    let mut out = Vec::new();\n    for spec in specs {\n        match spec {\n            ActionSpec::SuspendUser { perm, policy } => out.push(serde_json::json!({\n                \"kind\": \"suspend\", \"permanent\": perm, \"policy\": policy,\n            })),\n            ActionSpec::AddLabelsV2 { labels, ttl_msec }\n            | ActionSpec::AddPostLabelsV2 { labels, ttl_msec } => {\n                let kind = if matches!(spec, ActionSpec::AddLabelsV2 { .. }) {\n                    \"label\"\n                } else {\n                    \"post_label\"\n                };\n",
+      "source_digest": "6efb2244428d032c50872685bd75a9292c7b9b96234a7f108cacf46def4be91e",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E36": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 242,
+      "end_line": 266,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n#[derive(Debug, Clone, Default, PartialEq, Eq)]\npub struct ControlConfig {\n                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n",
+      "source_digest": "8665faa2ff16748960eec286ace4d6fbcf8f064ff8c96e1db49ab6eb5807aeff",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E37": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 245,
+      "end_line": 269,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                pub enabled: bool,\n        pub ignore_store: bool,\n                pub aliases: HashMap<String, String>,\n                pub updated_by_keys: Option<HashSet<String>>,\n        pub confidence: ConfidenceConfig,\n}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n",
+      "source_digest": "0c8b8e899736f78334eca4c1bbc2cefb83e8dba5560a6401e0b9174db9b2f9ed",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E38": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 250,
+      "end_line": 274,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "}\n\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n",
+      "source_digest": "3b66c2eb9d34025ee21d73c23734bfa58ae0c5351ce0724f7fded35be761ac2f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E39": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 251,
+      "end_line": 275,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\nimpl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n",
+      "source_digest": "4de6fef33819db6a9c10f8bf883dce577d8f55edbbda898e1d229644f0376aee",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E40": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 252,
+      "end_line": 276,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "impl ControlConfig {\n                    pub fn from_config(config: Option<&Value>) -> Self {\n        static LAST_BAD: Mutex<Option<String>> = Mutex::new(None);\n        let mut out = Self::default();\n        let Some(v) = config\n            .and_then(|c| c.get(CONFIG_KEY))\n            .filter(|v| !v.is_null())\n        else {\n            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n",
+      "source_digest": "3b459aead22e76de83f09adc1f40d8923c400fbb73e20f139c3ebaed896c7c74",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E41": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 260,
+      "end_line": 284,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            return out;\n        };\n        out.confidence = ConfidenceConfig::from_value(v.get(crate::confidence::CONFIG_KEY));\n        let mut bad = Vec::new();\n        match v.get(\"enabled\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n",
+      "source_digest": "76e68c7dd92cb925c03bff5084565e8c3996c0632a0efefd992d15aca69ad512",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E42": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 265,
+      "end_line": 289,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n",
+      "source_digest": "2ef43c2b2422d591adc1a5a26208dd2c4fd94f64917dc5fc488c0784ead24cdb",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E43": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 266,
+      "end_line": 290,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            Some(Value::Bool(b)) => out.enabled = *b,\n            Some(other) => {\n                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n",
+      "source_digest": "2e3d447cd3e5e747fa2fbb81d6336c7cccc68dd828a18f6ea55b818582e254b3",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E44": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 268,
+      "end_line": 292,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "                out.enabled = false;\n                bad.push(format!(\"enabled={other}\"));\n            }\n        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n",
+      "source_digest": "4e7dabe18a5d0b8af9814482e563db1d9a4bc8e4f043da4db8c71cf544da9378",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E45": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 271,
+      "end_line": 295,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        }\n        match v.get(\"ignore_store\") {\n            None | Some(Value::Null) => {}\n            Some(Value::Bool(b)) => out.ignore_store = *b,\n            Some(other) => bad.push(format!(\"ignore_store={other}\")),\n        }\n        if let Some(map) = v.get(\"aliases\").and_then(Value::as_object) {\n            out.aliases.extend(map.iter().filter_map(|(new, old)| {\n                let old = old.as_str()?;\n                (valid_name(new) && valid_name(old)).then(|| (new.clone(), old.to_owned()))\n            }));\n        }\n        match v.get(\"updated_by_keys\") {\n            None | Some(Value::Null) => {}\n            Some(keys) => {\n                let parsed: Option<HashSet<String>> = keys.as_array().and_then(|arr| {\n                    arr.iter()\n                        .map(|k| {\n                            k.as_str()\n                                .map(str::trim)\n                                .filter(|s| !s.is_empty())\n                                .map(str::to_owned)\n                        })\n                        .collect()\n                });\n",
+      "source_digest": "45fa552996f5fb3a28052b8383ec9d4651425ec81f83214072c321e5a06d8942",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E46": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 319,
+      "end_line": 343,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    pub fn may_name_updater(&self, key_id: &str) -> bool {\n        self.updated_by_keys\n            .as_ref()\n            .is_none_or(|keys| keys.contains(key_id))\n    }\n}\n\n\n#[async_trait]\npub trait ControlStore: Send + Sync {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>>;\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>>;\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n",
+      "source_digest": "028df223a225c87816005e22b8068f867d315e188915e5b7e3455e92da278c16",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E47": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 336,
+      "end_line": 360,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "        value: Vec<u8>,\n        ttl_secs: u64,\n    ) -> anyhow::Result<()>;\n    async fn delete(&self, pkey: &str, lkey: &str) -> anyhow::Result<()>;\n}\n\npub struct ManhattanControlStore {\n    client: Arc<NativeManhattanClient>,\n    tenant: Tenant,\n}\n\nimpl ManhattanControlStore {\n    pub fn new(client: Arc<NativeManhattanClient>, tenant: Tenant) -> Self {\n        Self { client, tenant }\n    }\n}\n\n#[async_trait]\nimpl ControlStore for ManhattanControlStore {\n    async fn scan(&self, pkey: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {\n        let items = self\n            .client\n            .scan(\n                self.tenant.clone(),\n                [pkey],\n",
+      "source_digest": "bc8c54e0db2d9f16912fde6d1339b921868e9d936fde4bd4f046716a1bb6b796",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E48": {
+      "path": "abuse-enforcement-service/service-lib/src/action_control.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 374,
+      "end_line": 398,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "            );\n        }\n        Ok(items\n            .iter()\n            .filter_map(|it| {\n                let lkey =\n                    String::from_utf8(it.lkey().into_byte_vecs().into_iter().next()?).ok()?;\n                Some((lkey, it.value().as_bytes().to_vec()))\n            })\n            .collect())\n    }\n\n    async fn get(&self, pkey: &str, lkey: &str) -> anyhow::Result<Option<Vec<u8>>> {\n        Ok(self\n            .client\n            .get(self.tenant.clone(), [pkey], [lkey])\n            .await\n            .map_err(|e| anyhow::anyhow!(\"{e}\"))?\n            .map(|it| it.value().into_bytes()))\n    }\n\n    async fn put(\n        &self,\n        pkey: &str,\n        lkey: &str,\n",
+      "source_digest": "da98d3da877c54d27d3233597981864602a1ab0f9a4a2c9d508c5583453b09ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-790d75c6228ff62fda4f279fdb5b08297f3705f29186ad567114bcf65ca52e12",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "bf37f1886214313849e8fa406e3c856c1f252e71c38a806aa0a3169f839ff217",
+      "context_complete": true,
+      "task_id": "T-62b52a54eb14d67c9c9f234780b151bf07b6828f71e2d0ffdcdc3db3155548c3",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ceddb4951ad914a348d46c6bfbdbeb030c7f7c3157dd3f6356e96be961502e71",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-94906af740a63755cb791a17889f36c95baf3596c7266fcdeafe2dc4cf7eb478",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-77568a1ce4a0c869cd67cc48b0da6f4a6c7072f82bf849691dc2f5cf61b508c8",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-fa5658083f010a31fc829494eff8040007b00fc50cc673d4963e7d9a45eb6545",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0d8625c0d2ee914e3fd590690cc17ab2ee56c7086d64fa3f7c71d90c50625a70",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-adb7f35db8afa017a09dcb58cef2d0561c9eb8af4df821f93fba990a6d2262fe",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-429538a26c93bf54b2c41d782d6f55c1b267de97c9863f6296b2cf922b8167ea",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-8395425d0da8fd9af2789dc159dc094eff3f3d93f0c4ac7e5c6ce2c7bae7ab62",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-782655e0d2d3ea6312757c978e9345548d94cd134f99fe600fbe8ff3b6481c64",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-51a923bcedb88eee1246057b6f965e784d1e0c35564c2ea5891772b0583ef8fc",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-df12e0e99ed6126ac38a48b53f6c40b06027db1ac79ad20eed177e228427736e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-eaf1f5dfc1d066676ce184e8722cfc253fa0c4dc0c9696537872359b19283b2e",
+      "evidence_refs": [
+        "E8"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-9400c27cb2d6140835bf2252118bf931e12cfa08405df842e8ee4332f0cc4d4e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-4370ba851adba17666d93a169a8cbcff7d5685ad229925c79fdd4044e91ecd28",
+      "evidence_refs": [
+        "E9"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-890d12789eeeb774e7c13c3d0b537a46da6bb2afb5ae436cd037b22cd121c94f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-7359e58f51d683b969629e0eacb2c9a178ff5687803ffc2851e4962928c82919",
+      "evidence_refs": [
+        "E10"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5984f857cbe6c70510bf90cf4ba4eadee463c7d4f81009ac0227e54e893d178a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-8f8d8b708b30fe771bc8cf0bb868ff514df6f54f079e5eb2ccf91d09ace1cc8b",
+      "evidence_refs": [
+        "E11"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-d1cbb2580031b4370ca8a6516f93571259f68e00e11983523c46668002e1276d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-d05e15f85a7ec4852a135ca87cfb5bc03af6f5a1a4aad35a5d2103e110ea1af7",
+      "evidence_refs": [
+        "E12"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-368114d7e05003b9549661c2f1e46cdcf012e81fa0b5cf9a0359f4d4bbb61005",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-082e8482f0502f41eb0dd7f2a9b25fc74eb1f127cd2df58e625b0b731330e35d",
+      "evidence_refs": [
+        "E13"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5a861aa246c25b29489d1f440a297db038152863c795273002657b6351ad154b",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-f859191d30a40c91e5a100e499ffc0a1db106fd3982a64151620f42b089921f6",
+      "evidence_refs": [
+        "E14"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ea5f3c2312b78c90e2ce8585ce909e5d1c6910edcebb36746a38493a70ef52f6",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-6fdab28cddd33900ef484f77fce69db3a571bc2852cbb23723c37006ceb7efb7",
+      "evidence_refs": [
+        "E15"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b5d64d6d43efa98df99753375738c2341e0ba6fded7e69b247f2401c0b07dbaf",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c2d701b70a688e3e24e49c712bde585ce3f382f95f767035ec53c274439baf9",
+      "evidence_refs": [
+        "E16"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-0e0b6c9e024cf81962ea504210be8889aed34f09246c085f03dd01e2e2efe848",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-c9270cb368a022ee0d194acd5fdad6f66d0bc1111c4c04e578d4e4cc15add09a",
+      "evidence_refs": [
+        "E17"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8d1285d9aeb11a563eacf2b57517c147c503be34f3a874ffaefda0243ef67f3d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-d0c41a1a062a675c7b8a385b235d5ec7eff4c6ecd3034dc8b6b771170110ba6b",
+      "evidence_refs": [
+        "E18"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ae4e963e992ab75d3419416fa547c6abe4458f2d8db55258a882537e927addc5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-161d7f9d7e12aef381a76d24e4a6713b8c7c2e8ada0871c2b038ab18c0b4c786",
+      "evidence_refs": [
+        "E19"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a19bd9d808ad71ad85e458b38760ae120cc2eda0cdd16c95d64537a139baf8db",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-ad2c8af132ec734cdc1e3eadaa878e7f0fda75f49b8806b25320a09a54314333",
+      "evidence_refs": [
+        "E20"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-6a874a29d43ae5729f1fa00b638eea6af44c6bf78c39a4a89cd10f9414dec019",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-12f84916acfedd60bdeb3285b2815edd24525e245bf70b0a0661178e19a64d3b",
+      "evidence_refs": [
+        "E21"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-808128e079e1d8c634c30b58bdf66aaefc4507dd95f80cb299f5af0a93c5ae77",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-abef6828a41fd3ee519d4a8630c803f9bd78e5dac46865f7e7ef1c920ed06ad0",
+      "evidence_refs": [
+        "E22"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-4001e6597e0ba8aee34fb7f45058876ad3ae642281db62b1028286f0bd43c0fe",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-9019bd521e5c7176dd3d1df9f4ffc16cdec9d0670e160f8723d219ba702a20fe",
+      "evidence_refs": [
+        "E23"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-325396e3e7e9274887e389e3307659c4c5b1830e67fc6809ebbcf21fedebc386",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-b515d1395335780d3388ca4de19af557cce216428f7722ccb023b23bc3154701",
+      "evidence_refs": [
+        "E24"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ed7b9eb573f2f2738f93de2283306a37237ab82681e0a2846a114642e6a04b01",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-c13dcc4093aab40508c0d9766eaabc0c2f4caebac5087484f1d4ebcdce21e479",
+      "evidence_refs": [
+        "E25"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-7972e2ac45c262535fff6045c73e30b9e114e6162130cc6a63572b7720a273f1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-79551dd01d2f4a77c8e957f95d01f019370af617af0ce5f29113b7eb8b8c5ba3",
+      "evidence_refs": [
+        "E26"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8adf498cd045b22fb04cc35bea7eec9aed2ccfd5d8190525fdfd8c538059754f",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-7c392b73f1e59c7086adb4a0039f2c08921dc6b90cc4b0689990c66dedf8f65e",
+      "evidence_refs": [
+        "E27"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-711d4a700acb06a43474c45b3bea4a37470cf3d3e32617402ca62efbc776b474",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-c293b61090d196ecde3de4134e4ae949d6564dc3848faf7ef6319817d6220523",
+      "evidence_refs": [
+        "E28"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-fd1f67677afbfcc9e0144dccf3bdd5f5a4a58a1d3636b3e82cef7c6deec2fe38",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-511dbf729a643fc45f1c8486303a275a6ae40d71384c6b6893717c28a7fc7d97",
+      "evidence_refs": [
+        "E29"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c47c54b10e309a1758f5d03109a01649e357ee4b337c89fe6196dd336e3c0cf1",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-9468fc97b9cefaeb432a3b6d03ce530d62ec78ee5b8ae79ecd652d2c6090352c",
+      "evidence_refs": [
+        "E30"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-33be42ee2e5abc4ff505c4bbc72dcab3e149e2a0384c15ef28ab27f3cb7e29bd",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-e2bd3740dce1f763b3120de9fdd1256500cf7f57219c6732c15fc86ba88fb332",
+      "evidence_refs": [
+        "E31"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-2e5b56099d7291ddadae9cdcd6463c4009e4bf2263cdc98693dcddf05d209b73",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-58a760a9aa0898599bd5976cbd40c2e98e3d5335d27922f0e6708241aea8897a",
+      "evidence_refs": [
+        "E32"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a8c75b29bd253ba0b6ca34f770f1ba0796c42b50b83205f9bff4aab026fcbc77",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-37ee89e78359dbcf5a84f4a2a7e313af74159bacaac6d91fdc0f0cbd6f02a597",
+      "evidence_refs": [
+        "E33"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-b435bf1faf5c596039123688474e4ca470be60a9ad13eb07b45ac708e8a6d0fa",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-69bdfcc83b3faba6b922f4febc411dd389f716985d1bdcc5ad0b7644c0e4e49c",
+      "evidence_refs": [
+        "E34"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c2d0e29b39d9e0b379d902fce9eacdbd5d8784dcac2fc47de83e907d72317375",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-622fc6a7602ea1a01761739f654f46332c458787b86d5a950a2f411c209ff9f1",
+      "evidence_refs": [
+        "E35"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ababc6ede24757c1697be7924d3d90662b630f539891b58b261fe2b525805515",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-18170b38c1bab1ed84ac1bd1129d8a5d1af428b188c911f131956d4ffa3f0b0e",
+      "evidence_refs": [
+        "E36"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-eb02ef34b2c66755c66898461f23102d594b2b2b0db366c9a81e48d811084974",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-9298d80b0926c09411579ab8efdc5dd738109a4f591ce874151b072d5f2ed974",
+      "evidence_refs": [
+        "E37"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-5d74fb68c481ed445e510e4f7ecd708812715c7658fc6d7ba30fe8695e53c33a",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-c76d0adb67b583ab19a953dfd9acf86a90628e26c93033983f5e9d2b5e0df44c",
+      "evidence_refs": [
+        "E38"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-10395d3da664bed71538971108479b6cb6be65484ff2c471139ae588b66da3af",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-bdb7ae29a14e51a6171dfa1dc92bee0a3437b04c83eec77cbca4405370460acf",
+      "evidence_refs": [
+        "E39"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-51c817b20648eaefffa6bceac6413d9770d64eeb3dc0b029cad0ae1a3fe917c9",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-ba79b6e1eb59e256be6624089f0c671d4e97e3699509f9652b07ddbdf10a084b",
+      "evidence_refs": [
+        "E40"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-8fa8679022c62533d46e9c9336b30892debb480281959872912f14563c33b2ae",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-84993c4d2dc3e78fe9817359ed7b5fa7034e3fc906def55d502da493193bc03c",
+      "evidence_refs": [
+        "E41"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ca415ec007e42b1d3583b613ffa9e1d4370997be095b5e32bc0184a862bb55e4",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-81aba2e6cade75c63160e7f378ebdcf7d068a8fcc502bdcc38df4a4174d5c76a",
+      "evidence_refs": [
+        "E42"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-944b72a05e607e1962bc33d568b47cffdb83d60b64f040f774b89c4de4bf6ab5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-9c08e6aa5a8fb9535a9ea30055a38e71dbf3bab17a31208eae9474e78638b2a9",
+      "evidence_refs": [
+        "E43"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-e5dd429cf1a1f4ac0c3c0f08be86e49c637c1a69c703735117be15b8f65d9d60",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-4d4b660de20b85003c6b50f8fe619b76a61ed40dc0c840591590b45c095d3ee3",
+      "evidence_refs": [
+        "E44"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-915ff1c8a1d29f00077002011a1805813488d501092e76a957b266bafc7d955d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-911da379fba2c6f477f0d21c5e0e51883dfef3765e2338033f6ab2850f90f719",
+      "evidence_refs": [
+        "E45"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-cfe5c0341ccf6f257505fbbbd389edac8e26faf5c8bf28fc9995dd8878820b62",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-be0ccc68eabad1a6ce186e4d4f056c627c2143e39b6dfb9e2cb2c3de41b3f5a1",
+      "evidence_refs": [
+        "E46"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c3e5e9412985e9c33dfb773614b8ba189bf3e7168a616b931139b2260afeae1c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-603aa8799ceb1be04a9755a2fa8af5f3ca612749302218871f2ab8cc790a1794",
+      "evidence_refs": [
+        "E47"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/lookup.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-51e51a3ce19ed753997d9b1c40c375d8d3562b1d20dbb743e1b73066925c903e",
+      "change_scope": "supporting_context",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "query_symbols": [
+        "get",
+        "RemoteSource",
+        "with_warmer",
+        "FakeManhattan",
+        "new",
+        "FakeWarmer",
+        "published",
+        "warm"
+      ],
+      "context_complete": false,
+      "task_id": "T-9455f3bd3f24777786ae47de63a3eb7b09dfba5098bdd10d34bac0160186e277",
+      "evidence_refs": [
+        "E48"
+      ]
+    }
+  ],
+  "task_id": "T-807bf376a9172888da904a7e9a7f85d9aca2e25780767626ca045a8e08d9bc30"
+}
