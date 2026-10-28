@@ -1,6 +1,7 @@
 """独立机制判断协议：精确片段、前后行为和允许表达范围。"""
 
 import re
+import json
 from typing import Any
 
 from .evidence import digest
@@ -71,7 +72,10 @@ def validate_mechanisms(value: Any, task: dict[str, Any]) -> list[str]:
         errors.append("task_id 与当前证据任务不匹配")
     actual = [s["segment_id"] for s in value["segments"]]
     if set(actual) != segment_ids(task) or len(actual) != len(set(actual)):
-        errors.append("每个证据区段必须且只能记录一次研究结果")
+        expected = segment_ids(task)
+        errors.append("每个证据区段必须且只能记录一次研究结果；" + json.dumps({
+            "missing": sorted(expected - set(actual)), "unexpected": sorted(set(actual) - expected),
+            "duplicates": sorted({s for s in actual if actual.count(s) > 1})}, ensure_ascii=False))
     keys = [c["key"] for c in value["claims"]]
     if len(keys) != len(set(keys)):
         errors.append("机制结论 key 重复")
@@ -91,7 +95,13 @@ def validate_mechanisms(value: Any, task: dict[str, Any]) -> list[str]:
                 errors.append(where + " 引用行号超出实际片段")
                 continue
             if cite["quote"].strip() != "".join(lines[start - first:end - first + 1]).strip():
-                errors.append(where + " 引文与具体源码行不一致")
+                exact = "".join(lines[start - first:end - first + 1]).strip()
+                detail = {"evidence_ref": cite["evidence_ref"], "start_line": start, "end_line": end}
+                if len(exact) <= 2000:
+                    detail["exact_quote_for_selected_lines"] = exact
+                else:
+                    detail["instruction"] = "选取不超过 2000 字符的更短连续完整行，不能删行或拼接"
+                errors.append(where + " 引文与具体源码行不一致；此处仅纠正选定行的转录，不证明断言成立：" + json.dumps(detail, ensure_ascii=False))
             if revision and entry["commit"] != revision:
                 errors.append(where + " 引用了错误的前后版本")
 

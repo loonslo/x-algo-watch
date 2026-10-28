@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
-updated: 2026-10-28
+updated: 2026-10-29
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 本地研究主链、共享预算和超大补证归并已实现；基于最新 main 的独立候选完成 Windows 421 项全量回归、末端边界 54 项检查，并在 WSL Ubuntu/Python 3.14.4 完成 423 项 Linux 全量回归。2026-10-28 07:46:59 UTC 只读预检见发布候选记录：DRAFT_ENABLED=true，Actions queued/in_progress 均为空，最近定时检查成功。原工作区修改保留，data/registry 未覆盖；尚未执行新模型、推送或远程 CI。
-next: 已完成授权推送及一轮 Actions；远程 CI 423 项通过，6258a15 检测/起草/发布成功，但两次真实机制输出未通过片段及精确引用校验而暂停。需处理实际输出后显式恢复，继续真实研究和读者验收。
+next: 2026-10-29 已修复区段目标歧义及引文纠错反馈，相关 24 项和真实失败回放 1 项通过；继续远程 CI，之后显式恢复真实研究以验证改善，完整读者验收仍未完成。
 evidence:
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md
