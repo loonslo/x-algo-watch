@@ -57,6 +57,9 @@ def test_sample_job_is_read_only_owner_main_and_key_only_in_model_step():
     key_steps=[step for step in job['steps'] if 'OPENROUTER_API_KEY' in step.get('env',{})]
     assert len(key_steps)==1 and 'x_algo_watch.drafting' in key_steps[0]['run']
     assert not any('x_algo_watch.automation publish' in step.get('run','') for step in job['steps'])
+    assert workflow['on']['workflow_dispatch']['inputs']['direct_probe']['default'] == 'false'
+    assert 'x_algo_watch.model_probe' in key_steps[0]['run']
+    assert key_steps[0]['env']['DIRECT_PROBE'] == '${{ inputs.direct_probe }}'
 
 
 def test_queued_detection_uses_fresh_main_and_draft_uses_that_source():

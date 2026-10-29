@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-29
-status: waiting
+status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: Gemma 切换提交的远程 CI40857941519 为 441 项通过；按用户要求实际运行 Actions40867213103、40867670620，每轮真实新增一次指定 Gemma 的请求，两次均 HTTP429 / provider_overloaded，未返回模型正文，未进入三审。原始云端草稿已按字节保存，旧模型审计与日预算保留。
-next: 等待指定 Gemma 端点恢复可用后按预算和恢复边界继续真实研究；目前无模型正文可评价，机制分析、三审及读者质量仍未验收，不把 Actions 成功保存产物写成内容通过。
+next: 按用户要求执行直接 OpenRouter API 诊断，比较最小文本与项目 JSON 参数，并核验密钥认证；诊断入口及预算/安全边界相关 31 项已通过，真实结果待运行。机制分析、三审及读者质量仍未验收。
 evidence:
   - docs/acceptance-gemma-cloud-result.md
   - docs/samples/2026-10-29-gemma-cloud-40867213103.json

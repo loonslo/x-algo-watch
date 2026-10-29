@@ -2,6 +2,14 @@
 
 维护日期：2026-10-29。本次由用户明确要求实际执行 GitHub Actions，查看云端模型真实结果。
 
+## 直接 API 诊断准备
+
+用户随后要求直接调用以排除研究流程影响。本机未配置模型密钥；密钥仅保存在 GitHub openrouter 环境，不能从 GitHub 读取或导出。因此在现有 sample.yml 增加默认关闭的 direct_probe，保持所有者、main、只读权限、同一串行锁、请求前预算核对与调用账本。
+
+诊断不经过研究执行器：直接以 urllib 请求 OpenRouter，先 GET key 核验认证（只保存认证布尔值，不保存账户详情），再依次发最小文本请求和使用项目参数的 JSON 小请求。固定 Gemma、最多两次模型请求、间隔 15 秒；状态码、经过敏感信息扫描的 error.message、provider_name、正文和用量保存为 model-probe.json。不能把连通性小请求当作算法研究质量验收。
+
+Windows / Python 3.14.0 相关预算、诊断及工作流边界测试 31 passed，0.51 秒。直接云端诊断结果将在执行后追加；这些模拟测试不证明模型可用。
+
 ## 执行范围
 
 - 仓库：loonslo/x-algo-watch，分支 main，代码提交 5ac42510d65462373b1310bf19d24da9927495c8。
