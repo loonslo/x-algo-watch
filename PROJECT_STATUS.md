@@ -3,9 +3,10 @@ project_id: x-algo-watch
 updated: 2026-10-29
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 已按用户要求直接调用 API：Actions40868437463、40868764414 的密钥认证均200，三次最小/JSON模型请求均429；后者返回提供方 Google AI Studio 原文 temporarily rate-limited upstream。云端原始产物已保存，调用计入共享预算，未返回模型正文或进入审核。
-next: 按用户最新要求切回 openrouter/free，直接调用以核对真实返回及实际型号；保留 Gemma 上游限流记录和全部累计预算。机制、三审及读者质量仍未验收。
+progress: 已按用户要求切回 openrouter/free；Actions40872174653 直接 API 两次请求均200：nvidia/nemotron-3-ultra-550b-a55b:free 返回 OK，dots-studio/dots-3-note-preview:free 返回完整 JSON。此前 Gemma 上游429记录与全部预算保留，相关59项检查通过；本次只证明小请求可用。
+next: 使用当前免费路由按原恢复、预算和三关规则继续真实算法研究；API可用不等于整版机制分析、三审或读者质量已验收，不清空历史审计或当日调用。
 evidence:
+  - docs/samples/2026-10-29-free-router-direct-40872174653.json
   - docs/acceptance-free-router-return.md
   - docs/samples/2026-10-29-gemma-direct-40868437463.json
   - docs/samples/2026-10-29-gemma-direct-40868764414.json
