@@ -1,11 +1,12 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-29
-status: waiting
+status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 已按用户要求直接调用 API：Actions40868437463、40868764414 的密钥认证均200，三次最小/JSON模型请求均429；后者返回提供方 Google AI Studio 原文 temporarily rate-limited upstream。云端原始产物已保存，调用计入共享预算，未返回模型正文或进入审核。
-next: 等待指定 Gemma 免费端点恢复可用，或由用户决定是否调整提供方接入方式；当前最小请求也被上游拒绝，不能评价模型内容质量。保留全部真实请求及审计，机制、三审和读者质量仍未验收。
+next: 按用户最新要求切回 openrouter/free，直接调用以核对真实返回及实际型号；保留 Gemma 上游限流记录和全部累计预算。机制、三审及读者质量仍未验收。
 evidence:
+  - docs/acceptance-free-router-return.md
   - docs/samples/2026-10-29-gemma-direct-40868437463.json
   - docs/samples/2026-10-29-gemma-direct-40868764414.json
   - docs/acceptance-gemma-cloud-result.md

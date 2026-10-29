@@ -3,6 +3,7 @@ import json
 from urllib.error import HTTPError
 
 import pytest
+import yaml
 
 from x_algo_watch import model_probe
 from x_algo_watch.models import WatchError
@@ -37,7 +38,8 @@ def test_direct_http_error_retains_message_and_provider_without_leaking_secrets(
 
 
 @pytest.mark.parametrize("available", [True, False])
-def test_canaries_reserve_budget_before_network_and_save_raw_response(tmp_path, monkeypatch, available):
+@pytest.mark.parametrize("model", [model_probe.GEMMA_MODEL, model_probe.FREE_ROUTER])
+def test_canaries_reserve_budget_before_network_and_save_raw_response(tmp_path, monkeypatch, available, model):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-secret")
     monkeypatch.setattr(model_probe, "load_receipt", lambda p: {})
     monkeypatch.setattr(model_probe.time, "sleep", lambda n: None)
@@ -57,6 +59,9 @@ def test_canaries_reserve_budget_before_network_and_save_raw_response(tmp_path, 
     monkeypatch.setattr(model_probe, "BudgetClient", Budget)
     monkeypatch.setattr(model_probe, "request_api", call)
     monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/watch.yaml").write_text(yaml.safe_dump({"models": {"analysis": model, "review": model},
+        "allow_same_model": model != model_probe.FREE_ROUTER}), encoding="utf-8")
     output = tmp_path / "probe.json"
     if not available:
         with pytest.raises(WatchError):
@@ -66,7 +71,8 @@ def test_canaries_reserve_budget_before_network_and_save_raw_response(tmp_path, 
         model_probe.run_probe(tmp_path / "receipt", tmp_path / "ledger", output)
         result = json.loads(output.read_text(encoding="utf-8"))
         assert len(intents) == len(requests) == len(result["requests"]) == 2
-        assert all(r["model"] == model_probe.GEMMA_MODEL for r in requests)
+        assert all(r["model"] == model for r in requests)
         assert "provider" not in requests[0] and "reasoning" not in requests[0] and "response_format" not in requests[0]
-        assert requests[1]["provider"] == {"require_parameters": True, "allow_fallbacks": False}
+        assert requests[1]["provider"] == {"require_parameters": True, "allow_fallbacks": model == model_probe.FREE_ROUTER}
+        assert requests[1]["response_format"]["type"] == ("json_schema" if model == model_probe.FREE_ROUTER else "json_object")
         assert result["requests"][0]["response"]["content"] == "OK"

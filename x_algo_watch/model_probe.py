@@ -1,4 +1,4 @@
-"""固定型号的真实连通性诊断；直接请求 API，不生成研究或裁决。"""
+"""配置型号的真实连通性诊断；直接请求 API，不生成研究或裁决。"""
 
 import argparse
 from datetime import datetime, timezone
@@ -10,9 +10,11 @@ from typing import Any
 import urllib.error
 import urllib.request
 
+import yaml
+
 from .call_budget import BudgetClient, load_receipt
 from .evidence import digest
-from .model_policy import GEMMA_MODEL
+from .model_policy import FREE_ROUTER, GEMMA_MODEL, pipeline_models
 from .models import WatchError
 from .storage import RecordStore, atomic_write, public_json
 
@@ -91,8 +93,10 @@ def run_probe(receipt: Path, ledger: Path, output: Path) -> None:
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise WatchError("诊断环境未配置模型密钥")
+    settings = yaml.safe_load(Path("config/watch.yaml").read_text(encoding="utf-8"))
+    model = pipeline_models(settings.get("models"), allow_same_model=settings.get("allow_same_model", False))["analysis"]
     budget = BudgetClient(object(), load_receipt(receipt), ledger, RecordStore(Path("data")).events())
-    result: dict[str, Any] = {"model": GEMMA_MODEL, "run_id": os.environ.get("GITHUB_RUN_ID"),
+    result: dict[str, Any] = {"model": model, "run_id": os.environ.get("GITHUB_RUN_ID"),
         "authentication": request_api(key), "requests": []}
     def save():
         public_json(result)
@@ -101,10 +105,14 @@ def run_probe(receipt: Path, ledger: Path, output: Path) -> None:
     if result["authentication"].get("authenticated") is not True:
         return
     bodies = [
-        ("minimal_text", {"model": GEMMA_MODEL, "messages": [{"role": "user", "content": "Reply only OK."}], "max_tokens": 128}),
-        ("project_json", {"model": GEMMA_MODEL, "messages": [{"role": "user", "content": 'Reply only with this JSON object: {"ok":true}'}],
-            "response_format": {"type": "json_object"}, "provider": {"require_parameters": True, "allow_fallbacks": False},
+        ("minimal_text", {"model": model, "messages": [{"role": "user", "content": "Reply only OK."}], "max_tokens": 128}),
+        ("project_json", {"model": model, "messages": [{"role": "user", "content": 'Reply only with this JSON object: {"ok":true}'}],
+            "response_format": {"type": "json_object"}, "provider": {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER},
             "max_tokens": 12000, "reasoning": {"max_tokens": 3000}})]
+    if model == FREE_ROUTER:
+        bodies[1][1]["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "connectivity_probe", "strict": True, "schema": {"type": "object", "additionalProperties": False,
+                "properties": {"ok": {"type": "boolean", "const": True}}, "required": ["ok"]}}}
     for index, (name, body) in enumerate(bodies):
         if index:
             time.sleep(15)
