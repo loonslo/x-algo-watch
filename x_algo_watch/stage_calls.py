@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable
 
 from .evidence import digest
-from .model_policy import FREE_ROUTER, MAX_DAILY_CALLS
+from .model_policy import FREE_ROUTER, GEMMA_MODEL, MAX_DAILY_CALLS
 from .models import Deferred, UnsafePublicText, WatchError
 from .storage import public_text, public_json
 
@@ -37,13 +37,16 @@ def deferred_metadata(exc: Deferred, client: Any) -> dict[str, Any]:
 def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any], schema: dict[str, Any],
                validate: Callable[[Any], list[str]], prompt: str, prior: list[dict[str, Any]], client: Any,
                now: datetime, daily_limit: int = MAX_DAILY_CALLS, resume: bool = False,
-               deadline: float | None = None, persist: Callable[[dict[str, Any]], None] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+               deadline: float | None = None, persist: Callable[[dict[str, Any]], None] | None = None,
+               model: str = FREE_ROUTER) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if model not in (FREE_ROUTER, GEMMA_MODEL):
+        raise WatchError("研究阶段模型未经适配")
     if type(daily_limit) is not int or not 1 <= daily_limit <= MAX_DAILY_CALLS or now.tzinfo is None:
         raise WatchError("研究阶段需要有效共享日预算及带时区时间")
     now = now.astimezone(timezone.utc)
     prompt += "\n仅输出此精确协议规定的 JSON：\n" + json.dumps(schema, ensure_ascii=False)
     version = digest({"prompt": prompt, "schema": schema, "transport": PIPELINE})
-    family = digest({"unit": unit_id, "stage": stage, "payload": payload, "version": version, "model": FREE_ROUTER})
+    family = digest({"unit": unit_id, "stage": stage, "payload": payload, "version": version, "model": model})
     prior = list({e["id"]: e for e in prior}.values())
     family_calls = [e for e in prior if e.get("call_family") == family]
     epoch = max((e.get("attempt_epoch", 0) for e in family_calls), default=0)
@@ -79,7 +82,7 @@ def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any]
             if previous.get("output") is not None:
                 request["previous_invalid_output"] = previous["output"]
         event = {"type": "model_call", "pipeline_protocol": PIPELINE, "commit": commit,
-                 "item_id": unit_id, "stage": stage, "model": FREE_ROUTER, "prompt_version": version,
+                 "item_id": unit_id, "stage": stage, "model": model, "prompt_version": version,
                  "call_family": family, "analysis_key": digest([family, epoch]), "attempt_epoch": epoch,
                  "input_hash": digest(request), "day": now.date().isoformat(), "valid": False}
         event["id"] = "stage:" + digest([family, epoch, len(calls), now.isoformat()])
@@ -91,7 +94,7 @@ def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any]
         if persist:
             persist({**event, "outcome": "started", "errors": ["请求已记入预算，响应尚未保存"]})
         try:
-            raw = client.call(FREE_ROUTER, prompt, request)
+            raw = client.call(model, prompt, request)
             public_json(raw)
             event["raw_output"] = raw
             try:

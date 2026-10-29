@@ -175,6 +175,11 @@ class OpenRouter:
                 if "analysis" in payload:
                     body["max_tokens"] = 24000
                     body["reasoning"] = {"effort": "low"}
+        from .model_policy import GEMMA_MODEL
+        if model == GEMMA_MODEL:
+            # 此端点支持 JSON 模式但不支持服务端 schema 强制；精确协议仍随请求发送并由本地逐项校验。
+            body["response_format"] = {"type": "json_object"}
+            body["provider"] = {"require_parameters": True, "allow_fallbacks": False}
         if model == "minimax/minimax-m3.1-flash:free":
             # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
             body["reasoning"] = {"effort": "low"}

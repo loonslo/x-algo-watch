@@ -51,9 +51,9 @@
 5. 三个角色必须全部同意；任一角色有实质问题就合并异议并更新问题清单，依据原始证据修订后重新执行全部三个角色，即使稿件相同也不沿用上一候选裁决。默认最多 5 个候选，即初稿加 4 次修订；连续两次可识别的无进展或达到本批上限时暂停，保留稿件和明确恢复条件。已知问题同步修正 reader、标题、技术断言，不用多数票抵消异议。证据不足可收窄、撤回推断或明确未知，之后仍须全部审核同意。仍有分歧时用户正文待修订，原稿仅留在审计记录。
 6. 通过后，程序固定排成上述四层，并把证据编号转换为可点击链接。新版本无需 `editorial/` 文件即可发布阅读页；正式 digest 仍须所有者确认。
 
-所有角色使用 `openrouter/free` 免费自动路由，不固定具体型号。请求保留 JSON 输出要求；记录请求路由和接口实际返回的型号，没有返回时明确为未知。路由可能重复选中同一型号，多轮核对不能宣称保证异模型独立复核，也不能保证没有语义错误。[OpenRouter 官方说明](https://openrouter.ai/docs/guides/routing/routers/free-router)介绍了免费模型自动选择及响应型号字段。
+2026-10-29 按用户指定，所有角色固定使用 `google/gemma-4-26b-a4b-it:free`，配置显式开启 `allow_same_model`。请求保留 JSON 输出要求；记录请求和实际响应型号，没有返回时明确为未知。这是同型号的三个审核角色，不能宣称异模型独立复核，也不能保证没有语义错误。旧 `openrouter/free` 调用仍留在审计，全部计入当日共享预算。
 
-项目研究请求使用 `response_format=json_schema`，起草发送完整研究协议，三轮复核发送精确 agree/issues 协议；设置 strict 和 require_parameters，只要求支持对应参数的端点。免费路由允许提供方故障切换，仍限定 openrouter/free。按[官方结构化输出文档](https://openrouter.ai/docs/guides/features/structured-outputs)，不同提供方的执行保证有差异，因此保留本地字段与证据校验。传输协议版本参与调用键与研究指纹，避免沿用旧格式失败缓存。
+Gemma 端点支持 JSON 输出但不支持服务端 JSON Schema 强制约束，使用 `response_format=json_object` 及 `require_parameters`，关闭提供方故障切换。完整研究协议随请求发送，返回后仍执行全部本地结构、字段、引用与证据校验；三轮复核继续使用精确 agree/issues 协议。历史免费自动路由的严格 schema 传输保持兼容。模型选择参与调用键及研究指纹，新模型不复用旧路由的稿件、裁决或失败缓存。能力依据见 [OpenRouter 模型端点](https://openrouter.ai/api/v1/models/google/gemma-4-26b-a4b-it:free/endpoints)及[模型说明](https://openrouter.ai/google/gemma-4-26b-a4b-it:free)。
 
 免费整版本起草设置 max_tokens=12,000、reasoning.max_tokens=3,000；审核设置 max_tokens=24,000、reasoning.effort=low，为完整裁决保留空间（实际提供方曾将 3,000 推理预算映射为超过 12,000，导致审核截断）；提供方可能映射或忽略推理设置，实际计数仍以安全审计为准。输出达到 length 边界视为未完成，不能使用部分 JSON，也不计入格式无效次数。请求失败、安全扫描命中和正文校验失败分别诊断，只记录固定类别、阶段和 HTTP 状态，不记录敏感原文或未知异常消息。CLI 与导入的循环共用 models.Deferred，避免把可恢复请求失败误报为安全拦截。
 

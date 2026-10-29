@@ -363,7 +363,8 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
                 plan = load_pipeline_plan(bundle / "data", pack) if pack else None
                 unit = event.get("item_id", "")
                 valid_unit = bool(plan) and (unit in {t["task_id"] for t in plan["tasks"]} or unit == pack["item_id"] or (isinstance(unit, str) and re.fullmatch(r"selection:[0-9a-f]{64}", unit)))
-                if not valid_unit or event.get("model") != "openrouter/free":
+                from .model_policy import FREE_ROUTER, GEMMA_MODEL
+                if not valid_unit or event.get("model") not in (FREE_ROUTER, GEMMA_MODEL):
                     raise WatchError("分任务调用审计不属于当前可信计划")
     if merge_research:
         selected = manifest.get('research', [])

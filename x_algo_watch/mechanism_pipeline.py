@@ -10,7 +10,7 @@ from .evidence import digest
 from .iteration import iteration_policy
 from .mechanisms import bind_claims, mechanism_schema, validate_mechanisms, validate_shape
 from .mechanism_reviews import combine_reviews, review_schema, validate_review
-from .model_policy import FREE_ROUTER, REVIEW_STAGES
+from .model_policy import FREE_ROUTER, REVIEW_STAGES, pipeline_models, review_mode
 from .pipeline_context import load_pipeline_plan
 from .revision_audit import field_changes, issue_identity
 from .stage_calls import PIPELINE, call_stage
@@ -84,23 +84,27 @@ def validate_revision(value: Any, task: dict[str, Any], feedback: dict[str, Any]
     return errors
 
 
-def pipeline_profile(prompt_root: Path) -> str:
+def pipeline_profile(prompt_root: Path, models: dict[str, str] | None = None) -> str:
     from .reader_pipeline import reader_schema, selection_schema
     paths = ["mechanism-analysis-v1", *["mechanism-" + stage + "-v1" for stage in REVIEW_STAGES]]
     paths += ["reader-analysis-v1", "reader-selection-v1", "context-analysis-v1", *["reader-" + stage + "-v1" for stage in REVIEW_STAGES]]
-    return digest({"protocol": PIPELINE, "flow_revision": 4, "prompts": [(prompt_root / (p + ".md")).read_text(encoding="utf-8") for p in paths],
+    profile = digest({"protocol": PIPELINE, "flow_revision": 4, "prompts": [(prompt_root / (p + ".md")).read_text(encoding="utf-8") for p in paths],
                    "analysis": mechanism_schema(), "review": review_schema(), "revision": revision_schema(),
                    "context": task_schema({"context_kind": "scan"}),
                    "reader": reader_schema(), "selection": selection_schema()})
+    if models is None or models == {"analysis": FREE_ROUTER, "review": FREE_ROUTER}:
+        return profile
+    return digest({"profile": profile, "models": models, "transport": "gemma-json-object-v1"})
 
 
 def run_pipeline(pack: dict[str, Any], data: Path, prior: list[dict[str, Any]], client: Any, settings: dict[str, Any],
                  prompt_root: Path, *, resume: bool = False, deadline: float | None = None,
                  persist: Callable[[dict[str, Any]], None] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plan = load_pipeline_plan(data, pack)
-    if settings.get("models") != {"analysis": FREE_ROUTER, "review": FREE_ROUTER} or settings.get("extra_review_rounds") != 2:
-        raise WatchError("新机制流程必须使用免费路由和全部三个审核角色")
-    profile = pipeline_profile(prompt_root)
+    models = pipeline_models(settings.get("models"), allow_same_model=settings.get("allow_same_model", False))
+    if settings.get("extra_review_rounds") != 2:
+        raise WatchError("新机制流程必须使用全部三个审核角色")
+    profile = pipeline_profile(prompt_root, models)
     maximum, stagnant = iteration_policy(settings)
     checkpoint = next((e for e in reversed(prior) if e.get("type") == "version_research" and e.get("item_id") == pack["item_id"] and e.get("pipeline_profile") == profile), None)
     loop = deepcopy(checkpoint["pipeline_loop"]) if checkpoint else {
@@ -134,8 +138,8 @@ def run_pipeline(pack: dict[str, Any], data: Path, prior: list[dict[str, Any]], 
     initial_loop.update(phase="researching", reason="in_progress")
     provisional = {"type": "version_research", "commit": pack["commit"], "item_id": pack["item_id"],
         "profile_hash": profile, "pipeline_profile": profile, "pipeline_protocol": PIPELINE, "plan_id": plan["plan_id"], "run_id": run_id,
-        "state": "pending", "models": {"analysis": FREE_ROUTER, "review": FREE_ROUTER}, "repair_attempted": loop["candidate"] > 1,
-        "review_mode": "free_router", "coverage": pack["coverage"], "sources": {}, "pipeline_loop": initial_loop,
+        "state": "pending", "models": models, "repair_attempted": loop["candidate"] > 1,
+        "review_mode": review_mode(models), "coverage": pack["coverage"], "sources": {}, "pipeline_loop": initial_loop,
         "iteration": {k: initial_loop[k] for k in ("candidate", "phase", "reason", "next_stage")}, "task_states": {},
         "file_states": file_progress(plan, {}, prior)}
     provisional["id"] = "research:" + digest(provisional)
@@ -153,7 +157,8 @@ def run_pipeline(pack: dict[str, Any], data: Path, prior: list[dict[str, Any]], 
         result, calls = call_stage(unit_id=task["task_id"], commit=pack["commit"], stage=stage,
             payload=payload, schema=schema, validate=validator, prompt=prompt, prior=prior + events,
             client=client, now=datetime.now(timezone.utc), daily_limit=settings.get("daily_calls", 1000),
-            resume=resume, deadline=deadline, persist=persist)
+            resume=resume, deadline=deadline, persist=persist,
+            model=models["review" if stage.endswith(tuple("_" + role for role in REVIEW_STAGES)) else "analysis"])
         events.extend(calls)
         if result["state"] != "complete":
             loop.update(phase="waiting_manual" if result["state"] == "waiting_manual" else {
@@ -316,8 +321,8 @@ def run_pipeline(pack: dict[str, Any], data: Path, prior: list[dict[str, Any]], 
     event = {"type": "version_research", "commit": pack["commit"], "item_id": pack["item_id"],
              "run_id": run_id,
              "profile_hash": profile, "pipeline_profile": profile, "pipeline_protocol": PIPELINE,
-             "plan_id": plan["plan_id"], "state": state, "models": {"analysis": FREE_ROUTER, "review": FREE_ROUTER},
-             "repair_attempted": loop["candidate"] > 1, "review_mode": "free_router", "coverage": pack["coverage"], "sources": {},
+             "plan_id": plan["plan_id"], "state": state, "models": models,
+             "repair_attempted": loop["candidate"] > 1, "review_mode": review_mode(models), "coverage": pack["coverage"], "sources": {},
              "pipeline_loop": loop, "iteration": {k: loop[k] for k in ("candidate", "phase", "reason", "next_stage")},
              "task_states": task_states, "file_states": file_progress(plan, task_states, prior + events)}
     if reader_result and loop["phase"] == "ready":
@@ -334,7 +339,8 @@ def validate_pipeline_event(event: dict[str, Any], pack: dict[str, Any], data: P
         if event.get("pipeline_protocol") != PIPELINE or event.get("id") != "research:" + digest({k: v for k, v in event.items() if k not in {"id", "created_at"}}):
             return False
         plan = load_pipeline_plan(data, pack)
-        if event.get("models") != {"analysis": FREE_ROUTER, "review": FREE_ROUTER} or event.get("review_mode") != "free_router":
+        models = pipeline_models(event.get("models"), allow_same_model=True)
+        if event.get("review_mode") != review_mode(models):
             return False
         if event["commit"] != pack["commit"] or event["item_id"] != pack["item_id"] or event["plan_id"] != plan["plan_id"]:
             return False
@@ -367,7 +373,7 @@ def validate_pipeline_event(event: dict[str, Any], pack: dict[str, Any], data: P
                 return False
             item = row_item(task_id, row)
             draft = by_id[row["analysis_call"]]
-            if draft.get("valid") is not True or draft.get("stage") != "mechanism" or draft.get("item_id") != task_id or draft.get("model") != FREE_ROUTER or draft.get("commit") != pack["commit"]:
+            if draft.get("valid") is not True or draft.get("stage") != "mechanism" or draft.get("item_id") != task_id or draft.get("model") != models["analysis"] or draft.get("commit") != pack["commit"]:
                 return False
             output = draft["output"].get("result", draft["output"])
             if validate_task(output, item) or set(row["review_calls"]) != set(REVIEW_STAGES):
@@ -377,7 +383,7 @@ def validate_pipeline_event(event: dict[str, Any], pack: dict[str, Any], data: P
             reviews = {}
             for stage in REVIEW_STAGES:
                 call = by_id[row["review_calls"][stage]]
-                if call.get("valid") is not True or call.get("stage") != "mechanism_" + stage or call.get("item_id") != task_id or call.get("model") != FREE_ROUTER:
+                if call.get("valid") is not True or call.get("stage") != "mechanism_" + stage or call.get("item_id") != task_id or call.get("model") != models["review"]:
                     return False
                 if validate_review(call["output"], task_id, output, item):
                     return False
@@ -428,13 +434,15 @@ def validate_pipeline_event(event: dict[str, Any], pack: dict[str, Any], data: P
             states = row["task_states"]
             if set(states) != set(tasks) or any(state["state"] != "approved" or not check_row(t, state) for t, state in states.items()):
                 return False
+            if any(by_id[c].get("model") != models["analysis"] for c in row["selection_calls"]):
+                return False
             frozen = frozen_claims(plan, states, calls)
             selected = verify_selection_receipts(frozen, row["selection_calls"], by_id)
             if row["claim_ids"] != selected:
                 return False
             catalog = {c: frozen[c] for c in selected}
             draft = by_id[row["analysis_call"]]
-            if draft.get("valid") is not True or draft.get("stage") != "reader" or draft.get("item_id") != pack["item_id"] or draft.get("model") != FREE_ROUTER or draft["output"] != row["draft"]:
+            if draft.get("valid") is not True or draft.get("stage") != "reader" or draft.get("item_id") != pack["item_id"] or draft.get("model") != models["analysis"] or draft["output"] != row["draft"]:
                 return False
             if validate_reader_draft(row["draft"], catalog, previous):
                 return False
@@ -443,7 +451,7 @@ def validate_pipeline_event(event: dict[str, Any], pack: dict[str, Any], data: P
                 return False
             for stage, identifier in row["review_calls"].items():
                 call = by_id[identifier]
-                if call.get("valid") is not True or call.get("stage") != "reader_" + stage or call.get("item_id") != pack["item_id"] or call.get("model") != FREE_ROUTER:
+                if call.get("valid") is not True or call.get("stage") != "reader_" + stage or call.get("item_id") != pack["item_id"] or call.get("model") != models["review"]:
                     return False
                 if validate_reader_review(call["output"], pack["item_id"], row["draft"], catalog):
                     return False

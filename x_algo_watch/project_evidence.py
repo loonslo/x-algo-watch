@@ -238,7 +238,7 @@ def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
                   ("iteration" not in e and (e.get("state") == "manual" or (e.get("state") == "disputed" and e.get("repair_attempted")))))))}
     if any(e.get("pipeline_protocol") == "mechanisms-v1" for e in latest.values()):
         from .mechanism_pipeline import pipeline_profile
-        current_profile = pipeline_profile(Path("prompts"))
+        current_profile = pipeline_profile(Path("prompts"), (settings or {}).get("models"))
         finished.update(e.get("item_id") for e in latest.values() if e.get("pipeline_protocol") == "mechanisms-v1"
                         and e.get("pipeline_profile") == current_profile
                         and e.get("iteration", {}).get("phase") in {"waiting_manual", "paused_limit", "paused_stagnation"})
