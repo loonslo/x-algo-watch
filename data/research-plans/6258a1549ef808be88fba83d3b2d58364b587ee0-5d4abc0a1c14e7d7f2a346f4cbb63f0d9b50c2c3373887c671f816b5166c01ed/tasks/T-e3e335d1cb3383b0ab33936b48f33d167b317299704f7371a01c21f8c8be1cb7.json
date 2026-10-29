@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-8401f959d14db6834bdd10be04048406b848848bf50976ac4d2945cc7754835d",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 171,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport functools\n\nimport jax\nimport jax.numpy as jnp\nfrom jax.typing import DTypeLike\n\n_ROWS = 16\n_LANES_M = 4\n_WARPS = 8\n_WARP_SIZE = 32\n_LANES_N = _WARP_SIZE // _LANES_M\n_QUANTIZE_COLS = 8\n_TRANSPOSE_COLS = 16\n_PTX_CVT_TYPE = {\"float8_e4m3fn\": \"e4m3x2\", \"float8_e5m2\": \"e5m2x2\"}\n\n\ndef quantize_transposed_supported(shape: tuple[int, ...]) -> bool:\n    return _supported(shape, _QUANTIZE_COLS)\n\n\ndef transpose_supported(shape: tuple[int, ...]) -> bool:\n    return _supported(shape, _TRANSPOSE_COLS)\n\n\ndef _supported(shape: tuple[int, ...], cols: int) -> bool:\n    return (\n        len(shape) == 2\n        and 0 < shape[0] * shape[1] < 2**31\n        and shape[0] % (_ROWS * _LANES_M) == 0\n        and shape[0] <= 65535 * _ROWS * _LANES_M * _WARPS\n        and shape[1] % (cols * _LANES_N) == 0\n    )\n\n\ndef quantize_transposed(\n    x: jax.Array, inv_scale: jax.Array, dtype: DTypeLike, *, with_untransposed: bool = True\n) -> tuple[jax.Array | None, jax.Array]:\n    m, n = x.shape\n    assert x.dtype == jnp.bfloat16 and quantize_transposed_supported(x.shape), (x.dtype, x.shape)\n    call = _compiled_kernel(m, n, _PTX_CVT_TYPE[jnp.dtype(dtype).name], with_untransposed)\n    x_words = jax.lax.bitcast_convert_type(x.reshape(m, n // 2, 2), jnp.int32)\n    outputs = call(x_words, inv_scale.astype(jnp.float32).reshape(1))\n    q_t = jax.lax.bitcast_convert_type(outputs[-1], dtype).reshape(n, m)\n    q = jax.lax.bitcast_convert_type(outputs[0], dtype).reshape(m, n) if with_untransposed else None\n    return q, q_t\n\n\ndef transpose(q: jax.Array) -> jax.Array:\n    m, n = q.shape\n    assert q.dtype.itemsize == 1 and transpose_supported(q.shape), (q.dtype, q.shape)\n    call = _compiled_kernel(m, n, ptx_cvt_type=None, with_untransposed=False)\n    (q_t,) = call(jax.lax.bitcast_convert_type(q.reshape(m, n // 4, 4), jnp.int32))\n    return jax.lax.bitcast_convert_type(q_t, q.dtype).reshape(n, m)\n\n\ndef _store_transposed(words, num_words, m_q_t, col, row0):\n    import cutlass.cute as cute\n    from cutlass import Int32\n\n    for word in range(num_words):\n        outs = [cute.make_rmem_tensor((1, _ROWS // 4), Int32) for _ in range(4)]\n        for block in range(_ROWS // 4):\n            a0, a1, a2, a3 = (words[4 * block + i][0, word] for i in range(4))\n            b0, b1 = cute.arch.prmt(a0, a1, 0x5140), cute.arch.prmt(a0, a1, 0x7362)\n            b2, b3 = cute.arch.prmt(a2, a3, 0x5140), cute.arch.prmt(a2, a3, 0x7362)\n            outs[0][0, block] = cute.arch.prmt(b0, b2, 0x5410)\n            outs[1][0, block] = cute.arch.prmt(b0, b2, 0x7632)\n            outs[2][0, block] = cute.arch.prmt(b1, b3, 0x5410)\n            outs[3][0, block] = cute.arch.prmt(b1, b3, 0x7632)\n        for j in range(4):\n            cute.autovec_copy(\n                outs[j],\n                cute.local_tile(m_q_t, (1, _ROWS // 4), (col + 4 * word + j, row0 // _ROWS)),\n            )\n\n\n\u0040functools.cache\ndef _compiled_kernel(m: int, n: int, ptx_cvt_type: str | None, with_untransposed: bool):\n    import cuda.bindings.driver as cuda_driver\n    import cutlass\n    import cutlass.cute as cute\n    from cutlass import Float32, Int32, const_expr\n    from cutlass._mlir.dialects import llvm\n    from cutlass.cutlass_dsl import T, dsl_user_op\n    from cutlass.jax import cutlass_call\n\n    quantize = ptx_cvt_type is not None\n    cols = _QUANTIZE_COLS if quantize else _TRANSPOSE_COLS\n    num_warp_rows = m // (_ROWS * _LANES_M)\n    grid = [n // (cols * _LANES_N), -(-num_warp_rows // _WARPS), 1]\n    block = [_WARP_SIZE * _WARPS, 1, 1]\n\n    \u0040dsl_user_op\n    def quantize4(lo: Int32, hi: Int32, inv: Float32, *, loc=None, ip=None) -> Int32:\n        return Int32(\n            llvm.inline_asm(\n                T.i32(),\n                [arg.ir_value(loc=loc, ip=ip) for arg in (Int32(lo), Int32(hi), Float32(inv))],\n                \"{\\n\"\n                \".reg .b32 a0, a1, a2, a3;\\n\"\n                \".reg .b16 l, h;\\n\"\n                \"shl.b32 a0, $1, 16;\\n\"\n                \"and.b32 a1, $1, 0xFFFF0000;\\n\"\n                \"shl.b32 a2, $2, 16;\\n\"\n                \"and.b32 a3, $2, 0xFFFF0000;\\n\"\n                \"mul.rn.f32 a0, a0, $3;\\n\"\n                \"mul.rn.f32 a1, a1, $3;\\n\"\n                \"mul.rn.f32 a2, a2, $3;\\n\"\n                \"mul.rn.f32 a3, a3, $3;\\n\"\n                f\"cvt.rn.satfinite.{ptx_cvt_type}.f32 l, a1, a0;\\n\"\n                f\"cvt.rn.satfinite.{ptx_cvt_type}.f32 h, a3, a2;\\n\"\n                \"mov.b32 $0, {l, h};\\n\"\n                \"}\",\n                \"=r,r,r,f\",\n                has_side_effects=False,\n                is_align_stack=False,\n                asm_dialect=llvm.AsmDialect.AD_ATT,\n            )\n        )\n\n    \u0040cute.kernel\n    def kernel(mIn, mInv, mQ, mQT):\n        tidx, _, _ = cute.arch.thread_idx()\n        bx, by, _ = cute.arch.block_idx()\n        warp, lane = tidx // _WARP_SIZE, tidx % _WARP_SIZE\n        warp_row = by * _WARPS + warp\n        if warp_row < num_warp_rows:\n            col = (bx * _LANES_N + lane % _LANES_N) * cols\n            row0 = (warp_row * _LANES_M + lane // _LANES_N) * _ROWS\n            if const_expr(quantize):\n                inv = mInv[0]\n            words = [cute.make_rmem_tensor((1, 4), Int32) for _ in range(_ROWS)]\n            for r in cutlass.range_constexpr(_ROWS):\n                cute.autovec_copy(cute.local_tile(mIn, (1, 4), (row0 + r, col // cols)), words[r])\n            if const_expr(quantize):\n                q = [cute.make_rmem_tensor((1, 2), Int32) for _ in range(_ROWS)]\n                for r in cutlass.range_constexpr(_ROWS):\n                    q[r][0, 0] = quantize4(words[r][0, 0], words[r][0, 1], inv)\n                    q[r][0, 1] = quantize4(words[r][0, 2], words[r][0, 3], inv)\n                    if const_expr(mQ is not None):\n                        cute.autovec_copy(\n                            q[r], cute.local_tile(mQ, (1, 2), (row0 + r, col // cols))\n                        )\n                words = q\n            _store_transposed(words, cols // 4, mQT, col, row0)\n\n    \u0040cute.jit\n    def launch(stream: cuda_driver.CUstream, mIn, mInv, mQ, mQT):\n        kernel(mIn, mInv, mQ, mQT).launch(grid=grid, block=block, stream=stream)\n\n    \u0040cute.jit\n    def launch_quantize_transposed_only(stream: cuda_driver.CUstream, mIn, mInv, mQT):\n        launch(stream, mIn, mInv, None, mQT)\n\n    \u0040cute.jit\n    def launch_transpose(stream: cuda_driver.CUstream, mIn, mQT):\n        launch(stream, mIn, None, None, mQT)\n\n    q_t_spec = jax.ShapeDtypeStruct((n, m // 4), jnp.int32)\n    if not quantize:\n        return cutlass_call(\n            launch_transpose, output_shape_dtype=[q_t_spec], use_static_tensors=True\n        )\n    if not with_untransposed:\n        return cutlass_call(\n            launch_quantize_transposed_only, output_shape_dtype=[q_t_spec], use_static_tensors=True\n        )\n    q_spec = jax.ShapeDtypeStruct((m, n // 4), jnp.int32)\n    return cutlass_call(launch, output_shape_dtype=[q_spec, q_t_spec], use_static_tensors=True)\n",
+      "source_digest": "0f0ab3e610121c015abcce6598d3dedf9e734ccbce0069646668392cb63072fa",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/cutedsl/fp8_transpose.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-8401f959d14db6834bdd10be04048406b848848bf50976ac4d2945cc7754835d",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "2c6789709ef2118342a01a0d58ce840f624b8cecb05ab1491a288da5972d53e3",
+      "context_complete": true,
+      "task_id": "T-ced570332e44b8fe6e8c27d4830d62ab6d9540f458ff203e89967cde9b82ed3f",
+      "evidence_refs": [
+        "E1"
+      ]
+    }
+  ],
+  "task_id": "T-e3e335d1cb3383b0ab33936b48f33d167b317299704f7371a01c21f8c8be1cb7",
+  "context_dependencies": [
+    "T-6566ccf62e1e649652d075e1e8dee422975452e604064aa486107833a1015d81"
+  ],
+  "replaces_task_id": "T-3ae69ac5fd4d356b27e3aa50fdc19c2252604f725a321c0fa6d88e08d7c47be7",
+  "ancestor_task_ids": [
+    "T-3ae69ac5fd4d356b27e3aa50fdc19c2252604f725a321c0fa6d88e08d7c47be7"
+  ]
+}

@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-ee2ebdf7a280db26bac91f120b2d76cd26d8d43d7e1bc2564960c72184b6ae44",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 298,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport math\nimport typing\nfrom dataclasses import replace\nfrom typing import TYPE_CHECKING, Any, NamedTuple\n\nimport jax\nimport jax.numpy as jnp\nfrom jax import shard_map\nfrom jax.sharding import PartitionSpec as P\n\nfrom xai_configlib import Config, configclass\nfrom xrex.models.model_utils import Parameter\nfrom xrex.optimizers.recsys.protocol import AsyncEmbOptimizer, RecsysEmbeddingOptimizer, _lookup\n\nif TYPE_CHECKING:\n    from xrex.cuda.async_emb import (\n        async_emb,\n    )\n\n_LN2 = math.log(2)\n\n\n\u0040configclass\nclass RecsysRowwiseAdagradConfig(Config):\n    enabled: bool = False\n    learning_rate: float = 0.1\n    eps: float = 1e-10\n    initial_accumulator_value: float = 0.0\n    half_life_steps: int | None = 5000\n    lazy_decay: bool = False\n    weight_decay: float = 0.0\n\n\nclass RecsysRowwiseAdagradState(NamedTuple):\n    row_sum_sq: dict[str, jnp.ndarray]\n    step: jnp.ndarray | None = None\n    last_step: dict[str, jnp.ndarray] | None = None\n\n\nclass RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer):\n    def __init__(\n        self,\n        learning_rate: float = 0.1,\n        eps: float = 1e-10,\n        initial_accumulator_value: float = 0.0,\n        half_life_steps: int | None = None,\n        lazy_decay: bool = False,\n        weight_decay: float = 0.0,\n    ):\n        self._learning_rate = learning_rate\n        self._eps = eps\n        self._initial_accumulator_value = initial_accumulator_value\n        self._lazy_decay = lazy_decay\n        self._weight_decay = weight_decay\n        self._decay_rate = _LN2 / half_life_steps if half_life_steps is not None else None\n\n    def init(self, params: dict[str, Parameter]) -> RecsysRowwiseAdagradState:\n        row_sum_sq = {}\n        last_step = {}\n        for key, p in params.items():\n            num_rows = p.x.shape[0]\n            row_sum_sq[key] = jnp.full(\n                (num_rows,), self._initial_accumulator_value, dtype=jnp.float32\n            )\n            last_step[key] = jnp.zeros((num_rows,), dtype=jnp.int32)\n        lazy_features = self._decay_rate is not None or self._weight_decay > 0.0\n        need_timestamps = lazy_features and self._lazy_decay\n        return RecsysRowwiseAdagradState(\n            row_sum_sq=row_sum_sq,\n            step=jnp.zeros((), dtype=jnp.int32) if need_timestamps else None,\n            last_step=last_step if need_timestamps else None,\n        )\n\n    def transform_embeddings(\n        self,\n        embeddings: Any,\n        token_ids: jax.Array,\n        state: Any,\n    ) -> tuple[Any, Any]:\n        return embeddings, None\n\n    \u0040property\n    def decay_factor(self) -> float:\n        return math.exp(-self._decay_rate) if self._decay_rate is not None else 1.0\n\n    def gradient_update_start(\n        self,\n        context: async_emb.AsyncEmbContextHandle,\n        table: jax.Array,\n        state: RecsysRowwiseAdagradState,\n        gate: jax.Array,\n    ) -> tuple[jax.Array, jax.Array, RecsysRowwiseAdagradState, dict[str, jax.Array]]:\n        if self._lazy_decay and (state.step is None or state.last_step is None):\n            raise ValueError(\"fused lazy decay needs timestamped state (step/last_step)\")\n\n        from xrex.utils import recsys_async_emb\n\n        async_emb = recsys_async_emb.kernel_bindings(context)\n        row_sharded = recsys_async_emb.is_row_sharded(context)\n        if not row_sharded and 32 % context.shard_width != 0:\n            raise ValueError(\n                f\"the fused rowwise Adagrad update needs a row shard that divides a warp, \"\n                f\"got shard_width={context.shard_width} (emb_width={context.emb_width})\"\n            )\n\n        metrics: dict[str, jax.Array] = {}\n\n        table_spec = recsys_async_emb.table_spec(context)\n        state_spec = P(context.table_axis) if row_sharded else P()\n        if self._lazy_decay:\n\n            \u0040shard_map(\n                mesh=context.mesh,\n                in_specs=(table_spec, state_spec, state_spec, P(), P(context.data_axis, None)),\n                out_specs=(table_spec, state_spec, state_spec, P()),\n                check_vma=False,\n            )\n            def start_lazy(\n                table: jax.Array,\n                accum: jax.Array,\n                last_step: jax.Array,\n                step: jax.Array,\n                gate: jax.Array,\n            ) -> tuple[jax.Array, ...]:\n                return async_emb.rowwise_adagrad_lazy_update_start(\n                    table,\n                    accum,\n                    last_step,\n                    step,\n                    gate,\n                    context,\n                    learning_rate=self._learning_rate,\n                    eps=self._eps,\n                    accum_decay_rate=self._decay_rate or 0.0,\n                    weight_decay_rate=self._weight_decay,\n                )\n\n            assert state.step is not None and state.last_step is not None\n            table_out, accum_out, last_step_out, pin = start_lazy(\n                table, state.row_sum_sq[\"table\"], state.last_step[\"table\"], state.step, gate\n            )\n            return (\n                pin,\n                table_out,\n                state._replace(\n                    row_sum_sq={**state.row_sum_sq, \"table\": accum_out},\n                    last_step={**state.last_step, \"table\": last_step_out},\n                ),\n                metrics,\n            )\n\n        \u0040shard_map(\n            mesh=context.mesh,\n            in_specs=(table_spec, state_spec, P(context.data_axis, None)),\n            out_specs=(table_spec, state_spec, P()),\n            check_vma=False,\n        )\n        def start(table: jax.Array, accum: jax.Array, gate: jax.Array) -> tuple[jax.Array, ...]:\n            return async_emb.rowwise_adagrad_update_start(\n                table,\n                accum,\n                gate,\n                context,\n                learning_rate=self._learning_rate,\n                eps=self._eps,\n                decay_factor=self.decay_factor,\n                weight_decay_factor=math.exp(-self._weight_decay),\n            )\n\n        table_out, accum_out, pin = start(table, state.row_sum_sq[\"table\"], gate)\n        return (\n            pin,\n            table_out,\n            state._replace(row_sum_sq={**state.row_sum_sq, \"table\": accum_out}),\n            metrics,\n        )\n\n    def gradient_update_done(\n        self,\n        context: async_emb.AsyncEmbContextHandle,\n        state: RecsysRowwiseAdagradState,\n        gate: jax.Array,\n    ) -> tuple[jax.Array, jax.Array, jax.Array, RecsysRowwiseAdagradState, jax.Array]:\n        from xrex.utils import recsys_async_emb\n\n        async_emb = recsys_async_emb.kernel_bindings(context)\n\n        \u0040shard_map(\n            mesh=context.mesh, in_specs=(P(),), out_specs=(P(), P(), P(), P()), check_vma=False\n        )\n        def done(gate: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:\n            norm, valid, pending, done_pin = async_emb.rowwise_adagrad_update_done(gate, context)\n            return norm, valid != 0, pending != 0, done_pin\n\n        norm, valid, pending, done_pin = done(gate)\n        if self._lazy_decay:\n            assert state.step is not None\n            state = state._replace(step=state.step + valid.astype(jnp.int32))\n        return norm, valid, pending, state, done_pin\n\n    def sparse_update(\n        self,\n        grads: Parameter,\n        full_state: Any,\n        full_emb_table: Parameter,\n        unique_tokens: jax.Array,\n        num_unique: int,\n        lr: float,\n        valid_step: jax.Array,\n        carry: Any = None,\n    ) -> tuple[Parameter, RecsysRowwiseAdagradState, dict[str, jax.Array]]:\n        del lr\n        full_state = typing.cast(RecsysRowwiseAdagradState, full_state)\n        eps = self._eps\n\n        big_accum = full_state.row_sum_sq[\"table\"]\n        small_accum = big_accum[unique_tokens]\n        small_emb_table = _lookup(full_emb_table, unique_tokens)\n\n        _has_timestamps = full_state.step is not None and full_state.last_step is not None\n        delta = None\n        if _has_timestamps:\n            current_step = full_state.step\n            small_last_step = full_state.last_step[\"table\"][unique_tokens]\n            delta = jnp.maximum(0, current_step - small_last_step)\n        if self._decay_rate is not None:\n            if self._lazy_decay:\n                assert delta is not None\n                decay_factor = jnp.exp(-delta * self._decay_rate)\n            else:\n                decay_factor = self.decay_factor\n            small_accum = small_accum * decay_factor\n\n        g = grads.x.astype(jnp.float32)\n        row_mean_sq = jnp.mean(g**2, axis=-1)\n        new_small_accum = small_accum + row_mean_sq\n        scale = 1.0 / (jnp.sqrt(new_small_accum) + eps)\n        update = -self._learning_rate * scale[:, None] * g\n\n        base_x = small_emb_table.x\n        if self._weight_decay > 0.0:\n            if self._lazy_decay:\n                assert delta is not None\n                wd_factor = jnp.exp(-delta.astype(jnp.float32) * self._weight_decay)\n            else:\n                wd_factor = jnp.full_like(row_mean_sq, math.exp(-self._weight_decay))\n            touched = row_mean_sq > 0.0\n            wd_factor = jnp.where(touched, wd_factor, 1.0)[:, None]\n            base_x = (base_x.astype(jnp.float32) * wd_factor).astype(small_emb_table.x.dtype)\n        new_params = replace(\n            small_emb_table,\n            x=(base_x + update.astype(small_emb_table.x.dtype)),\n        )\n\n        new_emb_table = replace(\n            full_emb_table,\n            x=full_emb_table.x.at[unique_tokens[:num_unique]].set(\n                jnp.where(valid_step, new_params.x, small_emb_table.x)\n            ),\n        )\n\n        metrics: dict[str, jax.Array] = {}\n\n        new_big_accum = jnp.where(\n            valid_step,\n            big_accum.at[unique_tokens].set(new_small_accum),\n            big_accum,\n        )\n\n        if _has_timestamps:\n            big_last_step = full_state.last_step[\"table\"]\n            new_big_last_step = jnp.where(\n                valid_step,\n                big_last_step.at[unique_tokens].set(\n                    jnp.broadcast_to(current_step, unique_tokens.shape)\n                ),\n                big_last_step,\n            )\n            new_step = jnp.where(valid_step, current_step + 1, current_step)\n            return (\n                new_emb_table,\n                RecsysRowwiseAdagradState(\n                    row_sum_sq={\"table\": new_big_accum},\n                    step=new_step,\n                    last_step={\"table\": new_big_last_step},\n                ),\n                metrics,\n            )\n\n        return (\n            new_emb_table,\n            RecsysRowwiseAdagradState(row_sum_sq={\"table\": new_big_accum}),\n            metrics,\n        )\n",
+      "source_digest": "af8b4a871b7ee4ace115cec8d4b2135a2b2f2473be3c622659770814a5802e39",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 300,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport math\nimport typing\nfrom dataclasses import replace\nfrom typing import TYPE_CHECKING, Any, NamedTuple\n\nimport jax\nimport jax.numpy as jnp\nfrom jax import shard_map\nfrom jax.sharding import PartitionSpec as P\n\nfrom xai_configlib import Config, configclass\nfrom xrex.models.model_utils import Parameter\nfrom xrex.optimizers.recsys.protocol import AsyncEmbOptimizer, RecsysEmbeddingOptimizer, _lookup\n\nif TYPE_CHECKING:\n    from xrex.cuda.async_emb import (\n        async_emb,\n    )\n\n_LN2 = math.log(2)\n_MAX_FUSED_SHARD_WIDTH = 32\n\n\n\u0040configclass\nclass RecsysRowwiseAdagradConfig(Config):\n    enabled: bool = False\n    learning_rate: float = 0.1\n    eps: float = 1e-10\n    initial_accumulator_value: float = 0.0\n    half_life_steps: int | None = 5000\n    lazy_decay: bool = False\n    weight_decay: float = 0.0\n\n\nclass RecsysRowwiseAdagradState(NamedTuple):\n    row_sum_sq: dict[str, jnp.ndarray]\n    step: jnp.ndarray | None = None\n    last_step: dict[str, jnp.ndarray] | None = None\n\n\nclass RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer):\n    def __init__(\n        self,\n        learning_rate: float = 0.1,\n        eps: float = 1e-10,\n        initial_accumulator_value: float = 0.0,\n        half_life_steps: int | None = None,\n        lazy_decay: bool = False,\n        weight_decay: float = 0.0,\n    ):\n        self._learning_rate = learning_rate\n        self._eps = eps\n        self._initial_accumulator_value = initial_accumulator_value\n        self._lazy_decay = lazy_decay\n        self._weight_decay = weight_decay\n        self._decay_rate = _LN2 / half_life_steps if half_life_steps is not None else None\n\n    def init(self, params: dict[str, Parameter]) -> RecsysRowwiseAdagradState:\n        row_sum_sq = {}\n        last_step = {}\n        for key, p in params.items():\n            num_rows = p.x.shape[0]\n            row_sum_sq[key] = jnp.full(\n                (num_rows,), self._initial_accumulator_value, dtype=jnp.float32\n            )\n            last_step[key] = jnp.zeros((num_rows,), dtype=jnp.int32)\n        lazy_features = self._decay_rate is not None or self._weight_decay > 0.0\n        need_timestamps = lazy_features and self._lazy_decay\n        return RecsysRowwiseAdagradState(\n            row_sum_sq=row_sum_sq,\n            step=jnp.zeros((), dtype=jnp.int32) if need_timestamps else None,\n            last_step=last_step if need_timestamps else None,\n        )\n\n    def transform_embeddings(\n        self,\n        embeddings: Any,\n        token_ids: jax.Array,\n        state: Any,\n    ) -> tuple[Any, Any]:\n        return embeddings, None\n\n    \u0040property\n    def decay_factor(self) -> float:\n        return math.exp(-self._decay_rate) if self._decay_rate is not None else 1.0\n\n    def gradient_update_start(\n        self,\n        context: async_emb.AsyncEmbContextHandle,\n        table: jax.Array,\n        state: RecsysRowwiseAdagradState,\n        gate: jax.Array,\n    ) -> tuple[jax.Array, jax.Array, RecsysRowwiseAdagradState, dict[str, jax.Array]]:\n        if self._lazy_decay and (state.step is None or state.last_step is None):\n            raise ValueError(\"fused lazy decay needs timestamped state (step/last_step)\")\n\n        from xrex.utils import recsys_async_emb\n\n        async_emb = recsys_async_emb.kernel_bindings(context)\n        row_sharded = recsys_async_emb.is_row_sharded(context)\n        if not row_sharded and _MAX_FUSED_SHARD_WIDTH % context.shard_width != 0:\n            raise ValueError(\n                \"the fused rowwise Adagrad update needs shard_width to divide \"\n                f\"{_MAX_FUSED_SHARD_WIDTH}, got shard_width={context.shard_width} \"\n                f\"(emb_width={context.emb_width})\"\n            )\n\n        metrics: dict[str, jax.Array] = {}\n\n        table_spec = recsys_async_emb.table_spec(context)\n        state_spec = P(context.table_axis) if row_sharded else P()\n        if self._lazy_decay:\n\n            \u0040shard_map(\n                mesh=context.mesh,\n                in_specs=(table_spec, state_spec, state_spec, P(), P(context.data_axis, None)),\n                out_specs=(table_spec, state_spec, state_spec, P()),\n                check_vma=False,\n            )\n            def start_lazy(\n                table: jax.Array,\n                accum: jax.Array,\n                last_step: jax.Array,\n                step: jax.Array,\n                gate: jax.Array,\n            ) -> tuple[jax.Array, ...]:\n                return async_emb.rowwise_adagrad_lazy_update_start(\n                    table,\n                    accum,\n                    last_step,\n                    step,\n                    gate,\n                    context,\n                    learning_rate=self._learning_rate,\n                    eps=self._eps,\n                    accum_decay_rate=self._decay_rate or 0.0,\n                    weight_decay_rate=self._weight_decay,\n                )\n\n            assert state.step is not None and state.last_step is not None\n            table_out, accum_out, last_step_out, pin = start_lazy(\n                table, state.row_sum_sq[\"table\"], state.last_step[\"table\"], state.step, gate\n            )\n            return (\n                pin,\n                table_out,\n                state._replace(\n                    row_sum_sq={**state.row_sum_sq, \"table\": accum_out},\n                    last_step={**state.last_step, \"table\": last_step_out},\n                ),\n                metrics,\n            )\n\n        \u0040shard_map(\n            mesh=context.mesh,\n            in_specs=(table_spec, state_spec, P(context.data_axis, None)),\n            out_specs=(table_spec, state_spec, P()),\n            check_vma=False,\n        )\n        def start(table: jax.Array, accum: jax.Array, gate: jax.Array) -> tuple[jax.Array, ...]:\n            return async_emb.rowwise_adagrad_update_start(\n                table,\n                accum,\n                gate,\n                context,\n                learning_rate=self._learning_rate,\n                eps=self._eps,\n                decay_factor=self.decay_factor,\n                weight_decay_factor=math.exp(-self._weight_decay),\n            )\n\n        table_out, accum_out, pin = start(table, state.row_sum_sq[\"table\"], gate)\n        return (\n            pin,\n            table_out,\n            state._replace(row_sum_sq={**state.row_sum_sq, \"table\": accum_out}),\n            metrics,\n        )\n\n    def gradient_update_done(\n        self,\n        context: async_emb.AsyncEmbContextHandle,\n        state: RecsysRowwiseAdagradState,\n        gate: jax.Array,\n    ) -> tuple[jax.Array, jax.Array, jax.Array, RecsysRowwiseAdagradState, jax.Array]:\n        from xrex.utils import recsys_async_emb\n\n        async_emb = recsys_async_emb.kernel_bindings(context)\n\n        \u0040shard_map(\n            mesh=context.mesh, in_specs=(P(),), out_specs=(P(), P(), P(), P()), check_vma=False\n        )\n        def done(gate: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:\n            norm, valid, pending, done_pin = async_emb.rowwise_adagrad_update_done(gate, context)\n            return norm, valid != 0, pending != 0, done_pin\n\n        norm, valid, pending, done_pin = done(gate)\n        if self._lazy_decay:\n            assert state.step is not None\n            state = state._replace(step=state.step + valid.astype(jnp.int32))\n        return norm, valid, pending, state, done_pin\n\n    def sparse_update(\n        self,\n        grads: Parameter,\n        full_state: Any,\n        full_emb_table: Parameter,\n        unique_tokens: jax.Array,\n        num_unique: int,\n        lr: float,\n        valid_step: jax.Array,\n        carry: Any = None,\n    ) -> tuple[Parameter, RecsysRowwiseAdagradState, dict[str, jax.Array]]:\n        del lr\n        full_state = typing.cast(RecsysRowwiseAdagradState, full_state)\n        eps = self._eps\n\n        big_accum = full_state.row_sum_sq[\"table\"]\n        small_accum = big_accum[unique_tokens]\n        small_emb_table = _lookup(full_emb_table, unique_tokens)\n\n        _has_timestamps = full_state.step is not None and full_state.last_step is not None\n        delta = None\n        if _has_timestamps:\n            current_step = full_state.step\n            small_last_step = full_state.last_step[\"table\"][unique_tokens]\n            delta = jnp.maximum(0, current_step - small_last_step)\n        if self._decay_rate is not None:\n            if self._lazy_decay:\n                assert delta is not None\n                decay_factor = jnp.exp(-delta * self._decay_rate)\n            else:\n                decay_factor = self.decay_factor\n            small_accum = small_accum * decay_factor\n\n        g = grads.x.astype(jnp.float32)\n        row_mean_sq = jnp.mean(g**2, axis=-1)\n        new_small_accum = small_accum + row_mean_sq\n        scale = 1.0 / (jnp.sqrt(new_small_accum) + eps)\n        update = -self._learning_rate * scale[:, None] * g\n\n        base_x = small_emb_table.x\n        if self._weight_decay > 0.0:\n            if self._lazy_decay:\n                assert delta is not None\n                wd_factor = jnp.exp(-delta.astype(jnp.float32) * self._weight_decay)\n            else:\n                wd_factor = jnp.full_like(row_mean_sq, math.exp(-self._weight_decay))\n            touched = row_mean_sq > 0.0\n            wd_factor = jnp.where(touched, wd_factor, 1.0)[:, None]\n            base_x = (base_x.astype(jnp.float32) * wd_factor).astype(small_emb_table.x.dtype)\n        new_params = replace(\n            small_emb_table,\n            x=(base_x + update.astype(small_emb_table.x.dtype)),\n        )\n\n        new_emb_table = replace(\n            full_emb_table,\n            x=full_emb_table.x.at[unique_tokens[:num_unique]].set(\n                jnp.where(valid_step, new_params.x, small_emb_table.x)\n            ),\n        )\n\n        metrics: dict[str, jax.Array] = {}\n\n        new_big_accum = jnp.where(\n            valid_step,\n            big_accum.at[unique_tokens].set(new_small_accum),\n            big_accum,\n        )\n\n        if _has_timestamps:\n            big_last_step = full_state.last_step[\"table\"]\n            new_big_last_step = jnp.where(\n                valid_step,\n                big_last_step.at[unique_tokens].set(\n                    jnp.broadcast_to(current_step, unique_tokens.shape)\n                ),\n                big_last_step,\n            )\n            new_step = jnp.where(valid_step, current_step + 1, current_step)\n            return (\n                new_emb_table,\n                RecsysRowwiseAdagradState(\n                    row_sum_sq={\"table\": new_big_accum},\n                    step=new_step,\n                    last_step={\"table\": new_big_last_step},\n                ),\n                metrics,\n            )\n\n        return (\n            new_emb_table,\n            RecsysRowwiseAdagradState(row_sum_sq={\"table\": new_big_accum}),\n            metrics,\n        )\n",
+      "source_digest": "27454b091340b5be5ebd8e1c19ef344884d5886829f0f147e03313162d4f1828",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E3": {
+      "path": "phoenix/xrex/optimizers/recsys/__init__.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 13,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom xrex.optimizers.recsys.config import RecsysEmbeddingOptimConfig\nfrom xrex.optimizers.recsys.dense_optim import RecsysDenseOptimConfig\nfrom xrex.optimizers.recsys.protocol import (\n    RecsysEmbeddingOptimizer,\n    _lookup,\n)\nfrom xrex.optimizers.recsys.rowwise_adagrad import (\n    RecsysRowwiseAdagradConfig,\n    RecsysRowwiseAdagradOptimizer,\n    RecsysRowwiseAdagradState,\n)\n",
+      "source_digest": "2e94d85ba5b58ca2d35c03421971aa13914bea5bafc8cf688f77b292413cc3ad",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E4": {
+      "path": "phoenix/xrex/optimizers/recsys/config.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 23,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport optax\n\nfrom xai_configlib import Config, configclass\nfrom xrex.optimizers.recsys.protocol import RecsysEmbeddingOptimizer\nfrom xrex.optimizers.recsys.rowwise_adagrad import (\n    RecsysRowwiseAdagradConfig,\n    RecsysRowwiseAdagradOptimizer,\n)\n\n\n\u0040configclass\nclass RecsysEmbeddingOptimConfig(Config):\n    rowwise_adagrad: RecsysRowwiseAdagradConfig = RecsysRowwiseAdagradConfig()\n\n    def _active(self) -> str:\n        return \"rowwise_adagrad\"\n\n    def make(self) -> optax.GradientTransformation | None:\n        return None\n",
+      "source_digest": "fc62027aa2b00fdf45ecc23c0ac2842804ecc3224f781f13801c9b8633617abf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E5": {
+      "path": "phoenix/xrex/optimizers/recsys/config.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 18,
+      "end_line": 37,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    def _active(self) -> str:\n        return \"rowwise_adagrad\"\n\n    def make(self) -> optax.GradientTransformation | None:\n        return None\n\n    def make_optimizer(\n        self, shared_optim: optax.GradientTransformation\n    ) -> RecsysEmbeddingOptimizer:\n        del shared_optim\n        cfg = self.rowwise_adagrad\n        return RecsysRowwiseAdagradOptimizer(\n            learning_rate=cfg.learning_rate,\n            eps=cfg.eps,\n            initial_accumulator_value=cfg.initial_accumulator_value,\n            half_life_steps=cfg.half_life_steps,\n            lazy_decay=cfg.lazy_decay,\n            weight_decay=cfg.weight_decay,\n        )\n",
+      "source_digest": "142bbcaabd26e25144ead8cf393302a8067d37da7a64fddab26059cb0a908ce7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E6": {
+      "path": "phoenix/xrex/optimizers/recsys/__init__.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 13,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom xrex.optimizers.recsys.config import RecsysEmbeddingOptimConfig\nfrom xrex.optimizers.recsys.dense_optim import RecsysDenseOptimConfig\nfrom xrex.optimizers.recsys.protocol import (\n    RecsysEmbeddingOptimizer,\n    _lookup,\n)\nfrom xrex.optimizers.recsys.rowwise_adagrad import (\n    RecsysRowwiseAdagradConfig,\n    RecsysRowwiseAdagradOptimizer,\n    RecsysRowwiseAdagradState,\n)\n",
+      "source_digest": "2e94d85ba5b58ca2d35c03421971aa13914bea5bafc8cf688f77b292413cc3ad",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E7": {
+      "path": "phoenix/xrex/optimizers/recsys/config.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 23,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport optax\n\nfrom xai_configlib import Config, configclass\nfrom xrex.optimizers.recsys.protocol import RecsysEmbeddingOptimizer\nfrom xrex.optimizers.recsys.rowwise_adagrad import (\n    RecsysRowwiseAdagradConfig,\n    RecsysRowwiseAdagradOptimizer,\n)\n\n\n\u0040configclass\nclass RecsysEmbeddingOptimConfig(Config):\n    rowwise_adagrad: RecsysRowwiseAdagradConfig = RecsysRowwiseAdagradConfig()\n\n    def _active(self) -> str:\n        return \"rowwise_adagrad\"\n\n    def make(self) -> optax.GradientTransformation | None:\n        return None\n",
+      "source_digest": "fc62027aa2b00fdf45ecc23c0ac2842804ecc3224f781f13801c9b8633617abf",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E8": {
+      "path": "phoenix/xrex/optimizers/recsys/config.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 18,
+      "end_line": 37,
+      "kind": "definition_or_reference",
+      "scope": "reference_window",
+      "text": "\n    def _active(self) -> str:\n        return \"rowwise_adagrad\"\n\n    def make(self) -> optax.GradientTransformation | None:\n        return None\n\n    def make_optimizer(\n        self, shared_optim: optax.GradientTransformation\n    ) -> RecsysEmbeddingOptimizer:\n        del shared_optim\n        cfg = self.rowwise_adagrad\n        return RecsysRowwiseAdagradOptimizer(\n            learning_rate=cfg.learning_rate,\n            eps=cfg.eps,\n            initial_accumulator_value=cfg.initial_accumulator_value,\n            half_life_steps=cfg.half_life_steps,\n            lazy_decay=cfg.lazy_decay,\n            weight_decay=cfg.weight_decay,\n        )\n",
+      "source_digest": "142bbcaabd26e25144ead8cf393302a8067d37da7a64fddab26059cb0a908ce7",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-ee2ebdf7a280db26bac91f120b2d76cd26d8d43d7e1bc2564960c72184b6ae44",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "2cbbb2768f5444d0aebe85a57b516cbf78bf4e4427f48dd931df97bfc7905b65",
+      "context_complete": true,
+      "task_id": "T-df52bfbeb1037476656795bd905c368a998e58ad5a2febea106678cf7c0835ed",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-4e59fd36acc3aed524f013b1c25fc7f0164f2785a6b9519cc1022ccb2d924b8c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "RecsysRowwiseAdagradOptimizer"
+      ],
+      "context_complete": false,
+      "task_id": "T-c5e1daaeaa4f8372451e7046e193bcb8f5275313dff090d03da66b68e692edea",
+      "evidence_refs": [
+        "E3"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-7ebd24aa598a86b55ad42809ffd1612ee7b0f394e7ad3587a5d630c349781c77",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "RecsysRowwiseAdagradOptimizer"
+      ],
+      "context_complete": false,
+      "task_id": "T-a7667d0c6ba11520b467a5cc9850c6e81ea5f337ea15333b75f434814c96506b",
+      "evidence_refs": [
+        "E4"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-3c3de5a9de4a31f714fac245c599357fbaf1b6bc20f6df35d918f99c2408a58d",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "RecsysRowwiseAdagradOptimizer"
+      ],
+      "context_complete": false,
+      "task_id": "T-ce7d6589695d27c49dd7c28a4d5cc2631a43ece783300a4aa0f2e070d305ca11",
+      "evidence_refs": [
+        "E5"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-6b739decf553dd59b22ef13402908e17d37da4c64cb530f06e5bb64a421312e5",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "RecsysRowwiseAdagradOptimizer"
+      ],
+      "context_complete": false,
+      "task_id": "T-85528fd4ed4a677a687a7adb9a4cff65471d77906235efd9a317f4ea46dc18fd",
+      "evidence_refs": [
+        "E6"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-bce17e19238b67e2adf3f618a9a60a975e3927fa806abf68c4c8727a3181009c",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "RecsysRowwiseAdagradOptimizer"
+      ],
+      "context_complete": false,
+      "task_id": "T-1a448cea5207bb634f25a3a43238e23eb9c5404e90b499d19691132c406b0aa1",
+      "evidence_refs": [
+        "E7"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/optimizers/recsys/rowwise_adagrad.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-5668e8a1652ee0124082462c14a9637740ca66200140c15f98101f7ec5181106",
+      "change_scope": "supporting_context",
+      "mechanism_group": "phoenix/xrex",
+      "query_symbols": [
+        "RecsysRowwiseAdagradOptimizer"
+      ],
+      "context_complete": false,
+      "task_id": "T-53a16b9c54d0382924a5fe68350107261f1a24d949cae4645ee22f3e7bda35a6",
+      "evidence_refs": [
+        "E8"
+      ]
+    }
+  ],
+  "task_id": "T-a384e72c109d5e79371eab66ba289bf94e7087b8732b1510ec483a6f652f643e"
+}

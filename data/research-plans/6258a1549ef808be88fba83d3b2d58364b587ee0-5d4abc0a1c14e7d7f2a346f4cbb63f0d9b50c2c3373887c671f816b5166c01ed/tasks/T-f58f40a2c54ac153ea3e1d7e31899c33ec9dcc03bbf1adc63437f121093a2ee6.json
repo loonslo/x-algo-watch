@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/train/checkpoint_write.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-9ec0a0e967da2999a12500b1aa3ec0f2f0e0cc04a332a077ed1266e3abd70836",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 167,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport json\nimport logging\nimport os\nfrom collections import namedtuple\nfrom typing import Callable\n\nimport jax\nfrom jax.experimental import multihost_utils\nfrom opentelemetry.trace import Tracer\n\nfrom xrex.models.model_utils import unwrap_tree\nfrom xrex.utils import checkpointing\nfrom xrex.utils import metrics as metrics_utils\nfrom xrex.utils.aot import JittedOrCompiled\nfrom xrex.utils.tracer import MockTracer\n\nrank_logger = logging.getLogger(\"rank\")\n\n\ndef install_offload_state(trainer) -> None:\n    def d2h_copy(src, dst):\n        dst = jax.device_put(src, trainer.host_sharding)\n        return src, dst\n\n    trainer.offload_state = JittedOrCompiled(\n        jax.jit(\n            d2h_copy,\n            in_shardings=(trainer.state_sharding, trainer.host_sharding),\n            out_shardings=(trainer.state_sharding, trainer.host_sharding),\n            donate_argnums=(0, 1),\n            keep_unused=True,\n        )\n    )\n\n\ndef register_offload_state(trainer) -> None:\n    trainer.register_jit_function(\n        trainer.offload_state, trainer.state_shape, trainer.state_shape, phase=\"early\"\n    )\n\n\ndef barrier(self, name: str) -> None:\n    multihost_utils.sync_global_devices(name)\n\n\ndef get_checkpoint_path(self, ctx) -> str:\n    return ctx.run.checkpoint_path(self.checkpoint_config.checkpoint_dir, self.elapsed_samples)\n\n\ndef save_checkpoint(\n    self,\n    tag: str | None = None,\n    blocking: bool = False,\n    callback: Callable[[int, str], None] | None = None,\n    tracer: Tracer | None = None,\n    checkpoint_index: int | None = None,\n    checksum_dict: dict | None = None,\n):\n    if not tracer:\n        tracer = MockTracer()\n    if not hasattr(jax._src.config, \"enable_memories\"):\n        _FakeState = namedtuple(\"_FakeState\", [\"value\"])\n        jax._src.config.enable_memories = _FakeState(value=True)\n\n    path = self.get_checkpoint_path(self.ctx)\n\n    encrypt_checkpoint = self.checkpoint_config.encrypt\n    if getattr(self, \"_restored_encrypted\", False) and not encrypt_checkpoint:\n        raise ValueError(\n            \"restored from an ENCRYPTED checkpoint but checkpoint_config.encrypt is \"\n            \"false — refusing to downgrade to plaintext saves; set \"\n            \"checkpoint_config.encrypt=true with encryption_key_id/encryption_context\"\n        )\n    kms_client = None\n    if encrypt_checkpoint:\n        if self.checkpoint_config.encryption_key_id is None:\n            raise ValueError(\n                \"checkpoint_config.encrypt requires checkpoint_config.encryption_key_id\"\n            )\n        missing_context = {\"domain\", \"run\"} - self.checkpoint_config.encryption_context.keys()\n        if missing_context:\n            raise ValueError(\n                \"encrypted checkpoint context is missing \" + \", \".join(sorted(missing_context))\n            )\n        import hashlib\n\n        import xai_kms\n\n        encryption_context = dict(self.checkpoint_config.encryption_context)\n        encryption_context[\"mint_nonce\"] = hashlib.sha256(os.fsencode(path)).hexdigest()\n        kms_client = xai_kms.KmsClient.from_cluster_env(\n            key_id=self.checkpoint_config.encryption_key_id,\n            encryption_context=encryption_context,\n        )\n\n    with tracer.start_as_current_span(\"write_checksum\"):\n        if self.checkpoint_config.write_checksums:\n            if checksum_dict is None:\n                rank_logger.info(\"Computing checksums for state\")\n                checksum_dict = self.checksum_dict()\n            if jax.process_index() == 0:\n                os.makedirs(path, exist_ok=True)\n                with open(f\"{path}/checksums.{jax.process_index()}.json\", \"w\") as f:\n                    json.dump(checksum_dict, f)\n                    rank_logger.info(\n                        \"Wrote %i checksums to %s\",\n                        len(checksum_dict[\"shard_checksums\"]),\n                        f.name,\n                    )\n\n    def _callback(\n        elapsed_samples: int = self.elapsed_samples,\n        elapsed_tokens: int = self.elapsed_tokens,\n        trainer_step: int = self.step,\n    ) -> None:\n        if checkpoint_index is not None:\n            self.current_ckpt_index = checkpoint_index\n        else:\n            self.current_ckpt_index += 1\n        metrics_utils.addto(\"checkpoints_done\", ((elapsed_samples, self.current_ckpt_index),), ())\n\n        self.ctx.meta.record_completed_checkpoint(\n            self.checkpoint_config.checkpoint_dir,\n            elapsed_samples,\n            self.current_ckpt_index,\n            elapsed_tokens,\n            trainer_step,\n            self.checkpoint_config.checkpoint_ttl,\n        )\n\n        if callback is not None:\n            callback(self.elapsed_samples, path)\n\n    if self.checkpoint_config.save_method != \"orbax\":\n        raise ValueError(\n            f\"save_method={self.checkpoint_config.save_method!r} is retired: the \"\n            '\"tensorstore\" save arm (xai_checkpointing background_save_ts plus its '\n            \"d2h offload staging) was removed because no fork configuration ever \"\n            \"selected it — orbax is the only writer whose output the serving \"\n            \"loader and repack tooling accept. Leave save_method unset (it \"\n            'defaults to \"orbax\"); the field survives only because stored '\n            \"run-configs serialize it and strict from_dict would reject a \"\n            \"deleted key.\"\n        )\n    checkpointing.save_checkpoint(\n        unwrap_tree(self.state),\n        path=path,\n        callback=_callback,\n        tag=tag,\n        blocking=blocking,\n        timeout_secs=self.checkpoint_config.timeout_secs,\n        chunked=self.checkpoint_config.checkpoint_chunked,\n        compressed=self.checkpoint_config.checkpoint_compressed,\n        chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,\n        tracer=tracer,\n        save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,\n        kms_client=kms_client,\n        encryption_chunk_size=self.checkpoint_config.encryption_chunk_size_bytes,\n    )\n\n\ndef install(trainer_cls) -> None:\n    trainer_cls.barrier = barrier\n    trainer_cls.get_checkpoint_path = get_checkpoint_path\n    trainer_cls.save_checkpoint = save_checkpoint\n",
+      "source_digest": "8423c4107ae38027fbeb671d86f1ff8a351f74131c6d8da2b2699f2c7bd89e9b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 169,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport json\nimport logging\nimport os\nfrom collections import namedtuple\nfrom typing import Callable\n\nimport jax\nfrom jax.experimental import multihost_utils\nfrom opentelemetry.trace import Tracer\n\nfrom xrex.models.model_utils import unwrap_tree\nfrom xrex.utils import checkpointing\nfrom xrex.utils import metrics as metrics_utils\nfrom xrex.utils.aot import JittedOrCompiled\nfrom xrex.utils.tracer import MockTracer\n\nrank_logger = logging.getLogger(\"rank\")\n\n\ndef install_offload_state(trainer) -> None:\n    state_sharding = trainer.state_sharding.purge_opt_state()\n    host_sharding = trainer.host_sharding.purge_opt_state()\n\n    def d2h_copy(src, dst):\n        del dst\n        return jax.device_put(src, host_sharding)\n\n    trainer.offload_state = JittedOrCompiled(\n        jax.jit(\n            d2h_copy,\n            in_shardings=(state_sharding, host_sharding),\n            out_shardings=host_sharding,\n            donate_argnums=1,\n            keep_unused=True,\n        )\n    )\n\n\ndef register_offload_state(trainer) -> None:\n    state_shape = trainer.state_shape.purge_opt_state()\n    trainer.register_jit_function(trainer.offload_state, state_shape, state_shape, phase=\"early\")\n\n\ndef barrier(self, name: str) -> None:\n    multihost_utils.sync_global_devices(name)\n\n\ndef get_checkpoint_path(self, ctx) -> str:\n    return ctx.run.checkpoint_path(self.checkpoint_config.checkpoint_dir, self.elapsed_samples)\n\n\ndef save_checkpoint(\n    self,\n    tag: str | None = None,\n    blocking: bool = False,\n    callback: Callable[[int, str], None] | None = None,\n    tracer: Tracer | None = None,\n    checkpoint_index: int | None = None,\n    checksum_dict: dict | None = None,\n):\n    if not tracer:\n        tracer = MockTracer()\n    if not hasattr(jax._src.config, \"enable_memories\"):\n        _FakeState = namedtuple(\"_FakeState\", [\"value\"])\n        jax._src.config.enable_memories = _FakeState(value=True)\n\n    path = self.get_checkpoint_path(self.ctx)\n\n    encrypt_checkpoint = self.checkpoint_config.encrypt\n    if getattr(self, \"_restored_encrypted\", False) and not encrypt_checkpoint:\n        raise ValueError(\n            \"restored from an ENCRYPTED checkpoint but checkpoint_config.encrypt is \"\n            \"false — refusing to downgrade to plaintext saves; set \"\n            \"checkpoint_config.encrypt=true with encryption_key_id/encryption_context\"\n        )\n    kms_client = None\n    if encrypt_checkpoint:\n        if self.checkpoint_config.encryption_key_id is None:\n            raise ValueError(\n                \"checkpoint_config.encrypt requires checkpoint_config.encryption_key_id\"\n            )\n        missing_context = {\"domain\", \"run\"} - self.checkpoint_config.encryption_context.keys()\n        if missing_context:\n            raise ValueError(\n                \"encrypted checkpoint context is missing \" + \", \".join(sorted(missing_context))\n            )\n        import hashlib\n\n        import xai_kms\n\n        encryption_context = dict(self.checkpoint_config.encryption_context)\n        encryption_context[\"mint_nonce\"] = hashlib.sha256(os.fsencode(path)).hexdigest()\n        kms_client = xai_kms.KmsClient.from_cluster_env(\n            key_id=self.checkpoint_config.encryption_key_id,\n            encryption_context=encryption_context,\n        )\n\n    with tracer.start_as_current_span(\"write_checksum\"):\n        if self.checkpoint_config.write_checksums:\n            if checksum_dict is None:\n                rank_logger.info(\"Computing checksums for state\")\n                checksum_dict = self.checksum_dict()\n            if jax.process_index() == 0:\n                os.makedirs(path, exist_ok=True)\n                with open(f\"{path}/checksums.{jax.process_index()}.json\", \"w\") as f:\n                    json.dump(checksum_dict, f)\n                    rank_logger.info(\n                        \"Wrote %i checksums to %s\",\n                        len(checksum_dict[\"shard_checksums\"]),\n                        f.name,\n                    )\n\n    def _callback(\n        elapsed_samples: int = self.elapsed_samples,\n        elapsed_tokens: int = self.elapsed_tokens,\n        trainer_step: int = self.step,\n    ) -> None:\n        if checkpoint_index is not None:\n            self.current_ckpt_index = checkpoint_index\n        else:\n            self.current_ckpt_index += 1\n        metrics_utils.addto(\"checkpoints_done\", ((elapsed_samples, self.current_ckpt_index),), ())\n\n        self.ctx.meta.record_completed_checkpoint(\n            self.checkpoint_config.checkpoint_dir,\n            elapsed_samples,\n            self.current_ckpt_index,\n            elapsed_tokens,\n            trainer_step,\n            self.checkpoint_config.checkpoint_ttl,\n        )\n\n        if callback is not None:\n            callback(self.elapsed_samples, path)\n\n    if self.checkpoint_config.save_method != \"orbax\":\n        raise ValueError(\n            f\"save_method={self.checkpoint_config.save_method!r} is retired: the \"\n            '\"tensorstore\" save arm (xai_checkpointing background_save_ts plus its '\n            \"d2h offload staging) was removed because no fork configuration ever \"\n            \"selected it — orbax is the only writer whose output the serving \"\n            \"loader and repack tooling accept. Leave save_method unset (it \"\n            'defaults to \"orbax\"); the field survives only because stored '\n            \"run-configs serialize it and strict from_dict would reject a \"\n            \"deleted key.\"\n        )\n    checkpointing.save_checkpoint(\n        unwrap_tree(self.state),\n        path=path,\n        callback=_callback,\n        tag=tag,\n        blocking=blocking,\n        timeout_secs=self.checkpoint_config.timeout_secs,\n        chunked=self.checkpoint_config.checkpoint_chunked,\n        compressed=self.checkpoint_config.checkpoint_compressed,\n        chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,\n        tracer=tracer,\n        save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,\n        kms_client=kms_client,\n        encryption_chunk_size=self.checkpoint_config.encryption_chunk_size_bytes,\n    )\n\n\ndef install(trainer_cls) -> None:\n    trainer_cls.barrier = barrier\n    trainer_cls.get_checkpoint_path = get_checkpoint_path\n    trainer_cls.save_checkpoint = save_checkpoint\n",
+      "source_digest": "52e14ad4a2e1d0e57c1f991e845243d83342c26074887b56496377219b4b1596",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/train/checkpoint_write.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-9ec0a0e967da2999a12500b1aa3ec0f2f0e0cc04a332a077ed1266e3abd70836",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "734ed407dcbd2b11f88ae809c0868349a35308176c3a9a0d5013077363391834",
+      "context_complete": true,
+      "task_id": "T-422265f4c9bbd45860c2bdda13b07127a76c2f42418a3dad907b753d65d9d17a",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    }
+  ],
+  "task_id": "T-f58f40a2c54ac153ea3e1d7e31899c33ec9dcc03bbf1adc63437f121093a2ee6",
+  "context_dependencies": [
+    "T-d898d0dc2aa531f7ce07de59c2bad225674968d3cc77ea3eb6de617219c6ee50"
+  ],
+  "replaces_task_id": "T-484bfb7a5349dc48c3ccc6ae69077e6db628c74996d88f0acee9624938432d99",
+  "ancestor_task_ids": [
+    "T-484bfb7a5349dc48c3ccc6ae69077e6db628c74996d88f0acee9624938432d99"
+  ]
+}

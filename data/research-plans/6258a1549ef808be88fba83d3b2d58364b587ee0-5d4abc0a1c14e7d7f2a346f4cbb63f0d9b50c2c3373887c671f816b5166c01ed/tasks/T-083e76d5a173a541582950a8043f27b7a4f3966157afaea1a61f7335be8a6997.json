@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/models/fp8.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-93eec7318280149015d440c1f84dd8b57601aba021014b646ca4d4e68854fa93",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/models/fp8.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 200,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nimport collections\nimport dataclasses\nimport enum\nimport functools\nimport math\nimport re\n\nimport jax\nimport jax.numpy as jnp\nfrom jax import lax\nfrom jax.ad_checkpoint import checkpoint_name\nfrom jax.sharding import AxisType\nfrom jax.typing import DTypeLike\n\nfrom xrex.cutedsl import fp8_transpose\nfrom xrex.utils import gpu\n\n\nclass Fp8Gemms(enum.StrEnum):\n    OFF = \"off\"\n    BWD = \"bwd\"\n    ALL = \"all\"\n\n\n_E4M3 = jnp.float8_e4m3fn\n_E5M2 = jnp.float8_e5m2\n_FWD_PRECISION = lax.Precision.DEFAULT\n_GRAD_PRECISION = lax.Precision.HIGHEST\n_NN = (((1,), (0,)), ((), ()))\n_NT = (((1,), (1,)), ((), ()))\n_TN = (((0,), (0,)), ((), ()))\n_CUBLASLT_FP8_GEMM = 'custom_call_target=\"__cublas$lt$matmul$f8\"'\n_OPERAND_PRECISION = re.compile(r'\"operand_precision\":\\[([^]]*)\\]')\n\n\n\u0040dataclasses.dataclass(frozen=True)\nclass Fp8Dot:\n    gemms: Fp8Gemms = Fp8Gemms.OFF\n    input_is_materialized: bool = False\n    transposed_input_checkpoint_name: str | None = None\n    fuse_gradient_amax: bool = False\n\n    def __call__(self, x: jax.Array, w: jax.Array) -> jax.Array:\n        if self.gemms == Fp8Gemms.OFF:\n            return jnp.dot(x, w)\n        assert x.dtype == w.dtype, (x.dtype, w.dtype)\n        use_transpose_kernels = _use_transpose_kernels(self.gemms, x.shape, w.shape[1], x.dtype)\n        assert not (\n            use_transpose_kernels\n            and jax.device_count() > 1\n            and (jax.typeof(x).vma or jax.typeof(w).vma)\n        ), \"Fp8Dot's transpose kernels need check_vma=False in their shard_map\"\n        return _fp8_dot(x, w, self, use_transpose_kernels)\n\n\ndef count_compiled_fp8_gemms(hlo: str) -> tuple[int, int]:\n    precisions = collections.Counter(\n        match[1] if (match := _OPERAND_PRECISION.search(line)) else None\n        for line in hlo.splitlines()\n        if _CUBLASLT_FP8_GEMM in line\n    )\n    forward, gradient = (\n        precisions.pop(f'\"{precision.name}\",\"{precision.name}\"', 0)\n        for precision in (_FWD_PRECISION, _GRAD_PRECISION)\n    )\n    assert not precisions, f\"FP8 GEMMs of other operand precisions: {precisions}\"\n    return forward, gradient\n\n\ndef check_compiled_fp8_gemms(program_name: str, hlo: str, gemms: Fp8Gemms) -> None:\n    forward, gradient = count_compiled_fp8_gemms(hlo)\n    min_forward = gradient // 2 if gemms == Fp8Gemms.ALL else 0\n    if not gradient or forward < min_forward:\n        raise ValueError(\n            f\"{program_name} compiled {forward} forward and {gradient} gradient FP8 GEMMs \"\n            f\"(at least {min_forward} and 1 expected): check its XLA flags\"\n        )\n\n\ndef _use_transpose_kernels(\n    gemms: Fp8Gemms, x_shape: tuple[int, ...], output_size: int, dtype: DTypeLike\n) -> bool:\n    num_rows = math.prod(x_shape[:-1])\n    x_2d_shape, g_2d_shape = (num_rows, x_shape[-1]), (num_rows, output_size)\n    mesh = jax.sharding.get_abstract_mesh()\n    per_device_operands = jax.device_count() == 1 or (\n        not mesh.empty\n        and all(\n            kind == AxisType.Manual or size == 1\n            for kind, size in zip(mesh.axis_types, mesh.axis_sizes, strict=True)\n        )\n    )\n    return (\n        gemms == Fp8Gemms.ALL\n        and gpu.cuda_compute_capability(jax.devices()[0]) == (9, 0)\n        and dtype == jnp.bfloat16\n        and fp8_transpose.transpose_supported(x_2d_shape)\n        and fp8_transpose.quantize_transposed_supported(x_2d_shape)\n        and fp8_transpose.quantize_transposed_supported(g_2d_shape)\n        and per_device_operands\n    )\n\n\ndef _scale(x: jax.Array, dtype: DTypeLike) -> jax.Array:\n    amax = jnp.max(jnp.abs(x)).astype(jnp.float32)\n    largest_mantissa, largest_exponent = math.frexp(float(jnp.finfo(dtype).max))\n    mantissa, exponent = jnp.frexp(amax)\n    scale_exponent = exponent - largest_exponent + (mantissa > largest_mantissa).astype(jnp.int32)\n    finfo = jnp.finfo(jnp.float32)\n    scale_exponent = jnp.clip(scale_exponent, finfo.minexp, finfo.maxexp - 1)\n    scale = jnp.ldexp(jnp.float32(1), scale_exponent)\n    return jnp.where(amax == 0, 1.0, jnp.where(jnp.isfinite(amax), scale, jnp.nan))\n\n\ndef _quantize(x: jax.Array, scale: jax.Array, dtype: DTypeLike) -> jax.Array:\n    limit = float(jnp.finfo(dtype).max)\n    return jnp.clip(x.astype(jnp.float32) / scale, -limit, limit).astype(dtype)\n\n\ndef _dequantize(q: jax.Array, scale: jax.Array, dtype: DTypeLike) -> jax.Array:\n    return q.astype(dtype) * scale.astype(dtype)\n\n\ndef _quantize_dequantize(x: jax.Array, scale: jax.Array, dtype: DTypeLike) -> jax.Array:\n    return _dequantize(_quantize(x, scale, dtype), scale, x.dtype)\n\n\ndef _matmul(\n    a: jax.Array, b: jax.Array, dims: lax.DotDimensionNumbers, precision: lax.Precision\n) -> jax.Array:\n    return lax.dot_general(a, b, dims, precision=precision, preferred_element_type=a.dtype)\n\n\n\u0040functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3))\ndef _fp8_dot(x: jax.Array, w: jax.Array, dot: Fp8Dot, use_transpose_kernels: bool) -> jax.Array:\n    return jnp.dot(x, w)\n\n\ndef _fp8_dot_fwd(x, w, dot: Fp8Dot, use_transpose_kernels: bool):\n    w_scale = checkpoint_name(_scale(w, _E4M3), \"scalar_stats\")\n    if dot.gemms != Fp8Gemms.ALL:\n        return jnp.dot(x, w), (x, w, None, w_scale, None)\n    x_2d = x.reshape(-1, x.shape[-1])\n    x_scale = _scale(x_2d, _E4M3)\n    x_q_t_bits = None\n    if use_transpose_kernels and dot.transposed_input_checkpoint_name is not None:\n        x_q, x_q_t = fp8_transpose.quantize_transposed(x_2d, 1.0 / x_scale, _E4M3)\n        x_fp8 = _dequantize(x_q, x_scale, x_2d.dtype)\n        x_q_t_bits = checkpoint_name(\n            lax.bitcast_convert_type(x_q_t, jnp.uint8), dot.transposed_input_checkpoint_name\n        )\n    else:\n        x_fp8 = _quantize_dequantize(x_2d, x_scale, _E4M3)\n    y = _matmul(x_fp8, _quantize_dequantize(w, w_scale, _E4M3), _NN, _FWD_PRECISION)\n    x_scale = checkpoint_name(x_scale, \"scalar_stats\")\n    x_residual = None if x_q_t_bits is not None else x\n    return y.reshape(*x.shape[:-1], w.shape[1]), (x_residual, w, x_scale, w_scale, x_q_t_bits)\n\n\ndef _fp8_dot_bwd(dot: Fp8Dot, use_transpose_kernels: bool, residuals, g):\n    x, w, x_scale, w_scale, x_q_t_bits = residuals\n    g_2d = g.reshape(-1, g.shape[-1])\n    x_2d = None if x is None else x.reshape(-1, x.shape[-1])\n    if x_scale is None:\n        x_scale = _scale(x_2d, _E4M3)\n    w_fp8 = _quantize_dequantize(w, w_scale, _E4M3)\n    if not use_transpose_kernels:\n        g_fp8 = _quantize_dequantize(g_2d, _scale(g_2d, _E5M2), _E5M2)\n        dx = _matmul(g_fp8, w_fp8, _NT, _GRAD_PRECISION)\n        dw = _matmul(_quantize_dequantize(x_2d, x_scale, _E4M3), g_fp8, _TN, _GRAD_PRECISION)\n        return dx.reshape(*g.shape[:-1], w.shape[0]), dw\n\n    if dot.fuse_gradient_amax:\n        finfo = jnp.finfo(g_2d.dtype)\n        g_2d = lax.reduce_precision(g_2d, exponent_bits=finfo.nexp, mantissa_bits=finfo.nmant)\n    else:\n        g_2d = lax.optimization_barrier(g_2d)\n    g_scale = _scale(g_2d, _E5M2)\n    g_q, g_q_t = fp8_transpose.quantize_transposed(g_2d, 1.0 / g_scale, _E5M2)\n    dx = _matmul(_dequantize(g_q, g_scale, g_2d.dtype), w_fp8, _NT, _GRAD_PRECISION)\n    if x_q_t_bits is not None:\n        x_q_t = lax.bitcast_convert_type(x_q_t_bits, _E4M3)\n    elif dot.input_is_materialized:\n        _, x_q_t = fp8_transpose.quantize_transposed(\n            x_2d, 1.0 / x_scale, _E4M3, with_untransposed=False\n        )\n    else:\n        x_q_t = fp8_transpose.transpose(_quantize(x_2d, x_scale, _E4M3))\n    dw = _matmul(\n        _dequantize(x_q_t, x_scale, g_2d.dtype),\n        _dequantize(g_q_t, g_scale, g_2d.dtype),\n        _NT,\n        _GRAD_PRECISION,\n    )\n    return dx.reshape(*g.shape[:-1], w.shape[0]), dw\n\n\n_fp8_dot.defvjp(_fp8_dot_fwd, _fp8_dot_bwd)\n",
+      "source_digest": "685f0c961d72cd22e182c2c0c529bf35baf1ad63cc77da3a6e8c04fd779ac43c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/fp8.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-93eec7318280149015d440c1f84dd8b57601aba021014b646ca4d4e68854fa93",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "b71d3314c38ba095fdc8420a45a362af0ed326d29ec59de1eb431a1f3cfa80f5",
+      "context_complete": true,
+      "task_id": "T-ebabdd1e82a451042cb22c1e1a44889d0b3ba38a1c4beb8782ef2507db60d6ef",
+      "evidence_refs": [
+        "E1"
+      ]
+    }
+  ],
+  "task_id": "T-083e76d5a173a541582950a8043f27b7a4f3966157afaea1a61f7335be8a6997",
+  "context_dependencies": [
+    "T-6bc2e409d6ce4d53ba340d572085b7eec9ca41ceeff66d232c18195c8eba0473"
+  ],
+  "replaces_task_id": "T-b32ab89d50b70828eb971de746510ff8ee578b899b77c5753cb5e3a1423bf01d",
+  "ancestor_task_ids": [
+    "T-b32ab89d50b70828eb971de746510ff8ee578b899b77c5753cb5e3a1423bf01d"
+  ]
+}

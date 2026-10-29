@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/models/normalization.py",
+  "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+  "claim_namespace": "N-1167484abaf8b4e58fcd0ae28e100452a257c726261bce4ff98f788c8ce27e57",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/models/normalization.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 118,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom collections import abc\nfrom typing import Callable, Optional, Sequence, Union\n\nimport haiku as hk\nimport jax\nimport jax.numpy as jnp\nfrom jax.sharding import PartitionSpec as P\n\nfrom xrex.models.model_utils import get_parameter\nfrom xrex.utils.sharding import with_sharding_constraint_unless_manual\n\n\ndef rms_norm_fn(\n    x: jax.Array,\n    name: str,\n    lr_multiplier: float = 1.0,\n    eps: float = 1e-5,\n    create_scale: bool = True,\n    weight_decay_mask: float = 0.0,\n) -> jax.Array:\n    x = RMSNorm(\n        axis=-1,\n        create_scale=create_scale,\n        pspec=P(None),\n        lr_multiplier=lr_multiplier,\n        name=name,\n        eps=eps,\n        weight_decay_mask=weight_decay_mask,\n    )(x)\n    return x\n\n\ndef all_heads_qk_norm(\n    name: str,\n    lr_multiplier: float = 1.0,\n    eps: float = 1e-5,\n    create_scale: bool = True,\n    weight_decay_mask: float = 0.0,\n) -> Callable[[jax.Array], jax.Array]:\n    norm = RMSNorm(\n        axis=-1,\n        create_scale=create_scale,\n        lr_multiplier=lr_multiplier,\n        name=name,\n        eps=eps,\n        weight_decay_mask=weight_decay_mask,\n    )\n    return lambda x: jnp.reshape(norm(jnp.reshape(x, (*x.shape[:2], -1))), x.shape)\n\n\nclass RMSNorm(hk.Module):\n    def __init__(\n        self,\n        axis: Union[int, Sequence[int], slice],\n        eps: float = 1e-5,\n        scale_init: Optional[hk.initializers.Initializer] = None,\n        name: Optional[str] = None,\n        create_scale: bool = True,\n        pspec: Optional[P] = P(None),\n        lr_multiplier: float = 1.0,\n        weight_decay_mask: float = 0.0,\n    ):\n        super().__init__(name=name)\n        if isinstance(axis, slice):\n            self.axis = axis\n        elif isinstance(axis, int):\n            self.axis = (axis,)\n        elif isinstance(axis, abc.Iterable) and all(isinstance(ax, int) for ax in axis):\n            self.axis = tuple(axis)\n        else:\n            raise ValueError(\"`axis` should be an int, slice or iterable of ints.\")\n\n        self.eps = eps\n        self.create_scale = create_scale\n        self.reparameterize = weight_decay_mask > 0\n        if scale_init is None:\n            scale_init = jnp.zeros if self.reparameterize else jnp.ones\n        if self.reparameterize and scale_init is not jnp.zeros:\n            raise ValueError(\n                \"RMSNorm: when weight_decay_mask > 0 the layer is \"\n                \"re-parameterized as (1 + scale) * x and `scale_init` must be \"\n                f\"jnp.zeros (got {scale_init!r}). Pass scale_init=jnp.zeros or \"\n                \"leave it as None to use the default.\"\n            )\n        self.scale_init = scale_init\n        self.pspec = pspec\n        self.lr_multiplier = lr_multiplier\n        self.weight_decay_mask = weight_decay_mask\n\n    def __call__(self, inputs: jax.Array):\n        fprop_dtype = inputs.dtype\n        param_shape = (inputs.shape[-1],)\n        if self.create_scale:\n            scale = get_parameter(\n                \"scale\",\n                param_shape,\n                dtype=jnp.float32,\n                init=self.scale_init,\n                pspec=self.pspec,\n                lr_multiplier=self.lr_multiplier,\n                weight_decay_mask=self.weight_decay_mask,\n            )\n            if self.pspec:\n                scale = with_sharding_constraint_unless_manual(scale, self.pspec)\n            scale = scale.astype(jnp.float32)\n            gain = 1.0 + scale if self.reparameterize else scale\n        else:\n            gain = 1.0\n\n        inputs = inputs.astype(jnp.float32)\n        mean_squared = jnp.mean(jnp.square(inputs), axis=-1, keepdims=True)\n\n        normed_inputs = inputs * jax.lax.rsqrt(mean_squared + self.eps)\n        outputs = gain * normed_inputs\n\n        return outputs.astype(fprop_dtype)\n",
+      "source_digest": "4114f6680a83adc1d4eee66590671b601c0a5001c6ce4f16f42e2692b5c4054a",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "phoenix/xrex/models/normalization.py",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "start_line": 1,
+      "end_line": 122,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom collections import abc\nfrom typing import Callable, Optional, Sequence, Union\n\nimport haiku as hk\nimport jax\nimport jax.numpy as jnp\nfrom jax.ad_checkpoint import checkpoint_name\nfrom jax.sharding import PartitionSpec as P\n\nfrom xrex.models.model_utils import get_parameter\nfrom xrex.models.scaling import ScaleConfig\nfrom xrex.utils.sharding import with_sharding_constraint_unless_manual\n\n\ndef rms_norm_fn(\n    x: jax.Array,\n    name: str,\n    lr_multiplier: float = 1.0,\n    eps: float = 1e-5,\n    create_scale: bool = True,\n    weight_decay_mask: float = 0.0,\n) -> jax.Array:\n    x = RMSNorm(\n        axis=-1,\n        create_scale=create_scale,\n        pspec=P(None),\n        lr_multiplier=lr_multiplier,\n        name=name,\n        eps=eps,\n        weight_decay_mask=weight_decay_mask,\n    )(x)\n    return x\n\n\ndef qk_norm(name: str, scale_config: ScaleConfig) -> \"RMSNorm\":\n    return RMSNorm(\n        axis=-1,\n        lr_multiplier=scale_config.qk_norm_lr_multiplier(),\n        name=name,\n        weight_decay_mask=scale_config.ln_weight_decay_mask,\n    )\n\n\ndef all_heads_qk_norm(name: str, scale_config: ScaleConfig) -> Callable[[jax.Array], jax.Array]:\n    norm = qk_norm(name, scale_config)\n    return lambda x: jnp.reshape(norm(jnp.reshape(x, (*x.shape[:2], -1))), x.shape)\n\n\nclass RMSNorm(hk.Module):\n    def __init__(\n        self,\n        axis: Union[int, Sequence[int], slice],\n        eps: float = 1e-5,\n        scale_init: Optional[hk.initializers.Initializer] = None,\n        name: Optional[str] = None,\n        create_scale: bool = True,\n        pspec: Optional[P] = P(None),\n        lr_multiplier: float = 1.0,\n        weight_decay_mask: float = 0.0,\n    ):\n        super().__init__(name=name)\n        if isinstance(axis, slice):\n            self.axis = axis\n        elif isinstance(axis, int):\n            self.axis = (axis,)\n        elif isinstance(axis, abc.Iterable) and all(isinstance(ax, int) for ax in axis):\n            self.axis = tuple(axis)\n        else:\n            raise ValueError(\"`axis` should be an int, slice or iterable of ints.\")\n\n        self.eps = eps\n        self.create_scale = create_scale\n        self.reparameterize = weight_decay_mask > 0\n        if scale_init is None:\n            scale_init = jnp.zeros if self.reparameterize else jnp.ones\n        if self.reparameterize and scale_init is not jnp.zeros:\n            raise ValueError(\n                \"RMSNorm: when weight_decay_mask > 0 the layer is \"\n                \"re-parameterized as (1 + scale) * x and `scale_init` must be \"\n                f\"jnp.zeros (got {scale_init!r}). Pass scale_init=jnp.zeros or \"\n                \"leave it as None to use the default.\"\n            )\n        self.scale_init = scale_init\n        self.pspec = pspec\n        self.lr_multiplier = lr_multiplier\n        self.weight_decay_mask = weight_decay_mask\n\n    def __call__(self, inputs: jax.Array, stats_name: Optional[str] = None):\n        gain = self.gain(inputs.shape[-1]) if self.create_scale else 1.0\n        return rms_normalize(inputs, gain, self.eps, stats_name)\n\n    def gain(self, size: int) -> jax.Array:\n        scale = get_parameter(\n            \"scale\",\n            (size,),\n            dtype=jnp.float32,\n            init=self.scale_init,\n            pspec=self.pspec,\n            lr_multiplier=self.lr_multiplier,\n            weight_decay_mask=self.weight_decay_mask,\n        )\n        if self.pspec:\n            scale = with_sharding_constraint_unless_manual(scale, self.pspec)\n        scale = scale.astype(jnp.float32)\n        return 1.0 + scale if self.reparameterize else scale\n\n\ndef rms_normalize(\n    inputs: jax.Array, gain: jax.Array | float, eps: float, stats_name: Optional[str] = None\n) -> jax.Array:\n    fprop_dtype = inputs.dtype\n    inputs = inputs.astype(jnp.float32)\n    mean_squared = jnp.mean(jnp.square(inputs), axis=-1, keepdims=True)\n    if stats_name is not None:\n        mean_squared = checkpoint_name(mean_squared, stats_name)\n\n    normed_inputs = inputs * jax.lax.rsqrt(mean_squared + eps)\n    outputs = gain * normed_inputs\n\n    return outputs.astype(fprop_dtype)\n",
+      "source_digest": "9b15e1e467bfe361a9e6386f6aa1772cac54d6c8f1f2076fd66958e6ae7a294b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/models/normalization.py",
+      "base": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "commit": "6258a1549ef808be88fba83d3b2d58364b587ee0",
+      "claim_namespace": "N-1167484abaf8b4e58fcd0ae28e100452a257c726261bce4ff98f788c8ce27e57",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "3e4b372d1f1b19e83ddffac81a491e2fbe929f950be4d86a4218d503739b8379",
+      "context_complete": true,
+      "task_id": "T-ae0cf161ae4d9e13ea3e7b6b13ac7358afbd464e0d46c149474b3883abba9a7b",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    }
+  ],
+  "task_id": "T-fed4fb88584bfbb0f00be1045d974398e7a36d08cd136bc6d6899c05dace15cb",
+  "context_dependencies": [
+    "T-33ef7bc62c236a0a517c04635b27d312553540a61d0562ec362607e0f0d0031a"
+  ],
+  "replaces_task_id": "T-209d6c64a70f678b4f708baf84982ea125f1d29e7905d3894ce047584b7b78f5",
+  "ancestor_task_ids": [
+    "T-209d6c64a70f678b4f708baf84982ea125f1d29e7905d3894ce047584b7b78f5"
+  ]
+}
