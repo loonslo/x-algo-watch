@@ -24,7 +24,7 @@ def assign_id(item: dict[str, Any]) -> str:
     return item["task_id"]
 
 
-def split_context(parent: dict[str, Any], additions: list[tuple[dict[str, Any], dict[str, Any]]]) -> list[dict[str, Any]]:
+def split_context(parent: dict[str, Any], additions: list[tuple[dict[str, Any], dict[str, Any]]], *, batch_sources: bool = False) -> list[dict[str, Any]]:
     """将所有补证移出父任务；初始实现仍完整保留，已有归并依赖也保留。"""
     entries = []
     kept = {}
@@ -56,6 +56,22 @@ def split_context(parent: dict[str, Any], additions: list[tuple[dict[str, Any], 
                         claim_namespace="N-" + digest({"owner": question, "request": request, "piece": piece}),
                         context_question={**question, "request": request}, context_dependencies=[])
             nodes.append(node)
+    if batch_sources:
+        batches, current, size = [], [], 0
+        for node in nodes:
+            piece = node["evidence"]["E1"]
+            if current and (len(current) >= 8 or size + len(piece["text"]) > CONTEXT_SOURCE_LIMIT):
+                batches.append(current)
+                current, size = [], 0
+            current.append(piece)
+            size += len(piece["text"])
+        if current:
+            batches.append(current)
+        nodes = [task(parent["path"], parent["base"], parent["commit"], pieces, context_kind="scan",
+                      claim_namespace="N-" + digest({"owner": question, "pieces": pieces}),
+                      context_question=question, context_dependencies=[],
+                      segments=[{"task_id": "S-" + digest(piece), "evidence_refs": ["E" + str(i)]}
+                                for i, piece in enumerate(pieces, 1)]) for pieces in batches]
     level = [*parent.get("context_dependencies", []), *[n["task_id"] for n in nodes]]
     if not level:
         raise WatchError("超大补证拆分未产生任何上下文任务")

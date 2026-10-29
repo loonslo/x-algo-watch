@@ -123,6 +123,39 @@ def enrich_plan(repo: Repository, plan: dict[str, Any], requests: list[dict[str,
     return result
 
 
+def split_initial_context(plan: dict[str, Any]) -> dict[str, Any]:
+    """把初始引用窗口移入可审计的事实归并树，原实现及结论命名空间保持。"""
+    from .context_tasks import assign_id, split_context, validate_graph
+    result = deepcopy(plan)
+    scheduled, replacements = [], {}
+    for item in result["tasks"]:
+        refs = [r for r, e in item["evidence"].items() if e["kind"] == "definition_or_reference"]
+        if item.get("context_kind") or item.get("context_dependencies") or len(refs) <= 8:
+            scheduled.append(item)
+            continue
+        old_id = item["task_id"]
+        additions = [(item["evidence"].pop(ref), {"issue_id": "initial-context-" + ref,
+                      "reason": "初始定义及引用窗口独立研究；不证明本次行为改变"}) for ref in refs]
+        item["segments"] = [s for s in item.get("segments", []) if not set(s.get("evidence_refs", [])) & set(refs)]
+        scheduled.extend(split_context(item, additions, batch_sources=True))
+        item["replaces_task_id"] = old_id
+        item["ancestor_task_ids"] = [*item.get("ancestor_task_ids", []), old_id]
+        assign_id(item)
+        replacements[old_id] = item["task_id"]
+        scheduled.append(item)
+    if not replacements:
+        return plan
+    result["tasks"] = scheduled
+    result["parent_plan_id"] = plan["plan_id"]
+    result["ancestor_plan_ids"] = [*plan.get("ancestor_plan_ids", []), plan["plan_id"]]
+    for row in result["files"]:
+        row["task_ids"] = [replacements.get(t, t) for t in row["task_ids"]]
+    result["shared_context_task_ids"] = [replacements.get(t, t) for t in result["shared_context_task_ids"]]
+    validate_graph(result)
+    result["plan_id"] = digest({k: v for k, v in result.items() if k != "plan_id"})
+    return result
+
+
 def prepare_pipeline_context(repo: Repository, record: dict[str, Any], data: Path,
                              previous: dict[str, Any] | None = None, requests: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if previous and previous.get("research_pipeline") == PIPELINE:
@@ -133,6 +166,8 @@ def prepare_pipeline_context(repo: Repository, record: dict[str, Any], data: Pat
                 save_plan_bundle(data / "research-plans", plan)
     else:
         plan = build_plan(repo, record)
+    save_plan_bundle(data / "research-plans", plan)
+    plan = split_initial_context(plan)
     manifest = save_plan_bundle(data / "research-plans", plan)
     pack = {"schema_version": 1, "scope": "project_version", "research_pipeline": PIPELINE,
             "commit": record["commit"], "base": record["base"], "committed_at": record["committed_at"],
