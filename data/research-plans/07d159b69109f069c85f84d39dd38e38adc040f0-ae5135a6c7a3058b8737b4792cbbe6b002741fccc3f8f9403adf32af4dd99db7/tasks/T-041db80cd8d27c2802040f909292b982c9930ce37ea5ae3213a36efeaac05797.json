@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-39a466de9804e034acb4e9eacdac7e892e7814e07742555ff236f6f1e6048701",
+  "change_scope": "changed_file",
+  "mechanism_group": "home-mixer/side_effects",
+  "evidence": {
+    "E1": {
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 233,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::models::query::ScoredPostsQuery;\nuse crate::params::EnableAdsFunnelTrace;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};\nuse xai_ads_proto::funnel_trace::LiFunnelCounters;\nuse xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{\n    KafkaCluster, KafkaPublisherClient, ProdKafkaPublisherClient, FUNNEL_TRACE_TOPIC,\n};\nuse xai_candidate_pipeline::component_library::utils::funnel_trace::{\n    self, FunnelCounts, DROPPED_BLENDER_KEY, SERVED_KEY,\n};\nuse xai_candidate_pipeline::component_library::utils::{current_timestamp_millis, is_prod};\nuse xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};\nuse xai_home_mixer_proto::{feed_item, FeedItem};\nuse xai_recsys_proto::AdIndexInfo;\n\n#[derive(Clone)]\npub struct FunnelTraceSideEffect {\n    kafka_client: Arc<dyn KafkaPublisherClient>,\n    pod_id: String,\n}\n\nimpl FunnelTraceSideEffect {\n    pub fn new(kafka_client: Arc<dyn KafkaPublisherClient>) -> Self {\n        Self {\n            kafka_client,\n            pod_id: std::env::var(\"HOSTNAME\").unwrap_or_else(|_| \"unknown\".to_string()),\n        }\n    }\n\n    pub async fn prod() -> Self {\n        static FUNNEL_TRACE: tokio::sync::OnceCell<FunnelTraceSideEffect> =\n            tokio::sync::OnceCell::const_new();\n        FUNNEL_TRACE\n            .get_or_init(|| async {\n                Self::new(Arc::new(\n                    ProdKafkaPublisherClient::new(FUNNEL_TRACE_TOPIC, KafkaCluster::Ads).await,\n                ))\n            })\n            .await\n            .clone()\n    }\n}\n\n#[async_trait]\nimpl SideEffect<ScoredPostsQuery, FeedItem> for FunnelTraceSideEffect {\n    fn enable(&self, query: Arc<ScoredPostsQuery>) -> bool {\n        is_prod() && query.params.get(EnableAdsFunnelTrace)\n    }\n\n    async fn side_effect(\n        &self,\n        input: Arc<SideEffectInput<ScoredPostsQuery, FeedItem>>,\n    ) -> Result<(), String> {\n        let counts = input.query.ad_drops.read(|drops| {\n            funnel_counts(\n                &input.selected_candidates,\n                &input.non_selected_candidates,\n                drops,\n            )\n        });\n        if counts.is_empty() {\n            return Ok(());\n        }\n        let flush_timestamp_ms = current_timestamp_millis().unwrap_or_default() as i64;\n        let messages: Vec<LiFunnelCounters> = counts\n            .into_iter()\n            .map(|(line_item_id, counts)| LiFunnelCounters {\n                line_item_id,\n                counts,\n                flush_timestamp_ms,\n                pod_id: self.pod_id.clone(),\n            })\n            .collect();\n        funnel_trace::publish(self.kafka_client.as_ref(), messages).await\n    }\n}\n\nfn drop_key(reason: AdDropReason) -> &'static str {\n    match reason {\n        AdDropReason::TooFewPosts => \"dropped.too_few_posts\",\n        AdDropReason::SpacingCap => \"dropped.spacing_cap\",\n        AdDropReason::NoEligibleNeighbours => \"dropped.no_eligible_neighbours\",\n        AdDropReason::LowRiskNeighbour => \"dropped.low_risk_neighbour\",\n        AdDropReason::ExcludedHandle => \"dropped.excluded_handle\",\n        AdDropReason::ExcludedKeyword => \"dropped.excluded_keyword\",\n        AdDropReason::ServedNeighbour => \"dropped.served_neighbour\",\n        AdDropReason::Truncated => \"dropped.truncated\",\n        AdDropReason::Unspecified => DROPPED_BLENDER_KEY,\n    }\n}\n\nfn funnel_counts(\n    selected: &[FeedItem],\n    non_selected: &[FeedItem],\n    drops: &[DroppedAd],\n) -> FunnelCounts {\n    let any_traced = selected\n        .iter()\n        .chain(non_selected)\n        .any(|item| traced_ad(item).is_some())\n        || drops.iter().any(|drop| traced_drop(drop).is_some());\n    if !any_traced {\n        return FunnelCounts::new();\n    }\n    let reason_key = |impression_id: i64| {\n        drops\n            .iter()\n            .find(|drop| drop.impression_id == impression_id as u64)\n            .map_or(DROPPED_BLENDER_KEY, |drop| drop_key(drop.drop_reason()))\n    };\n    let selector_ad_ids: Vec<u64> = selected\n        .iter()\n        .chain(non_selected)\n        .filter_map(as_ad)\n        .map(|ad| ad.impression_id as u64)\n        .collect();\n    let served = selected\n        .iter()\n        .filter_map(traced_ad)\n        .map(|ad| (ad.line_item_id, SERVED_KEY));\n    let dropped_by_selector = non_selected\n        .iter()\n        .filter_map(traced_ad)\n        .map(|ad| (ad.line_item_id, reason_key(ad.impression_id)));\n    let dropped_after_selection = drops\n        .iter()\n        .filter(|drop| !selector_ad_ids.contains(&drop.impression_id))\n        .filter_map(|drop| {\n            traced_drop(drop).map(|ad| (ad.line_item_id, drop_key(drop.drop_reason())))\n        });\n    let mut counts = FunnelCounts::new();\n    for (line_item_id, key) in served\n        .chain(dropped_by_selector)\n        .chain(dropped_after_selection)\n    {\n        *counts\n            .entry(line_item_id)\n            .or_default()\n            .entry(key.to_string())\n            .or_default() += 1;\n    }\n    counts\n}\n\nfn as_ad(item: &FeedItem) -> Option<&AdIndexInfo> {\n    match &item.item {\n        Some(feed_item::Item::Ad(ad)) => Some(ad),\n        _ => None,\n    }\n}\n\nfn traced_ad(item: &FeedItem) -> Option<&AdIndexInfo> {\n    as_ad(item).filter(|ad| ad.funnel_traced)\n}\n\nfn traced_drop(drop: &DroppedAd) -> Option<&AdIndexInfo> {\n    drop.ad_info.as_ref().filter(|ad| ad.funnel_traced)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::ads::drops::dropped_ad;\n\n    fn ad(line_item_id: i64, impression_id: i64, funnel_traced: bool) -> AdIndexInfo {\n        AdIndexInfo {\n            line_item_id,\n            impression_id,\n            funnel_traced,\n            ..Default::default()\n        }\n    }\n\n    fn item(ad: AdIndexInfo) -> FeedItem {\n        FeedItem {\n            position: 0,\n            item: Some(feed_item::Item::Ad(ad)),\n        }\n    }\n\n    #[test]\n    fn traced_served_ad_counts_as_served() {\n        let counts = funnel_counts(&[item(ad(10, 1, true))], &[], &[]);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"served\"], 1);\n    }\n\n    #[test]\n    fn traced_non_selected_ad_counts_under_its_reason() {\n        let drops = vec![dropped_ad(&ad(10, 1, true), AdDropReason::SpacingCap)];\n        let counts = funnel_counts(&[], &[item(ad(10, 1, true))], &drops);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"dropped.spacing_cap\"], 1);\n    }\n\n    #[test]\n    fn traced_non_selected_ad_without_reason_counts_as_blender_drop() {\n        let counts = funnel_counts(&[], &[item(ad(10, 1, true))], &[]);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"dropped.blender\"], 1);\n    }\n\n    #[test]\n    fn traced_ad_dropped_after_selection_counts_under_its_reason() {\n        let drops = vec![dropped_ad(&ad(10, 1, true), AdDropReason::ServedNeighbour)];\n        let counts = funnel_counts(&[], &[], &drops);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 1);\n        assert_eq!(counts[&10][\"dropped.served_neighbour\"], 1);\n    }\n\n    #[test]\n    fn same_line_item_served_and_dropped_keeps_both_keys() {\n        let drops = vec![dropped_ad(&ad(10, 2, true), AdDropReason::SpacingCap)];\n        let counts = funnel_counts(&[item(ad(10, 1, true))], &[item(ad(10, 2, true))], &drops);\n        assert_eq!(counts.len(), 1);\n        assert_eq!(counts[&10].len(), 2);\n        assert_eq!(counts[&10][\"served\"], 1);\n        assert_eq!(counts[&10][\"dropped.spacing_cap\"], 1);\n    }\n\n    #[test]\n    fn untraced_ads_produce_nothing() {\n        let drops = vec![dropped_ad(&ad(10, 3, false), AdDropReason::ServedNeighbour)];\n        let counts = funnel_counts(&[item(ad(10, 1, false))], &[item(ad(10, 2, false))], &drops);\n        assert!(counts.is_empty());\n    }\n}\n",
+      "source_digest": "38a4f1cfe87492a4c5d93657744cbb31117fc1067c62ab8a1697eff9739824cd",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "home-mixer/side_effects/funnel_trace_side_effect.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39a466de9804e034acb4e9eacdac7e892e7814e07742555ff236f6f1e6048701",
+      "change_scope": "changed_file",
+      "mechanism_group": "home-mixer/side_effects",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "ea5366298ce7572b7f5b15e026d4555240ec9378811a8fa4816ae7f72312e1eb",
+      "context_complete": true,
+      "task_id": "T-01eef1fdb1405960f3b28ded9aa1b7c178f5f73cde6eccf9e512ae9fab822f2b",
+      "evidence_refs": [
+        "E1"
+      ]
+    }
+  ],
+  "task_id": "T-041db80cd8d27c2802040f909292b982c9930ce37ea5ae3213a36efeaac05797",
+  "context_dependencies": [
+    "T-41bac9538ec8b57171a542bb23506514a44a384109f55a98071617f3b93a24d8"
+  ],
+  "replaces_task_id": "T-ad5dd5dc9c531798af3b613104572eebf01c34181747a733d1f619cad56bb505",
+  "ancestor_task_ids": [
+    "T-ad5dd5dc9c531798af3b613104572eebf01c34181747a733d1f619cad56bb505"
+  ]
+}

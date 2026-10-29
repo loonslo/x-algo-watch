@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-10dcfaf23a3e3faf93f22cfed473906b70221380fef874fe5bbf9a8df2da3375",
+  "change_scope": "changed_file",
+  "mechanism_group": "phoenix/xrex",
+  "evidence": {
+    "E1": {
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 198,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2026 X.AI Corp.\nfrom __future__ import annotations\n\nimport argparse\nimport os\nimport random\nimport sys\n\nimport numpy as np\nimport pyarrow.compute as pc\nimport pyarrow.parquet as pq\n\nsys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))\n\nfrom xrex.data.recsys import history_id_lists as hil\nfrom xrex.data.recsys import id_list_features as ilf\nfrom xrex.data.recsys import id_list_presets as presets\nfrom xrex.data.recsys.constants import action_type_map_raw\n\nRECORDS = \"/data/phoenix/kafka/ads/phoenix_training_records\"\nSIDECARS = \"/data/phoenix/kafka/ads/list_features_backfill/list_features\"\n\n\ndef _col(rb, name, n, dtype):\n    values = pc.list_flatten(rb.column(name).combine_chunks())\n    if values.null_count:\n        values = values.fill_null(False if dtype is np.bool_ else 0)\n    return values.to_numpy(zero_copy_only=False).reshape(n, -1).astype(dtype)\n\n\ndef history_counts(files: list[str], specs) -> np.ndarray:\n    big = tuple(ilf.IdListFeatureSpec(s.name, 2000) for s in specs if s.is_history)\n    bits = hil.ActionBits.for_vocab(action_type_map_raw, 256)\n    out = []\n    for f in files:\n        t = pq.read_table(f)\n        n = t.num_rows\n        actions = (\n            pc.list_flatten(pc.list_flatten(t.column(\"actionNameMultiHotSeqSeq\").combine_chunks()))\n            .to_numpy(zero_copy_only=False)\n            .reshape(n, -1, 256)\n        )\n        pad = _col(t, \"paddingMask\", n, np.bool_)\n        new = _col(t, \"newEventMask\", n, np.bool_)\n        imp = _col(t, \"impressedTimeMsSeq\", n, np.int64)\n        served = (\n            _col(t, \"servedTimeMsSeq\", n, np.int64) if \"servedTimeMsSeq\" in t.schema.names else None\n        )\n        cont = (\n            pc.list_flatten(\n                pc.list_flatten(t.column(\"continuousActionValuesSeqSeq\").combine_chunks())\n            )\n            .to_numpy(zero_copy_only=False)\n            .reshape(n, -1, 8)\n        )\n        arrays = hil.HistoryArrays(\n            actions=actions,\n            author_ids=_col(t, \"authorIdSeq\", n, np.int64),\n            tweet_ids=_col(t, \"tweetIdSeq\", n, np.int64),\n            promoted_ids=_col(t, \"promotedIdSeq\", n, np.int64),\n            impressed_ms=imp,\n            request_ms=hil.request_time_ms(imp, served, pad & new, pad & ~new),\n            history_mask=pad & ~new,\n            dwell_secs=cont[:, :, hil.DWELL_TIME_SLOT].astype(np.float32),\n        )\n        ids, mask = ilf.empty_arrays(n, big)\n        hil.fill(ids, mask, big, arrays, bits)\n        offsets = ilf.slot_offsets(big)\n        out.append(\n            np.stack([mask[:, offsets[i] : offsets[i + 1]].sum(axis=1) for i in range(len(big))], 1)\n        )\n    return np.concatenate(out) if out else np.zeros((0, len(big)), np.int64)\n\n\ndef hydrator_counts(files: list[str], specs) -> np.ndarray:\n    hyd = [s for s in specs if not s.is_history]\n    out = []\n    for f in files:\n        col = pq.read_table(f, columns=[ilf.COLUMN]).column(0).combine_chunks()\n        n = len(col)\n        structs = pc.list_flatten(col)\n        names = structs.field(\"name\").to_numpy(zero_copy_only=False)\n        lens = (\n            pc.list_value_length(structs.field(\"ids\")).fill_null(0).to_numpy(zero_copy_only=False)\n        )\n        row_of = np.repeat(\n            np.arange(n), pc.list_value_length(col).fill_null(0).to_numpy(zero_copy_only=False)\n        )\n        counts = np.zeros((n, len(hyd)), np.int64)\n        for j, s in enumerate(hyd):\n            sel = names == s.name\n            counts[row_of[sel], j] = lens[sel]\n        out.append(counts)\n    return np.concatenate(out) if out else np.zeros((0, len(hyd)), np.int64)\n\n\ndef propose_k(counts: np.ndarray, cap: int | None, max_k: int) -> int:\n    nonempty = float((counts > 0).mean()) if counts.size else 0.0\n    q = 95 if nonempty < 0.5 else 90\n    k = int(np.percentile(counts, q)) if counts.size else 0\n    k = max(5, int(5 * round(k / 5)))\n    k = min(k, max_k)\n    if cap is not None:\n        k = min(k, cap)\n    return k\n\n\ndef main() -> None:\n    ap = argparse.ArgumentParser(\n        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter\n    )\n    ap.add_argument(\"--records\", default=RECORDS)\n    ap.add_argument(\n        \"--sidecars\", default=SIDECARS, help=\"list-features sidecar root; '' to skip hydrator lists\"\n    )\n    ap.add_argument(\"--min-batch\", type=int, required=True)\n    ap.add_argument(\"--max-batch\", type=int, required=True)\n    ap.add_argument(\"--batch-step\", type=int, default=200)\n    ap.add_argument(\"--partitions\", default=\"0,64,128,192\")\n    ap.add_argument(\n        \"--specs\", default=None, help=\"id_list_features string; default: id_list_presets.ALL_LISTS\"\n    )\n    ap.add_argument(\n        \"--max-k\",\n        type=int,\n        default=50,\n        help=\"cap for proposed k (dense lists are capped by design)\",\n    )\n    args = ap.parse_args()\n\n    specs = (\n        ilf.parse_specs(args.specs)\n        if args.specs\n        else ilf.parse_specs(presets.ADS_ID_LIST_FEATURES_ALL)\n    )\n    parts = [int(p) for p in args.partitions.split(\",\")]\n    batches = range(args.min_batch, args.max_batch + 1, args.batch_step)\n    rec_files = [\n        f\"{args.records}/partition={p}/{b // 2000}/batch_{b}.parquet\"\n        for b in batches\n        for p in parts\n    ]\n    rec_files = [f for f in rec_files if os.path.exists(f)]\n    random.Random(0).shuffle(rec_files)\n    hist_specs = [s for s in specs if s.is_history]\n    hyd_specs = [s for s in specs if not s.is_history]\n\n    rows: dict[str, tuple[np.ndarray, int | None]] = {}\n    if hist_specs:\n        counts = history_counts(rec_files, specs)\n        for j, s in enumerate(hist_specs):\n            rows[s.feature_name] = (counts[:, j], None)\n    if hyd_specs and args.sidecars:\n        side_files = [\n            f\"{args.sidecars}/partition={p}/{b // 2000}/batch_{b}.list_features.parquet\"\n            for b in batches\n            for p in parts\n        ]\n        side_files = [f for f in side_files if os.path.exists(f)]\n        if not side_files:\n            print(\n                f\"no sidecars in [{args.min_batch}, {args.max_batch}] under {args.sidecars}; hydrator lists skipped\"\n            )\n        else:\n            counts = hydrator_counts(side_files, specs)\n            for j, s in enumerate(hyd_specs):\n                rows[s.feature_name] = (counts[:, j], ilf.source_cap(s.name))\n\n    print(\n        f\"records files {len(rec_files)} | users (records) {sum(len(v[0]) for n, v in rows.items() if n.startswith('hist_')) // max(len(hist_specs), 1)}\"\n    )\n    print(\n        f\"{'feature':54s} {'k':>3s} {'>=1':>6s} {'full':>6s} {'fill':>5s} {'p50':>5s} {'p90':>5s} {'p99':>5s} {'propose':>7s}\"\n    )\n    by_feature = {s.feature_name: s for s in specs}\n    changes = {}\n    for name, (c, cap) in rows.items():\n        s = by_feature[name]\n        if c.size == 0:\n            continue\n        k = s.k\n        prop = propose_k(c, cap, args.max_k)\n        print(\n            f\"{name:54s} {k:>3d} {(c > 0).mean() * 100:>5.1f}% {(c >= k).mean() * 100:>5.1f}% \"\n            f\"{np.minimum(c, k).mean() / k * 100:>4.0f}% {np.percentile(c, 50):>5.0f} {np.percentile(c, 90):>5.0f} \"\n            f\"{np.percentile(c, 99):>5.0f} {prop:>7d}{'  *' if prop != k else ''}\"\n        )\n        if prop != k:\n            changes[s.identity] = prop\n    if changes:\n        print(\"\\nproposed with_k overrides (identity -> k):\")\n        for ident, k in changes.items():\n            print(f'    \"{ident}\": {k},')\n\n\nif __name__ == \"__main__\":\n    main()\n",
+      "source_digest": "2061d396e0eef28debc24e0487246f3b3a3492b0369d881e8fd578f36b92b05f",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": false,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "phoenix/xrex/tools/id_list_fill_stats.py",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-10dcfaf23a3e3faf93f22cfed473906b70221380fef874fe5bbf9a8df2da3375",
+      "change_scope": "changed_file",
+      "mechanism_group": "phoenix/xrex",
+      "presence": {
+        "before_exists": false,
+        "after_exists": true
+      },
+      "diff_digest": "83e542d11c07f2d1e39c6c6f3434cbae1c5bbd4c4ccbfb6ba1e2339474991b12",
+      "context_complete": true,
+      "task_id": "T-b1231f9e2e5c8b85090e02e0a9238339e3a5eda0960cf83ee3fa1799f91a1923",
+      "evidence_refs": [
+        "E1"
+      ]
+    }
+  ],
+  "task_id": "T-d7a2f9ec8be91388e5c05a579c76ed03a0b0c97ac4d64f585aba6529a8d7340a",
+  "context_dependencies": [
+    "T-1f0fd9bbfc6185ffd5e6a522726a8a356c1812ab746ddd9c9e1a9a8fce65cd90"
+  ],
+  "replaces_task_id": "T-f6b093cb3a508a1bfe02728f315b2264488333c79c65eadc6df9f624494b5e5d",
+  "ancestor_task_ids": [
+    "T-f6b093cb3a508a1bfe02728f315b2264488333c79c65eadc6df9f624494b5e5d"
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "path": "home-mixer/sources/ads_source.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-c26c46d160c55476ae0ccd07adb986c44d7e2d0ebd38da7002161f31228d55c1",
+  "change_scope": "changed_file",
+  "mechanism_group": "home-mixer/sources",
+  "evidence": {
+    "E1": {
+      "path": "home-mixer/sources/ads_source.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 164,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::clients::ad_index_client::AdIndexClient;\nuse crate::models::query::{RequestType, ScoredPostsQuery};\nuse crate::params::EnableAdsSource;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::component_library::utils::client_utils::{\n    feed_cursor_direction, RequestContext,\n};\nuse xai_candidate_pipeline::source::Source;\nuse xai_home_mixer_proto::{feed_item, FeedItem};\nuse xai_recsys_proto::{AdIndexRequest, ClientContext, FeedRequestContext, ProductSurface};\n\npub struct AdsSource {\n    pub ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,\n}\n\n#[async_trait]\nimpl Source<ScoredPostsQuery, FeedItem> for AdsSource {\n    fn enable(&self, query: &ScoredPostsQuery) -> bool {\n        query.params.get(EnableAdsSource) && !query.is_preview\n    }\n\n    async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {\n        let request = build_ad_index_request(query);\n\n        let response = self\n            .ad_index_client\n            .get_eligible_ads(request)\n            .await\n            .map_err(|e| format!(\"AdsSource: {e}\"))?;\n\n        let feed_items = response\n            .ad_info\n            .into_iter()\n            .map(|ad| FeedItem {\n                position: 0,\n                item: Some(feed_item::Item::Ad(ad)),\n            })\n            .collect();\n        Ok(feed_items)\n    }\n}\n\nfn build_ad_index_request(query: &ScoredPostsQuery) -> AdIndexRequest {\n    let product_surface = match query.request_type {\n        RequestType::RankedFollowing => ProductSurface::HomeTimelineRankedFollowing,\n        RequestType::Following => ProductSurface::HomeTimelineLatest,\n        _ => ProductSurface::HomeTimelineRanking,\n    };\n\n    let dsp_client_context = query.dsp_client_context.clone().filter(|dcc| {\n        dcc.google_sdk.as_ref().is_some_and(|g| {\n            !g.gsig_native.is_empty() || g.gsigs_native.iter().any(|s| !s.is_empty())\n        })\n    });\n\n    AdIndexRequest {\n        user_id: query.user_id as i64,\n        product_surface: product_surface as i32,\n        dsp_client_context,\n        client_seen_post_ids: query.seen_ids.iter().map(|&id| id as i64).collect(),\n        feed_request_context: FeedRequestContext::from(RequestContext::parse(\n            &query.request_context,\n        )) as i32,\n        feed_cursor_direction: feed_cursor_direction(query.cursor.as_ref()) as i32,\n        client_context: Some(ClientContext {\n            user_id: query.user_id as i64,\n            app_id: query.client_app_id as i64,\n            country_code: query.country_code.clone(),\n            language_code: query.language_code.clone(),\n            ip_address: query.ip_address.clone(),\n            user_agent: query.user_agent.clone(),\n            user_roles: query.user_roles.clone(),\n            device_id: query.device_id.clone(),\n            mobile_device_id: query.mobile_device_id.clone(),\n            mobile_device_ad_id: query.mobile_device_ad_id.clone(),\n            client_version: query.client_version.clone(),\n            ..Default::default()\n        }),\n        ..Default::default()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::clients::ad_index_client::MockAdIndexClient;\n    use xai_candidate_pipeline::source::Source;\n\n    fn ads_source() -> AdsSource {\n        AdsSource {\n            ad_index_client: Arc::new(MockAdIndexClient),\n        }\n    }\n\n    #[test]\n    fn enable_returns_false_when_is_preview() {\n        let query = ScoredPostsQuery {\n            is_preview: true,\n            ..Default::default()\n        };\n        assert!(!ads_source().enable(&query));\n    }\n\n    #[test]\n    fn forwards_seen_ids_into_ad_index_request() {\n        let query = ScoredPostsQuery {\n            user_id: 42,\n            seen_ids: vec![7, 9],\n            ..Default::default()\n        };\n        assert_eq!(\n            build_ad_index_request(&query).client_seen_post_ids,\n            vec![7, 9]\n        );\n    }\n\n    #[test]\n    fn forwards_dsp_client_context_into_ad_index_request() {\n        let query = ScoredPostsQuery {\n            user_id: 42,\n            dsp_client_context: Some(xai_recsys_proto::DspClientContext {\n                session_id: \"sess-1\".to_string(),\n                webkit_user_agent: \"Mozilla/5.0 (wv)\".to_string(),\n                google_sdk: Some(xai_recsys_proto::GoogleSdk {\n                    gsig_native: \"DUMMY_GSIG_ABC123\".to_string(),\n                    gsigs_native: vec![\"g1\".to_string(), \"g2\".to_string()],\n                }),\n            }),\n            ..Default::default()\n        };\n        let req = build_ad_index_request(&query);\n        let dcc = req\n            .dsp_client_context\n            .expect(\"dsp_client_context set when gsig present\");\n        assert_eq!(dcc.session_id, \"sess-1\");\n        assert_eq!(dcc.webkit_user_agent, \"Mozilla/5.0 (wv)\");\n        let sdk = dcc.google_sdk.expect(\"google_sdk set\");\n        assert_eq!(sdk.gsig_native, \"DUMMY_GSIG_ABC123\");\n        assert_eq!(sdk.gsigs_native, vec![\"g1\".to_string(), \"g2\".to_string()]);\n    }\n\n    #[test]\n    fn omits_dsp_client_context_when_gsig_empty() {\n        let query = ScoredPostsQuery {\n            dsp_client_context: Some(xai_recsys_proto::DspClientContext {\n                session_id: \"sess-1\".to_string(),\n                webkit_user_agent: String::new(),\n                google_sdk: Some(xai_recsys_proto::GoogleSdk {\n                    gsig_native: String::new(),\n                    gsigs_native: vec![String::new()],\n                }),\n            }),\n            ..Default::default()\n        };\n        assert!(build_ad_index_request(&query).dsp_client_context.is_none());\n    }\n\n    #[test]\n    fn omits_dsp_client_context_when_no_gsig() {\n        let req = build_ad_index_request(&ScoredPostsQuery::default());\n        assert!(req.dsp_client_context.is_none());\n    }\n}\n",
+      "source_digest": "adb6f5207f6536550437baf4fb62b5d73f941e9a94c10478902cf5b1d687f70b",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test",
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "home-mixer/sources/ads_source.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 168,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use crate::clients::ad_index_client::{AdIndexClient, SR_ROUTER_DECIDER};\nuse crate::models::query::{RequestType, ScoredPostsQuery};\nuse crate::params::EnableAdsSource;\nuse std::sync::Arc;\nuse tonic::async_trait;\nuse xai_candidate_pipeline::component_library::utils::client_utils::{\n    feed_cursor_direction, RequestContext,\n};\nuse xai_candidate_pipeline::source::Source;\nuse xai_home_mixer_proto::{feed_item, FeedItem};\nuse xai_recsys_proto::{AdIndexRequest, ClientContext, FeedRequestContext, ProductSurface};\n\npub struct AdsSource {\n    pub ad_index_client: Arc<dyn AdIndexClient + Send + Sync>,\n}\n\n#[async_trait]\nimpl Source<ScoredPostsQuery, FeedItem> for AdsSource {\n    fn enable(&self, query: &ScoredPostsQuery) -> bool {\n        query.params.get(EnableAdsSource) && !query.is_preview\n    }\n\n    async fn source(&self, query: &ScoredPostsQuery) -> Result<Vec<FeedItem>, String> {\n        let request = build_ad_index_request(query);\n        let sr_router_enabled = query\n            .decider\n            .as_ref()\n            .is_some_and(|d| d.enabled(SR_ROUTER_DECIDER));\n\n        let response = self\n            .ad_index_client\n            .get_eligible_ads(request, sr_router_enabled)\n            .await\n            .map_err(|e| format!(\"AdsSource: {e}\"))?;\n\n        let feed_items = response\n            .ad_info\n            .into_iter()\n            .map(|ad| FeedItem {\n                position: 0,\n                item: Some(feed_item::Item::Ad(ad)),\n            })\n            .collect();\n        Ok(feed_items)\n    }\n}\n\nfn build_ad_index_request(query: &ScoredPostsQuery) -> AdIndexRequest {\n    let product_surface = match query.request_type {\n        RequestType::RankedFollowing => ProductSurface::HomeTimelineRankedFollowing,\n        RequestType::Following => ProductSurface::HomeTimelineLatest,\n        _ => ProductSurface::HomeTimelineRanking,\n    };\n\n    let dsp_client_context = query.dsp_client_context.clone().filter(|dcc| {\n        dcc.google_sdk.as_ref().is_some_and(|g| {\n            !g.gsig_native.is_empty() || g.gsigs_native.iter().any(|s| !s.is_empty())\n        })\n    });\n\n    AdIndexRequest {\n        user_id: query.user_id as i64,\n        product_surface: product_surface as i32,\n        dsp_client_context,\n        client_seen_post_ids: query.seen_ids.iter().map(|&id| id as i64).collect(),\n        feed_request_context: FeedRequestContext::from(RequestContext::parse(\n            &query.request_context,\n        )) as i32,\n        feed_cursor_direction: feed_cursor_direction(query.cursor.as_ref()) as i32,\n        client_context: Some(ClientContext {\n            user_id: query.user_id as i64,\n            app_id: query.client_app_id as i64,\n            country_code: query.country_code.clone(),\n            language_code: query.language_code.clone(),\n            ip_address: query.ip_address.clone(),\n            user_agent: query.user_agent.clone(),\n            user_roles: query.user_roles.clone(),\n            device_id: query.device_id.clone(),\n            mobile_device_id: query.mobile_device_id.clone(),\n            mobile_device_ad_id: query.mobile_device_ad_id.clone(),\n            client_version: query.client_version.clone(),\n            ..Default::default()\n        }),\n        ..Default::default()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::clients::ad_index_client::MockAdIndexClient;\n    use xai_candidate_pipeline::source::Source;\n\n    fn ads_source() -> AdsSource {\n        AdsSource {\n            ad_index_client: Arc::new(MockAdIndexClient),\n        }\n    }\n\n    #[test]\n    fn enable_returns_false_when_is_preview() {\n        let query = ScoredPostsQuery {\n            is_preview: true,\n            ..Default::default()\n        };\n        assert!(!ads_source().enable(&query));\n    }\n\n    #[test]\n    fn forwards_seen_ids_into_ad_index_request() {\n        let query = ScoredPostsQuery {\n            user_id: 42,\n            seen_ids: vec![7, 9],\n            ..Default::default()\n        };\n        assert_eq!(\n            build_ad_index_request(&query).client_seen_post_ids,\n            vec![7, 9]\n        );\n    }\n\n    #[test]\n    fn forwards_dsp_client_context_into_ad_index_request() {\n        let query = ScoredPostsQuery {\n            user_id: 42,\n            dsp_client_context: Some(xai_recsys_proto::DspClientContext {\n                session_id: \"sess-1\".to_string(),\n                webkit_user_agent: \"Mozilla/5.0 (wv)\".to_string(),\n                google_sdk: Some(xai_recsys_proto::GoogleSdk {\n                    gsig_native: \"DUMMY_GSIG_ABC123\".to_string(),\n                    gsigs_native: vec![\"g1\".to_string(), \"g2\".to_string()],\n                }),\n            }),\n            ..Default::default()\n        };\n        let req = build_ad_index_request(&query);\n        let dcc = req\n            .dsp_client_context\n            .expect(\"dsp_client_context set when gsig present\");\n        assert_eq!(dcc.session_id, \"sess-1\");\n        assert_eq!(dcc.webkit_user_agent, \"Mozilla/5.0 (wv)\");\n        let sdk = dcc.google_sdk.expect(\"google_sdk set\");\n        assert_eq!(sdk.gsig_native, \"DUMMY_GSIG_ABC123\");\n        assert_eq!(sdk.gsigs_native, vec![\"g1\".to_string(), \"g2\".to_string()]);\n    }\n\n    #[test]\n    fn omits_dsp_client_context_when_gsig_empty() {\n        let query = ScoredPostsQuery {\n            dsp_client_context: Some(xai_recsys_proto::DspClientContext {\n                session_id: \"sess-1\".to_string(),\n                webkit_user_agent: String::new(),\n                google_sdk: Some(xai_recsys_proto::GoogleSdk {\n                    gsig_native: String::new(),\n                    gsigs_native: vec![String::new()],\n                }),\n            }),\n            ..Default::default()\n        };\n        assert!(build_ad_index_request(&query).dsp_client_context.is_none());\n    }\n\n    #[test]\n    fn omits_dsp_client_context_when_no_gsig() {\n        let req = build_ad_index_request(&ScoredPostsQuery::default());\n        assert!(req.dsp_client_context.is_none());\n    }\n}\n",
+      "source_digest": "1c1b98be17a6cdc92aa95fb41a5a8421283482057eb51d39bd8df6f4ae540335",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test",
+        "mock"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "home-mixer/sources/ads_source.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-c26c46d160c55476ae0ccd07adb986c44d7e2d0ebd38da7002161f31228d55c1",
+      "change_scope": "changed_file",
+      "mechanism_group": "home-mixer/sources",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "3b7ac523487fe366ce520fb7c812e73502d463fc6a8848ef0ea79039ff6be653",
+      "context_complete": true,
+      "task_id": "T-2311e8595d1bbdec948b3329af1b3559dcc2c8f2f4d6bcf0db6be03dbb462dfa",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    }
+  ],
+  "task_id": "T-70a2bfc77a0ef04be08d3a6e1cc60051a106c857414bd1d8aac1878259e9699c",
+  "context_dependencies": [
+    "T-261ae7b05d9bc43e6d8d51d5baa813b627814d044dc6577c773ad6b45aa7dc40"
+  ],
+  "replaces_task_id": "T-d283cc0f08c2cb4b104074b1d30203ef0edb0cb93c550687829c314e9c038341",
+  "ancestor_task_ids": [
+    "T-d283cc0f08c2cb4b104074b1d30203ef0edb0cb93c550687829c314e9c038341"
+  ]
+}

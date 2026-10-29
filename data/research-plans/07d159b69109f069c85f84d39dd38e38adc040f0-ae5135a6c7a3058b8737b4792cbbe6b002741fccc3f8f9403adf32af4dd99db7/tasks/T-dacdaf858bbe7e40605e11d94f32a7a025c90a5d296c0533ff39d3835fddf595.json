@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/rules/legacy_table.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-1bf25a6b16565fb2e6d1be06b9bffd97dda64c2dfeb3a51ef50852980ce1cdcb",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/rules",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 144,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use crate::rules::rule_spec::engine::Engine;\nuse crate::rules::rule_spec::features::{PostFactsLeaf, RequestLeaf};\nuse crate::rules::rule_spec::rule::{Rule, RuleCond};\nuse crate::rules::rule_spec::Predicate;\nuse std::fmt::Write;\n\n#[derive(Debug, PartialEq, Eq)]\npub(super) struct Unrepresentable {\n    pub(super) rule: &'static str,\n    pub(super) part: String,\n}\n\npub(super) fn legacy_table<E: Engine>(\n    rules: &[(&'static str, Rule<E>)],\n) -> Result<String, Unrepresentable> {\n    let mut table = String::new();\n    let mut severity = None;\n    for &(name, ref rule) in rules {\n        let unrepresentable = |part: RuleCond<E>| Unrepresentable {\n            rule: name,\n            part: part.spelled(),\n        };\n        let action = rule.action.spec();\n        if severity != Some(action.severity()) {\n            severity = Some(action.severity());\n            match action.kind_and_slot() {\n                (kind, \"withholding\") => writeln!(table, \"## {kind}, withholding\"),\n                (kind, slot) => writeln!(table, \"## {kind}, {slot} slot\"),\n            }\n            .unwrap();\n        }\n        let mut when = Vec::new();\n        conjuncts(rule.when, &mut when).map_err(unrepresentable)?;\n        let when = if when.is_empty() {\n            \"always\".to_owned()\n        } else {\n            when.join(\" & \")\n        };\n        writeln!(\n            table,\n            \"{name} | {:?} | {when} | {}\",\n            rule.audience,\n            action.spelled()\n        )\n        .unwrap();\n    }\n    Ok(table)\n}\n\nfn conjuncts<E: Engine>(\n    condition: RuleCond<E>,\n    conjuncts: &mut Vec<String>,\n) -> Result<(), RuleCond<E>> {\n    let leaves = |branches: &[RuleCond<E>]| -> Option<Vec<Predicate>> {\n        branches\n            .iter()\n            .map(|branch| match *branch {\n                RuleCond::Leaf(leaf) => Some(E::lift(leaf)),\n                RuleCond::All(_) | RuleCond::Any(_) | RuleCond::Not(_) | RuleCond::Named(_) => None,\n            })\n            .collect()\n    };\n    match condition {\n        RuleCond::Leaf(leaf) => conjuncts.push(E::lift(leaf).spelled()),\n        RuleCond::Not(&RuleCond::Leaf(leaf)) => conjuncts.push(negated(E::lift(leaf))),\n        RuleCond::All(children) => {\n            for &child in children {\n                self::conjuncts(child, conjuncts)?;\n            }\n        }\n        RuleCond::Named(named) => match named.condition {\n            RuleCond::All(_) => self::conjuncts(named.condition, conjuncts)?,\n            RuleCond::Any(branches) => {\n                let leaves = leaves(branches).ok_or(condition)?;\n                let leaves: Vec<String> = leaves.into_iter().map(Predicate::spelled).collect();\n                conjuncts.push(format!(\"{}[{}]\", named.name, leaves.join(\" | \")));\n            }\n            RuleCond::Not(&RuleCond::Any(branches)) => {\n                conjuncts.extend(leaves(branches).ok_or(condition)?.into_iter().map(negated));\n            }\n            RuleCond::Leaf(_) | RuleCond::Not(_) | RuleCond::Named(_) => return Err(condition),\n        },\n        RuleCond::Any(_) | RuleCond::Not(_) => return Err(condition),\n    }\n    Ok(())\n}\n\nfn negated(leaf: Predicate) -> String {\n    if let Predicate::PostFacts(PostFactsLeaf::TweetCreatedAfter(unix_ms)) = leaf {\n        format!(\"tweet_created_before({unix_ms})\")\n    } else if leaf == Predicate::Request(RequestLeaf::ClientHasModernBlur) {\n        \"is_client_deprecated\".to_owned()\n    } else {\n        format!(\"not({})\", leaf.spelled())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::rules::rule_spec::leaves::*;\n    use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors};\n    use crate::rules::rule_spec::rule::{all, any, Audience, NamedCond};\n    use crate::rules::rule_spec::{drop_post, DropAs, RuleId};\n\n    #[test]\n    fn the_legacy_table_rejects_a_rule_it_cannot_print() {\n        static NESTED: NamedCond = NamedCond {\n            name: \"nested\",\n            condition: any![\n                ViewerMutesAuthor,\n                all![ViewerFollowsAuthor, ViewerBlocksAuthor]\n            ],\n        };\n        let printed = |audience: Audience, when: RuleCond| {\n            let rule = Rule {\n                id: RuleId::FilterAll,\n                audience,\n                when,\n                action: drop_post(DropAs::UnspecifiedReason),\n            };\n            legacy_table(&[(\"rule\", rule)]).map_err(|error| error.part)\n        };\n        let nested_any = const { RuleCond::Not(&any![ViewerMutesAuthor, ViewerBlocksAuthor]) };\n        for (audience, when, part) in [\n            (\n                Everyone,\n                nested_any,\n                \"not(any[viewer_mutes_author | viewer_blocks_author])\",\n            ),\n            (\n                NonAuthors,\n                const { all![ViewerFollowsAuthor, RuleCond::Named(&NESTED)] },\n                \"nested=any[viewer_mutes_author | all[viewer_follows_author & viewer_blocks_author]]\",\n            ),\n        ] {\n            assert_eq!(printed(audience, when), Err(part.to_owned()));\n        }\n        assert_eq!(\n            printed(NonAuthors, const { all![ViewerFollowsAuthor] }),\n            Ok(\"## drop, withholding\\nrule | NonAuthors | viewer_follows_author | Legacy(UnspecifiedReason)\\n\".to_owned())\n        );\n    }\n}\n",
+      "source_digest": "48cd9b581f0807df2e41347f68990d25e8b11b5286ee4756b4997e0c6e34d324",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": false
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/rules/legacy_table.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-1bf25a6b16565fb2e6d1be06b9bffd97dda64c2dfeb3a51ef50852980ce1cdcb",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/rules",
+      "presence": {
+        "before_exists": true,
+        "after_exists": false
+      },
+      "diff_digest": "676bb6407786425b28ae61905328e514b16993d040229ba5506457a49df47657",
+      "context_complete": true,
+      "task_id": "T-aae23d5588b486996cb752dc94790cea6980a95c32a810399234b48d569567ed",
+      "evidence_refs": [
+        "E1"
+      ]
+    }
+  ],
+  "task_id": "T-dacdaf858bbe7e40605e11d94f32a7a025c90a5d296c0533ff39d3835fddf595",
+  "context_dependencies": [
+    "T-fa90965b4d9cc02cb539b55889827580534ee2d00a41f2afcee84444c9f74ea9"
+  ],
+  "replaces_task_id": "T-7479932aa22d9c4832f1a562c776e916d85b5d380d97954507cb7f6e7ad8c259",
+  "ancestor_task_ids": [
+    "T-7479932aa22d9c4832f1a562c776e916d85b5d380d97954507cb7f6e7ad8c259"
+  ]
+}

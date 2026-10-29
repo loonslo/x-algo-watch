@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/explain.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-a6525daf702ebe0e8ec6b4820060d4a31e07a11d6e928b6e285e7666f0bbdfd8",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/explain.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1779,
+      "end_line": 2056,
+      "kind": "before_implementation",
+      "scope": "change_window",
+      "text": "        let spam = row(&trace, \"spam/drop/undesirable\");\n        assert_eq!(\n            (spam.truth, spam.defaults_admitted, spam.defaults_retained),\n            (\n                Truth::Unknown {\n                    default: false,\n                    failed: failed_labels\n                },\n                failed_labels,\n                failed_labels\n            )\n        );\n        assert_eq!(trace.evaluation.fail_open_defaults(), failed_labels);\n        let logged_out = row(&trace, \"sensitive_viewer_logged_out/drop\");\n        assert_eq!(logged_out.truth, Truth::False);\n        assert_eq!(\n            (logged_out.defaults_admitted, logged_out.defaults_retained),\n            (Hydrators::empty(), Hydrators::empty())\n        );\n        let nodes = subtree(&trace, logged_out.root);\n        let [viewer_logged_out] = leaves(&nodes, |leaf| {\n            leaf == Predicate::Request(RequestLeaf::ViewerLoggedOut)\n        })[..] else {\n            panic!(\"one logged-out leaf\");\n        };\n        assert_eq!(viewer_logged_out.truth, Truth::False);\n        let labelled = leaves(&nodes, |leaf| {\n            matches!(leaf, Predicate::TweetSafetyLabels(_))\n        });\n        assert!(!labelled.is_empty());\n        for label in labelled {\n            assert_eq!(\n                label.truth,\n                Truth::Unknown {\n                    default: false,\n                    failed: Hydrators::of(Hydrator::TweetSafetyLabels)\n                }\n            );\n            let Some(Skip::FalseConjunct(cause)) = label.skip else {\n                panic!(\"{label:?}\");\n            };\n            assert_eq!(trace.nodes[cause].truth, Truth::False);\n            assert!(\n                subtree(&trace, cause)\n                    .iter()\n                    .any(|node| node.node == viewer_logged_out.node)\n            );\n        }\n\n        let mut features = TweetFeatures::default();\n        features.media.has_media = true;\n        let trace = home_trace(\n            world().tweet_features(4, features).labels(\n                4,\n                labels(&[\n                    SafetyLabelType::NSFW_HIGH_PRECISION,\n                    SafetyLabelType::NSFW_HIGH_RECALL,\n                ]),\n            ),\n            0,\n        )\n        .await;\n        let logged_out = row(&trace, \"sensitive_viewer_logged_out/drop\");\n        assert_eq!(logged_out.truth, Truth::True);\n        let nodes = subtree(&trace, logged_out.root);\n        let labelled = leaves(&nodes, |leaf| {\n            matches!(leaf, Predicate::TweetSafetyLabels(_))\n        });\n        let [first, second, third] = labelled[..] else {\n            panic!(\"{labelled:?}\");\n        };\n        assert_eq!(\n            [first.truth, second.truth, third.truth],\n            [Truth::True, Truth::True, Truth::False]\n        );\n        assert_eq!(first.skip, None);\n        assert_eq!(second.skip, Some(Skip::TrueDisjunct(first.node)));\n        assert_eq!(third.skip, Some(Skip::TrueDisjunct(first.node)));\n        let any = &trace.nodes[first.parent.unwrap()];\n        assert_eq!(any.kind, NodeKind::Any);\n        assert_eq!(\n            any.witnesses,\n            [first, second].map(|node| Witness {\n                node: node.node,\n                truth: Truth::True,\n                negated: false,\n            })\n        );\n    }\n\n    #[tokio::test]\n    async fn an_excluded_author_reads_a_failed_follow_as_neutral_in_the_audience() {\n        let explanation = explainer(\n            InMemorySources::default()\n                .tweet(4, 40)\n                .authors(&[40])\n                .fail_edge(Graph::Follows, 40),\n            no_copy(),\n        )\n        .explain(&ask(40, 4, Client::Web))\n        .await;\n        let trace = requested(&explanation.levels[0]);\n        let failed_follow = Truth::Unknown {\n            default: false,\n            failed: Hydrators::of(Hydrator::Follows),\n        };\n        let mut rows = 0;\n        for row in &trace.rows {\n            let nodes = subtree(trace, row.root);\n            let [follows] = leaves(&nodes, |leaf| {\n                leaf == Predicate::Relationship(RelationshipLeaf::ViewerFollowsAuthor)\n            })[..] else {\n                continue;\n            };\n            rows += 1;\n            assert_eq!(row.truth, Truth::False, \"{}\", row.by);\n            assert_eq!(\n                (row.defaults_admitted, row.defaults_retained),\n                (Hydrators::empty(), Hydrators::empty())\n            );\n            assert_eq!(follows.truth, failed_follow);\n            assert!(matches!(follows.skip, Some(Skip::FalseConjunct(_))));\n            let not = &trace.nodes[follows.parent.unwrap()];\n            assert_eq!(not.kind, NodeKind::Not);\n            assert_eq!(\n                not.truth,\n                Truth::Unknown {\n                    default: true,\n                    failed: Hydrators::of(Hydrator::Follows)\n                }\n            );\n            let negated = |truth| Witness {\n                node: follows.node,\n                truth,\n                negated: true,\n            };\n            assert_eq!(not.witnesses, [negated(failed_follow)]);\n            assert_eq!(not.default_witnesses, [negated(Truth::False)]);\n        }\n        assert!(rows > 0);\n        let ViewerFacts::NoUser { relationship, .. } = explanation.viewer else {\n            panic!(\"{:?}\", explanation.viewer);\n        };\n        assert!(relationship.is_author);\n        assert_eq!(relationship.follows, Seen::Failed);\n    }\n\n    #[tokio::test]\n    async fn each_use_of_a_named_condition_is_its_own_observed_occurrence() {\n        let [.., level_82] = explainer(\n            InMemorySources::default().tweet(4, 40).authors(&[40]),\n            no_copy(),\n        )\n        .explain(&ask(VIEWER, 4, Client::Web))\n        .await\n        .levels;\n        let trace = requested(&level_82);\n        for name in [\n            \"viewer_is_not_age_verified_in_age_verification_countries\",\n            \"viewer_is_not_age_verified_in_tombstone_countries\",\n            \"viewer_is_neither_root_author_nor_invited\",\n        ] {\n            let uses: Vec<&NodeTrace> = trace\n                .nodes\n                .iter()\n                .filter(|node| node.kind == NodeKind::Named(name))\n                .collect();\n            assert!(uses.len() > 1, \"{name}\");\n            for named in &uses {\n                let rows = trace\n                    .rows\n                    .iter()\n                    .filter(|row| subtree(trace, row.root).contains(named))\n                    .count();\n                assert_eq!(rows, 1, \"{name}\");\n                let [body] = trace\n                    .nodes\n                    .iter()\n                    .filter(|node| node.parent == Some(named.node))\n                    .collect::<Vec<_>>()[..]\n                else {\n                    panic!(\"{name} has one body\");\n                };\n                assert_eq!(body.truth, named.truth, \"{name}\");\n            }\n        }\n    }\n\n    #[tokio::test]\n    async fn leaf_wording_keeps_the_label_and_follower_sentences_and_every_payload() {\n        let world = || InMemorySources::default().tweet(4, 40).authors(&[40]);\n        let bounce = Predicate::TweetSafetyLabels(TweetSafetyLabelsLeaf::TweetHasLabel(\n            SafetyLabelType::BOUNCE,\n        ));\n        let mut observed = Vec::new();\n        for (sources, label, follower) in [\n            (\n                world().labels(4, labels(&[SafetyLabelType::BOUNCE])).edge(\n                    Graph::Follows,\n                    VIEWER,\n                    40,\n                ),\n                \"The post has the BOUNCE safety label.\",\n                \"The viewer follows the author.\",\n            ),\n            (\n                world(),\n                \"The post does not have the BOUNCE safety label.\",\n                \"The viewer does not follow the author.\",\n            ),\n            (\n                world()\n                    .fail_key(Source::SafetyLabels, 4)\n                    .fail_edge(Graph::Follows, 40),\n                \"Whether the post has the BOUNCE safety label.\",\n                \"Whether the viewer follows the author.\",\n            ),\n        ] {\n            let levels = explainer(sources, no_copy())\n                .explain(&ask(VIEWER, 4, Client::Web))\n                .await\n                .levels;\n            let nodes: Vec<&NodeTrace> = requested(&levels[0]).nodes.iter().collect();\n            let rendered = |predicate: Predicate| {\n                let leaf = leaves(&nodes, |leaf| leaf == predicate)[0];\n                predicate.render(leaf.truth)\n            };\n            assert_eq!(rendered(bounce), label);\n            assert_eq!(\n                rendered(Predicate::Relationship(\n                    RelationshipLeaf::ViewerFollowsAuthor\n                )),\n                follower\n            );\n            for level in &levels {\n                observed.extend(\n                    requested(level)\n                        .nodes\n                        .iter()\n                        .filter_map(|node| match node.kind {\n                            NodeKind::Leaf(leaf) => Some(leaf),\n                            NodeKind::Rule\n                            | NodeKind::All\n                            | NodeKind::Any\n                            | NodeKind::Not\n                            | NodeKind::Named(_) => None,\n                        }),\n                );\n            }\n        }\n        observed.sort_by_key(|leaf| format!(\"{leaf:?}\"));\n        observed.dedup();\n        let artificial = [\n            Truth::True,\n            Truth::False,\n            Truth::Unknown {\n                default: false,\n                failed: Hydrators::empty(),\n            },\n        ];\n        for truth in artificial {\n            let mut rendered: Vec<String> =\n                observed.iter().map(|leaf| leaf.render(truth)).collect();\n            assert!(rendered.iter().all(|text| !text.is_empty()));\n            rendered.sort();\n            rendered.dedup();\n            assert_eq!(rendered.len(), observed.len(), \"{truth:?}\");\n        }\n        for leaf in &observed {\n            let mut rendered = artificial.map(|truth| leaf.render(truth));\n            rendered.sort();\n            assert!(\n                rendered[0] != rendered[1] && rendered[1] != rendered[2],\n                \"{leaf:?}\"\n            );\n        }\n    }\n}\n",
+      "source_digest": "65db26cad35b5a5662705797e4bd0014620981990491c8b5c5edc92478e0c53c",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "unknown",
+      "purpose_markers": [],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/explain.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-a6525daf702ebe0e8ec6b4820060d4a31e07a11d6e928b6e285e7666f0bbdfd8",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "context_complete": false,
+      "hunk": 17,
+      "part": 4,
+      "change_range": {
+        "before_start": 569,
+        "before_count": 1488,
+        "after_start": 570,
+        "after_count": 203
+      },
+      "diff_digest": "c1bb450c494385a8d58683c4677a815b13365dba49ae35509c3ac2b7766e4202",
+      "task_id": "T-5f501e671b9ec9d10b44e7f742d90cd1164cd065c543fd88a0d07bd9e3ebed78",
+      "evidence_refs": [
+        "E1"
+      ]
+    }
+  ],
+  "task_id": "T-4d96b061d7477cb06fbce4ba53fbac405c2b9714ba74d3c721be2fda33bdec0c",
+  "context_dependencies": [
+    "T-eeeb5ef9eaa57132e54be98ca7f42b9dfc01d501fd95e05470627cde59ac69a1"
+  ],
+  "replaces_task_id": "T-479a68329f43cc6850312084b8d25c027a02692eb5a82dd839129c08284ae28e",
+  "ancestor_task_ids": [
+    "T-479a68329f43cc6850312084b8d25c027a02692eb5a82dd839129c08284ae28e"
+  ]
+}

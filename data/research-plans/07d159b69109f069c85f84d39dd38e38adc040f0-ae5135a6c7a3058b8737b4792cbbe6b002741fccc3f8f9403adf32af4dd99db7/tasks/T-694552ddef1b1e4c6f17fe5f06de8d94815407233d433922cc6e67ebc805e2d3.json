@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/safety_label_source/warmer.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-39d5ff85b7f4ef75e60a6ee89ad2132b39799784b4c6598947f44cd43c179b3d",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/safety_label_source",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 161,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use std::sync::Arc;\nuse std::time::Duration;\n\nuse tokio::sync::mpsc;\nuse tonic::async_trait;\nuse xai_strato::{encode, StratoGrpc};\n\nuse super::metrics::{self, WarmKeyResult};\n\nconst WARM_COLUMN_PATH: &str = \"visibility/baseTweetSafetyLabelMap\";\nconst WARM_CHANNEL_CAPACITY: usize = 1024;\nconst WARM_LINGER: Duration = Duration::from_millis(500);\nconst WARM_FETCH_MAX_KEYS: usize = 50;\n\npub(crate) trait Warmer: Send + Sync {\n    fn warm(&self, miss_ids: Vec<u64>);\n}\n\n#[async_trait]\npub(crate) trait WarmFetcher: Send + Sync {\n    async fn fetch(&self, ids: &[u64]) -> usize;\n}\n\npub(crate) struct StratoWarmFetcher {\n    grpc: StratoGrpc,\n}\n\nimpl StratoWarmFetcher {\n    pub(crate) fn new(grpc: StratoGrpc) -> Self {\n        Self { grpc }\n    }\n}\n\n#[async_trait]\nimpl WarmFetcher for StratoWarmFetcher {\n    async fn fetch(&self, ids: &[u64]) -> usize {\n        let calls = ids\n            .iter()\n            .map(|id| {\n                (\n                    WARM_COLUMN_PATH.to_string(),\n                    \"fetch\".to_string(),\n                    vec![encode(&(id.cast_signed(), ()))],\n                )\n            })\n            .collect();\n        self.grpc\n            .batch_call(calls, None)\n            .await\n            .iter()\n            .filter(|result| result.is_err())\n            .count()\n    }\n}\n\npub(crate) struct CacheWarmer {\n    tx: mpsc::Sender<Vec<u64>>,\n}\n\nimpl CacheWarmer {\n    pub(crate) fn spawn(fetcher: Arc<dyn WarmFetcher>) -> Arc<Self> {\n        let (tx, rx) = mpsc::channel(WARM_CHANNEL_CAPACITY);\n        tokio::spawn(drain(rx, fetcher));\n        Arc::new(Self { tx })\n    }\n\n    #[cfg(test)]\n    pub(crate) fn without_drain_task(capacity: usize) -> (Self, mpsc::Receiver<Vec<u64>>) {\n        let (tx, rx) = mpsc::channel(capacity);\n        (Self { tx }, rx)\n    }\n}\n\nimpl Warmer for CacheWarmer {\n    fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n        }\n        for chunk in ids.chunks(WARM_FETCH_MAX_KEYS) {\n            let failed = fetcher.fetch(chunk).await;\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchIssued, chunk.len());\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchFailed, failed);\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeFetcher {\n        batches: Mutex<Vec<Vec<u64>>>,\n    }\n\n    impl FakeFetcher {\n        fn new() -> Arc<Self> {\n            Arc::new(Self {\n                batches: Mutex::new(Vec::new()),\n            })\n        }\n\n        fn batches(&self) -> Vec<Vec<u64>> {\n            self.batches.lock().unwrap().clone()\n        }\n    }\n\n    #[async_trait]\n    impl WarmFetcher for FakeFetcher {\n        async fn fetch(&self, ids: &[u64]) -> usize {\n            self.batches.lock().unwrap().push(ids.to_vec());\n            0\n        }\n    }\n\n    #[tokio::test(start_paused = true)]\n    async fn drain_lingers_then_flushes_in_chunks() {\n        let fetcher = FakeFetcher::new();\n        let warmer = CacheWarmer::spawn(Arc::<FakeFetcher>::clone(&fetcher));\n\n        warmer.warm((0..30).collect());\n        warmer.warm((30..60).collect());\n        tokio::time::sleep(WARM_LINGER * 2).await;\n        warmer.warm(vec![100]);\n        tokio::time::sleep(WARM_LINGER * 2).await;\n\n        let batches = fetcher.batches();\n        assert_eq!(batches.len(), 3);\n        assert_eq!(batches[0], (0..50).collect::<Vec<u64>>());\n        assert_eq!(batches[1], (50..60).collect::<Vec<u64>>());\n        assert_eq!(batches[2], vec![100]);\n\n        for start in (0..150).step_by(30) {\n            warmer.warm((start..start + 30).collect());\n        }\n        tokio::time::sleep(WARM_LINGER * 2).await;\n        let batches = fetcher.batches();\n        assert!(batches\n            .iter()\n            .all(|batch| batch.len() <= WARM_FETCH_MAX_KEYS));\n        assert_eq!(batches[3..].concat(), (0..150).collect::<Vec<u64>>());\n    }\n}\n",
+      "source_digest": "9afa34044a431096d76f7d4ab8670caf3d3a7fce72255b73f975d44c4a6020c2",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 155,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use std::sync::Arc;\nuse std::time::Duration;\n\nuse tokio::sync::mpsc;\nuse tonic::async_trait;\nuse xai_strato::{encode, StratoGrpc};\n\nuse super::metrics::{self, WarmKeyResult};\n\nconst WARM_COLUMN_PATH: &str = \"visibility/baseTweetSafetyLabelMap\";\nconst WARM_CHANNEL_CAPACITY: usize = 1024;\nconst WARM_LINGER: Duration = Duration::from_millis(500);\nconst WARM_FETCH_MAX_KEYS: usize = 50;\n\n#[async_trait]\npub(crate) trait WarmFetcher: Send + Sync {\n    async fn fetch(&self, ids: &[u64]) -> usize;\n}\n\npub(crate) struct StratoWarmFetcher {\n    grpc: StratoGrpc,\n}\n\nimpl StratoWarmFetcher {\n    pub(crate) fn new(grpc: StratoGrpc) -> Self {\n        Self { grpc }\n    }\n}\n\n#[async_trait]\nimpl WarmFetcher for StratoWarmFetcher {\n    async fn fetch(&self, ids: &[u64]) -> usize {\n        let calls = ids\n            .iter()\n            .map(|id| {\n                (\n                    WARM_COLUMN_PATH.to_string(),\n                    \"fetch\".to_string(),\n                    vec![encode(&(id.cast_signed(), ()))],\n                )\n            })\n            .collect();\n        self.grpc\n            .batch_call(calls, None)\n            .await\n            .iter()\n            .filter(|result| result.is_err())\n            .count()\n    }\n}\n\npub(crate) struct CacheWarmer {\n    tx: mpsc::Sender<Vec<u64>>,\n}\n\nimpl CacheWarmer {\n    pub(crate) fn spawn(fetcher: Arc<dyn WarmFetcher>) -> Arc<Self> {\n        let (tx, rx) = mpsc::channel(WARM_CHANNEL_CAPACITY);\n        tokio::spawn(drain(rx, fetcher));\n        Arc::new(Self { tx })\n    }\n\n    #[cfg(test)]\n    pub(crate) fn without_drain_task(capacity: usize) -> (Self, mpsc::Receiver<Vec<u64>>) {\n        let (tx, rx) = mpsc::channel(capacity);\n        (Self { tx }, rx)\n    }\n\n    pub(crate) fn warm(&self, miss_ids: Vec<u64>) {\n        metrics::record_cache_warm_keys(WarmKeyResult::EligibleMiss, miss_ids.len());\n        if miss_ids.is_empty() {\n            return;\n        }\n        let count = miss_ids.len();\n        match self.tx.try_send(miss_ids) {\n            Ok(()) => metrics::record_cache_warm_keys(WarmKeyResult::Enqueued, count),\n            Err(_) => metrics::record_cache_warm_keys(WarmKeyResult::DroppedChannelFull, count),\n        }\n    }\n}\n\nasync fn drain(mut rx: mpsc::Receiver<Vec<u64>>, fetcher: Arc<dyn WarmFetcher>) {\n    while let Some(mut ids) = rx.recv().await {\n        let deadline = tokio::time::Instant::now() + WARM_LINGER;\n        while ids.len() < WARM_FETCH_MAX_KEYS {\n            match tokio::time::timeout_at(deadline, rx.recv()).await {\n                Ok(Some(mut more)) => ids.append(&mut more),\n                _ => break,\n            }\n        }\n        for chunk in ids.chunks(WARM_FETCH_MAX_KEYS) {\n            let failed = fetcher.fetch(chunk).await;\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchIssued, chunk.len());\n            metrics::record_cache_warm_keys(WarmKeyResult::FetchFailed, failed);\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::sync::Mutex;\n\n    struct FakeFetcher {\n        batches: Mutex<Vec<Vec<u64>>>,\n    }\n\n    impl FakeFetcher {\n        fn new() -> Arc<Self> {\n            Arc::new(Self {\n                batches: Mutex::new(Vec::new()),\n            })\n        }\n\n        fn batches(&self) -> Vec<Vec<u64>> {\n            self.batches.lock().unwrap().clone()\n        }\n    }\n\n    #[async_trait]\n    impl WarmFetcher for FakeFetcher {\n        async fn fetch(&self, ids: &[u64]) -> usize {\n            self.batches.lock().unwrap().push(ids.to_vec());\n            0\n        }\n    }\n\n    #[tokio::test(start_paused = true)]\n    async fn drain_lingers_then_flushes_in_chunks() {\n        let fetcher = FakeFetcher::new();\n        let warmer = CacheWarmer::spawn(Arc::<FakeFetcher>::clone(&fetcher));\n\n        warmer.warm((0..30).collect());\n        warmer.warm((30..60).collect());\n        tokio::time::sleep(WARM_LINGER * 2).await;\n        warmer.warm(vec![100]);\n        tokio::time::sleep(WARM_LINGER * 2).await;\n\n        let batches = fetcher.batches();\n        assert_eq!(batches.len(), 3);\n        assert_eq!(batches[0], (0..50).collect::<Vec<u64>>());\n        assert_eq!(batches[1], (50..60).collect::<Vec<u64>>());\n        assert_eq!(batches[2], vec![100]);\n\n        for start in (0..150).step_by(30) {\n            warmer.warm((start..start + 30).collect());\n        }\n        tokio::time::sleep(WARM_LINGER * 2).await;\n        let batches = fetcher.batches();\n        assert!(batches\n            .iter()\n            .all(|batch| batch.len() <= WARM_FETCH_MAX_KEYS));\n        assert_eq!(batches[3..].concat(), (0..150).collect::<Vec<u64>>());\n    }\n}\n",
+      "source_digest": "8f3ae17b03a6f1f2a4996721e2fb6177bdf1f4fa557e77393b958635232da3ef",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/safety_label_source/warmer.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-39d5ff85b7f4ef75e60a6ee89ad2132b39799784b4c6598947f44cd43c179b3d",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/safety_label_source",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "6d991d1968db19e8c8046b12922aaca9af0e33e1192d8b105e62bcf1a62f6ae3",
+      "context_complete": true,
+      "task_id": "T-ca2f26887b389b309f27faa0241a6f4583e9b6cc5a03d8c986e66998f654bf50",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    }
+  ],
+  "task_id": "T-694552ddef1b1e4c6f17fe5f06de8d94815407233d433922cc6e67ebc805e2d3",
+  "context_dependencies": [
+    "T-92a6e37ca9663baa60563296fd612481b2cc1bef0ca7847fd56464a42f79a808"
+  ],
+  "replaces_task_id": "T-c82b129be526444996c9fcae15f06fd9ffa23c199a30b717823e35b42c7ec46e",
+  "ancestor_task_ids": [
+    "T-c82b129be526444996c9fcae15f06fd9ffa23c199a30b717823e35b42c7ec46e"
+  ]
+}

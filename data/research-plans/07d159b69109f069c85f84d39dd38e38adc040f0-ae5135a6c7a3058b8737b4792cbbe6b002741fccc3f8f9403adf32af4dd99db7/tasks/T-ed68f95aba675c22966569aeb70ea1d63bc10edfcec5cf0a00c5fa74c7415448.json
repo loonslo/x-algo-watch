@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "path": "visibility-filtering/hydration/batch.rs",
+  "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+  "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+  "claim_namespace": "N-ce0e5e3e103e68ec45c0ab3c2afe20f71dae755a3bb5f3c581de110f9943ada6",
+  "change_scope": "changed_file",
+  "mechanism_group": "visibility-filtering/hydration",
+  "evidence": {
+    "E1": {
+      "path": "visibility-filtering/hydration/batch.rs",
+      "commit": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "start_line": 1,
+      "end_line": 180,
+      "kind": "before_implementation",
+      "scope": "complete_file",
+      "text": "use rustc_hash::FxHashMap;\nuse std::collections::hash_map::Entry;\nuse std::collections::HashMap;\nuse std::hash::{BuildHasher, Hash};\nuse std::slice;\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) enum HydrationError {\n    Timeout,\n    Error,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) enum Hydrated<V> {\n    Found(V),\n    Partial(V),\n    NotFound,\n    Failed(HydrationError),\n}\n\nimpl<V> Hydrated<V> {\n    pub(crate) fn value(&self) -> Option<&V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed(_) => None,\n        }\n    }\n\n    pub(crate) fn into_value(self) -> Option<V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed(_) => None,\n        }\n    }\n\n    pub(crate) fn is_complete(&self) -> bool {\n        matches!(self, Hydrated::Found(_) | Hydrated::NotFound)\n    }\n}\n\nimpl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {\n    fn from(result: Result<Option<V>, E>) -> Self {\n        match result {\n            Ok(Some(value)) => Hydrated::Found(value),\n            Ok(None) => Hydrated::NotFound,\n            Err(_) => Hydrated::Failed(HydrationError::Error),\n        }\n    }\n}\n\n#[derive(Clone)]\npub(crate) struct HydrationBatch<K, V> {\n    results: FxHashMap<K, Hydrated<V>>,\n}\n\npub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;\n\nimpl<K: Eq + Hash, V> HydrationBatch<K, V> {\n    pub(crate) fn empty() -> Self {\n        Self {\n            results: FxHashMap::default(),\n        }\n    }\n\n    pub(crate) fn from_results<E, S: BuildHasher>(\n        expected: impl IntoIterator<Item = K>,\n        mut results: HashMap<K, Result<Option<V>, E>, S>,\n    ) -> Self {\n        Self::from_expected(expected, |key| {\n            results\n                .remove(key)\n                .map(Hydrated::from)\n                .unwrap_or(Hydrated::Failed(HydrationError::Error))\n        })\n    }\n\n    pub(crate) fn from_hydrated(results: FxHashMap<K, Hydrated<V>>) -> Self {\n        Self { results }\n    }\n\n    fn from_expected(\n        expected: impl IntoIterator<Item = K>,\n        mut resolve: impl FnMut(&K) -> Hydrated<V>,\n    ) -> Self {\n        let mut results = FxHashMap::default();\n        for key in expected {\n            if let Entry::Vacant(entry) = results.entry(key) {\n                let hydrated = resolve(entry.key());\n                entry.insert(hydrated);\n            }\n        }\n        Self { results }\n    }\n\n    pub(crate) fn timed_out(expected: impl IntoIterator<Item = K>) -> Self {\n        Self {\n            results: expected\n                .into_iter()\n                .map(|key| (key, Hydrated::Failed(HydrationError::Timeout)))\n                .collect(),\n        }\n    }\n\n    pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {\n        self.results.get(key)\n    }\n\n    pub(crate) fn into_hydrated(self) -> FxHashMap<K, Hydrated<V>> {\n        self.results\n    }\n\n    #[cfg(test)]\n    pub(crate) fn get(&self, key: &K) -> Option<&V> {\n        self.results.get(key).and_then(Hydrated::value)\n    }\n\n    pub(crate) fn map<V2>(self, mut f: impl FnMut(V) -> V2) -> HydrationBatch<K, V2> {\n        HydrationBatch {\n            results: self\n                .results\n                .into_iter()\n                .map(|(key, hydrated)| {\n                    let hydrated = match hydrated {\n                        Hydrated::Found(value) => Hydrated::Found(f(value)),\n                        Hydrated::Partial(value) => Hydrated::Partial(f(value)),\n                        Hydrated::NotFound => Hydrated::NotFound,\n                        Hydrated::Failed(e) => Hydrated::Failed(e),\n                    };\n                    (key, hydrated)\n                })\n                .collect(),\n        }\n    }\n}\n\nimpl<K, V> AsRef<[HydrationBatch<K, V>]> for HydrationBatch<K, V> {\n    fn as_ref(&self) -> &[Self] {\n        slice::from_ref(self)\n    }\n}\n\nimpl<K: Eq + Hash, V> Default for HydrationBatch<K, V> {\n    fn default() -> Self {\n        Self::empty()\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn batch(results: HashMap<u64, Result<Option<u32>, &str>>) -> HydrationBatch<u64, u32> {\n        HydrationBatch::from_results(results.keys().copied().collect::<Vec<_>>(), results)\n    }\n\n    #[test]\n    fn absent_expected_keys_become_missing() {\n        let batch: HydrationBatch<u64, u32> =\n            HydrationBatch::from_results([1, 2], HashMap::from([(1, Ok::<_, &str>(Some(7)))]));\n\n        assert_eq!(\n            batch.hydrated(&2),\n            Some(&Hydrated::Failed(HydrationError::Error))\n        );\n    }\n\n    #[test]\n    fn map_preserves_tri_state() {\n        let mapped = batch(HashMap::from([\n            (1, Ok(Some(7))),\n            (2, Ok(None)),\n            (3, Err(\"boom\")),\n        ]))\n        .map(|v| v * 10);\n\n        assert_eq!(mapped.get(&1), Some(&70));\n        assert_eq!(mapped.hydrated(&2), Some(&Hydrated::NotFound));\n        assert!(matches!(mapped.hydrated(&3), Some(&Hydrated::Failed(_))));\n    }\n}\n",
+      "source_digest": "a0ff436393751fdcddd91ea724a23b586d6f1858ab537e6da5e549d705e3aa43",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    },
+    "E2": {
+      "path": "visibility-filtering/hydration/batch.rs",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "start_line": 1,
+      "end_line": 168,
+      "kind": "after_implementation",
+      "scope": "complete_file",
+      "text": "use rustc_hash::FxHashMap;\nuse std::collections::hash_map::Entry;\nuse std::collections::HashMap;\nuse std::hash::{BuildHasher, Hash};\nuse std::slice;\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub(crate) enum Hydrated<V> {\n    Found(V),\n    Partial(V),\n    NotFound,\n    Failed,\n    Unanswered,\n}\n\nimpl<V> Hydrated<V> {\n    pub(crate) fn value(&self) -> Option<&V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed | Hydrated::Unanswered => None,\n        }\n    }\n\n    pub(crate) fn into_value(self) -> Option<V> {\n        match self {\n            Hydrated::Found(value) | Hydrated::Partial(value) => Some(value),\n            Hydrated::NotFound | Hydrated::Failed | Hydrated::Unanswered => None,\n        }\n    }\n\n    pub(crate) fn is_complete(&self) -> bool {\n        matches!(self, Hydrated::Found(_) | Hydrated::NotFound)\n    }\n}\n\nimpl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {\n    fn from(result: Result<Option<V>, E>) -> Self {\n        match result {\n            Ok(Some(value)) => Hydrated::Found(value),\n            Ok(None) => Hydrated::NotFound,\n            Err(_) => Hydrated::Failed,\n        }\n    }\n}\n\n#[derive(Clone)]\npub(crate) struct HydrationBatch<K, V> {\n    results: FxHashMap<K, Hydrated<V>>,\n}\n\npub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;\n\nimpl<K: Eq + Hash, V> HydrationBatch<K, V> {\n    pub(crate) fn from_results<E, S: BuildHasher>(\n        expected: impl IntoIterator<Item = K>,\n        mut results: HashMap<K, Result<Option<V>, E>, S>,\n    ) -> Self {\n        Self::from_expected(expected, |key| {\n            results\n                .remove(key)\n                .map_or(Hydrated::Unanswered, Hydrated::from)\n        })\n    }\n\n    pub(crate) fn from_hydrated(results: FxHashMap<K, Hydrated<V>>) -> Self {\n        Self { results }\n    }\n\n    fn from_expected(\n        expected: impl IntoIterator<Item = K>,\n        mut resolve: impl FnMut(&K) -> Hydrated<V>,\n    ) -> Self {\n        let mut results = FxHashMap::default();\n        for key in expected {\n            if let Entry::Vacant(entry) = results.entry(key) {\n                let hydrated = resolve(entry.key());\n                entry.insert(hydrated);\n            }\n        }\n        Self { results }\n    }\n\n    pub(crate) fn failed(expected: impl IntoIterator<Item = K>) -> Self {\n        Self {\n            results: expected\n                .into_iter()\n                .map(|key| (key, Hydrated::Failed))\n                .collect(),\n        }\n    }\n\n    pub(crate) fn hydrated(&self, key: &K) -> Option<&Hydrated<V>> {\n        self.results.get(key)\n    }\n\n    pub(crate) fn into_hydrated(self) -> FxHashMap<K, Hydrated<V>> {\n        self.results\n    }\n\n    #[cfg(test)]\n    pub(crate) fn get(&self, key: &K) -> Option<&V> {\n        self.results.get(key).and_then(Hydrated::value)\n    }\n\n    pub(crate) fn map<V2>(self, mut f: impl FnMut(V) -> V2) -> HydrationBatch<K, V2> {\n        HydrationBatch {\n            results: self\n                .results\n                .into_iter()\n                .map(|(key, hydrated)| {\n                    let hydrated = match hydrated {\n                        Hydrated::Found(value) => Hydrated::Found(f(value)),\n                        Hydrated::Partial(value) => Hydrated::Partial(f(value)),\n                        Hydrated::NotFound => Hydrated::NotFound,\n                        Hydrated::Failed => Hydrated::Failed,\n                        Hydrated::Unanswered => Hydrated::Unanswered,\n                    };\n                    (key, hydrated)\n                })\n                .collect(),\n        }\n    }\n}\n\nimpl<K, V> AsRef<[HydrationBatch<K, V>]> for HydrationBatch<K, V> {\n    fn as_ref(&self) -> &[Self] {\n        slice::from_ref(self)\n    }\n}\n\nimpl<K: Eq + Hash, V> Default for HydrationBatch<K, V> {\n    fn default() -> Self {\n        Self {\n            results: FxHashMap::default(),\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn batch(results: HashMap<u64, Result<Option<u32>, &str>>) -> HydrationBatch<u64, u32> {\n        HydrationBatch::from_results(results.keys().copied().collect::<Vec<_>>(), results)\n    }\n\n    #[test]\n    fn an_expected_key_the_results_leave_out_is_unanswered() {\n        let batch: HydrationBatch<u64, u32> =\n            HydrationBatch::from_results([1, 2], HashMap::from([(1, Ok::<_, &str>(Some(7)))]));\n\n        assert_eq!(batch.hydrated(&2), Some(&Hydrated::Unanswered));\n    }\n\n    #[test]\n    fn map_preserves_tri_state() {\n        let mapped = batch(HashMap::from([\n            (1, Ok(Some(7))),\n            (2, Ok(None)),\n            (3, Err(\"boom\")),\n        ]))\n        .map(|v| v * 10);\n\n        assert_eq!(mapped.get(&1), Some(&70));\n        assert_eq!(mapped.hydrated(&2), Some(&Hydrated::NotFound));\n        assert!(matches!(mapped.hydrated(&3), Some(&Hydrated::Failed)));\n    }\n}\n",
+      "source_digest": "8fc8f4dbed963ea1c883aa68e5f20adc423cf24f24323729d0009ac67f17be11",
+      "redacted_contacts": 0,
+      "truncated": false,
+      "purpose": "mixed_or_unknown",
+      "purpose_markers": [
+        "test"
+      ],
+      "production_reachability": "unverified"
+    }
+  },
+  "limitations": [
+    "目录分组不是机制结论；用途未知不能当作生产实现",
+    "窗口不证明完整调用链；文件不存在不证明平台此前没有相同功能"
+  ],
+  "context_complete": false,
+  "presence": {
+    "before_exists": true,
+    "after_exists": true
+  },
+  "segments": [
+    {
+      "schema_version": 1,
+      "path": "visibility-filtering/hydration/batch.rs",
+      "base": "989fb91254d461bf4b9df53fb12d5c9a61c2b354",
+      "commit": "07d159b69109f069c85f84d39dd38e38adc040f0",
+      "claim_namespace": "N-ce0e5e3e103e68ec45c0ab3c2afe20f71dae755a3bb5f3c581de110f9943ada6",
+      "change_scope": "changed_file",
+      "mechanism_group": "visibility-filtering/hydration",
+      "presence": {
+        "before_exists": true,
+        "after_exists": true
+      },
+      "diff_digest": "13da18cdd44793cbfb8c2dc772f0732f0f287f1d8e0ca71483d59ad248ad11d2",
+      "context_complete": true,
+      "task_id": "T-bc061e5bab38ed5bff403a588151e5d9a31fb1cf6d311d38f7be33eff44320bb",
+      "evidence_refs": [
+        "E1",
+        "E2"
+      ]
+    }
+  ],
+  "task_id": "T-ed68f95aba675c22966569aeb70ea1d63bc10edfcec5cf0a00c5fa74c7415448",
+  "context_dependencies": [
+    "T-768033937d2aca632072569b5069b6885e51b811596331d2875640b8007d681d"
+  ],
+  "replaces_task_id": "T-0e4963f3ea349360b229adc35d93a15348a3fa7b1d9c97e88db5e1be371c9440",
+  "ancestor_task_ids": [
+    "T-0e4963f3ea349360b229adc35d93a15348a3fa7b1d9c97e88db5e1be371c9440"
+  ]
+}
