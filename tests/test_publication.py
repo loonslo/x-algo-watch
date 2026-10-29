@@ -81,7 +81,7 @@ def test_latest_failure_controls_home_index_and_page_without_changing_progress(s
 def test_real_6258_failure_is_not_an_announcement_and_rebound_is_preserved():
     root = Path(__file__).resolve().parents[1]
     events = [e for e in RecordStore(root / "data").events() if e["type"] == "version_research" and e["commit"].startswith("6258a15")]
-    event = events[-1]
+    event = [e for e in events if e.get("iteration", {}).get("history")][-1]
     assert [len(row["result"]["review"]["issues"]) for row in event["iteration"]["history"]] == [11, 10, 1, 9]
     text = render_research(event, reader_only=True)
     assert "失败暂停" in text and "两次输出校验失败" in text

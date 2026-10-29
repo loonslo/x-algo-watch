@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
-updated: 2026-10-28
-status: waiting
+updated: 2026-10-29
+status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 本地研究主链、共享预算和超大补证归并已实现；基于最新 main 的独立候选保留自动记录并完成 421 项全量回归，最后账本等边界在候选中 54 项通过。原工作区修改保留，data/registry 未覆盖；尚未执行新模型、推送或部署。
-next: 等待对 loonslo/x-algo-watch 的 main、DRAFT_ENABLED 变量及两个精确试点工作流的远程授权；获得后执行 Linux CI、预算恢复验证、真实模型与读者验收，再决定历史扩展。
+next: 修复最新 CI 的历史事件选取与引用反馈回归，相关 32 项通过；继续远程 CI，之后恢复真实试点研究并验收内容质量。既有用户授权持续有效。
 evidence:
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md

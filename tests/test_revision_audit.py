@@ -27,7 +27,7 @@ def test_claim_identity_aligns_reordered_claims_and_tracks_precise_affected_fiel
 
 def test_real_6258_comparison_preserves_rebound_and_exposes_exact_reader_edits():
     root = Path(__file__).resolve().parents[1]
-    event = [e for e in RecordStore(root / "data").events() if e["type"] == "version_research" and e["commit"].startswith("6258a15")][-1]
+    event = [e for e in RecordStore(root / "data").events() if e["type"] == "version_research" and e["commit"].startswith("6258a15") and e.get("iteration", {}).get("history")][-1]
     result = audit_revisions(event["iteration"]["history"])
     assert [step["issue_count"] for step in result["steps"]] == [11, 10, 1, 9]
     assert result["steps"][-1]["issue_count_increased"]
