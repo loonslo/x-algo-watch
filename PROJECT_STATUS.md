@@ -3,9 +3,10 @@ project_id: x-algo-watch
 updated: 2026-10-29
 status: waiting
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 研究主链已推送，远程完整 CI 40813422813 通过；6258a15 恢复运行已保存一次真实延期请求，未形成新通过正文。已补充固定延期分类及安全响应元数据，相关 15 项通过；内容及读者质量验收仍未完成。
+progress: 研究主链已推送；本次同步至 f92066c 确认冲突回退修复已恢复，Windows/Python 3.14.0 相关 50 项、完整 437 项均通过，版本页重建无差异；已存在的远程 CI 40824020077 为 437 项通过。真实研究仍因提供方拥堵等待，内容及读者质量验收未完成。
 next: CI40823111899通过；续跑40823724947确认HTTP429为provider_overloaded。等待免费路由提供方恢复后继续第二节点综合审核，保留首节点三审及预算；事实错误修订、整版机制及读者质量仍未完成。
 evidence:
+  - docs/acceptance-conflict-recovery.md
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md
   - docs/samples/2026-10-28-context-consolidation.json
