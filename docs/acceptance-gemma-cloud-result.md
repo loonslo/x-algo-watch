@@ -12,7 +12,15 @@ Windows / Python 3.14.0 相关预算、诊断及工作流边界测试 31 passed�
 
 直接 API 诊断 [40868437463](https://github.com/loonslo/x-algo-watch/actions/runs/40868437463) 已完成：认证 HTTP200/authenticated=true；最小文本及项目 JSON 参数请求均在 0.19 秒返回 HTTP429/error_code=429，error_message 为 `Provider returned error`，provider_name 为 `Google AI Studio`，resolved_model=null，无模型正文。原始产物为 [model-probe.json](samples/2026-10-29-gemma-direct-40868437463.json)。此结果表明最小请求也被拒绝，不能归因于大研究输入或 JSON 参数；认证成功不证明上游配额可用。
 
-继续诊断仅提取提供方错误中的 message/status，经敏感信息扫描后保存，不复制完整原始 metadata、认证头或账户信息。最小请求非200时停止第二请求，避免已知失败下重复消耗。新增提取与安全边界相关 31 项通过，0.44 秒；具体提供方原因待实跑。
+继续诊断仅提取提供方错误中的 message/status，经敏感信息扫描后保存，不复制完整原始 metadata、认证头或账户信息。最小请求非200时停止第二请求，避免已知失败下重复消耗。新增提取与安全边界相关 31 项通过，0.44 秒。
+
+后续直接诊断 [40868764414](https://github.com/loonslo/x-algo-watch/actions/runs/40868764414) 已完成：认证 HTTP200，最小请求 0.13 秒返回 HTTP429，提供方 Google AI Studio；提供方原文为：
+
+> google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations
+
+原样云端产物：[第二次直接 API 诊断 JSON](samples/2026-10-29-gemma-direct-40868764414.json)。由于最小请求已被拒绝，本轮没有再发 JSON 对比请求；结果记录 comparison_skipped=minimal_request_rejected。
+
+本轮直接诊断总计三次真实模型 POST（首次两次、随后一次），全部先计入独立账本。两次认证 GET 均200。已能确认当前指定 Gemma 免费端点存在上游限流，最小输入同样被拒绝；不能推断提供方具体配额大小或恢复时间，也不能声称模型正文或内容质量已验证。提供方建议等待或接入自有 key；本项目没有修改密钥、提供方账户或模型选择。
 
 ## 执行范围
 
