@@ -122,6 +122,8 @@ def validate_reader_review(value: Any, item_id: str, subject: dict[str, Any], cl
         except (KeyError, TypeError, ValueError, IndexError, StopIteration): errors.append("读者问题字段不存在")
         if issue["category"] == "evidence" and not issue["evidence_requests"]:
             errors.append("读者缺证据问题须给出具体 Git 请求")
+        if issue["category"] == "coverage" and (not issue["evidence_refs"] or issue["evidence_requests"]):
+            errors.append("读者覆盖遗漏须绑定已有冻结结论且不请求补证；缺失材料另列 evidence 问题")
         if issue["evidence_requests"] and not issue["claim_id"]:
             errors.append("读者补证请求须绑定被质疑结论")
         for request in issue["evidence_requests"]:
