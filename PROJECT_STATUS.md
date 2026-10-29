@@ -4,7 +4,7 @@ updated: 2026-10-29
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 本地研究主链、共享预算和超大补证归并已实现；基于最新 main 的独立候选保留自动记录并完成 421 项全量回归，最后账本等边界在候选中 54 项通过。原工作区修改保留，data/registry 未覆盖；尚未执行新模型、推送或部署。
-next: 修复最新 CI 的历史事件选取与引用反馈回归，相关 32 项通过；继续远程 CI，之后恢复真实试点研究并验收内容质量。既有用户授权持续有效。
+next: 修复的远程 CI 40813422813 已通过；恢复研究运行 40813976433 全阶段成功，但新增模型请求延期，状态 waiting_service。继续缺少阶段并核对纠错反馈的真实效果，再完成两个试点及读者质量验收。
 evidence:
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md
