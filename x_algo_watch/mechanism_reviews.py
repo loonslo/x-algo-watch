@@ -8,7 +8,7 @@ from .mechanisms import bind_claims, validate_shape
 from .models import WatchError
 from .revision_audit import issue_identity
 
-CATEGORIES = ("fact", "evidence", "inference", "expression", "format")
+CATEGORIES = ("fact", "coverage", "evidence", "inference", "expression", "format")
 
 
 def review_schema() -> dict[str, Any]:
@@ -76,7 +76,9 @@ def validate_review(value: Any, item_id: str, analysis: dict[str, Any], task: di
         if any(ref not in task["evidence"] for ref in issue["evidence_refs"]):
             errors.append("审核引用不在当前证据任务")
         if issue["category"] == "evidence" and not issue["evidence_requests"]:
-            errors.append("缺证据问题须给出有界补证请求，不能直接重写稿件")
+            errors.append("缺证据问题须给出有界补证请求；若材料已在 evidence 中但稿件遗漏，使用 coverage 并引用已有 E 编号，不请求补证")
+        if issue["category"] == "coverage" and (not issue["evidence_refs"] or issue["evidence_requests"]):
+            errors.append("覆盖遗漏须引用已提供证据，不能同时请求缺失材料；缺失材料应另列 evidence 问题")
         for request in issue["evidence_requests"]:
             try:
                 safe_path(request["path"])
