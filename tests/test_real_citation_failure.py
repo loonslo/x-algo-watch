@@ -12,7 +12,9 @@ def test_saved_6258_outputs_remain_invalid_with_precise_repair_feedback():
     plan = "fdaa5b4682193089bdf3869f144476c32e7bbd85dff35760dedc2ff4d665f17c"
     calls = [json.loads(p.read_text(encoding="utf-8")) for p in
              (root / "data/research-runs" / commit).glob("*.json")]
-    failed = [c for c in calls if c.get("type") == "model_call" and c.get("outcome") == "invalid"]
+    failed = [c for c in calls if c.get("type") == "model_call" and c.get("outcome") == "invalid"
+              and c.get("stage") == "mechanism"
+              and c.get("item_id") == "T-340ed3162818f89e60a4bb4b6b5966cff523bec6323436372a1423659ba25eb2"]
     assert len(failed) >= 2
     for call in failed[:2]:
         task_path = root / "data/research-plans" / f"{commit}-{plan}" / "tasks" / (call["item_id"] + ".json")
