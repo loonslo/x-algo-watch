@@ -26,5 +26,17 @@ def test_escaped_credentials_are_still_rejected_in_decoded_or_malformed_json():
 def test_deferred_diagnostics_classify_without_copying_untrusted_message(message, reason):
     client = type("Client", (), {"last_response_received": True, "last_response_status": 429})()
     value = deferred_metadata(Deferred(message + " sk-or-v1-" + "a" * 40), client)
-    assert value == {"deferred_reason": reason, "response_received": True, "response_status": 429}
+    expected = {"deferred_reason": reason, "response_received": True, "response_status": 429}
+    if reason == "http":
+        expected["http_reason"] = "unspecified"
+    assert value == expected
     public_json(value)
+
+
+@pytest.mark.parametrize(("message", "category"), [("账户免费每日额度已用尽", "account_daily_limit"),
+    ("账户免费每分钟限流", "account_minute_limit"), ("模型提供方暂时拥堵", "provider_overloaded"),
+    ("项目密钥额度限制", "key_limit")])
+def test_http_reasons_keep_only_known_categories(message, category):
+    result = deferred_metadata(Deferred("HTTP 429；" + message), object())
+    assert result["http_reason"] == category
+    assert message not in str(result)

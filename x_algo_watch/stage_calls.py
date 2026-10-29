@@ -25,8 +25,13 @@ def deferred_metadata(exc: Deferred, client: Any) -> dict[str, Any]:
             reason = category
             break
     status = getattr(client, "last_response_status", None)
-    return {"deferred_reason": reason, "response_received": getattr(client, "last_response_received", False) is True,
-            "response_status": status if type(status) is int and 100 <= status <= 599 else None}
+    result = {"deferred_reason": reason, "response_received": getattr(client, "last_response_received", False) is True,
+              "response_status": status if type(status) is int and 100 <= status <= 599 else None}
+    if reason == "http":
+        result["http_reason"] = next((category for marker, category in (
+            ("账户免费每日额度已用尽", "account_daily_limit"), ("账户免费每分钟限流", "account_minute_limit"),
+            ("模型提供方暂时拥堵", "provider_overloaded"), ("项目密钥额度限制", "key_limit")) if marker in message), "unspecified")
+    return result
 
 
 def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any], schema: dict[str, Any],
