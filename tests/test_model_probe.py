@@ -22,7 +22,8 @@ def test_authentication_does_not_copy_key_details(monkeypatch):
 
 def test_direct_http_error_retains_message_and_provider_without_leaking_secrets(monkeypatch):
     raw = json.dumps({"error": {"message": "Model is temporarily rate-limited upstream", "code": 429,
-        "metadata": {"provider_name": "Google AI Studio", "raw": "test-secret"}}}).encode()
+        "metadata": {"provider_name": "Google AI Studio", "raw": json.dumps({"error": {
+            "message": "Quota exceeded test-secret", "status": "RESOURCE_EXHAUSTED"}})}}}).encode()
     def fail(*a, **k):
         raise HTTPError("https://openrouter.ai/api/v1/chat/completions", 429, "rate limit", {"Retry-After": "30"}, io.BytesIO(raw))
     monkeypatch.setattr("urllib.request.urlopen", fail)
@@ -31,6 +32,8 @@ def test_direct_http_error_retains_message_and_provider_without_leaking_secrets(
     assert result["provider_name"] == "Google AI Studio"
     assert result["error_message"] == "Model is temporarily rate-limited upstream"
     assert "test-secret" not in json.dumps(result)
+    assert result["provider_error_message"] == "Quota exceeded [redacted]"
+    assert result["provider_error_status"] == "RESOURCE_EXHAUSTED"
 
 
 @pytest.mark.parametrize("available", [True, False])

@@ -61,6 +61,15 @@ def request_api(key: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
             metadata = error.get("metadata")
             if isinstance(metadata, dict):
                 result["provider_name"] = safe_field(metadata.get("provider_name"), key)
+                upstream = metadata.get("raw")
+                if isinstance(upstream, str):
+                    try:
+                        upstream = json.loads(upstream)
+                    except ValueError:
+                        result["provider_error_message"] = safe_field(upstream, key)
+                if isinstance(upstream, dict) and isinstance(upstream.get("error"), dict):
+                    result["provider_error_message"] = safe_field(upstream["error"].get("message"), key)
+                    result["provider_error_status"] = safe_field(upstream["error"].get("status"), key)
         result["resolved_model"] = safe_field(value.get("model"), key)
         choices = value.get("choices", [])
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -107,6 +116,10 @@ def run_probe(receipt: Path, ledger: Path, output: Path) -> None:
         save()
         row["response"] = request_api(key, body)
         save()
+        if name == "minimal_text" and row["response"].get("status") != 200:
+            result["comparison_skipped"] = "minimal_request_rejected"
+            save()
+            break
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

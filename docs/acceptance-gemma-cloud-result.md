@@ -10,6 +10,10 @@
 
 Windows / Python 3.14.0 相关预算、诊断及工作流边界测试 31 passed，0.51 秒。直接云端诊断结果将在执行后追加；这些模拟测试不证明模型可用。
 
+直接 API 诊断 [40868437463](https://github.com/loonslo/x-algo-watch/actions/runs/40868437463) 已完成：认证 HTTP200/authenticated=true；最小文本及项目 JSON 参数请求均在 0.19 秒返回 HTTP429/error_code=429，error_message 为 `Provider returned error`，provider_name 为 `Google AI Studio`，resolved_model=null，无模型正文。原始产物为 [model-probe.json](samples/2026-10-29-gemma-direct-40868437463.json)。此结果表明最小请求也被拒绝，不能归因于大研究输入或 JSON 参数；认证成功不证明上游配额可用。
+
+继续诊断仅提取提供方错误中的 message/status，经敏感信息扫描后保存，不复制完整原始 metadata、认证头或账户信息。最小请求非200时停止第二请求，避免已知失败下重复消耗。新增提取与安全边界相关 31 项通过，0.44 秒；具体提供方原因待实跑。
+
 ## 执行范围
 
 - 仓库：loonslo/x-algo-watch，分支 main，代码提交 5ac42510d65462373b1310bf19d24da9927495c8。
