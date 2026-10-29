@@ -3,9 +3,12 @@ project_id: x-algo-watch
 updated: 2026-10-29
 status: waiting
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 按用户要求将起草及全部审核角色切换为 google/gemma-4-26b-a4b-it:free，接通机制链、模型缓存隔离及发布校验；Windows/Python 3.14.0 相关 65 项、扩展 133 项通过，两项真实 Git 历史回放单独补跑通过。旧模型审计及日预算累计保留；新模型真实可用性与内容质量尚未验证。
-next: 推送模型切换并核对远程 CI；后续按现有预算与恢复规则验证真实 Gemma 研究。旧 free 路由曾返回 provider_overloaded，不能据此判断新型号当前可用性；整版机制及读者质量仍待验收。
+progress: Gemma 切换提交的远程 CI40857941519 为 441 项通过；按用户要求实际运行 Actions40867213103、40867670620，每轮真实新增一次指定 Gemma 的请求，两次均 HTTP429 / provider_overloaded，未返回模型正文，未进入三审。原始云端草稿已按字节保存，旧模型审计与日预算保留。
+next: 等待指定 Gemma 端点恢复可用后按预算和恢复边界继续真实研究；目前无模型正文可评价，机制分析、三审及读者质量仍未验收，不把 Actions 成功保存产物写成内容通过。
 evidence:
+  - docs/acceptance-gemma-cloud-result.md
+  - docs/samples/2026-10-29-gemma-cloud-40867213103.json
+  - docs/samples/2026-10-29-gemma-cloud-40867670620.json
   - docs/acceptance-gemma-model.md
   - docs/acceptance-conflict-recovery.md
   - docs/release-candidate-research-pipeline.md

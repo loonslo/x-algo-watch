@@ -2,6 +2,8 @@
 
 维护日期：2026-10-29。
 
+本文件记录模型切换时的实现验收。随后按用户授权完成两轮 GitHub Actions 真实请求，两次均为 HTTP 429 / provider_overloaded，无模型正文；实际记录及未改写的云端产物见[云端真实调用记录](acceptance-gemma-cloud-result.md)。下文“未发真实请求”为切换实现完成时的历史边界。
+
 ## 范围与实现
 
 按用户指定，将 config/watch.yaml 中起草及全部审核角色切换为 `google/gemma-4-26b-a4b-it:free`，显式开启 allow_same_model。机制流程从配置传入各阶段请求、审计及发布校验，包含机制、上下文、筛选、读者起草与全部三角色审核；相同型号不宣称异模型复核。
