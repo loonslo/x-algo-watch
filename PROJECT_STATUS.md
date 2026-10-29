@@ -1,11 +1,12 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-29
-status: active
+status: waiting
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 已按用户要求切回 openrouter/free；Actions40872174653 直接 API 两次请求均200：nvidia/nemotron-3-ultra-550b-a55b:free 返回 OK，dots-studio/dots-3-note-preview:free 返回完整 JSON。此前 Gemma 上游429记录与全部预算保留，相关59项检查通过；本次只证明小请求可用。
-next: 使用当前免费路由按原恢复、预算和三关规则继续真实算法研究；API可用不等于整版机制分析、三审或读者质量已验收，不清空历史审计或当日调用。
+progress: 已用 openrouter/free 恢复6258a15正式研究；Actions40877016338 的 detect/draft/publish 全成功并写回 fcc07ef、90b8de1。实际 dots-studio/dots-3-note-preview:free 返回含两条事实异议的有效审核；下一事实审核HTTP404延期。两次调用已回读主线并保存原样云端产物，尚无新通过正文。
+next: 从 mechanism_facts_review 缺少阶段按原恢复及预算规则续跑，保留已获得的事实异议、旧任务状态和全部调用记录；若404重复，另核对端点及参数原因。整版机制、三审及读者质量仍未验收。
 evidence:
+  - docs/samples/2026-10-29-free-research-40877016338.json
   - docs/samples/2026-10-29-free-router-direct-40872174653.json
   - docs/acceptance-free-router-return.md
   - docs/samples/2026-10-29-gemma-direct-40868437463.json
