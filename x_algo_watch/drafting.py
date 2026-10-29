@@ -44,6 +44,15 @@ def http_failure(exc: urllib.error.HTTPError) -> Deferred:
             reason = "模型提供方暂时拥堵"
         elif "openrouter_key_limit" in details:
             reason = "项目密钥额度限制"
+        elif exc.code == 404:
+            if "no endpoints found" in details and "data policy" in details:
+                reason = "数据策略没有匹配端点"
+            elif "no endpoints found" in details and "parameter" in details:
+                reason = "请求参数没有匹配端点"
+            elif "no endpoints found" in details or "no allowed providers" in details:
+                reason = "暂无匹配模型端点"
+            elif "model not found" in details:
+                reason = "模型资源未找到"
     except (OSError, ValueError):
         pass
     retry = exc.headers.get("Retry-After", "") if exc.headers else ""

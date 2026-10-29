@@ -30,7 +30,9 @@ def deferred_metadata(exc: Deferred, client: Any) -> dict[str, Any]:
     if reason == "http":
         result["http_reason"] = next((category for marker, category in (
             ("账户免费每日额度已用尽", "account_daily_limit"), ("账户免费每分钟限流", "account_minute_limit"),
-            ("模型提供方暂时拥堵", "provider_overloaded"), ("项目密钥额度限制", "key_limit")) if marker in message), "unspecified")
+            ("模型提供方暂时拥堵", "provider_overloaded"), ("项目密钥额度限制", "key_limit"),
+            ("数据策略没有匹配端点", "no_policy_endpoint"), ("请求参数没有匹配端点", "no_parameter_endpoint"),
+            ("暂无匹配模型端点", "no_available_endpoint"), ("模型资源未找到", "model_not_found")) if marker in message), "unspecified")
     return result
 
 

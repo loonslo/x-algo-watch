@@ -3,9 +3,10 @@ project_id: x-algo-watch
 updated: 2026-10-29
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 已用 openrouter/free 恢复6258a15正式研究；Actions40877016338 的 detect/draft/publish 全成功并写回 fcc07ef、90b8de1。实际 dots-studio/dots-3-note-preview:free 返回含两条事实异议的有效审核；下一事实审核HTTP404延期。两次调用已回读主线并保存原样云端产物，尚无新通过正文。
-next: 按用户要求诊断404，已只读重建原审核请求并核对输入/提示词摘要一致，准备在共享预算内重放及逐参数对照。原事实异议和旧任务状态保留；具体原因及修复效果以云端响应为准。
+progress: 404精确诊断Actions40880082004已完成：原输入/提示词摘要匹配，原参数请求HTTP200，实际nvidia/nemotron-3.5-super-vl:free返回完整审核JSON。原404未复现、具体原因不能追溯；已补后续404固定安全分类，相关74项通过。诊断未代替正式裁决，旧异议保留。
+next: 按原参数及预算继续正式mechanism_facts_review缺少阶段，若404再次出现则依据新增明确分类诊断；不把本次单角色诊断同意当作整版通过，机制三审和读者质量仍待验收。
 evidence:
+  - docs/samples/2026-10-29-review-404-replay-40880082004.json
   - docs/acceptance-404-diagnosis.md
   - docs/samples/2026-10-29-free-research-40877016338.json
   - docs/samples/2026-10-29-free-router-direct-40872174653.json

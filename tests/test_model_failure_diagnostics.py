@@ -14,6 +14,25 @@ from x_algo_watch.models import UnsafePublicText, WatchError
 from x_algo_watch.storage import public_text
 
 
+@pytest.mark.parametrize(("message", "category"), [
+    ("No endpoints found that can handle the requested parameters", "no_parameter_endpoint"),
+    ("No endpoints found matching your data policy", "no_policy_endpoint"),
+    ("No allowed providers are available", "no_available_endpoint"),
+    ("Model not found", "model_not_found"),
+    ("Unspecified failure", "unspecified"),
+])
+def test_http404_records_fixed_reason_without_copying_provider_text(monkeypatch, message, category):
+    from x_algo_watch.drafting import http_failure
+    from x_algo_watch.stage_calls import deferred_metadata
+    secret = "sk-or-v1-" + "x" * 32
+    error = urllib.error.HTTPError("https://openrouter.ai/api/v1/chat/completions", 404, "not found", {},
+        io.BytesIO(json.dumps({"error": {"message": message + " " + secret}}).encode()))
+    exc = http_failure(error)
+    result = deferred_metadata(exc, type("Client", (), {"last_response_status": 404, "last_response_received": True})())
+    assert result["response_status"] == 404 and result["http_reason"] == category
+    assert secret not in str(exc) + json.dumps(result)
+
+
 @pytest.mark.parametrize(('text', 'category'), [
     ('sk-or-v1-' + 'x'*32, 'credential'),
     ('ghp_' + 'x'*32, 'credential'),
