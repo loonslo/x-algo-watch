@@ -14,6 +14,21 @@ from .storage import public_text, public_json
 PIPELINE = "mechanisms-v1"
 
 
+def deferred_metadata(exc: Deferred, client: Any) -> dict[str, Any]:
+    """仅保存固定分类及数值状态，不把异常或服务端原文写入审计。"""
+    message = str(exc)
+    reason = "unknown"
+    for marker, category in (("finish_reason=length", "output_length"), ("未返回可用 JSON", "empty_content"),
+                             ("返回超长内容", "oversized_content"), ("连接或响应异常", "connection"),
+                             ("HTTP ", "http")):
+        if marker in message:
+            reason = category
+            break
+    status = getattr(client, "last_response_status", None)
+    return {"deferred_reason": reason, "response_received": getattr(client, "last_response_received", False) is True,
+            "response_status": status if type(status) is int and 100 <= status <= 599 else None}
+
+
 def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any], schema: dict[str, Any],
                validate: Callable[[Any], list[str]], prompt: str, prior: list[dict[str, Any]], client: Any,
                now: datetime, daily_limit: int = MAX_DAILY_CALLS, resume: bool = False,
@@ -78,8 +93,9 @@ def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any]
                 value = None
             errors = validate(value)
             event.update(output=value, errors=errors, valid=not errors, outcome="invalid" if errors else "valid")
-        except Deferred:
+        except Deferred as exc:
             event.update(outcome="deferred", errors=["服务、输出长度或连接暂未完成"])
+            event.update(deferred_metadata(exc, client))
         except UnsafePublicText:
             event.pop("raw_output", None)
             event.pop("output", None)
