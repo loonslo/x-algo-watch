@@ -7,6 +7,7 @@ import yaml
 
 from x_algo_watch import model_probe
 from x_algo_watch.models import WatchError
+from x_algo_watch.evidence import digest
 
 
 class Response(io.BytesIO):
@@ -76,3 +77,32 @@ def test_canaries_reserve_budget_before_network_and_save_raw_response(tmp_path, 
         assert requests[1]["provider"] == {"require_parameters": True, "allow_fallbacks": model == model_probe.FREE_ROUTER}
         assert requests[1]["response_format"]["type"] == ("json_schema" if model == model_probe.FREE_ROUTER else "json_object")
         assert result["requests"][0]["response"]["content"] == "OK"
+
+
+@pytest.mark.parametrize("mismatch", [None, "input", "prompt"])
+def test_review_replay_requires_original_input_prompt_and_model(tmp_path, monkeypatch, mismatch):
+    commit = "a" * 40
+    payload = {"stage_kind": "review", "research_protocol": "mechanisms-v1", "stage_schema": {"type": "object"}}
+    prompt = "original review prompt"
+    original = {"id": "source-404", "commit": commit, "response_status": 404, "stage": "mechanism_facts_review",
+        "model": model_probe.FREE_ROUTER, "input_hash": digest(payload),
+        "prompt_version": digest({"prompt": prompt, "schema": payload["stage_schema"], "transport": "mechanisms-v1"})}
+    if mismatch == "input": original["input_hash"] = "wrong"
+    if mismatch == "prompt": original["prompt_version"] = "wrong"
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/watch.yaml").write_text(yaml.safe_dump({"models": {"analysis": model_probe.FREE_ROUTER,
+        "review": model_probe.FREE_ROUTER}}), encoding="utf-8")
+    monkeypatch.setattr(model_probe.RecordStore, "events", lambda self: [original])
+    monkeypatch.setattr("x_algo_watch.project_evidence.context_packs", lambda _: [{"commit": commit}])
+    def capture(pack, data, prior, client, *args):
+        client.call(model_probe.FREE_ROUTER, prompt, payload)
+    monkeypatch.setattr("x_algo_watch.mechanism_pipeline.run_pipeline", capture)
+    if mismatch:
+        with pytest.raises(WatchError, match="摘要不一致"):
+            model_probe.review_request(commit)
+    else:
+        body, source = model_probe.review_request(commit)
+        assert source["input_hash_matches"] is True and source["prompt_hash_matches"] is True
+        assert body["max_tokens"] == 24000 and body["reasoning"] == {"effort": "low"}
+        assert body["response_format"]["json_schema"]["strict"] is True

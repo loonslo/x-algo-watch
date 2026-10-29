@@ -1,6 +1,7 @@
 """配置型号的真实连通性诊断；直接请求 API，不生成研究或裁决。"""
 
 import argparse
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import os
@@ -89,7 +90,45 @@ def request_api(key: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     return result
 
 
-def run_probe(receipt: Path, ledger: Path, output: Path) -> None:
+def review_request(commit: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """仅重建下一缺失阶段；捕获调用参数后退出，不发送请求或写研究。"""
+    from .drafting import request_body
+    from .mechanism_pipeline import run_pipeline
+    from .project_evidence import context_packs
+    from .git import SHA
+    if not isinstance(commit, str) or not SHA.fullmatch(commit):
+        raise WatchError("审核重放须指定已有完整提交")
+    prior = RecordStore(Path("data")).events()
+    original = next((e for e in reversed(prior) if e.get("commit") == commit and e.get("response_status") == 404
+                     and e.get("stage") == "mechanism_facts_review"), None)
+    if original is None:
+        raise WatchError("没有可核对的事实审核404记录")
+    class Captured(Exception):
+        def __init__(self, model, prompt, payload):
+            self.model, self.prompt, self.payload = model, prompt, payload
+    class CaptureClient:
+        def call(self, model, prompt, payload):
+            raise Captured(model, prompt, payload)
+    settings = yaml.safe_load(Path("config/watch.yaml").read_text(encoding="utf-8"))
+    pack = next((p for p in context_packs(Path("data")) if p["commit"] == commit), None)
+    if pack is None:
+        raise WatchError("缺少可信上下文")
+    try:
+        run_pipeline(pack, Path("data"), prior, CaptureClient(), settings, Path("prompts"))
+    except Captured as captured:
+        from .stage_calls import PIPELINE
+        prompt_version = digest({"prompt": captured.prompt, "schema": captured.payload["stage_schema"], "transport": PIPELINE})
+        if (digest(captured.payload) != original["input_hash"] or prompt_version != original["prompt_version"]
+                or captured.model != original["model"]):
+            raise WatchError("重放请求与原404输入摘要不一致，停止诊断")
+        body = request_body(captured.model, captured.prompt, captured.payload)
+        public_json(body)
+        return body, {"source_call_id": original["id"], "input_hash": original["input_hash"],
+                      "body_hash": digest(body), "input_hash_matches": True, "prompt_hash_matches": True}
+    raise WatchError("未捕获到原404对应的下一缺失请求")
+
+
+def run_probe(receipt: Path, ledger: Path, output: Path, *, review_replay: bool = False) -> None:
     key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise WatchError("诊断环境未配置模型密钥")
@@ -113,6 +152,17 @@ def run_probe(receipt: Path, ledger: Path, output: Path) -> None:
         bodies[1][1]["response_format"] = {"type": "json_schema", "json_schema": {
             "name": "connectivity_probe", "strict": True, "schema": {"type": "object", "additionalProperties": False,
                 "properties": {"ok": {"type": "boolean", "const": True}}, "required": ["ok"]}}}
+    if review_replay:
+        body, result["replay_source"] = review_request(os.environ.get("RESEARCH_COMMIT", ""))
+        if body["model"] != model:
+            raise WatchError("重放型号与当前配置不一致")
+        without_reasoning = deepcopy(body)
+        without_reasoning.pop("reasoning", None)
+        smaller_output = deepcopy(body)
+        smaller_output["max_tokens"] = 12000
+        bodies = [("exact_review_replay", body), ("review_without_reasoning", without_reasoning),
+                  ("review_output_12000", smaller_output)]
+        save()
     for index, (name, body) in enumerate(bodies):
         if index:
             time.sleep(15)
@@ -128,7 +178,15 @@ def run_probe(receipt: Path, ledger: Path, output: Path) -> None:
             result["comparison_skipped"] = "minimal_request_rejected"
             save()
             break
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+        if review_replay and row["response"].get("status") != 404:
+            result["remaining_comparisons_skipped"] = "review_did_not_return_404"
+            save()
+            break
+    printable = deepcopy(result)
+    for row in printable["requests"]:
+        if review_replay:
+            row["request"].pop("messages", None)
+    print(json.dumps(printable, ensure_ascii=False, indent=2))
 
 
 def main() -> int:
@@ -136,9 +194,10 @@ def main() -> int:
     parser.add_argument("--budget-receipt", type=Path, required=True)
     parser.add_argument("--call-ledger", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--review-replay", action="store_true")
     args = parser.parse_args()
     try:
-        run_probe(args.budget_receipt, args.call_ledger, args.output)
+        run_probe(args.budget_receipt, args.call_ledger, args.output, review_replay=args.review_replay)
         return 0
     except WatchError:
         print("直接诊断暂停，检查预算或环境；未输出认证信息")

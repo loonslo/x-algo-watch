@@ -129,6 +129,42 @@ def validate_review(value: Any, pack: dict[str, Any], fields: set[str] = ANALYSI
     return errors
 
 
+def request_body(model: str, system: str, payload: dict[str, Any]) -> dict[str, Any]:
+    body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "max_tokens": 6000, "provider": {"allow_fallbacks": False}}
+    if payload.get("research_protocol") == "mechanisms-v1":
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": "research_stage", "strict": True, "schema": payload["stage_schema"]}}
+        body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
+        body["max_tokens"] = 24000 if payload.get("stage_kind") == "review" else 12000
+        body["reasoning"] = {"effort": "low"} if payload.get("stage_kind") == "review" else {"max_tokens": 3000}
+    elif payload.get("evidence_pack", {}).get("scope") == "mechanism_task":
+        from .mechanisms import mechanism_schema
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": "mechanism_research", "strict": True, "schema": mechanism_schema()}}
+        body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
+        body["max_tokens"] = 12000
+        body["reasoning"] = {"max_tokens": 3000}
+    elif payload.get("evidence_pack", {}).get("scope") == "project_version":
+        patch_fields = payload.get("reader_repair_fields")
+        schema = reader_repair_schema(patch_fields) if patch_fields else (review_schema() if "analysis" in payload else research_schema())
+        schema_name = "version_reader_patch" if patch_fields else ("version_review" if "analysis" in payload else "version_research")
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": schema}}
+        body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
+        if model == FREE_ROUTER:
+            body["max_tokens"] = 12000
+            body["reasoning"] = {"max_tokens": 3000}
+            if "analysis" in payload:
+                body["max_tokens"] = 24000
+                body["reasoning"] = {"effort": "low"}
+    from .model_policy import GEMMA_MODEL
+    if model == GEMMA_MODEL:
+        # 此端点支持 JSON 模式但不支持服务端 schema 强制；精确协议仍随请求发送并由本地逐项校验。
+        body["response_format"] = {"type": "json_object"}
+        body["provider"] = {"require_parameters": True, "allow_fallbacks": False}
+    if model == "minimax/minimax-m3.1-flash:free":
+        # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
+        body["reasoning"] = {"effort": "low"}
+    return body
+
+
 class OpenRouter:
     def __init__(self, key: str):
         if not key:
@@ -151,38 +187,7 @@ class OpenRouter:
         if delay > 0:
             time.sleep(delay)
         self._last_call = time.monotonic()
-        body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], "response_format": {"type": "json_object"}, "max_tokens": 6000, "provider": {"allow_fallbacks": False}}
-        if payload.get("research_protocol") == "mechanisms-v1":
-            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "research_stage", "strict": True, "schema": payload["stage_schema"]}}
-            body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
-            body["max_tokens"] = 24000 if payload.get("stage_kind") == "review" else 12000
-            body["reasoning"] = {"effort": "low"} if payload.get("stage_kind") == "review" else {"max_tokens": 3000}
-        elif payload.get("evidence_pack", {}).get("scope") == "mechanism_task":
-            from .mechanisms import mechanism_schema
-            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "mechanism_research", "strict": True, "schema": mechanism_schema()}}
-            body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
-            body["max_tokens"] = 12000
-            body["reasoning"] = {"max_tokens": 3000}
-        elif payload.get("evidence_pack", {}).get("scope") == "project_version":
-            patch_fields = payload.get("reader_repair_fields")
-            schema = reader_repair_schema(patch_fields) if patch_fields else (review_schema() if "analysis" in payload else research_schema())
-            schema_name = "version_reader_patch" if patch_fields else ("version_review" if "analysis" in payload else "version_research")
-            body["response_format"] = {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": schema}}
-            body["provider"] = {"require_parameters": True, "allow_fallbacks": model == FREE_ROUTER}
-            if model == FREE_ROUTER:
-                body["max_tokens"] = 12000
-                body["reasoning"] = {"max_tokens": 3000}
-                if "analysis" in payload:
-                    body["max_tokens"] = 24000
-                    body["reasoning"] = {"effort": "low"}
-        from .model_policy import GEMMA_MODEL
-        if model == GEMMA_MODEL:
-            # 此端点支持 JSON 模式但不支持服务端 schema 强制；精确协议仍随请求发送并由本地逐项校验。
-            body["response_format"] = {"type": "json_object"}
-            body["provider"] = {"require_parameters": True, "allow_fallbacks": False}
-        if model == "minimax/minimax-m3.1-flash:free":
-            # 此型号强制推理、默认 max；限制为其支持的 low，给 JSON 留出输出空间。
-            body["reasoning"] = {"effort": "low"}
+        body = request_body(model, system, payload)
         request = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + self._key, "Content-Type": "application/json"}, method="POST")
         try:
             timeout = 90 if payload.get("research_protocol") == "mechanisms-v1" or payload.get("evidence_pack", {}).get("scope") in {"project_version", "mechanism_task"} else 30
