@@ -46,11 +46,6 @@ def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any]
         if used >= daily_limit or (deadline is not None and time.monotonic() >= deadline):
             return {"state": "pending", "reason": "daily_budget" if used >= daily_limit else "time_budget"}, events
         request = {**payload, "research_protocol": PIPELINE, "stage_schema": schema}
-        pack = payload.get("evidence_pack")
-        if isinstance(pack, dict) and "evidence" in pack and "task_id" in pack:
-            from .mechanisms import segment_ids
-            request["required_segment_ids"] = sorted(segment_ids(pack))
-            request["segment_contract"] = "仅 required_segment_ids 各一次；shared_context_catalog 不是已读取的证据区段。quote 使用连续完整源码行，JSON 中换行写成 \\n，禁止删行、拼接或省略。"
         previous = next((e for e in reversed(calls) if e.get("outcome") == "invalid"), None)
         if previous:
             request["previous_validation_errors"] = previous.get("errors", [])
