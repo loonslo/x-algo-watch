@@ -1,10 +1,10 @@
 ---
 project_id: x-algo-watch
 updated: 2026-10-29
-status: active
+status: waiting
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 研究主链已推送，远程完整 CI 40813422813 通过；6258a15 恢复运行已保存一次真实延期请求，未形成新通过正文。已补充固定延期分类及安全响应元数据，相关 15 项通过；内容及读者质量验收仍未完成。
-next: 最新CI40821968401通过；续跑首事实节点三审同意，第二节点HTTP429延期，事实错误尚未修订。补充安全HTTP限流细分类，相关31项通过；远程复验后按诊断续跑缺少审核，仍须整版机制及读者质量验收。
+next: CI40823111899通过；续跑40823724947确认HTTP429为provider_overloaded。等待免费路由提供方恢复后继续第二节点综合审核，保留首节点三审及预算；事实错误修订、整版机制及读者质量仍未完成。
 evidence:
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md
