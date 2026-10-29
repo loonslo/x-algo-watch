@@ -55,7 +55,15 @@ def validate_review(value: Any, item_id: str, analysis: dict[str, Any], task: di
         try:
             resolve_field(analysis, issue["field"])
         except (ValueError, KeyError, TypeError, IndexError, StopIteration):
-            errors.append("审核字段未定位到具体存在的 JSON 路径")
+            message = "审核字段未定位到具体存在的 JSON 路径；field 相对于 analysis 对象本身，以 /claims/ 或 /segments/ 开始，不加 /analysis 前缀"
+            if issue["field"].startswith("/analysis/"):
+                candidate = issue["field"][len("/analysis"):]
+                try:
+                    resolve_field(analysis, candidate)
+                    message += "；此字段可解析的候选路径：" + candidate
+                except (ValueError, KeyError, TypeError, IndexError, StopIteration):
+                    pass
+            errors.append(message)
         if issue["claim_id"] and "/claims/" not in issue["field"]:
             errors.append("结论问题必须定位到 claims 字段")
         elif issue["claim_id"] in claim_catalog:

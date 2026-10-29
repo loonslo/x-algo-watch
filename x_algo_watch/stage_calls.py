@@ -61,6 +61,8 @@ def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any]
         if used >= daily_limit or (deadline is not None and time.monotonic() >= deadline):
             return {"state": "pending", "reason": "daily_budget" if used >= daily_limit else "time_budget"}, events
         request = {**payload, "research_protocol": PIPELINE, "stage_schema": schema}
+        if payload.get("stage_kind") == "review" and isinstance(payload.get("analysis"), dict):
+            request["field_pointer_root"] = "field 相对于 analysis 对象本身，使用 /claims/机制key/字段 或 /segments/区段编号/字段；不加 /analysis 前缀。"
         pack = payload.get("evidence_pack")
         if isinstance(pack, dict) and "evidence" in pack and "task_id" in pack:
             from .mechanisms import segment_ids
