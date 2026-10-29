@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from .evidence import digest
-from .mechanisms import bind_claims, mechanism_schema, validate_mechanisms
+from .mechanisms import bind_claims, mechanism_schema, validate_mechanisms, validate_shape
 from .models import WatchError
 from .research_plan import fragment, source_chunks, task
 
@@ -109,7 +109,17 @@ def validate_graph(plan: dict[str, Any]) -> None:
 def task_schema(item: dict[str, Any]) -> dict[str, Any]:
     schema = mechanism_schema()
     if item.get("context_kind"):
-        schema["properties"]["claims"]["maxItems"] = 4
+        schema["properties"]["claims"]["maxItems"] = 2
+        def compact(node):
+            if node.get("type") == "string" and node.get("maxLength") == 1200:
+                node["maxLength"] = 400
+            if node.get("type") == "array" and node.get("maxItems") == 8:
+                node["maxItems"] = 2
+            for child in node.get("properties", {}).values():
+                compact(child)
+            if "items" in node:
+                compact(node["items"])
+        compact(schema)
     return schema
 
 
@@ -118,8 +128,9 @@ def validate_task(value: Any, item: dict[str, Any]) -> list[str]:
     if errors:
         return errors
     if item.get("context_kind"):
-        if len(value["claims"]) > 4 or len(json.dumps(value, ensure_ascii=False)) > CONTEXT_REPORT_LIMIT:
-            errors.append("补证事实报告须聚焦原问题、至多四项且不超过 6000 字符；反证与缺口不能为缩短而删除")
+        errors.extend(validate_shape(value, task_schema(item)))
+        if len(value["claims"]) > 2 or len(json.dumps(value, ensure_ascii=False)) > CONTEXT_REPORT_LIMIT:
+            errors.append("补证事实报告须聚焦原问题、至多两项且不超过 6000 字符；反证与缺口不能为缩短而删除")
         if any(c["verdict"] == "mechanism_hypothesis" for c in value["claims"]):
             errors.append("补证分块及归并只形成源码事实、反证或不足判断，最终机制推测留给原任务")
     return errors
