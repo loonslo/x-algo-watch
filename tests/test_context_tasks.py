@@ -236,7 +236,8 @@ def test_real_pilot_oversized_supplement_preserves_both_versions_without_truncat
                  "start_line": 1, "end_line": 2000, "reason": "只验证实际 Git 超大补证的两侧行号、完整性及快照，尚未模型研究"} for version in ("before", "after")]
     pack = prepare_pipeline_context(upstream, record, data, old, requests)
     plan = load_pipeline_plan(data, pack)
-    scans = [t for t in plan["tasks"] if t.get("context_kind") == "scan"]
+    scans = [t for t in plan["tasks"] if t.get("context_kind") == "scan"
+             and t.get("context_question", {}).get("request", {}).get("issue_id") == "I-real-window"]
     assert len(scans) >= 8
     for revision in (record["base"], target):
         expected = "".join(upstream.read(revision, path).splitlines(keepends=True)[:2000])
