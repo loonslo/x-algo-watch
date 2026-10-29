@@ -4,7 +4,7 @@ updated: 2026-10-29
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
 progress: 研究主链已推送，远程完整 CI 40813422813 通过；6258a15 恢复运行已保存一次真实延期请求，未形成新通过正文。已补充固定延期分类及安全响应元数据，相关 15 项通过；内容及读者质量验收仍未完成。
-next: 修复的远程 CI 40813422813 已通过；恢复研究运行 40813976433 全阶段成功，但新增模型请求延期，状态 waiting_service。继续缺少阶段并核对纠错反馈的真实效果，再完成两个试点及读者质量验收。
+next: 最新 CI 40814677328 通过；真实续跑 40815092830 确认为 HTTP 200 后输出 12000 tokens 截断。将初始定义/引用上下文纳入分块三审归并，保留旧快照和结论身份，再验证两个试点和读者质量。
 evidence:
   - docs/release-candidate-research-pipeline.md
   - docs/acceptance-context-consolidation.md
