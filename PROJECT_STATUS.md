@@ -1,11 +1,12 @@
 ---
 project_id: x-algo-watch
-updated: 2026-10-29
+updated: 2026-10-30
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 404精确诊断Actions40880082004已完成：原输入/提示词摘要匹配，原参数请求HTTP200，实际nvidia/nemotron-3.5-super-vl:free返回完整审核JSON。原404未复现、具体原因不能追溯；已补后续404固定安全分类，相关74项通过。诊断未代替正式裁决，旧异议保留。
-next: 按原参数及预算继续正式mechanism_facts_review缺少阶段，若404再次出现则依据新增明确分类诊断；不把本次单角色诊断同意当作整版通过，机制三审和读者质量仍待验收。
+progress: 本轮本地系统优化已完成：纠错路由、恢复说明、安全扫描、引用搜索及Windows Git超时边界已修复；完整480项通过，最后脱敏快速路径相关65项通过，6项真实历史已在此前全量通过。
+next: 用户已授权提交并推送至origin/main；推送后核对远程CI，真实模型试点与读者质量仍按原预算和暂停规则单独验收。
 evidence:
+  - docs/acceptance-flow-reliability.md
   - docs/samples/2026-10-29-review-404-replay-40880082004.json
   - docs/acceptance-404-diagnosis.md
   - docs/samples/2026-10-29-free-research-40877016338.json

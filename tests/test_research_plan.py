@@ -141,3 +141,44 @@ def test_real_target_versions_cover_complete_git_inventory_without_modifying_ups
     assert all(not e["truncated"] for item in plan["tasks"] for e in item["evidence"].values())
     assert load_plan_bundle(save_plan_bundle(tmp_path, plan)) == plan
     assert before == repository_state(upstream)
+
+@pytest.mark.parametrize('max_hits', [1, 8])
+def test_batched_reference_search_preserves_individual_results(sample_repo, monkeypatch, max_hits):
+    from x_algo_watch import research_plan as module
+    repo, record = make_change(sample_repo)
+    original = module.reference_tasks
+    batched = build_plan(repo, record, max_reference_hits=max_hits)
+    def unbatched(repo, base, commit, path, symbols, budget, max_hits, search_results=None):
+        return original(repo, base, commit, path, symbols, budget, max_hits)
+    monkeypatch.setattr(module, 'reference_tasks', unbatched)
+    individual = build_plan(repo, record, max_reference_hits=max_hits)
+    assert batched == individual
+
+
+def test_plan_scans_each_revision_once(sample_repo, monkeypatch):
+    from x_algo_watch import research_plan as module
+    repo, record = make_change(sample_repo)
+    calls = []
+    original = module.reference_search
+    def counted(repo, revision, symbols):
+        calls.append(revision)
+        return original(repo, revision, symbols)
+    monkeypatch.setattr(module, 'reference_search', counted)
+    build_plan(repo, record)
+    assert calls == [record['base'], record['commit']]
+
+
+def test_combined_search_matches_legacy_fixed_string_results(sample_repo):
+    from x_algo_watch.research_plan import reference_search
+    from x_algo_watch.git import run_git
+    repo, record = make_change(sample_repo)
+    symbols = ['Example1', 'Example10', 'Example2']
+    args = ['grep', '-n', '-I', '-F', '--no-textconv']
+    for symbol in symbols:
+        args.extend(['-e', symbol])
+    revision = record['commit']
+    expected = run_git([*args, revision, '--', '*.rs', '*.py', '*.scala', '*.java', '*.go'], repo.path, allowed_codes=(0, 1)).decode('utf-8')
+    assert reference_search(repo, revision, symbols) == expected
+    assert reference_search(repo, revision, []) == ''
+    with pytest.raises(WatchError):
+        reference_search(repo, revision, ['.*'])

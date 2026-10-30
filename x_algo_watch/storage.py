@@ -20,9 +20,12 @@ def public_text(text: str) -> None:
         ("credential", r"sk-or-v1-[A-Za-z0-9_-]{12,}"), ("credential", r"gh[pousr]_[A-Za-z0-9]{20,}"),
         ("credential", r"github_pat_[A-Za-z0-9_]{20,}"), ("private_key", r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
         ("local_path", r"[A-Za-z]:[\\/](?:Users|workspace|home)[\\/]"), ("local_path", r"/(?:Users|home)/[^/\s]+/"),
-        ("email", r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"),
+        ("email", r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"),
     )
     for category, pattern in patterns:
+        # 邮箱必须含 @；从完整本地部分起点匹配，避免长源码逐字符重试。
+        if category == "email" and "@" not in text:
+            continue
         if re.search(pattern, text):
             raise UnsafePublicText(category)
 

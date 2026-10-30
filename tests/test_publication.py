@@ -123,3 +123,26 @@ def test_new_context_without_model_result_cannot_reuse_prior_approval(sample_rep
     build_versions(tmp_path)
     page = (tmp_path / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
     assert "新证据已准备" in page and "算法版本更新公告" not in page
+
+@pytest.mark.parametrize("phase,expected", [
+    ("waiting_service", "下次运行"), ("waiting_budget", "不会重置"),
+    ("waiting_time", "复用已完成"), ("waiting_manual", "不会自动解除"),
+    ("paused_limit", "保留原审核历史"), ("paused_stagnation", "不会无限重试"),
+    ("waiting_evidence", "补齐"), ("waiting_reader", "三个角色"),
+    ("insufficient_scope", "不生成无依据"),
+])
+def test_recovery_guidance_distinguishes_automatic_and_manual_actions(phase, expected):
+    from x_algo_watch.publication import recovery_guidance
+    event = {"state": "pending", "iteration": {"phase": phase}}
+    assert expected in recovery_guidance(event)
+    assert not publication_status(event)["publishable"]
+    assert "先修复源码检查" in recovery_guidance(event, complete=False)
+    assert "预算核实前" in recovery_guidance({**event, "budget_unverified": True})
+
+
+def test_unpublished_render_explains_recovery_without_exposing_raw_error():
+    from x_algo_watch.publication import render_unpublished
+    text = render_unpublished({"state": "pending", "iteration": {
+        "phase": "waiting_budget", "reason": "daily_budget"}, "error": "UNTRUSTED_PROVIDER_TEXT"})
+    assert "后续处理" in text and "不会重置" in text
+    assert "UNTRUSTED_PROVIDER_TEXT" not in text

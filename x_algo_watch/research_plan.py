@@ -49,7 +49,9 @@ def mechanism_group(path: str) -> str:
 
 
 def clean_source(text: str) -> tuple[str, int]:
-    text, count = re.subn(r"\w[\w.+-]*@[\w.-]+\.[A-Za-z]{2,}", "[已隐去源码联系地址]", text)
+    count = 0
+    if "@" in text:
+        text, count = re.subn(r"\w[\w.+-]*@[\w.-]+\.[A-Za-z]{2,}", "[已隐去源码联系地址]", text)
     public_text(text.replace("@", "\\u0040"))
     return text, count
 
@@ -123,17 +125,27 @@ def changed_file_tasks(repo: Repository, base: str, commit: str, path: str, budg
     return tasks, gaps
 
 
-def reference_tasks(repo: Repository, base: str, commit: str, path: str, symbols: list[str], budget: int, max_hits: int) -> tuple[list[dict[str, Any]], list[str]]:
+def reference_search(repo: Repository, revision: str, symbols: list[str]) -> str:
+    if not symbols:
+        return ""
+    if any(not re.fullmatch(r"[A-Za-z_]\w*", symbol) for symbol in symbols):
+        raise WatchError("引用搜索只接受已提取的定义名称")
+    # 通过标准输入传模式，避免大版本在 Windows 超出命令行长度限制。
+    # 名称不含正则操作符；单个择一表达式避免 Git 多固定模式的昂贵逐项匹配。
+    args = ["grep", "--threads=1", "-n", "-I", "-E", "--no-textconv", "-f", "-"]
+    return run_git([*args, revision, "--", "*.rs", "*.py", "*.scala", "*.java", "*.go"], repo.path,
+                   data="|".join(symbols).encode("utf-8"), allowed_codes=(0, 1)).decode("utf-8")
+
+
+def reference_tasks(repo: Repository, base: str, commit: str, path: str, symbols: list[str], budget: int, max_hits: int,
+                    search_results: dict[str, str] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     tasks, gaps = [], []
     for revision in (base, commit):
-        args = ["grep", "-n", "-I", "-F", "--no-textconv"]
-        for symbol in symbols:
-            args.extend(["-e", symbol])
-        raw = run_git([*args, revision, "--", "*.rs", "*.py", "*.scala", "*.java", "*.go"], repo.path, allowed_codes=(0, 1)).decode("utf-8")
+        raw = reference_search(repo, revision, symbols) if search_results is None else search_results[revision]
         hits = []
         for line in raw.splitlines():
             fields = line.split(":", 3)
-            if len(fields) == 4 and fields[2].isdigit() and fields[1] != path:
+            if len(fields) == 4 and fields[2].isdigit() and fields[1] != path and any(symbol in fields[3] for symbol in symbols):
                 hits.append((fields[1], int(fields[2])))
         if len(hits) > max_hits:
             gaps.append(f"{revision} 引用命中 {len(hits)} 处，仅准备前 {max_hits} 处；不能宣称调用关系已闭合")
@@ -195,6 +207,18 @@ def build_plan(repo: Repository, record: dict[str, Any], *, budget: int = 60_000
     repo.resolve(base); repo.resolve(commit)
     paths = repo.git("diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "--no-renames", base, commit, "--").split("\0")
     paths = sorted(p for p in paths if p)
+    names_by_path = {}
+    for path in paths:
+        if PurePosixPath(path).suffix.lower() not in TEXT_EXTENSIONS:
+            continue
+        try:
+            delta = repo.diff(base, commit, path)
+        except UnicodeError:
+            continue
+        symbols = list(dict.fromkeys(re.findall(r"\b(?:struct|class|fn|def)\s+([A-Za-z_]\w*)|param!\(\s*([A-Za-z_]\w*)", delta)))
+        names_by_path[path] = [a or b for a, b in symbols]
+    all_symbols = list(dict.fromkeys(name for names in names_by_path.values() for name in names[:8]))
+    search_results = {revision: reference_search(repo, revision, all_symbols) for revision in (base, commit)} if all_symbols and max_reference_hits else None
     files, tasks = [], {}
     for path in paths:
         safe_path(path)
@@ -206,13 +230,11 @@ def build_plan(repo: Repository, record: dict[str, Any], *, budget: int = 60_000
             continue
         try:
             prepared, gaps = changed_file_tasks(repo, base, commit, path, budget)
-            delta = repo.diff(base, commit, path)
-            symbols = list(dict.fromkeys(re.findall(r"\b(?:struct|class|fn|def)\s+([A-Za-z_]\w*)|param!\(\s*([A-Za-z_]\w*)", delta)))
-            names = [a or b for a, b in symbols]
+            names = names_by_path.get(path, [])
             if len(names) > 8:
                 gaps.append(f"变化区段识别 {len(names)} 个定义，仅检索前 8 个；其余定义的引用尚未准备")
             if names and max_reference_hits:
-                related, reference_gaps = reference_tasks(repo, base, commit, path, names[:8], budget, max_reference_hits)
+                related, reference_gaps = reference_tasks(repo, base, commit, path, names[:8], budget, max_reference_hits, search_results)
                 prepared.extend(related)
                 gaps.extend(reference_gaps)
             elif names:

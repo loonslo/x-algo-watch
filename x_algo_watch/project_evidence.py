@@ -80,7 +80,9 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
     def add(kind: str, path: str, revision: str, text: str, limit: int, start_line: int | None = None, *, required: bool = False, scope: str = "fragment") -> None:
         nonlocal used
         # 源码中的联系地址与机制研究无关；装饰器等 @ 符号仍保留原义。
-        text, redacted = re.subn(r"\w[\w.+-]*@[\w.-]+\.[A-Za-z]{2,}", "[已隐去源码联系地址]", text)
+        redacted = 0
+        if "@" in text:
+            text, redacted = re.subn(r"\w[\w.+-]*@[\w.-]+\.[A-Za-z]{2,}", "[已隐去源码联系地址]", text)
         public_text(text.replace("@", "\\u0040"))
         available = min(limit, MAX_TEXT - used)
         if required and (not text or len(text) > available):

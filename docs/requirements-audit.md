@@ -53,3 +53,7 @@
 2026-10-28 本地主链集成验收见 acceptance-integrated-research.md。前一阶段 388/35、预算续作 408/108 为此前阶段结果；预算只读核对识别 GitHub 当日 1 次已有调用，未调用新模型。超大补证已继续接通，阶段全量真实 Git 417 passed，最终相关 49 passed/2 skipped；被跳过的两项此前已实测，专项为 7 passed。详见 acceptance-context-consolidation.md。接下来必须经过授权后的远程 CI、预算恢复验证、两个真实模型样例与读者验收；不把本地实现当作目标完成，也不批量重跑历史模型。
 
 发布候选已在独立本地工作树保留最新 main 的自动记录，全量 421 passed、零跳过；最后账本等边界的候选相关检查 54 passed、2 deselected。源码补丁无冲突，候选 data/registry 相对最新 main 无改动，原工作区修改保留。精确目标、试点 SHA、变量与工作流操作见 release-candidate-research-pipeline.md，仍待远程授权及真实质量验收。
+
+## 2026-10-30 流程可靠性检查
+
+本轮本地优化完成：修复自动纠错路由覆盖，补充恢复说明，优化安全扫描与引用搜索，修正标准 Windows Git 启动器的超时边界。完整回归480 passed/0 skipped；最后两处源码脱敏快速路径相关65 passed/6 skipped，6项真实历史此前已在全量通过；超长单行边界复测从44.79秒降至0.94秒。未调用真实模型、推送或部署。完整证据、早期失败与未验证项见 [可靠性验收](acceptance-flow-reliability.md)。

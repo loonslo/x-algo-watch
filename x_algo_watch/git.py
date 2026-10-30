@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import shutil
 from pathlib import Path, PurePosixPath
 
 from .models import WatchError
@@ -20,9 +21,15 @@ def safe_path(value: str) -> str:
 
 def run_git(args: list[str], cwd: Path | None = None, data: bytes | None = None, *, allowed_codes: tuple[int, ...] = (0,)) -> bytes:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    executable = shutil.which("git") or "git"
+    if os.name == "nt" and Path(executable).parent.name.lower() == "cmd":
+        # Git for Windows 的 cmd 启动器另起进程；超时应直接终止真正的 Git。
+        native = Path(executable).parent.parent / "mingw64" / "bin" / "git.exe"
+        if native.is_file():
+            executable = str(native)
     try:
         result = subprocess.run(
-            ["git", "--no-pager", "-c", "core.hooksPath=", *args],
+            [executable, "--no-pager", "-c", "core.hooksPath=", *args],
             cwd=cwd, input=data, capture_output=True, timeout=120, env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

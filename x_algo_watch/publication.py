@@ -3,6 +3,33 @@
 from typing import Any
 
 
+def recovery_guidance(event: dict[str, Any] | None, *, complete: bool = True) -> str:
+    """只解释已有状态；不触发恢复、不放宽审核或预算边界。"""
+    if not complete:
+        return "先修复源码检查失败，再重跑检查；当前不能判断完整变化。"
+    if not event:
+        return "等待研究队列处理；尚无可以确认的版本解读。"
+    if event.get("budget_unverified"):
+        return "先核对共享调用记录；预算核实前不会发起新请求。"
+    if event.get("preparation_failure"):
+        return "下次检查重试证据准备；成功后再继续研究。"
+    if event.get("source_context_pending"):
+        return "使用新证据继续研究和审核；不能沿用旧稿的通过状态。"
+    phase = event.get("iteration", {}).get("phase")
+    actions = {
+        "waiting_service": "下次运行从缺少阶段重试，复用已完成结果；达到失败上限后需维护者处理。",
+        "waiting_budget": "等待 UTC 次日共享预算恢复，再从缺少阶段继续；重跑不会重置当日额度。",
+        "waiting_time": "下次运行复用已完成结果，继续当前候选。",
+        "waiting_manual": "维护者处理输出或接口错误后，显式恢复此版本；不会自动解除暂停。",
+        "paused_limit": "维护者核对未解决问题后，显式开启新修订批次；保留原审核历史。",
+        "paused_stagnation": "维护者核对重复问题与证据，处理后显式恢复；不会无限重试。",
+        "waiting_evidence": "补齐审核要求的源码证据，再重新研究及审核相关结论。",
+        "waiting_reader": "继续生成面向读者的稿件，并完成其三个角色的审核。",
+        "insufficient_scope": "补充必要证据或拆分过大的研究任务；当前不生成无依据的建议。",
+    }
+    return actions.get(phase, "继续完成研究与审核；全部关卡通过前不发布用户正文。")
+
+
 def publication_status(event: dict[str, Any] | None, *, complete: bool = True) -> dict[str, Any]:
     """最新事件控制状态；旧稿或人工迁移稿不能覆盖最新失败。"""
     if not complete:
@@ -45,6 +72,7 @@ def render_unpublished(event: dict[str, Any] | None, *, complete: bool = True) -
     status = publication_status(event, complete=complete)
     text = "## 版本解读状态\n\n**" + status["label"] + "；用户正文尚未通过发布门槛。**\n\n"
     text += "尚缺什么：" + status["gap"] + "\n\n"
+    text += "后续处理：" + recovery_guidance(event, complete=complete) + "\n\n"
     if event and "iteration" in event:
         from .iteration import PHASES, REASONS
         loop = event["iteration"]

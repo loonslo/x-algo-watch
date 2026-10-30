@@ -40,3 +40,45 @@ def test_http_reasons_keep_only_known_categories(message, category):
     result = deferred_metadata(Deferred("HTTP 429；" + message), object())
     assert result["http_reason"] == category
     assert message not in str(result)
+
+@pytest.mark.parametrize("actual", ["vendor/selected:free", None])
+def test_stage_correction_keeps_requested_router_and_reuses_success(actual):
+    from datetime import datetime, timezone
+    from x_algo_watch.stage_calls import call_stage
+    from x_algo_watch.model_policy import FREE_ROUTER
+
+    class Client:
+        last_response_model = actual
+
+        def __init__(self):
+            self.requests = []
+
+        def call(self, model, prompt, request):
+            self.requests.append((model, request))
+            assert model == FREE_ROUTER
+            return json.dumps({"ok": len(self.requests) == 2})
+
+    client = Client()
+    kwargs = dict(unit_id="unit", commit="commit", stage="analysis", payload={},
+                  schema={}, validate=lambda value: [] if value == {"ok": True} else ["needs correction"],
+                  prompt="prompt", client=client, now=datetime(2026, 10, 30, tzinfo=timezone.utc))
+    result, events = call_stage(prior=[], **kwargs)
+    assert result["state"] == "complete"
+    assert len(events) == 2
+    assert all(event["model"] == FREE_ROUTER for event in events)
+    assert all(event["resolved_model"] == actual for event in events)
+    assert client.requests[1][1]["previous_validation_errors"] == ["needs correction"]
+    cached, new_events = call_stage(prior=events, **kwargs)
+    assert cached == result
+    assert new_events == []
+    assert len(client.requests) == 2
+
+@pytest.mark.parametrize("prefix", ["", "prefix ", "(", "x" * 24000, ".+汉字-"])
+def test_long_email_local_parts_remain_blocked(prefix):
+    with pytest.raises(UnsafePublicText):
+        public_json(prefix + "person@example.com")
+
+
+def test_long_source_tokens_without_addresses_are_allowed():
+    public_json({"source": "x" * 120000})
+    public_json({"source": "x" * 120000 + "@not_an_address"})

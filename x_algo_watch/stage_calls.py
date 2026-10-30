@@ -116,8 +116,8 @@ def call_stage(*, unit_id: str, commit: str, stage: str, payload: dict[str, Any]
             event.pop("raw_output", None)
             event.pop("output", None)
             event.update(outcome="invalid", errors=["请求或本地校验失败，未确认敏感内容命中"])
-        model = getattr(client, "last_response_model", None)
-        event["resolved_model"] = model if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", model) else None
+        resolved_model = getattr(client, "last_response_model", None)
+        event["resolved_model"] = resolved_model if isinstance(resolved_model, str) and re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", resolved_model) else None
         usage = getattr(client, "last_response_usage", {})
         event["usage"] = {k: v for k, v in usage.items() if k in {"prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"} and type(v) is int and v >= 0} if isinstance(usage, dict) else {}
         public_json(event)
