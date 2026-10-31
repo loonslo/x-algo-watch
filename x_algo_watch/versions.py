@@ -170,23 +170,10 @@ def source_link(record: dict[str, Any], finding: dict[str, Any]) -> str:
 
 def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str, rechecks: list[dict[str, Any]], research: dict[str, Any] | None = None, edition: dict[str, Any] | None = None) -> str:
     sha = record["commit"]
-    status = {"confirmed": "已人工确认", "rejected": "解读已驳回"}.get(decision.get("outcome"), "未人工确认")
-    if not record["complete"]:
-        status += "；检查未完成"
     name = filename(record)
     text = f"# {name[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
     technical_link = f"technical/{name}"
-    if research:
-        technical_navigation = f"> 💡 **专业读者导航**：关于本版本的算法架构机制、代码行号与可验证假设，请查看 [本版本技术解读专页]({technical_link})。\n\n"
-    else:
-        technical_navigation = ""
-    metadata = f"- 原速报解读状态：**{status}**\n- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
-    metadata += f"- 检查级别：{inline(record['severity'])}；级别表示复核优先级，不代表流量影响大小。\n"
-    metadata += f"- [查看原始提交]({UPSTREAM}/commit/{sha})"
-    if record.get("base") and SHA.fullmatch(record["base"]):
-        metadata += f" · [对比前后代码]({UPSTREAM}/compare/{record['base']}...{sha})"
-    month = datetime.fromisoformat(record["checked_at"]).astimezone(timezone.utc).strftime("%Y-%m")
-    metadata += f" · [完整检查记录](../data/records/{month}.md)\n\n"
+    technical_navigation = f"> 💡 **专业读者导航**：算法架构机制、代码行号、源码链接与原始检测证据，请查看 [本版本技术解读专页]({technical_link})。\n\n"
     display = publication_status(research, complete=record["complete"])
     if (research and not display["publishable"]) or not record["complete"]:
         text += render_unpublished(research, complete=record["complete"])
@@ -195,14 +182,12 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         if confirmed:
             text += "原速报曾获人工确认；这不代表当前研究已经确认，原文见[速报汇总](../digest.md)。\n\n"
         text += technical_navigation
-        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
         return text
     if research and "analysis" in research and not (confirmed and decision.get("research_id") == research.get("id")):
         text += render_research(research, edition=edition, reader_only=True)
         if confirmed:
             text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
         text += technical_navigation
-        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
         return text
     elif research and "analysis" not in research and not (confirmed and decision.get("research_id") == research.get("id")):
         text += render_research(research, edition=edition, reader_only=True)
@@ -210,26 +195,45 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         if confirmed:
             text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
         text += technical_navigation
-        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
         return text
     elif research and confirmed:
         text += confirmed.strip() + "\n\n"
         text += technical_navigation
-        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
         return text
     elif not research and not record.get("base"):
         text += "## 30 秒摘要\n\n**这是起始基线，没有前一个版本可供比较，不属于待研究的算法迭代。**\n\n"
-        text += "<details><summary>版本检查信息与源码链接（普通读者可跳过）</summary>\n\n" + metadata + "</details>\n"
         return text
     elif not research:
         text += render_unpublished(None) + "已核实的变化范围（程序检测）：" + overview(record) + "\n\n"
     text += technical_navigation
     if decision.get("outcome") == "rejected":
-        text += "**先前解读已被所有者驳回，不能作为运营建议。以下仅保留源码变化与待核对问题。**\n\n"
-    text += "<details><summary>检查历史与原始检测数据（普通读者可跳过）</summary>\n\n" + metadata
+        text += "**先前解读已被驳回，不能作为运营建议。**\n\n"
     if confirmed and not (research and decision.get("research_id") == research.get("id")):
-        text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
-    text += "<details><summary>程序整理的原始变化与阅读提示（不属于模型项目解读）</summary>\n\n## 这次改了什么，可能影响什么\n\n"
+        text += "## 已确认的详细解读\n\n" + confirmed.strip() + "\n\n"
+    text += "## 创作者现在要做什么\n\n"
+    if not record["complete"]:
+        text += "检查恢复后系统会自动重试；目前无法据此调整运营策略。\n\n"
+    elif research and "analysis" in research:
+        text += "阅读上方“现在该做什么”；这些是可检验的机制判断，不承诺流量效果。\n\n"
+    else:
+        text += "先观察，保留自己的内容与数据记录；通俗解读生成后会自动更新到本页。\n\n"
+    return text
+
+
+def technical_evidence(record: dict[str, Any], decision: dict[str, Any], confirmed: str, rechecks: list[dict[str, Any]], research: dict[str, Any] | None) -> str:
+    """源码链接、检测原始事实与程序模板只进技术页，不进创作者页面。"""
+    sha = record["commit"]
+    text = "\n## 检查信息与源码链接\n\n"
+    text += f"- 上游提交时间：{inline(record['committed_at'])}（目录按 UTC 日期排序）\n"
+    text += f"- 检查级别：{inline(record['severity'])}；级别表示复核优先级，不代表流量影响大小。\n"
+    text += f"- [查看原始提交]({UPSTREAM}/commit/{sha})"
+    if record.get("base") and SHA.fullmatch(record["base"]):
+        text += f" · [对比前后代码]({UPSTREAM}/compare/{record['base']}...{sha})"
+    month = datetime.fromisoformat(record["checked_at"]).astimezone(timezone.utc).strftime("%Y-%m")
+    text += f" · [完整检查记录](../../data/records/{month}.md)\n\n"
+    if not record.get("base"):
+        return text + "起始基线：没有前一个版本可供比较。\n"
+    text += "## 程序整理的原始变化与阅读提示（不属于模型项目解读）\n\n"
     findings = [f for f in record["findings"] if f["category"] not in CONTEXT_ONLY]
     for index, finding in enumerate(findings, 1):
         change, impact = explanation(finding)
@@ -254,15 +258,6 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         text += "### 两项权重放在一起看\n\n"
         text += f"程序精确计算：点赞权重 ×{inline(context['favorite_multiplier'])}，不感兴趣权重 ×{inline(context['not_interested_multiplier'])}；绝对比值 {inline(context['negative_to_favorite_before'])} → {inline(context['negative_to_favorite_after'])}。"
         text += "这表示系数之间的数值关系，不能理解成一个操作抵消多少个点赞。\n\n"
-    text += "</details>\n\n## 创作者现在要做什么\n\n"
-    if not record["complete"]:
-        text += "先等待检查恢复及人工补充证据；目前无法据此调整运营策略。\n\n"
-    elif research and "analysis" in research:
-        text += "阅读模型推测中的“对创作者意味着什么”“成立条件”和“如何验证”。这些是可检验的机制判断，尚未经过人工确认，不承诺流量效果。\n\n"
-    elif confirmed:
-        text += "优先阅读上方已确认解读中的“现在要不要改做法”和“待核对”；确认解读也不等于线上部署已获证实。\n\n"
-    else:
-        text += "先观察，保留自己的内容与数据记录；这份源码档案尚不足以支持改变发帖频率、选题或互动方式。若手册引用了变化中的设置，先核对出处与适用条件。\n\n"
     extras = [f for f in record["findings"] if f["category"] in CONTEXT_ONLY]
     if extras:
         text += "## 同步与检查补充\n\n"
@@ -272,7 +267,7 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
                 f = grouped[-1]
                 text += f"- 源码同步标记：{value_text(f.get('before'))} → {value_text(f.get('after'))}；时间标记本身不证明功能变化。\n"
             elif category == "manual_overdue":
-                text += "- 人工资料核对提醒：" + "、".join(inline(f["name"]) for f in grouped) + "；属于登记维护事项，不是本次算法逻辑变化。\n"
+                text += "- 登记核对提醒：" + "、".join(inline(f["name"]) for f in grouped) + "；属于登记维护事项，不是本次算法逻辑变化。\n"
             else:
                 text += {"baseline": "- 本次建立基线，未把既有配置当作新增。\n", "legacy_levels": "- 此历史版本采用旧规则布局，没有现代级别名单的计数；未把缺少该文件当作规则清零。\n", "golden_corpus": f"- 有 {len(grouped)} 个测试样例文件变化；测试样例不能证明线上行为已改变。\n"}[category]
         text += "\n"
@@ -282,7 +277,6 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
             result = event["result"]
             text += f"- {inline(event['created_at'])}：登记重核级别 {inline(result['severity'])}，{'完整' if result['complete'] else '未完成'}；这是同一源码版本的依据核对，不是一次新的算法迭代。\n"
         text += "\n"
-    text += "\n</details>\n"
     return text
 
 
@@ -314,7 +308,7 @@ def build_versions(root: Path) -> int:
     pages: dict[str, str] = {}
     index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [怎么读这些文档](../docs/how-to-read.md) · [已确认速报汇总](../digest.md)\n\n"
     index += "面向普通创作者与运营：先读每版的“30 秒摘要：本次更新重点”和“具体调整与影响解读”，了解改了什么、是否上线、可能影响谁、现在该做什么。技术分析、证据和历史记录折叠在页面末尾。每个上游提交一份独立文件，按提交时间从新到旧排列。\n\n"
-    index += "未通过发布门槛的版本展示状态、检测范围与缺口；三个审核角色全部通过后才展示机制推测，仍标注尚未人工确认与线上未知。正式 digest 仍需所有者确认。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
+    index += "未通过发布门槛的版本展示状态与检测范围；三个模型审核角色全部通过后自动展示解读，线上部署情况仍未知。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
     index += "| 版本（UTC 日期） | 一句话变化 | 解读状态 | 核对级别 |\n| --- | --- | --- | --- |\n"
     home_rows = []
     for record in records:
@@ -327,11 +321,12 @@ def build_versions(root: Path) -> int:
         research = research_by_commit.get(record["commit"])
         edition = load_edition(root, research)
         pages[name] = render_page(record, decision, approved, rechecks, research, edition)
+        technical = f"# {name[:10]} · {record['commit'][:7]} · 技术解读\n\n[返回通俗解读](../{name}) · [全部版本](../README.md) · [阅读说明](../../docs/how-to-read.md)\n\n"
         if research:
-            technical = f"# {name[:10]} · {record['commit'][:7]} · 技术解读\n\n[返回通俗解读](../{name}) · [全部版本](../README.md) · [阅读说明](../../docs/how-to-read.md)\n\n"
             technical += "本页与通俗页来自同一份研究及复核记录；源码变化与条件性推断不等于线上部署。\n\n"
             technical += render_research(research, context_base="../../data/project-context", edition=edition, technical_only=True, check_complete=record["complete"], data_root=root / "data")
-            pages["technical/" + name] = technical
+        technical += technical_evidence(record, decision, approved, rechecks, research)
+        pages["technical/" + name] = technical
         display = publication_status(research, complete=record["complete"])
         status = display["label"]
         if not record.get("base"):
@@ -349,7 +344,7 @@ def build_versions(root: Path) -> int:
         if len(home_rows) < 5:
             point = reader["title"] if reader else ("起始基线快照" if not record.get("base") else "通俗解读生成中，暂未发布")
             home_rows.append(f"| {name[:10]} · `{record['commit'][:7]}` | {inline(point)} | [版本档案](versions/{name}) |")
-    pages["README.md"] = index + f"\n共 {len(records)} 个版本（含起始基线）。没有新上游提交的检查不会新增版本文件。\n\n目录和基础说明由程序重建；人工解读通过 Issue 审核后保存在速报中，不直接编辑这些生成文件。\n"
+    pages["README.md"] = index + f"\n共 {len(records)} 个版本（含起始基线）。没有新上游提交的检查不会新增版本文件。\n\n目录和说明由程序自动重建，无需人工编辑。\n"
     home_path = root / "README.md"
     home_update = None
     if home_path.is_symlink():

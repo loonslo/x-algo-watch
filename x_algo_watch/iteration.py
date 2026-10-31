@@ -130,10 +130,12 @@ def iterate_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             if not valid_research_event(clean, pack, required_extra_reviews=settings.get("extra_review_rounds", 0)):
                 raise WatchError("修订检查点无效，拒绝猜测恢复")
             loop = deepcopy(checkpoint["iteration"])
-            if loop["phase"] == "ready" or (loop["phase"] in PAUSED and not resume):
+            # 无人值守：开启后，暂停超过一个 UTC 日的版本自动开启新批次（历史保留；调用仍受共享日预算约束）。
+            resume_now = resume or (bool(settings.get("auto_resume_daily")) and checkpoint.get("created_at", "")[:10] < datetime.now(timezone.utc).date().isoformat())
+            if loop["phase"] == "ready" or (loop["phase"] in PAUSED and not resume_now):
                 outputs[pack["item_id"]] = {k: v for k, v in clean.items() if k in RESULT_KEYS | {"repair_attempted", "iteration"}}
                 continue
-            if loop["phase"] in PAUSED and resume:
+            if loop["phase"] in PAUSED and resume_now:
                 if loop["phase"] == "waiting_manual":
                     stage = loop["next_stage"]
                     loop["retry_epochs"][stage] = loop["retry_epochs"].get(stage, 0) + 1
