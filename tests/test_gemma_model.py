@@ -48,7 +48,7 @@ def test_gemma_pipeline_rechecks_all_roles_and_preserves_router_budget(tmp_path,
     config.write_text(yaml.safe_dump({**SETTINGS, "daily_calls": 8}), encoding="utf-8")
     run(bundle, output, config, client=RecordedClient(deepcopy(values)))
     old = json.loads(output.read_text(encoding="utf-8"))
-    assert old["events"][-1]["state"] == "pending_confirmation"
+    assert old["events"][-1]["state"] == "reviewed"
 
     models = {"analysis": GEMMA_MODEL, "review": GEMMA_MODEL}
     # 当日已有八次旧路由调用；换型号不清零，先只留四次调用空间。
@@ -67,7 +67,7 @@ def test_gemma_pipeline_rechecks_all_roles_and_preserves_router_budget(tmp_path,
     payload = json.loads(output.read_text(encoding="utf-8"))
     event = payload["events"][-1]
     assert len(resumed.calls) == 4 and all(c[0] == GEMMA_MODEL for c in resumed.calls)
-    assert event["state"] == "pending_confirmation" and event["review_mode"] == "same_model"
+    assert event["state"] == "reviewed" and event["review_mode"] == "same_model"
     assert event["models"] == models
     assert validate_pipeline_event(event, pack, bundle / "data", payload["events"])
     assert sum(e["type"] == "model_call" for e in payload["events"]) == 16

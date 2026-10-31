@@ -29,9 +29,9 @@ def test_archive_each_commit_newest_first_and_rebuild_is_read_only(tmp_path):
     assert index.index("ccccccc") < index.index("bbbbbbb")
     assert filename(first) in index and filename(second) in index
     page = (tmp_path / "versions" / filename(first)).read_text(encoding="utf-8")
-    assert "点赞信号的打分系数" in page and "0.6 → 0.66" in page
-    assert "可能影响" in page and "创作者现在要做什么" in page
-    assert "未人工确认" in page and "流量涨跌" in page
+    assert "创作者现在要做什么" in page
+    tech = (tmp_path / "versions" / "technical" / filename(first)).read_text(encoding="utf-8")
+    assert "点赞信号的打分系数" in tech and "0.6 → 0.66" in tech and "流量涨跌" in tech
     stamps = {p.name: p.stat().st_mtime_ns for p in (tmp_path / "versions").glob("*.md")}
     build_versions(tmp_path)
     assert stamps == {p.name: p.stat().st_mtime_ns for p in (tmp_path / "versions").glob("*.md")}
@@ -49,26 +49,6 @@ def test_failure_recovery_keeps_one_file_and_never_claims_no_change(tmp_path):
     assert len(pages) == 1
     assert "检查未完成" not in pages[0].read_text(encoding="utf-8")
 
-
-def test_decision_and_exact_owner_text_sync_without_model_drafts(tmp_path):
-    result = record(tmp_path)
-    store = RecordStore(tmp_path / "data")
-    store.append_event({"type": "model_call", "id": "model:test", "commit": result["commit"], "raw": "未经审核的模型猜测"}, NOW)
-    build_versions(tmp_path)
-    page = tmp_path / "versions" / filename(result)
-    assert "未经审核的模型猜测" not in page.read_text(encoding="utf-8")
-    store.append_event({"type": "decision", "id": "confirmed:test", "commit": result["commit"], "outcome": "confirmed"}, NOW)
-    with pytest.raises(WatchError, match="缺少对应速报"):
-        build_versions(tmp_path)
-    approved = "所有者编辑后的独特文字\n\n- 暂不改变运营方法。"
-    (tmp_path / "digest.md").write_text(f"# Digest\n\n<!-- xaw-digest:{result['commit']} -->\n{approved}\n", encoding="utf-8")
-    build_versions(tmp_path)
-    assert approved in page.read_text(encoding="utf-8")
-    assert "已人工确认" in page.read_text(encoding="utf-8")
-    store.append_event({"type": "decision", "id": "rejected:test", "commit": result["commit"], "outcome": "rejected"}, NOW + timedelta(seconds=1))
-    build_versions(tmp_path)
-    text = page.read_text(encoding="utf-8")
-    assert "解读已驳回" in text and approved not in text
 
 
 def test_exact_math_and_switch_explanation_do_not_promise_deployment(tmp_path):
@@ -113,13 +93,10 @@ def test_recheck_does_not_replace_iteration_changes(tmp_path):
 
 
 def test_sensitive_output_is_blocked_before_any_pages_written(tmp_path):
-    result = record(tmp_path)
-    RecordStore(tmp_path / "data").append_event({"type": "decision", "id": "confirmed:test", "commit": result["commit"], "outcome": "confirmed"}, NOW)
-    (tmp_path / "digest.md").write_text(f"<!-- xaw-digest:{result['commit']} -->\n" + "sk-or-v1-" + "a" * 40, encoding="utf-8")
+    record(tmp_path, findings=[Finding("parameter", Severity.ORANGE, "params.rs", "sk-or-v1-" + "a" * 40, "变化", 0.6, 0.66)])
     with pytest.raises(WatchError, match="疑似凭据"):
         build_versions(tmp_path)
     assert not (tmp_path / "versions").exists()
-
 
 def test_history_test_publish_never_writes_archive(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)

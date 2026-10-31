@@ -63,7 +63,7 @@ def test_draft_status_labels_transition_without_removing_custom_labels(ready):
     draft = {"version": "1" * 20, "body": "未经确认的草稿", "ready": ready}
     publish_issues(client, [record], False, {record["commit"]: draft})
     labels = {label["name"] for label in client.rows[0]["labels"]}
-    assert labels & {"待起草", "待确认", "需人工"} == {"待确认" if ready else "需人工"}
+    assert labels & {"待起草", "已复核", "自动重试"} == {"已复核" if ready else "自动重试"}
     assert {"所有者自定义", "x-algo-watch", "级别:橙"} <= labels
     before = len(client.calls)
     publish_issues(client, [record], False, {record["commit"]: draft})
@@ -71,7 +71,7 @@ def test_draft_status_labels_transition_without_removing_custom_labels(ready):
     draft.update(version="2" * 20, ready=not ready)
     publish_issues(client, [record], False, {record["commit"]: draft})
     labels = {label["name"] for label in client.rows[0]["labels"]}
-    assert labels & {"待起草", "待确认", "需人工"} == {"需人工" if ready else "待确认"}
+    assert labels & {"待起草", "已复核", "自动重试"} == {"自动重试" if ready else "已复核"}
     assert "所有者自定义" in labels
 
 

@@ -80,7 +80,7 @@ def test_failed_content_keeps_resolved_model_and_safe_usage_in_audit(sample_repo
 def test_three_reviews_are_independent_inputs_share_schema_and_all_required(sample_repo):
     repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
     output, events, client = invoke(pack, [analysis(pack), review(pack), review(pack), review(pack)])
-    assert len(client.calls) == 4 and output["state"] == "pending_confirmation"
+    assert len(client.calls) == 4 and output["state"] == "reviewed"
     assert set(output["reviews"]) == {"review", "facts_review", "reader_review"}
     assert all(payload == {"evidence_pack": pack, "analysis": analysis(pack)} for _, _, payload in client.calls[1:])
     assert len({system for _, system, _ in client.calls[1:]}) == 3
@@ -118,7 +118,7 @@ def test_quota_and_transport_resume_do_not_skip_final_check(sample_repo):
     assert partial["state"] == "pending"
     done, _, client = invoke(pack, [review(pack)], [*first, *second], daily_limit=5)
     assert len(client.calls) == 1 and "version-reader-review" in client.calls[0][1]
-    assert done["state"] == "pending_confirmation"
+    assert done["state"] == "reviewed"
 
 
 def test_invalid_extra_review_retries_once_then_requires_manual(sample_repo):
@@ -137,7 +137,7 @@ def test_time_boundary_saves_completed_stages_then_resumes(sample_repo, monkeypa
     partial, events, client = invoke(pack, [analysis(pack), review(pack)], call_deadline=1.0)
     assert partial["state"] == "pending" and len(client.calls) == 2
     done, _, client = invoke(pack, [review(pack), review(pack)], events)
-    assert done["state"] == "pending_confirmation" and len(client.calls) == 2
+    assert done["state"] == "reviewed" and len(client.calls) == 2
 
 
 def test_router_actual_models_survive_cache_and_event(sample_repo):
@@ -163,7 +163,7 @@ def test_publisher_rejects_missing_round_or_forged_aggregate(sample_repo):
     single, _, _ = invoke(pack, [analysis(pack), review(pack)], extra_review_rounds=0)
     assert not valid_research_event(research_event(pack, single, MODELS), pack, required_extra_reviews=2)
     done, _, _ = invoke(pack, [analysis(pack), review(pack), review(pack, False), review(pack)])
-    done["review"] = review(pack); done["state"] = "pending_confirmation"
+    done["review"] = review(pack); done["state"] = "reviewed"
     assert not valid_research_event(research_event(pack, done, MODELS), pack, required_extra_reviews=2)
 
 
@@ -183,7 +183,7 @@ def test_repair_reruns_every_review_even_when_analysis_is_unchanged(sample_repo)
     repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
     first, events, _ = invoke(pack, [analysis(pack), review(pack), review(pack, False), review(pack)])
     fixed, _, client = invoke(pack, [analysis(pack), review(pack), review(pack), review(pack)], events, repair_feedback={pack["item_id"]: first})
-    assert len(client.calls) == 4 and fixed["state"] == "pending_confirmation"
+    assert len(client.calls) == 4 and fixed["state"] == "reviewed"
     assert client.calls[0][2]["review_feedback"]["issues"]
     assert all("revision_context" in payload for _, _, payload in client.calls[1:])
 
@@ -214,7 +214,7 @@ def test_free_router_two_candidate_limit_gates_reader(sample_repo, tmp_path, mon
     assert len(model.calls) == 8
     event = next(e for e in RecordStore(workspace / "data").events() if e["type"] == "version_research")
     assert event["repair_attempted"] and len(event["reviews"]) == 3
-    assert event["state"] == ("pending_confirmation" if final_agrees else "disputed")
+    assert event["state"] == ("reviewed" if final_agrees else "disputed")
     front = next((workspace / "versions").glob("20*.md")).read_text(encoding="utf-8").split("研究附录：")[0]
     assert "影响对象错误标记" not in front
     assert (fixed["reader"]["title"] in front) == final_agrees
@@ -247,5 +247,5 @@ def test_partial_repair_persists_then_only_missing_two_checks_run(sample_repo, t
     assert len(second.calls) == 2
     assert all("revision_context" in payload for _, _, payload in second.calls)
     stored = [e for e in RecordStore(workspace / "data").events() if e["type"] == "version_research"][-1]
-    assert stored["state"] == "pending_confirmation" and stored["repair_attempted"]
+    assert stored["state"] == "reviewed" and stored["repair_attempted"]
     assert len([e for e in RecordStore(workspace / "data").events() if e["type"] == "model_call"]) == 8

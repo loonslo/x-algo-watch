@@ -14,7 +14,7 @@ PHASES = {
     "waiting_evidence": ("证据不足，等待 Git 补证", "检测阶段读取精确版本并保存新快照后恢复研究"),
     "waiting_reader": ("机制复核已完成，等待读者稿阶段", "继续读者稿生成与三角色审核；当前不发布用户结论"),
     "insufficient_scope": ("当前机制证据不足以形成用户结论", "补充有依据的机制判断后继续，不强行生成建议"),
-    "ready": ("达到模型验收标准，已通过复核", "机制推测可以展示；正式 digest 仍需所有者人工确认"),
+    "ready": ("达到模型验收标准，已通过复核", "机制推测可以展示；线上部署尚未核实"),
     "waiting_service": ("接口暂未完成，等待续跑", "下次运行从失败阶段重试；不增加候选版本号"),
     "waiting_budget": ("当日调用预算不足", "UTC 次日预算恢复后，从缺少阶段继续"),
     "waiting_time": ("本次运行时间用完", "下次运行复用已完成阶段，继续当前候选"),
@@ -28,7 +28,7 @@ REASONS.update(evidence_gap="审核要求补充具体源码证据", reader_stage
 REASONS.update(no_supported_claims="已研究材料尚无足够支持的结论", synthesis_budget="综合所需上下文超出当前边界，需进一步拆分")
 REASONS.update(in_progress="正在执行当前研究阶段")
 REASONS.update(unprepared_file="仍有变化文件缺少可研究的必要任务")
-NEXT_LABELS = {"analysis": "起草或修订", "review": "机制审核", "facts_review": "事实与遗漏审核", "reader_review": "普通读者理解审核", "confirmation": "等待所有者确认正式速报", "revision": "修订稿件", "manual": "显式恢复处理"}
+NEXT_LABELS = {"analysis": "起草或修订", "review": "机制审核", "facts_review": "事实与遗漏审核", "reader_review": "普通读者理解审核", "done": "完成", "revision": "修订稿件", "manual": "显式恢复处理"}
 RESULT_KEYS = {"state", "analysis", "review", "reviews", "extra_review_rounds", "resolved_models"}
 
 
@@ -97,7 +97,7 @@ def validate_iteration(value: Any, pack: dict[str, Any], models: dict[str, str],
         if not isinstance(row, dict) or set(row) != {"number", "result"} or type(row["number"]) is not int or row["number"] != number:
             return False
         result = row["result"]
-        if not isinstance(result, dict) or set(result) - RESULT_KEYS or result.get("state") not in ("disputed", "pending_confirmation"):
+        if not isinstance(result, dict) or set(result) - RESULT_KEYS or result.get("state") not in ("disputed", "reviewed"):
             return False
         if not valid_research_event(research_event(pack, result, models), pack, required_extra_reviews=rounds):
             return False
@@ -108,7 +108,7 @@ def validate_iteration(value: Any, pack: dict[str, Any], models: dict[str, str],
     complete = value["phase"] in {"ready", "paused_limit", "paused_stagnation"}
     if value["candidate"] != len(history) + (0 if complete else 1) or value["candidate"] < 1:
         return False
-    if complete and (not history or (value["phase"] == "ready") != (history[-1]["result"]["state"] == "pending_confirmation")):
+    if complete and (not history or (value["phase"] == "ready") != (history[-1]["result"]["state"] == "reviewed")):
         return False
     return value["ledger"] == issue_ledger(history) and isinstance(value["next_stage"], str) and value["next_stage"] in NEXT_LABELS
 
@@ -172,7 +172,7 @@ def iterate_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
                     "paused_stagnation" if stalled(history, loop["batch_start"], stagnant) else ""))
             if phase:
                 reason = {"ready": "accepted", "paused_limit": "candidate_limit", "paused_stagnation": "stagnation"}[phase]
-                loop.update(candidate=number, phase=phase, reason=reason, next_stage="confirmation" if phase == "ready" else "revision", ledger=issue_ledger(history))
+                loop.update(candidate=number, phase=phase, reason=reason, next_stage="done" if phase == "ready" else "revision", ledger=issue_ledger(history))
                 break
         if loop["phase"] in PAUSED and history:
             result = history[-1]["result"]

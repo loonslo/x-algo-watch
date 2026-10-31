@@ -43,7 +43,7 @@ def test_full_main_pipeline_publishes_only_after_mechanism_and_reader_three_role
     run(bundle, output, config, client=client)
     payload = json.loads(output.read_text(encoding="utf-8"))
     root = payload["events"][-1]
-    assert len(client.calls) == 8 and root["state"] == "pending_confirmation"
+    assert len(client.calls) == 8 and root["state"] == "reviewed"
     assert root["iteration"]["phase"] == "ready"
     assert validate_pipeline_event(root, pack, bundle / "data", payload["events"])
     assert payload["drafts"][pack["commit"]]["ready"] is True
@@ -52,7 +52,7 @@ def test_full_main_pipeline_publishes_only_after_mechanism_and_reader_three_role
     assert not (tmp_path / "digest.md").exists() and RecordStore(tmp_path / "data").last_success() == progress
     page = next((tmp_path / "versions").glob("20*.md")).read_text(encoding="utf-8")
     assert draft["reader"]["title"] in page and "算法版本更新公告" in page
-    assert "正式 digest 仍需所有者确认" in page
+    assert "线上部署尚未核实" in page
     client = RecordedClient([])
     run(bundle, output, config, client=client)
     assert client.calls == []
@@ -125,7 +125,7 @@ def test_reader_revision_rechecks_all_roles_and_preserves_closure_and_precise_di
     client = RecordedClient(responses); output = tmp_path / "draft.json"
     run(bundle, output, config, client=client)
     payload = json.loads(output.read_text(encoding="utf-8")); root = payload["events"][-1]
-    assert len(client.calls) == 15 and root["state"] == "pending_confirmation"
+    assert len(client.calls) == 15 and root["state"] == "reviewed"
     history = root["pipeline_loop"]["reader_history"]
     assert len(history) == 2 and history[1]["changes"] and history[1]["closure_reasons"]
     assert validate_pipeline_event(root, pack, bundle / "data", payload["events"])
@@ -147,7 +147,7 @@ def test_test_only_change_can_publish_an_honest_summary_without_manufactured_use
     output = tmp_path / "draft.json"
     run(bundle, output, config, client=RecordedClient([mechanism, *[approval(unit) for _ in range(3)], draft, *[approval(pack["item_id"]) for _ in range(3)]]))
     payload = json.loads(output.read_text(encoding="utf-8")); root = payload["events"][-1]
-    assert root["state"] == "pending_confirmation" and root["analysis"]["reader"]["impacts"] == []
+    assert root["state"] == "reviewed" and root["analysis"]["reader"]["impacts"] == []
     assert validate_pipeline_event(root, pack, bundle / "data", payload["events"])
     text = render_research(root, reader_only=True)
     assert "测试设置" in text and "你可能感受到的变化" not in text

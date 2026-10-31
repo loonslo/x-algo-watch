@@ -19,7 +19,6 @@ from .readers import load_edition
 from .publication import publication_status, render_unpublished
 
 VERSION_PATH = re.compile(r"versions/(?:README\.md|(?:technical/)?\d{4}-\d{2}-\d{2}-[0-9a-f]{40}\.md)\Z")
-DIGEST_SECTION = re.compile(r"<!-- xaw-digest:([0-9a-f]{40}) -->\n(.*?)(?=\n<!-- xaw-digest:|\Z)", re.S)
 CONTEXT_ONLY = {"sync", "legacy_levels", "golden_corpus", "baseline", "manual_overdue"}
 LABELS = {
     "FavoriteWeight": "点赞信号的打分系数", "NotInterestedWeight": "不感兴趣信号的打分系数",
@@ -168,7 +167,7 @@ def source_link(record: dict[str, Any], finding: dict[str, Any]) -> str:
     return f"[源码位置]({UPSTREAM}/{view}/{commit}/{quote(path, safe='/')}{suffix})"
 
 
-def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str, rechecks: list[dict[str, Any]], research: dict[str, Any] | None = None, edition: dict[str, Any] | None = None) -> str:
+def render_page(record: dict[str, Any], rechecks: list[dict[str, Any]], research: dict[str, Any] | None = None, edition: dict[str, Any] | None = None) -> str:
     sha = record["commit"]
     name = filename(record)
     text = f"# {name[:10]} · {sha[:7]} · 版本变化\n\n[返回全部版本](README.md) · [怎么读这份文档](../docs/how-to-read.md) · [项目首页](../README.md)\n\n"
@@ -179,25 +178,15 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
         text += render_unpublished(research, complete=record["complete"])
         text += "### 已核实的变化范围（程序检测）\n\n" + overview(record) + "\n\n"
         text += "这只说明检测范围，不能据此判断机制、用户影响或影响大小。\n\n"
-        if confirmed:
-            text += "原速报曾获人工确认；这不代表当前研究已经确认，原文见[速报汇总](../digest.md)。\n\n"
         text += technical_navigation
         return text
-    if research and "analysis" in research and not (confirmed and decision.get("research_id") == research.get("id")):
+    if research and "analysis" in research:
         text += render_research(research, edition=edition, reader_only=True)
-        if confirmed:
-            text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
         text += technical_navigation
         return text
-    elif research and "analysis" not in research and not (confirmed and decision.get("research_id") == research.get("id")):
+    elif research and "analysis" not in research:
         text += render_research(research, edition=edition, reader_only=True)
         text += f"### 本次检测代码变动概况（程序检测事实）\n\n- **代码变动摘要**：{overview(record)}\n- **复核优先级**：{inline(record['severity'])}（表示代码核对优先级，不代表实际流量影响）\n\n"
-        if confirmed:
-            text += "## 已人工确认的详细解读\n\n" + confirmed.strip() + "\n\n"
-        text += technical_navigation
-        return text
-    elif research and confirmed:
-        text += confirmed.strip() + "\n\n"
         text += technical_navigation
         return text
     elif not research and not record.get("base"):
@@ -206,10 +195,6 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     elif not research:
         text += render_unpublished(None) + "已核实的变化范围（程序检测）：" + overview(record) + "\n\n"
     text += technical_navigation
-    if decision.get("outcome") == "rejected":
-        text += "**先前解读已被驳回，不能作为运营建议。**\n\n"
-    if confirmed and not (research and decision.get("research_id") == research.get("id")):
-        text += "## 已确认的详细解读\n\n" + confirmed.strip() + "\n\n"
     text += "## 创作者现在要做什么\n\n"
     if not record["complete"]:
         text += "检查恢复后系统会自动重试；目前无法据此调整运营策略。\n\n"
@@ -220,7 +205,7 @@ def render_page(record: dict[str, Any], decision: dict[str, Any], confirmed: str
     return text
 
 
-def technical_evidence(record: dict[str, Any], decision: dict[str, Any], confirmed: str, rechecks: list[dict[str, Any]], research: dict[str, Any] | None) -> str:
+def technical_evidence(record: dict[str, Any], rechecks: list[dict[str, Any]], research: dict[str, Any] | None) -> str:
     """源码链接、检测原始事实与程序模板只进技术页，不进创作者页面。"""
     sha = record["commit"]
     text = "\n## 检查信息与源码链接\n\n"
@@ -285,7 +270,6 @@ def build_versions(root: Path) -> int:
     by_commit = {record["commit"]: record for record in store.records()}
     records = sorted(by_commit.values(), key=lambda r: (datetime.fromisoformat(r["committed_at"]), r["commit"]), reverse=True)
     events = sorted(store.events(), key=lambda e: e.get("created_at", ""))
-    decisions = {e["commit"]: e for e in events if e["type"] == "decision"}
     latest_research = {e["commit"]: e for e in events if e["type"] == "version_research"}
     research_by_commit = dict(latest_research)
     from .project_evidence import context_packs
@@ -302,39 +286,28 @@ def build_versions(root: Path) -> int:
         existing = research_by_commit.get(commit)
         if existing and publication_status(existing)["publishable"] and existing.get("item_id") != pack["item_id"]:
             research_by_commit[commit] = {"state": "pending", "source_context_pending": True, "id": "context:" + pack["item_id"], "commit": commit}
-    path = root / "digest.md"
-    digest = path.read_text(encoding="utf-8") if path.exists() else ""
-    confirmed = dict(DIGEST_SECTION.findall(digest))
     pages: dict[str, str] = {}
-    index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [怎么读这些文档](../docs/how-to-read.md) · [已确认速报汇总](../digest.md)\n\n"
+    index = "# 版本变化记录\n\n[返回项目首页](../README.md) · [怎么读这些文档](../docs/how-to-read.md)\n\n"
     index += "面向普通创作者与运营：先读每版的“30 秒摘要：本次更新重点”和“具体调整与影响解读”，了解改了什么、是否上线、可能影响谁、现在该做什么。技术分析、证据和历史记录折叠在页面末尾。每个上游提交一份独立文件，按提交时间从新到旧排列。\n\n"
     index += "未通过发布门槛的版本展示状态与检测范围；三个模型审核角色全部通过后自动展示解读，线上部署情况仍未知。红／橙／黄／灰表示核对优先级，不能理解成流量影响大小。\n\n"
     index += "| 版本（UTC 日期） | 一句话变化 | 解读状态 | 核对级别 |\n| --- | --- | --- | --- |\n"
     home_rows = []
     for record in records:
         name = filename(record)
-        decision = decisions.get(record["commit"], {})
-        approved = confirmed.get(record["commit"], "") if decision.get("outcome") == "confirmed" else ""
-        if decision.get("outcome") == "confirmed" and not approved:
-            raise WatchError("确认决策缺少对应速报，不能生成已确认版本档案")
         rechecks = [e for e in events if e["type"] == "verification" and e.get("commit") == record["commit"]]
         research = research_by_commit.get(record["commit"])
         edition = load_edition(root, research)
-        pages[name] = render_page(record, decision, approved, rechecks, research, edition)
+        pages[name] = render_page(record, rechecks, research, edition)
         technical = f"# {name[:10]} · {record['commit'][:7]} · 技术解读\n\n[返回通俗解读](../{name}) · [全部版本](../README.md) · [阅读说明](../../docs/how-to-read.md)\n\n"
         if research:
             technical += "本页与通俗页来自同一份研究及复核记录；源码变化与条件性推断不等于线上部署。\n\n"
             technical += render_research(research, context_base="../../data/project-context", edition=edition, technical_only=True, check_complete=record["complete"], data_root=root / "data")
-        technical += technical_evidence(record, decision, approved, rechecks, research)
+        technical += technical_evidence(record, rechecks, research)
         pages["technical/" + name] = technical
         display = publication_status(research, complete=record["complete"])
         status = display["label"]
         if not record.get("base"):
             status = "起始基线·无前版对比"
-        if approved:
-            status = "模型解读已人工确认" if research and decision.get("research_id") == research.get("id") else status + "；原速报已人工确认"
-        elif decision.get("outcome") == "rejected":
-            status += "；原速报解读已驳回"
         if not record["complete"]:
             status += "；检查未完成"
         reader = (research or {}).get("analysis", {}).get("reader") if display["publishable"] else None

@@ -78,7 +78,7 @@ class Artifacts:
         rid = 10 if aid < 20 else 20
         number = aid - rid
         if self.legacy:
-            return zipped({"events": [row(str(aid)), {"type": "version_research", "state": "pending_confirmation"}]}, "runtime/draft.json")
+            return zipped({"events": [row(str(aid)), {"type": "version_research", "state": "reviewed"}]}, "runtime/draft.json")
         return zipped({"schema_version": 1, "repository": self.repository, "run_id": rid, "attempt": number,
                        "calls": [row(str(aid)), row("yesterday", "2026-10-27")]})
 

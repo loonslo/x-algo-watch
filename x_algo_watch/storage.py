@@ -61,6 +61,17 @@ def atomic_write(path: Path, text: str) -> None:
     os.replace(staging, path)
 
 
+def _legacy_state(value: Any) -> Any:
+    """历史记录里的 pending_confirmation / next_stage=confirmation 即现在的 reviewed / done；只在读取时映射，不改写存档。"""
+    if value == "pending_confirmation":
+        return "reviewed"
+    if isinstance(value, dict):
+        return {k: ("done" if k == "next_stage" and v == "confirmation" else _legacy_state(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_legacy_state(v) for v in value]
+    return value
+
+
 class RecordStore:
     def __init__(self, root: Path):
         self.root = root
@@ -119,7 +130,7 @@ class RecordStore:
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise WatchError("研究审计文件损坏") from exc
             events.append(event)
-        return sorted(events, key=lambda e: e.get("created_at", ""))
+        return sorted((_legacy_state(e) for e in events), key=lambda e: e.get("created_at", ""))
 
     def append_event(self, event: dict[str, Any], now: datetime) -> bool:
         if event.get("pipeline_protocol") == "mechanisms-v1" and event.get("type") in {"model_call", "version_research"}:

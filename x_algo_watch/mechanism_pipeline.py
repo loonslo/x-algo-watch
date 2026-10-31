@@ -294,7 +294,7 @@ def run_pipeline(pack: dict[str, Any], data: Path, prior: list[dict[str, Any]], 
                 "closure_reasons": reader_result["draft"]["closure_reasons"],
                 "regressions": sorted(({i["issue_id"] for i in issues} - previous_reader) & seen_reader)})
             if not issues:
-                loop.update(phase="ready", reason="accepted", next_stage="confirmation")
+                loop.update(phase="ready", reason="accepted", next_stage="done")
                 stop = True
                 continue
             requests = []
@@ -317,7 +317,7 @@ def run_pipeline(pack: dict[str, Any], data: Path, prior: list[dict[str, Any]], 
                 stop = True
             else:
                 loop["candidate"] += 1
-    state = "pending_confirmation" if loop["phase"] == "ready" else "insufficient_evidence" if loop["phase"] in {"waiting_evidence", "insufficient_scope"} else "disputed" if loop["phase"] in {"paused_limit", "paused_stagnation"} else "manual" if loop["phase"] == "waiting_manual" else "pending"
+    state = "reviewed" if loop["phase"] == "ready" else "insufficient_evidence" if loop["phase"] in {"waiting_evidence", "insufficient_scope"} else "disputed" if loop["phase"] in {"paused_limit", "paused_stagnation"} else "manual" if loop["phase"] == "waiting_manual" else "pending"
     event = {"type": "version_research", "commit": pack["commit"], "item_id": pack["item_id"],
              "run_id": run_id,
              "profile_hash": profile, "pipeline_profile": profile, "pipeline_protocol": PIPELINE,
@@ -344,10 +344,10 @@ def validate_pipeline_event(event: dict[str, Any], pack: dict[str, Any], data: P
             return False
         if event["commit"] != pack["commit"] or event["item_id"] != pack["item_id"] or event["plan_id"] != plan["plan_id"]:
             return False
-        if event["state"] not in {"pending", "manual", "disputed", "insufficient_evidence", "pending_confirmation"}:
+        if event["state"] not in {"pending", "manual", "disputed", "insufficient_evidence", "reviewed"}:
             return False
         loop = event["pipeline_loop"]
-        expected = "pending_confirmation" if loop["phase"] == "ready" else "insufficient_evidence" if loop["phase"] in {"waiting_evidence", "insufficient_scope"} else "disputed" if loop["phase"] in {"paused_limit", "paused_stagnation"} else "manual" if loop["phase"] == "waiting_manual" else "pending"
+        expected = "reviewed" if loop["phase"] == "ready" else "insufficient_evidence" if loop["phase"] in {"waiting_evidence", "insufficient_scope"} else "disputed" if loop["phase"] in {"paused_limit", "paused_stagnation"} else "manual" if loop["phase"] == "waiting_manual" else "pending"
         if event["state"] != expected or event["iteration"] != {k: loop[k] for k in ("candidate", "phase", "reason", "next_stage")}:
             return False
         from .iteration import PHASES, REASONS

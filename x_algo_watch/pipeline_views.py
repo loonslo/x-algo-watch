@@ -36,7 +36,7 @@ def render_pipeline(event: dict[str, Any], context_base: str, *, technical_only:
     if not technical_only:
         if not status["publishable"]: return text
         reader = event["analysis"]["reader"]
-        text = "## 算法版本更新公告\n\n非官方源码解读；机制推测尚未人工确认，正式 digest 仍需所有者确认。\n\n"
+        text = "## 算法版本更新公告\n\n非官方源码解读；机制推测由模型审核；线上部署尚未核实。\n\n"
         text += "### " + safe(reader["title"]) + "\n\n" + safe(reader["what_changed"]) + "\n\n"
         text += "**线上与生效条件：** " + safe(reader["when"]) + "\n\n**可能涉及谁：** " + safe(reader["who"]) + "\n\n"
         text += links(reader["evidence_refs"], catalog) + "\n\n"

@@ -143,7 +143,7 @@ def test_hierarchical_context_main_reader_and_publisher_preserve_all_gates_and_r
     client = ContextClient(plan["plan_id"])
     run(bundle, out, config, client=client)
     payload = json.loads(out.read_text(encoding="utf-8")); root = payload["events"][-1]
-    assert root["state"] == "pending_confirmation"
+    assert root["state"] == "reviewed"
     assert len(first.calls) + len(client.calls) == 4 * len(plan["tasks"]) + 4
     assert all(len(json.dumps(c, ensure_ascii=False)) <= 120000 for c in first.calls + client.calls)
     assert validate_pipeline_event(root, pack, bundle / "data", payload["events"])
@@ -272,7 +272,7 @@ def test_second_large_snapshot_preserves_candidate_identity_and_role_own_questio
     output = tmp_path / "next.json"
     run(next_bundle, output, config, client=client)
     payload = json.loads(output.read_text(encoding="utf-8")); root = payload["events"][-1]
-    assert root["state"] == "pending_confirmation"
+    assert root["state"] == "reviewed"
     assert root["pipeline_loop"]["candidate"] == 2 and root["pipeline_loop"]["context_previous"] == old["id"]
     assert validate_pipeline_event(root, current, next_bundle / "data", RecordStore(tmp_path / "data").events() + payload["events"])
     child_reviews = [c for c in client.calls if c.get("stage_kind") == "review" and c.get("evidence_pack", {}).get("context_kind") and "original_question" in c]

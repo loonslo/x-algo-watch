@@ -135,18 +135,18 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
     rounds = event.get("extra_review_rounds", 0)
     if type(rounds) is not int or not 0 <= rounds <= 2:
         return False
-    if event.get("state") not in ("pending", "manual", "disputed", "pending_confirmation"):
+    if event.get("state") not in ("pending", "manual", "disputed", "reviewed"):
         return False
     if "analysis" in event or "review" in event:
         review = event.get("review")
         if validate_research(event.get("analysis"), pack, require_reader=True) or not isinstance(review, dict) or set(review) != {"item_id", "agree", "issues"} or review["item_id"] != pack["item_id"] or type(review["agree"]) is not bool or not isinstance(review["issues"], list) or review["agree"] == bool(review["issues"]):
             return False
-        if event["state"] != ("pending_confirmation" if review["agree"] else "disputed"):
+        if event["state"] != ("reviewed" if review["agree"] else "disputed"):
             return False
         for issue in review["issues"]:
             if not isinstance(issue, dict) or set(issue) != {"field", "reason", "evidence_refs"} or issue["field"] not in RESEARCH_FIELDS or not isinstance(issue["reason"], str) or not isinstance(issue["evidence_refs"], list) or not issue["evidence_refs"] or any(not isinstance(r, str) or r not in pack["evidence"] for r in issue["evidence_refs"]):
                 return False
-    elif event["state"] in ("disputed", "pending_confirmation"):
+    elif event["state"] in ("disputed", "reviewed"):
         return False
     if type(event.get("repair_attempted")) is not bool:
         return False
@@ -155,7 +155,7 @@ def valid_research_event(event: dict[str, Any], pack: dict[str, Any], *, require
         if not validate_iteration(event["iteration"], pack, models, required_extra_reviews):
             return False
         loop = event["iteration"]
-        if (loop["phase"] == "ready") != (event["state"] == "pending_confirmation"):
+        if (loop["phase"] == "ready") != (event["state"] == "reviewed"):
             return False
         if "analysis" in event:
             if not loop["history"] or any(event.get(key) != value for key, value in loop["history"][-1]["result"].items()):
@@ -204,7 +204,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     refs = lambda values: evidence_links(values, sources, context_url)
     # 迁移稿只在技术审计中保留；其文案未参加原稿三角色复核。
     reader = original.get("reader") if status["publishable"] else None
-    text = "## 算法版本更新公告\n\n非官方源码解读；机制推测尚未人工确认，正式 digest 仍需所有者确认；线上部署尚未核实。\n\n"
+    text = "## 算法版本更新公告\n\n非官方源码解读；机制推测由模型审核；线上部署尚未核实。\n\n"
     if reader:
         text += "### " + reader["title"] + "\n\n### 30 秒摘要：本次更新重点\n\n"
         for field, label in (("what_changed", "改了什么？"), ("when", "已经上线了吗？何时可能生效？"), ("who", "可能影响谁？")):
@@ -258,7 +258,7 @@ def render_research(event: dict[str, Any], context_base: str = "../data/project-
     if disputed:
         text += "源码变化已检测；模型推测，复核存在分歧；线上状态尚未核实。\n\n复核存在分歧，用户正文待修订。\n\n"
     else:
-        text += "源码变化已检测；原模型裁决同意，具体审核范围见各轮记录；机制推测尚未人工确认，正式 digest 仍需所有者确认；线上状态尚未核实。\n\n"
+        text += "源码变化已检测；原模型裁决同意，具体审核范围见各轮记录；机制推测由模型审核；线上状态尚未核实。\n\n"
     if "iteration" in event:
         records_base = context_base.removesuffix("project-context") + "records"
         text += "每版完整候选稿、审核裁决和问题清单保存在[追加研究记录](" + records_base + ")的 version_research.iteration 中；这些是审计材料，不能作为已发布结论。\n\n"

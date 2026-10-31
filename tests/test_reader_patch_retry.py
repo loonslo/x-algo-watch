@@ -25,7 +25,7 @@ def test_reader_patch_preserves_technical_analysis_and_still_runs_all_reviews(sa
     client = RecordedClient([bad, patch, review(pack), review(pack), review(pack)])
     outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
     final = outputs[pack["item_id"]]
-    assert final["state"] == "pending_confirmation"
+    assert final["state"] == "reviewed"
     assert len(client.calls) == 5 and set(final["reviews"]) == {"review", "facts_review", "reader_review"}
     assert client.calls[1][2]["reader_repair_fields"] == ["who"]
     assert "普通用户写更新说明的编辑" in client.calls[1][1]
@@ -49,7 +49,7 @@ def test_reader_patch_cache_resumes_reviews_without_requesting_another_draft(sam
     later = RecordedClient([review(pack), review(pack), review(pack)])
     done, _ = analyze_items([pack], events, later, MODELS, NOW, PROMPTS, daily_limit=5, project_research=True, extra_review_rounds=2)
     assert len(later.calls) == 3 and all("analysis" in c[2] for c in later.calls)
-    assert done[pack["item_id"]]["state"] == "pending_confirmation"
+    assert done[pack["item_id"]]["state"] == "reviewed"
 
 
 @pytest.mark.parametrize("patch", [
@@ -97,7 +97,7 @@ def test_summary_and_grounding_errors_are_reported_together_for_full_repair(samp
     assert '数字不在证据包：987654321' in errors
     assert 'reader_repair_fields' not in client.calls[1][2]
     assert client.calls[1][2]['previous_invalid_output'] == bad
-    assert result[pack['item_id']]['state'] == 'pending_confirmation'
+    assert result[pack['item_id']]['state'] == 'reviewed'
     assert len(client.calls) == 5
 
 
@@ -113,7 +113,7 @@ def test_known_status_literal_normalizes_before_validation_and_keeps_raw_audit(s
     assert call['output']['reader']['when'] == '线上状态尚未核实；仅在实际调用时生效。'
     assert call['output']['changes'] == bad['changes']
     assert call['normalizations'] == ['reader.when:unverified_status_literal']
-    assert len(client.calls) == 4 and outputs[pack['item_id']]['state'] == 'pending_confirmation'
+    assert len(client.calls) == 4 and outputs[pack['item_id']]['state'] == 'reviewed'
 
 
 def test_status_normalization_does_not_hide_other_identifiers_or_claims():
@@ -141,7 +141,7 @@ def test_explicit_recovery_carries_invalid_draft_instead_of_starting_over(sample
     assert client.calls[0][2]['previous_invalid_output'] == bad
     assert client.calls[0][2]['reader_repair_fields'] == ['who']
     assert len(client.calls) == 4
-    assert outputs[pack['item_id']]['state'] == 'pending_confirmation'
+    assert outputs[pack['item_id']]['state'] == 'reviewed'
     assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
 
 
@@ -159,7 +159,7 @@ def test_body_term_repairs_patch_only_reader_lists_and_preserve_technical_findin
     assert '暂不能判断全部规则会怎样影响你' in client.calls[1][1]
     assert outputs[pack['item_id']]['analysis']['changes'] == bad['changes']
     assert outputs[pack['item_id']]['analysis']['reader']['impacts'] == good
-    assert len(client.calls) == 5 and outputs[pack['item_id']]['state'] == 'pending_confirmation'
+    assert len(client.calls) == 5 and outputs[pack['item_id']]['state'] == 'reviewed'
     assert set(reader_repair_schema(['impacts.0.after'])['properties']['reader_patch']['properties']) == {'impacts.0.after'}
     assert reader_repair_fields(['数字不在证据包：51'], bad) == []
 
@@ -188,4 +188,4 @@ def test_unknown_body_identifier_requires_full_grounded_correction(sample_repo):
     outputs, events = analyze_items([pack], [], client, MODELS, NOW, PROMPTS, project_research=True, extra_review_rounds=2)
     assert 'reader_repair_fields' not in client.calls[1][2]
     assert '名字或路径不在证据包：FabricatedUnknownModule' in client.calls[1][2]['previous_validation_errors']
-    assert outputs[pack['item_id']]['state'] == 'pending_confirmation'
+    assert outputs[pack['item_id']]['state'] == 'reviewed'

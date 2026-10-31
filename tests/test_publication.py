@@ -29,7 +29,7 @@ def test_states_are_distinct_and_fail_closed(event, label):
 
 
 def approved_event(pack):
-    return research_event(pack, {"state": "pending_confirmation", "analysis": analysis(pack),
+    return research_event(pack, {"state": "reviewed", "analysis": analysis(pack),
         "review": review(pack), "extra_review_rounds": 2,
         "reviews": {stage: review(pack) for stage in ("review", "facts_review", "reader_review")}}, MODELS)
 

@@ -61,7 +61,7 @@ def test_reviewed_sample_can_publish_locally_without_issue_or_key_access(sample_
         publish(bundle,None,draft_bundle=draft,push=False,notify_issues=False)
     assert publish(bundle,None,draft_bundle=draft,push=False,notify_issues=False,merge_research=True)==[]
     event=[e for e in RecordStore(data).events() if e['type']=='version_research'][-1]
-    assert event['state']=='pending_confirmation' and len(event['reviews'])==3
+    assert event['state']=='reviewed' and len(event['reviews'])==3
     assert any(e['id']=='keep-new-record' for e in RecordStore(data).events())
     assert (root/'versions/technical').is_dir() and not (root/'digest.md').exists()
 

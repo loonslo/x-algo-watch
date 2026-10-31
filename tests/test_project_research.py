@@ -88,7 +88,7 @@ def test_project_review_cache_and_quota_resume_remain_separate(sample_repo):
     next_client = RecordedClient([review(pack)])
     resumed, resumed_events = analyze_items([pack], events, next_client, MODELS, NOW, PROMPTS, daily_limit=2, project_research=True)
     assert len(next_client.calls) == 1 and next_client.calls[0][0] == MODELS["review"]
-    assert resumed[pack["item_id"]]["state"] == "pending_confirmation"
+    assert resumed[pack["item_id"]]["state"] == "reviewed"
     assert "version-analysis-v1" in next(e for e in events if e["type"] == "model_call")["prompt_version"]
     assert "version-review-v1" in next(e for e in resumed_events if e["type"] == "model_call")["prompt_version"]
 
@@ -256,7 +256,7 @@ def test_project_run_with_two_candidate_limit_keeps_history(sample_repo, tmp_pat
     store = RecordStore(Path("data"))
     event = next(e for e in store.events() if e["type"] == "version_research")
     assert event["repair_attempted"] is True
-    assert event["state"] == ("pending_confirmation" if review_agrees else "disputed")
+    assert event["state"] == ("reviewed" if review_agrees else "disputed")
     assert event["analysis"]["summary"] == revised["summary"]
     assert len([e for e in store.events() if e["type"] == "model_call"]) == 4
     assert pending_packs(Path("data")) == []
@@ -274,7 +274,7 @@ def test_repair_budget_resumes_from_corrected_analysis_without_repeating_calls(s
     later = RecordedClient([review(pack)])
     done, _ = analyze_items([pack], first + calls, later, MODELS, NOW, PROMPTS, daily_limit=4, project_research=True, repair_feedback=feedback)
     assert len(later.calls) == 1 and later.calls[0][0] == MODELS["review"]
-    assert done[pack["item_id"]]["state"] == "pending_confirmation"
+    assert done[pack["item_id"]]["state"] == "reviewed"
 
 
 def test_related_file_catalog_supports_real_verification_paths_without_inventing_code(sample_repo):
@@ -356,7 +356,7 @@ def test_explicit_target_can_rerun_previously_agreed_research(sample_repo, tmp_p
     working = tmp_path / "working"
     RecordStore(working).append(result, NOW, "uncommitted")
     save_context(working, pack)
-    event = research_event(pack, {"state":"pending_confirmation", "analysis":analysis(pack), "review":review(pack)}, MODELS)
+    event = research_event(pack, {"state":"reviewed", "analysis":analysis(pack), "review":review(pack)}, MODELS)
     RecordStore(working).append_event(event, NOW)
     assert pending_packs(working) == []
     manifest = write_bundle(tmp_path / "bundle", {}, working, test=False, code="uncommitted", result_code=0, research_only=pack["commit"])

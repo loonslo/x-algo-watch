@@ -235,7 +235,7 @@ def pending_packs(data: Path, limit: int = 3) -> list[dict[str, Any]]:
         if event["type"] == "version_research":
             latest[event.get("item_id")] = event
     finished = {e.get("item_id") for e in latest.values() if
-                ((e.get("state") == "pending_confirmation" and e.get("profile_hash") in {profile, *compatible}) or
+                ((e.get("state") == "reviewed" and e.get("profile_hash") in {profile, *compatible}) or
                  (e.get("profile_hash") == profile and (e.get("iteration", {}).get("phase") in {"waiting_manual", "paused_limit", "paused_stagnation"} or
                   ("iteration" not in e and (e.get("state") == "manual" or (e.get("state") == "disputed" and e.get("repair_attempted")))))))}
     if any(e.get("pipeline_protocol") == "mechanisms-v1" for e in latest.values()):

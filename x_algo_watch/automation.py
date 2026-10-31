@@ -285,8 +285,8 @@ def publish_issues(client: GitHub, records: list[dict[str, Any]], test: bool, dr
 
 
 def commit_paths(paths: list[str], message: str, repository: str, token: str) -> bool:
-    if any(path not in ("data", "digest.md", "versions", "README.md") and not path.startswith("data/") and not VERSION_PATH.fullmatch(path) for path in paths):
-        raise WatchError("发布超出检测数据、速报与版本档案写入边界")
+    if any(path not in ("data", "versions", "README.md") and not path.startswith("data/") and not VERSION_PATH.fullmatch(path) for path in paths):
+        raise WatchError("发布超出检测数据与版本档案写入边界")
     if Path("versions").is_symlink():
         raise WatchError("版本档案目录不能是符号链接")
     if Path("versions/technical").is_symlink():
@@ -295,7 +295,7 @@ def commit_paths(paths: list[str], message: str, repository: str, token: str) ->
     if not run_git(["diff", "--cached", "--name-only"], Path.cwd()).strip():
         return False
     staged = run_git(["diff", "--cached", "--name-only"], Path.cwd()).decode().splitlines()
-    if any(path not in ("digest.md", "README.md") and not (path.startswith("data/") and DATA_PATH.fullmatch(path[5:])) and not VERSION_PATH.fullmatch(path) for path in staged):
+    if any(path not in ("README.md",) and not (path.startswith("data/") and DATA_PATH.fullmatch(path[5:])) and not VERSION_PATH.fullmatch(path) for path in staged):
         raise WatchError("暂存区包含发布范围外文件")
     if "README.md" in staged:
         from .versions import validate_home_summary_change
@@ -394,7 +394,7 @@ def publish(bundle: Path, client: GitHub | None, *, draft_bundle: Path | None = 
             for event in payload.get("events", []):
                 if merge_research and event['type']=='version_research' and event.get('pipeline_protocol') == 'mechanisms-v1':
                     baseline = baseline_roots.get(event['commit'], {})
-                    weight = lambda e: 2 if e.get('state') == 'pending_confirmation' else 0 if e.get('iteration', {}).get('phase') == 'researching' else 1
+                    weight = lambda e: 2 if e.get('state') == 'reviewed' else 0 if e.get('iteration', {}).get('phase') == 'researching' else 1
                     if event.get('run_id', '') < baseline.get('run_id', '') or (event.get('run_id') == baseline.get('run_id') and weight(event) < weight(baseline)):
                         continue  # 旧样例只补审计，不能将较新或同轮更完整的状态降级。
                 elif merge_research and event['type']=='version_research' and event.get('state')=='pending':

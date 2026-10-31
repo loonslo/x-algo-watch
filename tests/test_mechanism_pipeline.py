@@ -82,7 +82,7 @@ def test_main_drafting_publish_resumes_tasks_and_never_calls_mechanism_result_a_
     assert len(calls) == 4 and len(list((tmp_path / "data/research-runs").glob("*/*.json"))) >= 6
     page = next((tmp_path / "versions").glob("20*.md")).read_text(encoding="utf-8")
     assert "预算" in page and "算法版本更新公告" not in page
-    forged = {**root, "state": "pending_confirmation"}
+    forged = {**root, "state": "reviewed"}
     forged["id"] = "research:" + digest({k: v for k, v in forged.items() if k != "id"})
     assert not validate_pipeline_event(forged, pack, bundle / "data", payload["events"])
 

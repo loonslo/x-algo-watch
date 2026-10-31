@@ -49,7 +49,7 @@ def publication_status(event: dict[str, Any] | None, *, complete: bool = True) -
             key, label, gap = "paused", "失败暂停", "输出、接口或修订受阻，系统会在下一个 UTC 日自动重试。"
         elif event.get("state") == "disputed":
             key, label, gap = "disputed", "复核分歧", "审核意见尚未解决，当前稿件不能作为用户结论。"
-        elif event.get("state") == "pending_confirmation" and "analysis" in event:
+        elif event.get("state") == "reviewed" and "analysis" in event:
             reviews = event.get("reviews", {})
             passed = event.get("extra_review_rounds") == 2 and all(reviews.get(stage, {}).get("agree") is True and reviews[stage].get("issues") == []
                          and reviews[stage].get("item_id") == event.get("item_id")

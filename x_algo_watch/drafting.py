@@ -404,7 +404,7 @@ def analyze_items(packs: list[dict[str, Any]], prior: list[dict[str, Any]], clie
             stages = {"analysis": stages["analysis"], "review": aggregate_reviews(item_id, reviews)}
             if extra_review_rounds:
                 stages.update(reviews=reviews, extra_review_rounds=extra_review_rounds)
-            state = "pending_confirmation" if stages["review"]["agree"] else "disputed"
+            state = "reviewed" if stages["review"]["agree"] else "disputed"
         else:
             # 不能把第一关通过误标成三关通过。
             stages = {"analysis": stages["analysis"]} if "analysis" in stages else {}
@@ -427,13 +427,13 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
     completed = [pack for pack in packs if "review" in outputs.get(pack["item_id"], {})]
     if not completed:
         return None
-    ready = all(outputs.get(pack["item_id"], {}).get("state") == "pending_confirmation" for pack in packs)
+    ready = all(outputs.get(pack["item_id"], {}).get("state") == "reviewed" for pack in packs)
     text = "**未经确认的草稿。公开代码默认值不等于线上值；部署未知。**\n\n"
     if free_router:
         text += "**复核方式：免费自动路由；实际型号可能相同，不能保证异模型独立复核。**\n\n"
     elif same_model_review:
-        text += "**复核方式：同一模型的两次调用，不属于不同模型的独立复核；仍须仓库所有者人工确认。**\n\n"
-    text += f"### {record['committed_at'][:10]} · {record['commit'][:7]} · 源码变化待人工确认\n\n"
+        text += "**复核方式：同一模型的两次调用，不属于不同模型的独立复核；线上状态仍待核实。**\n\n"
+    text += f"### {record['committed_at'][:10]} · {record['commit'][:7]} · 源码变化待复核\n\n"
     for pack in packs:
         result = outputs.get(pack["item_id"], {})
         analysis = result.get("analysis") if "review" in result else None
@@ -464,7 +464,6 @@ def assemble(record: dict[str, Any], packs: list[dict[str, Any]], outputs: dict[
         for question in analysis["questions"]:
             text += "- 待核对：" + question + "\n"
         text += "\n"
-    text += "- 确认：待仓库所有者编辑核对并打标签。\n"
     public_text(text)
     return {"body": text, "ready": ready, "version": digest({"packs": packs, "outputs": outputs, "body": text})[:20]}
 
@@ -512,8 +511,8 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None, *, 
                 if event is not None and event.get("type") == "version_research" and "review" in event:
                     repository = os.environ.get("GITHUB_REPOSITORY", "")
                     context_base = f"https://github.com/{repository}/blob/main/data/project-context" if repository else "data/project-context"
-                    body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base) + "- 确认：待仓库所有者编辑核对并打标签。\n"
-                    mixed_drafts[event["commit"]] = {"body": body, "ready": event["state"] == "pending_confirmation", "version": digest({"event": event, "body": body})[:20]}
+                    body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base)
+                    mixed_drafts[event["commit"]] = {"body": body, "ready": event["state"] == "reviewed", "version": digest({"event": event, "body": body})[:20]}
                 if event is not None:
                     index = next((i for i, old in enumerate(accumulated) if old["id"] == event["id"]), None)
                     if index is None:
@@ -565,8 +564,8 @@ def run(bundle: Path, output: Path, config: Path, client: Any | None = None, *, 
             if "review" in result:
                 repository = os.environ.get("GITHUB_REPOSITORY", "")
                 context_base = f"https://github.com/{repository}/blob/main/data/project-context" if repository else "data/project-context"
-                body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base) + "- 确认：待仓库所有者编辑核对并打标签。\n"
-                drafts[pack["commit"]] = {"body": body, "ready": result["state"] == "pending_confirmation", "version": digest({"event": event, "body": body})[:20]}
+                body = "<!-- xaw-research:" + event["id"].removeprefix("research:") + " -->\n\n" + render_research(event, context_base)
+                drafts[pack["commit"]] = {"body": body, "ready": result["state"] == "reviewed", "version": digest({"event": event, "body": body})[:20]}
         payload = {"schema_version": 1, "source_manifest_hash": digest(manifest), "drafts": drafts, "events": [*events, *budget_statuses]}
         public_text(json.dumps(payload, ensure_ascii=False))
         atomic_write(output, json.dumps(payload, ensure_ascii=False, indent=2))

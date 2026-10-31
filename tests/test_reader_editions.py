@@ -27,7 +27,7 @@ def test_new_calls_require_four_question_reader_and_ground_its_claims(sample_rep
     old = analysis(pack); del old['reader']
     assert validate_research(old, pack) == []  # 历史审计仍可读取。
     assert validate_research(old, pack, require_reader=True)
-    forged=research_event(pack,{'state':'pending_confirmation','analysis':old,'review':review(pack)},MODELS)
+    forged=research_event(pack,{'state':'reviewed','analysis':old,'review':review(pack)},MODELS)
     assert not valid_research_event(forged,pack)  # 发布边界也不能绕过格式。
     wrong = analysis(pack); wrong['reader']['who'] += '曝光上涨 9876.54321'
     assert validate_analysis(analysis_projection(wrong), pack, project_research=True)
@@ -45,7 +45,7 @@ def test_reader_first_technical_details_last_no_duplicate_summary(sample_repo):
     repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
     value = analysis(pack)
     value['summary'] = 'TECHNICAL_SUMMARY_SENTINEL'
-    event = research_event(pack, {'state':'pending_confirmation','analysis':value,'review':review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
+    event = research_event(pack, {'state':'reviewed','analysis':value,'review':review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
     text = render_research(event)
     front, tail = text.split('<details><summary>技术分析', 1)
     assert all(q in front for q in ('改了什么？','已经上线了吗？','可能影响谁？','现在该做什么？'))
@@ -73,7 +73,7 @@ def test_edition_binds_exact_research_and_rejects_tampered_supplement(sample_rep
     repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
     save_context_snapshot(tmp_path/'data', pack)
     value = analysis(pack)
-    event = research_event(pack, {'state':'pending_confirmation','analysis':value,'review':review(pack)}, MODELS)
+    event = research_event(pack, {'state':'reviewed','analysis':value,'review':review(pack)}, MODELS)
     edition = {'schema_version':1,'source_research_id':event['id'],'item_id':event['item_id'],'reader':value['reader']}
     directory=tmp_path/'editorial/versions'; directory.mkdir(parents=True)
     path=directory/(event['commit']+'.json'); path.write_text(json.dumps(edition),encoding='utf-8')
@@ -88,7 +88,7 @@ def test_edition_binds_exact_research_and_rejects_tampered_supplement(sample_rep
 def test_readability_compatibility_keeps_agreed_research_but_not_disputes(sample_repo, tmp_path, monkeypatch):
     repo, result = prepare(sample_repo); pack = project_pack(repo, result.to_dict())
     save_context(tmp_path/'data',pack)
-    event=research_event(pack,{'state':'pending_confirmation','analysis':analysis(pack),'review':review(pack)},MODELS)
+    event=research_event(pack,{'state':'reviewed','analysis':analysis(pack),'review':review(pack)},MODELS)
     event['profile_hash']='a'*64
     RecordStore(tmp_path/'data').append_event(event,NOW)
     monkeypatch.chdir(tmp_path)
@@ -135,7 +135,7 @@ def test_all_current_nine_editions_validate_and_versions_build_without_data_chan
 def test_budget_deferred_new_profile_keeps_previous_reviewed_reading_page(sample_repo, tmp_path):
     repo, result = prepare(sample_repo); pack = project_pack(repo,result.to_dict())
     store=RecordStore(tmp_path/'data'); store.append(result,NOW,'uncommitted')
-    completed=research_event(pack,{'state':'pending_confirmation','analysis':analysis(pack),'review':review(pack)},MODELS)
+    completed=research_event(pack,{'state':'reviewed','analysis':analysis(pack),'review':review(pack)},MODELS)
     store.append_event(completed,NOW)
     pending=research_event(pack,{'state':'pending'},MODELS)
     store.append_event(pending,NOW+timedelta(seconds=1))
@@ -149,7 +149,7 @@ def test_budget_deferred_new_profile_keeps_previous_reviewed_reading_page(sample
 def test_technical_page_uses_same_research_with_working_relative_evidence_links(sample_repo, tmp_path):
     repo, result = prepare(sample_repo); pack = project_pack(repo,result.to_dict())
     store=RecordStore(tmp_path/'data'); store.append(result,NOW,'uncommitted')
-    event=research_event(pack,{'state':'pending_confirmation','analysis':analysis(pack),'review':review(pack)},MODELS)
+    event=research_event(pack,{'state':'reviewed','analysis':analysis(pack),'review':review(pack)},MODELS)
     store.append_event(event,NOW)
     build_versions(tmp_path)
     user_page=next((tmp_path/'versions').glob('20*.md'))
@@ -181,7 +181,7 @@ def test_missing_reader_auto_corrects_once_then_blocks_if_still_missing(sample_r
     invalid=analysis(pack); invalid.pop('reader')
     corrected=RecordedClient([invalid,analysis(pack),review(pack)])
     output,events=analyze_items([pack],[],corrected,MODELS,NOW,PROMPTS,project_research=True)
-    assert output[pack['item_id']]['state']=='pending_confirmation'
+    assert output[pack['item_id']]['state']=='reviewed'
     assert len(corrected.calls)==3 and corrected.calls[1][2]['previous_validation_errors']
     assert [e['valid'] for e in events if e['type']=='model_call']==[False,True,True]
     blocked=RecordedClient([invalid,invalid])
@@ -217,7 +217,7 @@ def test_announcement_keeps_same_evidence_and_action_after_adjustments(sample_re
     repo, result = prepare(sample_repo)
     pack = project_pack(repo, result.to_dict())
     value = analysis(pack)
-    event = research_event(pack, {'state': 'pending_confirmation', 'analysis': value, 'review': review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
+    event = research_event(pack, {'state': 'reviewed', 'analysis': value, 'review': review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
     page = render_research(event)
     front = page.split('<details><summary>技术分析')[0]
     assert '算法版本更新公告' in front and '非官方源码解读' in front
@@ -270,7 +270,7 @@ def test_before_after_numbers_are_grounded_and_process_follows_content(sample_re
     value = analysis(pack)
     value['reader']['impacts'][0]['before'] += ' 987654321'
     assert '数字不在证据包：987654321' in validate_analysis(analysis_projection(value), pack, project_research=True)
-    event = research_event(pack, {'state':'pending_confirmation', 'analysis':analysis(pack), 'review':review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
+    event = research_event(pack, {'state':'reviewed', 'analysis':analysis(pack), 'review':review(pack), 'extra_review_rounds':2, 'reviews':{stage:review(pack) for stage in ('review','facts_review','reader_review')}}, MODELS)
     page = render_research(event)
     assert '| 以前 | 现在的代码如何处理 |' in page
     assert page.index('对你的影响') < page.index('研究附录：')

@@ -60,7 +60,7 @@ def test_exact_decimal_relationships():
     value["facts"] = [{"text": value["summary"], "evidence_refs": ["E1", "E2"]}]
     assert not validate_analysis(value, pack)
     assert "79.2" not in json.dumps(value)
-    outputs = {pack["item_id"]: {"state": "pending_confirmation", "analysis": value, "review": review(pack)}}
+    outputs = {pack["item_id"]: {"state": "reviewed", "analysis": value, "review": review(pack)}}
     draft = assemble(record, [pack], outputs)
     body = draft["body"]
     assert "点赞权重 ×1.1" in body and "不感兴趣权重 ×1.1" in body
@@ -79,7 +79,7 @@ def test_legacy_record_recovers_math_from_complete_weight_evidence():
     assert pack["derived"]["negative_to_favorite_before"] == pack["derived"]["negative_to_favorite_after"] == "79.2"
     issue = evidence_body(record, "owner/x-algo-watch", False)
     assert json.loads(issue.split("```json\n")[1].split("\n```")[0])["numeric_context"] == pack["derived"]
-    outputs = {pack["item_id"]: {"state": "pending_confirmation", "analysis": analysis(pack), "review": review(pack)}}
+    outputs = {pack["item_id"]: {"state": "reviewed", "analysis": analysis(pack), "review": review(pack)}}
     assert "两者绝对比值 79.2 → 79.2" in assemble(record, [pack], outputs)["body"]
     assert record == original
 
@@ -117,7 +117,7 @@ def test_analysis_retry_review_and_idempotence():
     assert client.calls[0][0] != client.calls[-1][0]
     assert "previous_validation_errors" in client.calls[1][2]
     assert client.calls[1][2]["previous_invalid_output"] == bad
-    assert outputs[pack["item_id"]]["state"] == "pending_confirmation"
+    assert outputs[pack["item_id"]]["state"] == "reviewed"
     assert assemble(record, [pack], outputs)["ready"]
     no_calls = RecordedClient([])
     repeated, _ = analyze_items([pack], events, no_calls, MODELS, NOW, PROMPTS)
@@ -133,7 +133,7 @@ def test_quota_defers_review_then_resumes_without_repeating_analysis():
     next_client = RecordedClient([review(pack)])
     later, _ = analyze_items([pack], events, next_client, MODELS, NOW, PROMPTS)
     assert len(next_client.calls) == 1 and next_client.calls[0][0] == MODELS["review"]
-    assert later[pack["item_id"]]["state"] == "pending_confirmation"
+    assert later[pack["item_id"]]["state"] == "reviewed"
 
 
 def test_daily_budget_only_evidence_no_calls():
@@ -152,7 +152,7 @@ def test_thousand_call_budget_continues_past_fifty_and_stops_exactly(used):
     outputs, events = analyze_items([pack], prior, client, MODELS, NOW, PROMPTS)
     assert len(client.calls) == remaining
     assert len([e for e in events if e['type'] == 'model_call']) == remaining
-    assert outputs[pack['item_id']]['state'] == ('pending_confirmation' if remaining == 2 else 'pending')
+    assert outputs[pack['item_id']]['state'] == ('reviewed' if remaining == 2 else 'pending')
 
 
 @pytest.mark.parametrize('limit', [True, 0, -1, 1001, '1000'])
@@ -193,7 +193,7 @@ def test_explicit_same_model_mode_keeps_review_and_resume_boundaries():
     assert next(e for e in events if e["type"] == "analysis_state")["review_mode"] == "same_model"
     draft = assemble(record, [pack], outputs, same_model_review=True)
     assert draft["ready"] and "同一模型的两次调用" in draft["body"]
-    assert "仍须仓库所有者人工确认" in draft["body"]
+    assert "线上状态仍待核实" in draft["body"]
     no_calls = RecordedClient([])
     repeated, _ = analyze_items([pack], events, no_calls, models, NOW, PROMPTS, allow_same_model=True)
     assert repeated == outputs and not no_calls.calls

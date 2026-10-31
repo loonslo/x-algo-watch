@@ -63,7 +63,7 @@ def test_more_than_one_revision_then_all_three_roles_pass(study):
     event, calls, client = invoke(study, responses(pack, 0) + responses(pack, 1) + responses(pack, 2, True))
     assert len(client.calls) == 12
     assert event['iteration']['phase'] == 'ready' and event['iteration']['candidate'] == 3
-    assert len(event['iteration']['history']) == 3 and event['state'] == 'pending_confirmation'
+    assert len(event['iteration']['history']) == 3 and event['state'] == 'reviewed'
     assert all(row['status'] == 'rechecked' for row in event['iteration']['ledger'])
     assert client.calls[4][2]['issue_ledger']
     assert 'review_feedback' not in client.calls[5][2]  # 审核不读取其他角色的意见。
