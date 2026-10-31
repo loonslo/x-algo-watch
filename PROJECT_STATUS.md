@@ -1,11 +1,12 @@
 ---
 project_id: x-algo-watch
-updated: 2026-10-30
+updated: 2026-10-31
 status: active
 overview: 只读研究 X 推荐源码变化，按普通用户场景解释前后体验差异并保留技术证据。
-progress: 本轮本地系统优化已完成：纠错路由、恢复说明、安全扫描、引用搜索及Windows Git超时边界已修复；完整480项通过，最后脱敏快速路径相关65项通过，6项真实历史已在此前全量通过。
-next: 用户已授权提交并推送至origin/main；推送后核对远程CI，真实模型试点与读者质量仍按原预算和暂停规则单独验收。
+progress: 2026-10-31 已定位并本地修复生产自 10-29 起全部定时失败的两处根因（levels.rs 规则族新写法、已删除文件被当核心实现）；完整 464 项通过，真实历史 72 项通过，真实上游 3 个新提交本地检查完成。尚未推送，线上未验证。
+next: 经授权后推送并核对下一次定时运行是否转绿、进度是否越过 5ed7963；随后处理 33 个待复核提交的模型研究与读者质量验收。
 evidence:
+  - docs/acceptance-production-stall.md
   - docs/acceptance-flow-reliability.md
   - docs/samples/2026-10-29-review-404-replay-40880082004.json
   - docs/acceptance-404-diagnosis.md
@@ -58,6 +59,8 @@ evidence:
   - data/README.md
 ---
 
+
+2026-10-31 生产停滞修复：定时运行自 10-29 全部失败，根因为解析器不认识上游 606b254 的 levels.rs 规则族写法，以及 5ed7963 删除文件被误判为核心实现而使上下文永久延期。已本地修复并验证，未推送、线上未验证；详见 docs/acceptance-production-stall.md。
 2026-10-28 发布候选：已在独立本地工作树整合最新 main 218ebb2 的自动记录，源码补丁无冲突；421 项完整回归通过，最后账本等边界的候选相关检查 54 项通过。原工作区修改保留，候选生产 data/registry 未改变。远程授权按 AGENTS.md 要求确认；等待授权不代表功能、内容或部署已验收。详见 docs/release-candidate-research-pipeline.md。
 
 2026-10-28 超大补证续作：已实现完整行分块、紧凑事实及分层归并，每层三审后回到原机制，读者稿仍单独三审。两真实版本各 171,190 字符补证零截断，原快照与上游状态不变；跨快照候选号从 1 承接为 2，原 C 编号及本角色旧问题保持。阶段全量 417 passed，最后相关 49 passed/2 skipped；真实 Git 专项此前 7 passed。尚未执行新模型、远程 CI 或部署，仍须真实内容和读者验收。下段预算续作及更早“超大补证待完成”是历史阶段，已由本段更新。

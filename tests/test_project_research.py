@@ -335,6 +335,18 @@ def test_required_implementation_budget_stops_context_instead_of_clipping(sample
         project_pack(repo, result.to_dict())
 
 
+def test_deleted_filter_does_not_block_context_as_missing_core_implementation(sample_repo):
+    path, repo, base, commit = sample_repo
+    (path / "home-mixer/filters/example_filter.rs").unlink()
+    (path / "home-mixer/filters/other_filter.rs").write_text("pub fn replacement() {}\n", encoding="utf-8")
+    (path / "home-mixer/filters/mod.rs").write_text("pub mod other_filter;\n", encoding="utf-8")
+    result = compare(repo, base, commit(), [], date(2026, 10, 23))
+    assert result.complete
+    pack = project_pack(repo, result.to_dict())
+    paths = {e["path"] for e in pack["evidence"].values() if e.get("scope") == "complete_production_before_tests"}
+    assert "home-mixer/filters/other_filter.rs" in paths and "home-mixer/filters/example_filter.rs" not in paths
+
+
 def test_explicit_research_target_selects_only_that_version_even_beyond_first_batch(sample_repo, tmp_path):
     from x_algo_watch.models import CheckResult
     repo, result = prepare(sample_repo)

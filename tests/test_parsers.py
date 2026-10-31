@@ -125,3 +125,46 @@ def test_expansion_rejects_unknown_or_incomplete_dependencies(problem):
         dependencies["tweet_rules_text"] = dependencies["tweet_rules_text"].replace("drop_post(", "unknown_action(")
     with pytest.raises(ParseError):
         parse_levels(source, **dependencies)
+
+
+def family_sources():
+    return {
+        "expansion_text": (FIXTURES / "expansion-606b254.rs.txt").read_text(encoding="utf-8"),
+        "tweet_rules_text": (FIXTURES / "reacted-to-rules-07d159b.rs.txt").read_text(encoding="utf-8"),
+    }
+
+
+def test_actual_family_levels_flatten_in_declaration_order():
+    source = (FIXTURES / "levels-606b254.rs.txt").read_text(encoding="utf-8")
+    levels, style = parse_levels(source, **family_sources())
+    assert style == "PostRules+Families+Expansion"
+    assert len(levels["QUOTED_TWEET_RULES"]) == 8 and levels["QUOTED_TWEET_RULES"][0] == "DEACTIVATED_AUTHOR_DROP"
+    # 命名规则族与内联规则族按声明顺序拼接。
+    assert levels["TIMELINE_HOME"][:5] == ("SUSPENDED_AUTHOR_DROP", "DEACTIVATED_AUTHOR_DROP", "ERASED_AUTHOR_DROP_INACTIVE", "OFFBOARDED_AUTHOR_DROP_INACTIVE", "PROTECTED_AUTHOR_DROP")
+    assert levels["TIMELINE_HOME"][5:7] == ("VIEWER_BLOCKS_AUTHOR_DROP", "VIEWER_MUTES_AUTHOR_DROP")
+    assert set(levels["TIMELINE_HOME"]) < set(levels["TIMELINE_HOME_RECOMMENDATIONS"])
+    hydration = levels["TIMELINE_HOME_HYDRATION"]
+    assert hydration[6:8] == ("ORIGINAL_TWEET_ADULT_MEDIA_PROPAGATION_BLUR_SENSITIVE", "ORIGINAL_TWEET_GORE_MEDIA_PROPAGATION_BLUR_VIOLENCE")
+    assert hydration[-1] == "PROTECTED_ORIGINAL_AUTHOR_DROP"
+
+
+@pytest.mark.parametrize("problem", ["unverified_expansion", "missing_source", "unknown_family", "wrong_length", "duplicate_rule", "wrong_family_type", "unknown_const"])
+def test_family_levels_reject_unverified_syntax(problem):
+    source = (FIXTURES / "levels-606b254.rs.txt").read_text(encoding="utf-8")
+    dependencies = family_sources()
+    if problem == "unverified_expansion":
+        dependencies["expansion_text"] = dependencies["expansion_text"].replace("!withholds", "withholds")
+    elif problem == "missing_source":
+        dependencies["expansion_text"] = None
+    elif problem == "unknown_family":
+        source = source.replace("    HOME_BLURS,\n", "    HOME_BLURS_MISSING,\n", 1)
+    elif problem == "wrong_length":
+        source = source.replace("rule_count(TIMELINE_HOME_HYDRATION_OWN)", "rule_count(FOSNR_DROPS)")
+    elif problem == "duplicate_rule":
+        source = source.replace("&[&NULLCASTED_TWEET_DROP, &STALE_TWEET_DROP_UNSPECIFIED],", "&[&NULLCASTED_TWEET_DROP, &NULLCASTED_TWEET_DROP],", 1)
+    elif problem == "wrong_family_type":
+        source = source.replace("const HOME_BLURS: &[&Rule]", "const HOME_BLURS: &[Rule]", 1)
+    else:
+        source = source.replace("pub(super) const FILTER_ALL: PostRules", "pub(super) const FILTER_ALL: Unknown", 1)
+    with pytest.raises(ParseError):
+        parse_levels(source, **dependencies)

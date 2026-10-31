@@ -178,6 +178,11 @@ def expanded_post_rules(clean: str, name: str, expansion_text: str | None, tweet
     parent, expansion = array(matches[0]), array("REACTED_TO_RULES")
     if not parent or set(parent) & set(expansion):
         raise ParseError(f"{LEVEL_PATH} {name} 展开父表为空或规则重复")
+    return place_reacted_to(parent, expansion, tweet_rules_text)
+
+
+def place_reacted_to(parent: tuple[str, ...], expansion: tuple[str, ...], tweet_rules_text: str) -> tuple[str, ...]:
+    """未撤回的规则放在父表前，撤回类（drop_post）放在后；动作必须能在规则源码中核实。"""
     before: list[str] = []
     after: list[str] = []
     rules_source = uncomment(tweet_rules_text)
@@ -188,6 +193,101 @@ def expanded_post_rules(clean: str, name: str, expansion_text: str | None, tweet
             raise ParseError(f"{LEVEL_PATH} {rule} 展开规则动作未知")
         (after if actions[0] == "drop_post" else before).append(rule)
     return (*before, *parent, *after)
+
+
+# 606b254 起 placed 接收“规则族列表”，其余放置顺序不变；去注释/空白摘要同样须逐次核实。
+REACTED_TO_FAMILIES_DIGEST = "f53e100a7c96f6df39cd8f6189bc109c237ae119ff89ddfa4ead0d78d6e578bd"
+IDENT = r"[A-Z][A-Z0-9_]*"
+FAMILY_TYPES = {"&[&Rule]", "&[&UserRule]"}
+FAMILIES_TYPES = {"&[&[&Rule]]", "&[&[&UserRule]]"}
+
+
+def parse_family_levels(clean: str, expansion_text: str | None, tweet_rules_text: str | None) -> tuple[dict[str, tuple[str, ...]], str]:
+    """规则族写法：级别由命名/内联规则族按序拼接；只接受已核实的表达式。"""
+    table: dict[str, tuple[str, str]] = {}
+    exported: list[str] = []
+    for match in re.finditer(r"(pub(?:\([^)]*\))?\s+)?\bconst\s+(" + IDENT + r")\s*:\s*(.*?)\s*=\s*(.*?);", clean, re.S):
+        if match[2] in table:
+            raise ParseError(f"{LEVEL_PATH} 级别重复")
+        table[match[2]] = (re.sub(r"\s+", "", match[3]), match[4].strip())
+        if match[1]:
+            exported.append(match[2])
+
+    def inner(expr: str) -> str:
+        found = re.fullmatch(r"&\s*\[(.*)\]", expr.strip(), re.S)
+        if not found:
+            raise ParseError(f"{LEVEL_PATH} 数组写法不支持")
+        return found[1]
+
+    def family(item: str) -> tuple[str, ...]:
+        if re.match(r"&\s*\[", item):
+            return rules_list(inner(item), True)
+        entry = table.get(item) if re.fullmatch(IDENT, item) else None
+        if not entry or entry[0] not in FAMILY_TYPES:
+            raise ParseError(f"{LEVEL_PATH} {item} 规则族引用缺失或写法不支持")
+        return rules_list(inner(entry[1]), True)
+
+    def flatten(groups: list[tuple[str, ...]]) -> tuple[str, ...]:
+        result = tuple(rule for group in groups for rule in group)
+        if len(result) != len(set(result)):
+            raise ParseError(f"{LEVEL_PATH} 规则重复")
+        return result
+
+    def families(expr: str) -> list[tuple[str, ...]]:
+        return [family(item) for item in split_items(inner(expr))]
+
+    used_expansion = False
+
+    def placed(name: str) -> tuple[str, ...]:
+        nonlocal used_expansion
+        typ, body = table.get(name, ("", ""))
+        own = re.fullmatch(r"Expansion::ReactedTo\.placed\((" + IDENT + r")\)", re.sub(r"\s+", "", body))
+        length = re.fullmatch(r"\[&Rule;rule_count\((" + IDENT + r")\)\+Expansion::ReactedTo\.spec\(\)\.rules\.len\(\)\]", typ)
+        if not own or not length or own[1] != length[1]:
+            raise ParseError(f"{LEVEL_PATH} {name} 展开数组写法不支持或来源缺失")
+        if expansion_text is None or tweet_rules_text is None:
+            raise ParseError(f"{LEVEL_PATH} {name} 缺少展开实现或规则动作来源")
+        implementation = uncomment(expansion_text).split("#[cfg(test)]", 1)[0]
+        if sha256(re.sub(r"\s+", "", implementation).encode()).hexdigest() != REACTED_TO_FAMILIES_DIGEST:
+            raise ParseError(f"{LEVEL_PATH} {name} Expansion 实现尚未核实")
+        parent_type, parent_body = table.get(own[1], ("", ""))
+        if parent_type != "&[&[&Rule]]":
+            raise ParseError(f"{LEVEL_PATH} {own[1]} 展开父表缺失或写法不支持")
+        parent = flatten(families(parent_body))
+        expansion = family("REACTED_TO_RULES")
+        if not parent or set(parent) & set(expansion):
+            raise ParseError(f"{LEVEL_PATH} {name} 展开父表为空或规则重复")
+        used_expansion = True
+        return place_reacted_to(parent, expansion, tweet_rules_text)
+
+    def post_families(expr: str) -> list[tuple[str, ...]]:
+        groups: list[tuple[str, ...]] = []
+        for item in split_items(inner(expr)):
+            reference = re.fullmatch(r"&\s*(" + IDENT + r")", item)
+            groups.append(placed(reference[1]) if reference else family(item))
+        return groups
+
+    levels: dict[str, tuple[str, ...]] = {}
+    for name in exported:
+        typ, body = table[name]
+        if typ in FAMILY_TYPES:
+            levels[name] = flatten([family(body)])
+        elif typ in FAMILIES_TYPES:
+            levels[name] = flatten(families(body))
+        elif typ == "PostRules":
+            found = re.fullmatch(r"PostRules\s*\{(.*)\}", body, re.S)
+            fields = {}
+            for item in split_items(found[1]) if found else []:
+                field = re.fullmatch(r"(user|post)\s*:\s*(.*)", item, re.S)
+                if not field or field[1] in fields:
+                    raise ParseError(f"{LEVEL_PATH} {name} PostRules 写法不支持")
+                fields[field[1]] = field[2]
+            if set(fields) != {"user", "post"}:
+                raise ParseError(f"{LEVEL_PATH} {name} PostRules 写法不支持")
+            levels[name] = flatten(families(fields["user"]) + post_families(fields["post"]))
+        else:
+            raise ParseError(f"{LEVEL_PATH} {name} 未知常量类型")
+    return levels, "PostRules+Families+Expansion" if used_expansion else "PostRules+Families"
 
 
 def parse_levels(text: str, *, expansion_text: str | None = None, tweet_rules_text: str | None = None) -> tuple[dict[str, tuple[str, ...]], str]:
@@ -203,6 +303,8 @@ def parse_levels(text: str, *, expansion_text: str | None = None, tweet_rules_te
         if re.sub(pattern, "", macro[1], flags=re.S).strip():
             raise ParseError(f"{LEVEL_PATH} levels! 宏含未知语法")
         style = "levels!"
+    elif re.search(r"\buser\s*:\s*&\s*'static\s*\[\s*&\s*'static\s*\[", clean):
+        levels, style = parse_family_levels(clean, expansion_text, tweet_rules_text)
     else:
         # 只解析顶层常量，严格检查每个声明；不把 struct/enum 的类型字段当列表。
         consts = re.findall(r"pub\(super\)\s+const\s+(\w+)\s*:\s*(.*?)\s*=\s*(.*?);", clean, re.S)

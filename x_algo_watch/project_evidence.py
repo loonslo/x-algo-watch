@@ -124,7 +124,7 @@ def project_pack(repo: Repository, record: dict[str, Any]) -> dict[str, Any]:
     core_paths = sorted({
         path for path in [*selected, *hits]
         if (path in changed or path in parameter_paths)
-        and path.endswith(".rs") and Path(path).name != "mod.rs"
+        and path.endswith(".rs") and Path(path).name != "mod.rs" and path in repo.tree(commit)
         and (path.startswith("home-mixer/filters/") or path.startswith("home-mixer/candidate_hydrators/"))
     }, key=priority)
     network_source = "home-mixer/candidate_hydrators/in_network_candidate_hydrator.rs"
