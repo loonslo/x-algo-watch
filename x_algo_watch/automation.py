@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -429,7 +430,8 @@ def main(argv: list[str] | None = None) -> int:
             manifest, _, _ = load_bundle(args.bundle)
             if manifest["result_code"] != 0:
                 # 日志必须直接给出失败提交与解析证据，不用下载产物才能定位。
-                failed = {r["commit"]: r for r in RecordStore(args.bundle / "data").records() if not r["complete"]}
+                latest = {r["commit"]: r for r in RecordStore(args.bundle / "data").records()}
+                failed = {c: r for c, r in latest.items() if not r["complete"]}
                 for commit, record in failed.items():
                     for finding in record["findings"]:
                         if finding["category"] == "parse_failure":
