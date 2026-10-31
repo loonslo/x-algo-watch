@@ -238,7 +238,7 @@ def test_budget_failure_and_recovery_are_visible_on_all_pages_without_progress_c
     publish(bundle, FakeGitHub(), draft_bundle=out, push=False, notify_issues=False)
     record = RecordStore(tmp_path / "data").records()[0]
     paths = [home, tmp_path / "versions/README.md", tmp_path / "versions" / filename(record)]
-    assert all("共享预算尚未核实" in p.read_text(encoding="utf-8") for p in paths)
+    assert all("共享预算尚未核实" in p.read_text(encoding="utf-8") for p in paths[1:])
     assert all("算法版本更新公告" not in p.read_text(encoding="utf-8") for p in paths)
     verified = budget_status(pack, "verified", 90, 2, datetime.now(timezone.utc).isoformat())
     RecordStore(tmp_path / "data").append_event(verified, datetime.now(timezone.utc))

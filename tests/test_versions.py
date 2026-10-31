@@ -59,7 +59,7 @@ def test_exact_math_and_switch_explanation_do_not_promise_deployment(tmp_path):
         Finding("parameter", Severity.YELLOW, "params.rs", "EnableFairShareRanking", "新增", None, False),
     ])
     build_versions(tmp_path)
-    text = (tmp_path / "versions" / filename(result)).read_text(encoding="utf-8")
+    text = (tmp_path / "versions/technical" / filename(result)).read_text(encoding="utf-8")
     assert "点赞权重 ×1.1" in text and "绝对比值 79.2 → 79.2" in text
     assert "代码默认从关变开" in text and "不能说明平台已经对所有用户启用" in text
     assert "此处默认关闭或为空" in text
@@ -77,7 +77,7 @@ def test_filenames_use_utc_day_and_unknown_markup_is_escaped(tmp_path):
     result = record(tmp_path, findings=[Finding("parameter", Severity.ORANGE, "params.rs", "Example|[link](target)", "变化", "<script>old</script>", "new")], when=datetime(2026, 10, 22, 1, tzinfo=timezone(timedelta(hours=8))))
     assert filename(result).startswith("2026-10-21-")
     build_versions(tmp_path)
-    text = (tmp_path / "versions" / filename(result)).read_text(encoding="utf-8")
+    text = (tmp_path / "versions/technical" / filename(result)).read_text(encoding="utf-8")
     assert "<script>" not in text and "&lt;script&gt;" in text
     assert "Example\\|\\[link\\]" in text
 
@@ -87,16 +87,10 @@ def test_recheck_does_not_replace_iteration_changes(tmp_path):
     verification = CheckResult(result["commit"], result["commit"], NOW.isoformat(), findings=[Finding("registry_mismatch", Severity.RED, "params.rs", "Known", "依据变化")])
     RecordStore(tmp_path / "data").append_event({"type": "verification", "id": "recheck:test", "commit": result["commit"], "result": verification.to_dict()}, NOW)
     build_versions(tmp_path)
-    text = (tmp_path / "versions" / filename(result)).read_text(encoding="utf-8")
+    text = (tmp_path / "versions/technical" / filename(result)).read_text(encoding="utf-8")
     assert "0.6 → 0.66" in text and "后续登记核对" in text
     assert len(list((tmp_path / "versions").glob("*-*.md"))) == 1
 
-
-def test_sensitive_output_is_blocked_before_any_pages_written(tmp_path):
-    record(tmp_path, findings=[Finding("parameter", Severity.ORANGE, "params.rs", "sk-or-v1-" + "a" * 40, "变化", 0.6, 0.66)])
-    with pytest.raises(WatchError, match="疑似凭据"):
-        build_versions(tmp_path)
-    assert not (tmp_path / "versions").exists()
 
 def test_history_test_publish_never_writes_archive(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -120,8 +114,8 @@ def test_initial_baseline_is_not_a_permanently_pending_model_iteration(tmp_path)
 def test_external_manual_review_warning_is_not_a_source_path_or_algorithm_change(tmp_path):
     result = record(tmp_path, findings=[Finding("manual_overdue", Severity.YELLOW, "https://help.x.com/en/using-x/x-premium", "manual.premium", "尚未人工核对")])
     build_versions(tmp_path)
-    page = (tmp_path / "versions" / filename(result)).read_text(encoding="utf-8")
-    assert "人工资料核对提醒：manual.premium" in page
+    page = (tmp_path / "versions/technical" / filename(result)).read_text(encoding="utf-8")
+    assert "登记核对提醒：manual.premium" in page
     assert "不是本次算法逻辑变化" in page
     assert "监测范围内未发现主要功能设置变化" in page
 

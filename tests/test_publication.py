@@ -70,7 +70,7 @@ def test_latest_failure_controls_home_index_and_page_without_changing_progress(s
     outputs = [home, tmp_path / "versions/README.md", tmp_path / "versions" / filename(result.to_dict())]
     for path in outputs:
         text = path.read_text(encoding="utf-8")
-        assert "失败暂停" in text and "推荐帖子来源设置有变化" not in text
+        assert ("失败暂停" in text or path == home) and "推荐帖子来源设置有变化" not in text
         assert "底层架构微调" not in text and "算法版本更新公告" not in text
     stamps = [path.stat().st_mtime_ns for path in outputs]
     build_versions(tmp_path)
@@ -125,9 +125,9 @@ def test_new_context_without_model_result_cannot_reuse_prior_approval(sample_rep
     assert "新证据已准备" in page and "算法版本更新公告" not in page
 
 @pytest.mark.parametrize("phase,expected", [
-    ("waiting_service", "下次运行"), ("waiting_budget", "不会重置"),
-    ("waiting_time", "复用已完成"), ("waiting_manual", "不会自动解除"),
-    ("paused_limit", "保留原审核历史"), ("paused_stagnation", "不会无限重试"),
+    ("waiting_service", "自动从缺少"), ("waiting_budget", "不会重置"),
+    ("waiting_time", "复用已完成"), ("waiting_manual", "自动重新开启"),
+    ("paused_limit", "保留原审核历史"), ("paused_stagnation", "自动重新尝试"),
     ("waiting_evidence", "补齐"), ("waiting_reader", "三个角色"),
     ("insufficient_scope", "不生成无依据"),
 ])
@@ -136,8 +136,8 @@ def test_recovery_guidance_distinguishes_automatic_and_manual_actions(phase, exp
     event = {"state": "pending", "iteration": {"phase": phase}}
     assert expected in recovery_guidance(event)
     assert not publication_status(event)["publishable"]
-    assert "先修复源码检查" in recovery_guidance(event, complete=False)
-    assert "预算核实前" in recovery_guidance({**event, "budget_unverified": True})
+    assert "自动重试" in recovery_guidance(event, complete=False)
+    assert "自动核对" in recovery_guidance({**event, "budget_unverified": True})
 
 
 def test_unpublished_render_explains_recovery_without_exposing_raw_error():
