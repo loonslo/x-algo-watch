@@ -428,6 +428,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.stage == "assert-complete":
             manifest, _, _ = load_bundle(args.bundle)
             if manifest["result_code"] != 0:
+                # 日志必须直接给出失败提交与解析证据，不用下载产物才能定位。
+                failed = {r["commit"]: r for r in RecordStore(args.bundle / "data").records() if not r["complete"]}
+                for commit, record in failed.items():
+                    for finding in record["findings"]:
+                        if finding["category"] == "parse_failure":
+                            print(f"失败提交 {commit[:7]}（基线 {(record.get('base') or '无')[:7]}）：{finding.get('evidence') or finding['message']}", file=sys.stderr)
+                if not failed:
+                    print("检查退出码非 0，但记录中没有未完成提交；请查看 detect 阶段日志", file=sys.stderr)
                 raise WatchError("本轮检查未完成；已发布可用证据，进度未越过失败提交")
         else:
             # 同步 main 后校验 data 哈希，防止长时间起草期间的新提交被覆盖。
