@@ -9,7 +9,6 @@ import yaml
 from tests.fakes import FakeGitHub
 from tests.test_drafting import MODELS, PROMPTS, RecordedClient
 from x_algo_watch.automation import detect, publish, publish_issues, write_bundle
-from x_algo_watch.confirmation import confirm
 from x_algo_watch.drafting import analyze_items, run, validate_analysis
 from x_algo_watch.engine import compare
 from x_algo_watch.evidence import digest
@@ -129,22 +128,11 @@ def test_research_pipeline_publishes_unconfirmed_analysis_not_historical_issue_s
     tech_page = (workspace / "versions/technical" / filename(result.to_dict())).read_text(encoding="utf-8")
     assert "算法版本更新公告" in page and "推荐帖子来源设置有变化" in page
     assert "成立条件" in tech_page and "另一种解释" in tech_page
-    assert "未人工确认" in page
     assert not client.rows and not (workspace / "digest.md").exists()
     assert pending_packs(workspace / "data") == []
     assert len(model.calls) == 4
     assert RecordStore(Path("data")).last_success() == result.commit
     payload = json.loads(output.read_text(encoding="utf-8"))
-    # 可以直接读未确认推测；正式速报仍须单独的所有者确认。
-    publish_issues(client, [result.to_dict()], False, payload["drafts"])
-    client.rows[0]["labels"].append({"name": "已确认"})
-    (workspace / "digest.md").write_text("# Digest\n", encoding="utf-8")
-    event = {"action": "labeled", "sender": {"login": "owner"}, "label": {"name": "已确认"}, "repository": {"full_name": client.repository}, "issue": {"number": 1}}
-    assert confirm(event, client, NOW, workspace, push=False) == "confirmed"
-    text = (workspace / "versions" / filename(result.to_dict())).read_text(encoding="utf-8")
-    assert "模型解读，已获所有者人工确认" in text
-    assert text.count("## 算法版本更新公告") == 1
-    assert "模型解读已人工确认" in (workspace / "versions/README.md").read_text(encoding="utf-8")
 
 
 def test_context_identity_tampering_is_rejected(sample_repo, tmp_path):

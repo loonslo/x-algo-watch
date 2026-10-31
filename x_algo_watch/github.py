@@ -90,7 +90,7 @@ class GitHub:
         return self.pages(f"/issues/{int(number)}/comments")
 
     def ensure_labels(self) -> None:
-        labels = {"x-algo-watch": "5319e7", "级别:红": "d73a4a", "级别:橙": "ff8c00", "待起草": "fbca04", "待确认": "0075ca", "需人工": "b60205", "已确认": "0e8a16", "驳回": "666666", "测试": "bfdadc"}
+        labels = {"x-algo-watch": "5319e7", "级别:红": "d73a4a", "级别:橙": "ff8c00", "待起草": "fbca04", "已复核": "0075ca", "自动重试": "b60205", "测试": "bfdadc"}
         existing = {label["name"] for label in self.pages("/labels")}
         for name, color in labels.items():
             if name not in existing:

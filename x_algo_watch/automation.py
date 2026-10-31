@@ -236,7 +236,7 @@ def evidence_body(record: dict[str, Any], repository: str, test: bool) -> str:
     body += f"完整记录：[data/records](https://github.com/{repository}/tree/main/data/records)。\n\n"
     if not test:
         body += f"通俗说明与可能影响：[本次版本档案](https://github.com/{repository}/blob/main/versions/{filename(record)}) · [全部版本](https://github.com/{repository}/blob/main/versions/README.md)。\n\n"
-    body += "模型不可用时保留证据，下一轮补起草。请仅对机器人草稿使用 `已确认` / `驳回` 标签。"
+    body += "模型不可用时保留证据，下一轮自动补起草；无需人工操作。"
     public_text(body)
     return body
 
@@ -274,12 +274,12 @@ def publish_issues(client: GitHub, records: list[dict[str, Any]], test: bool, dr
                 body = comment_marker + "\n\n" + draft["body"]
                 public_text(body)
                 client.request("POST", f"/issues/{number}/comments", {"body": body})
-            state = "待确认" if draft["ready"] else "需人工"
+            state = "已复核" if draft["ready"] else "自动重试"
             labels = {label["name"] for label in issue.get("labels", [])}
             if state not in labels:
                 client.request("POST", f"/issues/{number}/labels", {"labels": [state]})
             # 只清理程序自己的旧状态，不整体覆盖标签，以保留所有者自定义标签。
-            for obsolete in sorted((labels & {"待起草", "待确认", "需人工"}) - {state}):
+            for obsolete in sorted((labels & {"待起草", "已复核", "自动重试", "待确认", "需人工"}) - {state}):
                 client.request("DELETE", f"/issues/{number}/labels/{quote(obsolete, safe='')}")
     return numbers
 

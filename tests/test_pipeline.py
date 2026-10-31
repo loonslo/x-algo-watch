@@ -9,7 +9,6 @@ import pytest
 from tests.fakes import FakeGitHub
 from tests.test_drafting import MODELS, RecordedClient, analysis, record_and_pack, review
 from x_algo_watch.automation import publish, write_bundle
-from x_algo_watch.confirmation import confirm
 from x_algo_watch.drafting import run
 from x_algo_watch.models import CheckResult, Finding, Severity
 from x_algo_watch.storage import RecordStore
@@ -43,17 +42,3 @@ def test_full_detect_draft_publish_owner_edit_confirm_pipeline(tmp_path, monkeyp
     assert ("同一模型的两次调用" in client.comment_rows[1][0]["body"]) == same_model
     assert not (tmp_path / "digest.md").exists()
     version_page = tmp_path / "versions" / filename(record)
-    assert "未人工确认" in version_page.read_text(encoding="utf-8")
-    (tmp_path / "digest.md").write_text("# Digest\n", encoding="utf-8")
-    client.comment_rows[1][0]["body"] += "\n人工补充：继续观察。"
-    client.rows[0]["labels"].append({"name": "已确认"})
-    event = {"action": "labeled", "sender": {"login": "owner"}, "label": {"name": "已确认"}, "repository": {"full_name": client.repository}, "issue": {"number": 1}}
-    assert confirm(event, client, datetime.now(timezone.utc), tmp_path, push=False) == "confirmed"
-    assert "人工补充" in (tmp_path / "digest.md").read_text(encoding="utf-8")
-    archived = version_page.read_text(encoding="utf-8")
-    assert "已人工确认的详细解读" in archived and "人工补充：继续观察。" in archived
-    if same_model:
-        confirmed = (tmp_path / "digest.md").read_text(encoding="utf-8")
-        assert "同一模型的两次调用" in confirmed and "仓库所有者已人工确认" in confirmed
-        assert "仍须仓库所有者人工确认" not in confirmed
-    assert client.rows[0]["state"] == "closed"

@@ -60,6 +60,7 @@ evidence:
 ---
 
 
+2026-10-31 取消人工确认：删除 confirm 工作流与 confirmation 模块，Issue 标签改为 已复核/自动重试，暂停版本次日自动重启；创作者页与技术页分离。历史已确认速报与 digest.md 仅作只读存档。未在 Actions 验证，部分旧测试断言可能需随 CI 结果调整。
 2026-10-31 生产停滞修复：定时运行自 10-29 全部失败，根因为解析器不认识上游 606b254 的 levels.rs 规则族写法，以及 5ed7963 删除文件被误判为核心实现而使上下文永久延期。已本地修复并验证，未推送、线上未验证；详见 docs/acceptance-production-stall.md。
 2026-10-28 发布候选：已在独立本地工作树整合最新 main 218ebb2 的自动记录，源码补丁无冲突；421 项完整回归通过，最后账本等边界的候选相关检查 54 项通过。原工作区修改保留，候选生产 data/registry 未改变。远程授权按 AGENTS.md 要求确认；等待授权不代表功能、内容或部署已验收。详见 docs/release-candidate-research-pipeline.md。
 

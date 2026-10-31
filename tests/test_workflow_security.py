@@ -11,7 +11,7 @@ def read(name):
 
 
 def test_actions_pinned_and_no_untrusted_script_interpolation():
-    for name in ("check.yml", "confirm.yml", "sample.yml"):
+    for name in ("check.yml", "sample.yml"):
         workflow = read(name)
         assert workflow["permissions"] == {"contents": "read"}
         assert workflow["concurrency"] == {"group": "x-algo-watch-main", "cancel-in-progress": "false"}
@@ -37,16 +37,6 @@ def test_key_is_only_available_to_draft_call_step():
         else:
             assert "environment" not in job
             assert "secrets." not in str(job)
-    assert "secrets." not in str(read("confirm.yml"))
-
-
-def test_confirm_job_restricted_to_owner_and_two_labels():
-    workflow = read("confirm.yml")
-    assert workflow["on"] == {"issues": {"types": ["labeled"]}}
-    condition = workflow["jobs"]["confirm"]["if"]
-    assert "github.actor == github.repository_owner" in condition
-    assert "已确认" in condition and "驳回" in condition
-
 
 def test_sample_job_is_read_only_owner_main_and_key_only_in_model_step():
     workflow = read('sample.yml')
