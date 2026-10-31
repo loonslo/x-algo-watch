@@ -345,9 +345,10 @@ def build_versions(root: Path) -> int:
         reader = (research or {}).get("analysis", {}).get("reader") if display["publishable"] else None
         summary = reader["title"] if reader else "用户正文尚未通过；" + overview(record) if record.get("base") else "起始基线快照"
         index += f"| [{name[:10]} · {record['commit'][:7]}]({name}) | {inline(summary)} | {status} | {inline(record['severity'])} |\n"
-        # 首页只展示已通过审核的更新重点；检测范围与流程状态留在版本目录和档案页。
-        if reader and len(home_rows) < 5:
-            home_rows.append(f"| {name[:10]} · `{record['commit'][:7]}` | {inline(summary)} | [版本档案](versions/{name}) |")
+        # 每次变更都必须有记录：首页逐版列出；正文未通过时只写“解读生成中”，检测范围与流程状态留在档案页。
+        if len(home_rows) < 5:
+            point = reader["title"] if reader else ("起始基线快照" if not record.get("base") else "通俗解读生成中，暂未发布")
+            home_rows.append(f"| {name[:10]} · `{record['commit'][:7]}` | {inline(point)} | [版本档案](versions/{name}) |")
     pages["README.md"] = index + f"\n共 {len(records)} 个版本（含起始基线）。没有新上游提交的检查不会新增版本文件。\n\n目录和基础说明由程序重建；人工解读通过 Issue 审核后保存在速报中，不直接编辑这些生成文件。\n"
     home_path = root / "README.md"
     home_update = None
@@ -359,7 +360,7 @@ def build_versions(root: Path) -> int:
         if start in home and end in home:
             before, rest = home.split(start, 1)
             _, after = rest.split(end, 1)
-            table = "| 更新日期与版本 | 更新重点 | 阅读入口 |\n| --- | --- | --- |\n" + "\n".join(home_rows) if home_rows else "暂无已通过审核的更新解读。"
+            table = "| 更新日期与版本 | 更新重点 | 阅读入口 |\n| --- | --- | --- |\n" + "\n".join(home_rows)
             updated = before + start + "\n\n" + table + "\n\n" + end + after
             public_text(updated)
             if updated != home:
