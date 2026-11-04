@@ -1,10 +1,10 @@
 # 当前状态
 
-- 运行代码提交：b4903a359eb02304e9aed64fd7ac508785e2f128
-- 最后处理的上游提交：b220448766ab4ee4c83d58a67d51f0cb5bda86c2
+- 运行代码提交：9723291d4351d5c98aadadedf8839580779d38d4
+- 最后处理的上游提交：b5089266c0fbad66f388051f8f89056e2a8f974d
 - 最近一次成功检查：2026-11-04
 - 最近检查日期（UTC）：2026-11-04
-- 待复核提交数：34
+- 待复核提交数：35
 - 过期人工核对项：manual.revenue, manual.premium, manual.automation, manual.policy.reposting, manual.policy.author_replies, manual.policy.search_entry, manual.policy.premium_reply_priority, manual.policy.community_notes_revenue, manual.policy.scheduled_posts, manual.policy.giveaways_brands, manual.policy.ai_disclosure, manual.revenue.subscription, manual.revenue.followers, manual.revenue.impressions, manual.revenue.region_age, manual.revenue.post_scope, manual.revenue.surface_scope, manual.revenue.viewer_counting
 - 本次状态：检查完成
 
